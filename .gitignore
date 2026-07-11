@@ -1,0 +1,62 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+out/
+release/
+*.tsbuildinfo
+
+# Bundled engine binary — fetched by scripts/fetch-engine.mjs, ~206 MB, never committed
+resources/engine/
+
+# Compiled local-assist Swift helper (Apple Foundation Models backend). Built from the committed
+# .swift source by `npm run build-assist-helper`; never committed (per-platform, signed at packaging).
+src/main/assist/native/assist-helper
+spike/local-assist/probe
+resources/assist/
+
+# Compiled voice (Speech) Swift helper. Built from the committed .swift source by
+# `npm run build-voice-helper`; never committed (per-platform, signed at packaging).
+src/main/voice/native/voice-helper
+resources/voice/
+
+# Vendored Playwright MCP server (optional agent browser-testing), staged by
+# scripts/vendor-playwright.mjs; never committed (~17 MB of JS). Browser binaries are downloaded
+# onto the user's machine at enable-time, not here.
+resources/playwright/
+
+
+# Koda runtime state created when dogfooding on this repo: the safety-git undo store
+# (.koda/safety.git — a nested git repo, ~150 internal files) + per-project memory. Machine-local,
+# never source. NB (product): in a USER's project Koda should auto-exclude this via the project's
+# .git/info/exclude when safety-git inits, so the user-git layer never commits it — see dual-git.md.
+.koda/*
+
+# Engine `isolation: worktree` scratch (normally auto-cleaned; a stale one can linger)
+.claude/worktrees/
+
+# Playwright E2E artifacts
+test-results/
+playwright-report/
+
+# Claude Code local settings (personal permissions — not shared)
+.claude/settings.local.json
+.claude/skills/settings.local.json
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# OS / editor cruft
+.DS_Store
+*.log
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+/temp*
+
+# Xcode build output
+ios/build/

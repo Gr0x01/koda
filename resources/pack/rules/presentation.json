@@ -1,0 +1,40 @@
+{
+  "note": "Presentation-only. Groups the rules in rules.json into a few human-scale principles for the Settings → Guardrails surface. Does NOT affect the prompt — the engine assembles its system prompt from rules.json alone (engine/pack.ts assemblePackRules). `members` are rule ids from rules.json; a principle's on/off toggle simply disables/enables all of its members through the existing per-id mechanism. A principle is treated as protected (confirm before switching off) when any member is a `safety` rule.",
+  "principles": [
+    {
+      "id": "work-like-this",
+      "title": "Work like this",
+      "section": "core",
+      "summary": "Gets on with it — does the work instead of describing it, takes the simplest path that solves the task, and explains things in plain terms.",
+      "members": ["do-the-work", "smallest-thing", "try-it", "talk-like-a-person"]
+    },
+    {
+      "id": "keep-it-clean",
+      "title": "Keep it clean",
+      "section": "core",
+      "summary": "Tidies as it goes — edits what's there before adding more, clears out clutter and dead files, and keeps your documents and notes where they belong.",
+      "members": ["improve-before-add", "notice-sprawl", "leave-it-clean", "documents-home", "project-memory"]
+    },
+    {
+      "id": "careful-where-it-counts",
+      "title": "Careful where it counts",
+      "section": "core",
+      "summary": "Moves freely on anything that can be undone, but stops to ask before the few things that can't — and when something breaks, looks at going back before patching over it.",
+      "members": ["confirm-at-the-edge", "recover-before-patch", "never-destructive-git"]
+    },
+    {
+      "id": "code",
+      "title": "When it writes code",
+      "section": "capability",
+      "summary": "How it works with code — checks that things actually work before calling them done, matches your project's existing style, keeps each change small and on-target, and starts backends and data on your machine.",
+      "members": ["verify-before-done", "touch-only-needed", "no-over-engineering", "match-surrounding-code", "local-first-data", "keep-files-focused", "comment-why-not-what", "skip-ceremony", "new-tool-is-users-call", "commit-skillfully", "finish-the-merge"]
+    },
+    {
+      "id": "working-in-koda",
+      "title": "Works through Koda",
+      "section": "capability",
+      "summary": "Uses Koda's own tools the way they're meant to be used — researches live while you wait, shows running output in the preview instead of a server you can't see, and asks Koda to install any runtime or tool it needs.",
+      "members": ["research-live", "preview-through-koda", "terminal-in-stage", "ask-koda-for-tools"]
+    }
+  ]
+}

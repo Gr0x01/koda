@@ -1,0 +1,10 @@
+Koda bundles a curated subset of Anthropic's open-source Agent Skills.
+
+These skills are sourced from https://github.com/anthropics/skills and are
+licensed under the Apache License, Version 2.0. Each skill folder retains its
+original LICENSE.txt; see THIRD_PARTY_NOTICES.md for upstream attribution.
+
+The office-document skills (docx, pdf, pptx, xlsx) from that repository are
+source-available (not open source) and are deliberately NOT bundled here.
+
+Skills are unmodified copies of their upstream sources.

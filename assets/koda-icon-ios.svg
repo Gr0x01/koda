@@ -1,0 +1,27 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>Koda app icon</title>
+  <defs>
+    <linearGradient id="chip" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#dbe2f1"/>
+    </linearGradient>
+    <filter id="drop" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="0" dy="6" stdDeviation="6" flood-color="#0a1740" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+  <rect width="1024" height="1024" fill="#2549A8"/>
+  <rect x="304" y="218" width="72" height="72" rx="12" fill="url(#chip)" filter="url(#drop)"/>
+  <rect x="648" y="218" width="72" height="72" rx="12" fill="url(#chip)" filter="url(#drop)"/>
+  <rect x="304" y="304" width="72" height="72" rx="12" fill="url(#chip)" filter="url(#drop)"/>
+  <rect x="562" y="304" width="72" height="72" rx="12" fill="url(#chip)" filter="url(#drop)"/>
+  <rect x="304" y="390" width="72" height="72" rx="12" fill="url(#chip)" filter="url(#drop)"/>
+  <rect x="476" y="390" width="72" height="72" rx="12" fill="url(#chip)" filter="url(#drop)"/>
+  <rect x="304" y="476" width="72" height="72" rx="12" fill="url(#chip)" filter="url(#drop)"/>
+  <rect x="390" y="476" width="72" height="72" rx="12" fill="url(#chip)" filter="url(#drop)"/>
+  <rect x="304" y="562" width="72" height="72" rx="12" fill="url(#chip)" filter="url(#drop)"/>
+  <rect x="476" y="562" width="72" height="72" rx="12" fill="url(#chip)" filter="url(#drop)"/>
+  <rect x="304" y="648" width="72" height="72" rx="12" fill="url(#chip)" filter="url(#drop)"/>
+  <rect x="562" y="648" width="72" height="72" rx="12" fill="url(#chip)" filter="url(#drop)"/>
+  <rect x="304" y="734" width="72" height="72" rx="12" fill="url(#chip)" filter="url(#drop)"/>
+  <rect x="648" y="734" width="72" height="72" rx="12" fill="url(#chip)" filter="url(#drop)"/>
+</svg>

@@ -1,0 +1,81 @@
+appId: com.koda.app
+productName: Koda
+directories:
+  buildResources: build
+  output: release
+files:
+  - out/**
+  - package.json
+  # Bundled so the offline "What's New" popup reads the shipped release notes with no network call
+  # (parsed by src/main/updater.ts from app.getAppPath()). The public /changelog is its online twin.
+  - CHANGELOG.md
+  # node-pty is a native module (the Terminal tool's shell). It's externalized from the main bundle, so
+  # main require()s it from node_modules at runtime — it must ship, and its .node binary can't load from
+  # inside the asar (hence asarUnpack). The only real native npm dep; everything else is bundled/external.
+  - node_modules/node-pty/**
+asarUnpack:
+  - node_modules/node-pty/**
+# The pinned native engine binary, fetched by scripts/fetch-engine.mjs (not committed).
+# Lands at <App>.app/Contents/Resources/engine/<platform>/claude.
+extraResources:
+  - from: resources/engine
+    to: engine
+  # The Koda behavior-layer pack (committed): plugin (skills + subagents) + always-on rules.
+  # Lands at <App>.app/Contents/Resources/pack; resolved by src/main/engine/pack.ts.
+  - from: resources/pack
+    to: pack
+  # Codex-only skills — supplements the pack skills for the Codex engine (e.g. code-review, which on
+  # Claude is a subagent, not a skill). Materialized into the isolated Codex home by codex-home.ts.
+  - from: resources/codex-skills
+    to: codex-skills
+  # The skills gallery — a curated, Apache-2.0 subset of Anthropic's Agent Skills (committed; vendored
+  # from github.com/anthropics/skills). Lands at <App>.app/Contents/Resources/skills-catalog; resolved
+  # by src/main/engine/skills-catalog.ts. Defaults seed into the userData global plugin dir at startup.
+  - from: resources/skills-catalog
+    to: skills-catalog
+  # The on-device voice (Speech) helper, compiled by scripts/build-voice-helper.mjs (not committed).
+  # Lands at <App>.app/Contents/Resources/voice/<platform>/voice-helper; resolved by voice/binary.ts.
+  - from: resources/voice
+    to: voice
+  # The local-assist (Apple Foundation Models) helper, compiled by scripts/build-assist-helper.mjs
+  # (not committed). Lands at <App>.app/Contents/Resources/assist/<platform>/assist-helper; resolved
+  # by assist/binary.ts (which falls back to the deterministic floor when absent).
+  - from: resources/assist
+    to: assist
+  # The Playwright MCP server (optional agent browser-testing), vendored by scripts/vendor-playwright.mjs
+  # (not committed). Lands at <App>.app/Contents/Resources/playwright; resolved by playwright/binary.ts.
+  # Browser binaries are NOT bundled — downloaded into the user's shared dir when they enable the toggle.
+  - from: resources/playwright
+    to: playwright
+# macOS signing & notarization: electron-builder auto-signs with a "Developer ID Application"
+# cert when one is in the keychain (none yet — needs the paid Apple Developer enrollment), and
+# `notarize: true` runs notarytool when APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID
+# are in the env — with them absent it logs "skipped notarization" and still produces the dmg,
+# so local builds keep working. When enrolling: the extra Mach-Os under Resources/ (engine,
+# voice/assist helpers, playwright's node) are the usual hardened-runtime signing fight.
+mac:
+  category: public.app-category.developer-tools
+  # The .dmg is the first manual download; the .zip is what Squirrel.Mac auto-updates FROM (electron-
+  # updater reads it via latest-mac.yml). Both ship to every release, or version-to-version updates break.
+  target:
+    - dmg
+    - zip
+  notarize: true
+  hardenedRuntime: true
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  gatekeeperAssess: false
+  # TCC usage strings for on-device voice dictation (Speech + microphone). macOS shows these in the
+  # permission prompts; both are required or the prompts crash the helper instead of asking.
+  extendInfo:
+    NSMicrophoneUsageDescription: Koda uses the microphone for voice dictation, transcribed on your device.
+    NSSpeechRecognitionUsageDescription: Koda transcribes your speech on your device to type messages.
+dmg:
+  artifactName: ${productName}-${version}-${arch}.dmg
+# Auto-update feed. electron-builder writes app-update.yml into the packaged app from this block, and
+# electron-updater's `github` provider reads signed releases from the koda-public repo with NO baked
+# token. Cutting a release with `--publish` needs a GH_TOKEN with write to koda-public in the local env.
+publish:
+  provider: github
+  owner: Gr0x01
+  repo: koda-public

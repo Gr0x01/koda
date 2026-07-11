@@ -1,0 +1,226 @@
+# Daily guard on the bundled engines (both `claude` and `codex`). Each job resolves the current `stable`
+# release (our pin policy — NOT `latest`/bleeding-edge; see architecture/engine-updates.md), and if it's
+# ahead of the version pinned in scripts/fetch-engine.mjs, downloads + verifies that build (linux) and
+# drives it through the engine-contract smoke test (the real driver). Green → opens a PR bumping the pin;
+# red → opens an issue so a protocol regression surfaces BEFORE we re-bundle for release.
+#
+# Each job is dormant until its API-key repo secret is set — the smoke tests bill to the API in CI
+# (claude: ANTHROPIC_API_KEY, codex: OPENAI_API_KEY). Without the key the job no-ops cleanly (never fails,
+# never opens noise). Codex bills to a ChatGPT OAuth login it can't do headlessly, so CI vets with an
+# OpenAI API key instead (buildEngineEnv maps it in).
+name: Engine Contract
+
+on:
+  schedule:
+    # Daily 06:00 UTC. Checking is cheap (a version compare + one API call); the API-billing smoke test only
+    # runs on days `stable` actually advanced. Daily (not weekly) so a new release — e.g. a flagship model
+    # launch — is caught within ~1 day instead of up to 7.
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Engine version to test (blank = npm `stable` dist-tag)'
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  engine-contract:
+    runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: Resolve versions + preconditions
+        id: v
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::notice::ANTHROPIC_API_KEY not set — skipping engine contract run."
+            echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          PINNED=$(node -p "require('fs').readFileSync('scripts/fetch-engine.mjs','utf8').match(/PINNED_VERSION\s*=\s*'([^']+)'/)[1]")
+          TARGET="${{ inputs.version }}"
+          # Pin policy: track the `stable` dist-tag, NOT `latest`. See architecture/engine-updates.md.
+          [ -z "$TARGET" ] && TARGET=$(npm view @anthropic-ai/claude-code dist-tags.stable)
+          echo "pinned=$PINNED" >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "::notice::pinned=$PINNED stable-target=$TARGET"
+          if [ "$PINNED" = "$TARGET" ]; then
+            echo "::notice::engine already pinned at $TARGET (stable) — nothing to test."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download + verify candidate binary
+        if: steps.v.outputs.go == 'true'
+        run: node scripts/fetch-candidate-engine.mjs --version ${{ steps.v.outputs.target }} --platform linux-x64 --out /tmp/candidate
+
+      - name: Engine contract smoke test
+        if: steps.v.outputs.go == 'true'
+        env:
+          KODA_ENGINE_CANDIDATE: /tmp/candidate/claude
+        run: npm run test:engine-contract
+
+      # Watch the server-advertised min_version floor — the one thing that breaks a frozen bundle (see
+      # architecture/engine-updates.md + the shared-home drift note). The smoke test above authenticates and
+      # drives real turns, which populates ~/.claude.json's cachedGrowthBookFeatures, so we read the floor
+      # off that — no extra engine spawn. Only meaningful when the smoke test ran (go==true); in steady state
+      # the bot proposes a bump daily anyway, so a frozen-and-falling-behind bundle is checked each run.
+      - name: Check server version floor
+        id: floor
+        if: success() && steps.v.outputs.go == 'true'
+        run: node scripts/check-engine-floor.mjs
+
+      # Surface a rising floor as a deduped tracking issue (a green-run ::warning:: would go unseen). Only
+      # one open issue at a time; re-runs update it rather than nagging on every run.
+      - name: Flag approaching floor
+        if: success() && steps.v.outputs.go == 'true' && (steps.floor.outputs.level == 'warn' || steps.floor.outputs.level == 'critical')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LEVEL: ${{ steps.floor.outputs.level }}
+          FLOOR: ${{ steps.floor.outputs.floor }}
+          FLOORKEY: ${{ steps.floor.outputs.floorKey }}
+          PINNED: ${{ steps.floor.outputs.pinned }}
+          BEHIND: ${{ steps.floor.outputs.patchesBehind }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="Engine server floor approaching pinned version ($FLOORKEY)"
+          BODY="Server-advertised floor \`$FLOOR\` (\`$FLOORKEY\`) vs Koda's pinned bundled engine \`$PINNED\` — **$BEHIND patch releases** of headroom left (level: **$LEVEL**). If the floor reaches the pin, the frozen bundled engine starts refusing to run. Plan a re-bundle above the floor. Background: architecture/engine-updates.md. Run: $RUN_URL"
+          EXISTING=$(gh issue list --state open --search "$TITLE in:title" --json number -q '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY" --label "engine" || \
+              gh issue create --title "$TITLE" --body "$BODY"
+          fi
+
+      - name: Open version-bump PR (passed)
+        if: success() && steps.v.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ steps.v.outputs.target }}
+        run: |
+          BRANCH="engine/bump-$TARGET"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          sed -i "s/PINNED_VERSION = '[^']*'/PINNED_VERSION = '$TARGET'/" scripts/fetch-engine.mjs
+          git add scripts/fetch-engine.mjs
+          git commit -m "chore(engine): bump bundled Claude CLI to $TARGET"
+          git push -u origin "$BRANCH" --force
+          # Don't mask a real create failure (e.g. the "Actions can create PRs" repo setting is off) as
+          # success — only the benign already-open case is tolerated, everything else fails the run loudly.
+          if [ -n "$(gh pr list --head "$BRANCH" --state open --json number -q '.[0].number')" ]; then
+            echo "::notice::PR for $BRANCH already open — pushed the updated branch."
+          else
+            gh pr create --base main --head "$BRANCH" \
+              --title "chore(engine): bump bundled Claude CLI to $TARGET" \
+              --body "Automated: the engine-contract smoke test passed against \`$TARGET\` (stable, linux-x64). This bumps the pinned version; \`npm run dist\` fetches + verifies the new binary. Re-bundle for the next release."
+          fi
+
+      - name: Open failure issue (regressed)
+        if: failure() && steps.v.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ steps.v.outputs.target }}
+        run: |
+          gh issue create \
+            --title "Engine contract FAILED on Claude CLI $TARGET" \
+            --body "The stream-json contract smoke test failed for \`$TARGET\` (stable) — do NOT bump the bundled engine until it's resolved. Logs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            || true
+
+  codex-contract:
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: Resolve versions + preconditions
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "::notice::OPENAI_API_KEY not set — skipping codex contract run."
+            echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          PINNED=$(node -p "require('fs').readFileSync('scripts/fetch-engine.mjs','utf8').match(/PINNED_CODEX_VERSION\s*=\s*'([^']+)'/)[1]")
+          # Pin policy: latest GitHub-releases `stable` (newest non-prerelease `rust-v*` tag), NOT prereleases.
+          # The workflow_dispatch `version` input is Claude-only (different version scheme) — Codex always
+          # resolves its own stable so a Claude version can't be mis-fed here.
+          TAG=$(gh api repos/openai/codex/releases --paginate \
+            --jq 'map(select(.prerelease==false and (.tag_name|startswith("rust-v")))) | first | .tag_name')
+          TARGET="${TAG#rust-v}"
+          echo "pinned=$PINNED" >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "::notice::pinned=$PINNED stable-target=$TARGET"
+          if [ -z "$TARGET" ] || [ "$PINNED" = "$TARGET" ]; then
+            echo "::notice::codex already pinned at $PINNED (stable) — nothing to test."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download + extract candidate binary
+        if: steps.v.outputs.go == 'true'
+        run: node scripts/fetch-candidate-codex.mjs --version ${{ steps.v.outputs.target }} --triple x86_64-unknown-linux-musl --out /tmp/candidate-codex
+
+      - name: Codex contract smoke test
+        if: steps.v.outputs.go == 'true'
+        env:
+          KODA_CODEX_CANDIDATE: /tmp/candidate-codex/codex
+        run: npm run test:engine-contract-codex
+
+      - name: Open version-bump PR (passed)
+        if: success() && steps.v.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ steps.v.outputs.target }}
+        run: |
+          # Recompute the bundled-platform (darwin-arm64) tarball SHA the pin records — the smoke test ran
+          # the linux build, but fetch-engine bundles the mac one, so its self-pinned checksum must match.
+          DARWIN_SHA=$(curl -fsSL "https://github.com/openai/codex/releases/download/rust-v$TARGET/codex-aarch64-apple-darwin.tar.gz" | sha256sum | cut -d' ' -f1)
+          if [ -z "$DARWIN_SHA" ]; then echo "::error::could not fetch darwin tarball for $TARGET"; exit 1; fi
+          BRANCH="engine/bump-codex-$TARGET"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          sed -i "s/PINNED_CODEX_VERSION = '[^']*'/PINNED_CODEX_VERSION = '$TARGET'/" scripts/fetch-engine.mjs
+          sed -i "s/'darwin-arm64': '[a-f0-9]*'/'darwin-arm64': '$DARWIN_SHA'/" scripts/fetch-engine.mjs
+          git add scripts/fetch-engine.mjs
+          git commit -m "chore(engine): bump bundled Codex CLI to $TARGET"
+          git push -u origin "$BRANCH" --force
+          if [ -n "$(gh pr list --head "$BRANCH" --state open --json number -q '.[0].number')" ]; then
+            echo "::notice::PR for $BRANCH already open — pushed the updated branch."
+          else
+            gh pr create --base main --head "$BRANCH" \
+              --title "chore(engine): bump bundled Codex CLI to $TARGET" \
+              --body "Automated: the codex app-server contract smoke test passed against \`$TARGET\` (stable, linux-musl). This bumps the pinned version + the darwin-arm64 tarball SHA; \`npm run fetch-engine\` fetches + verifies the new binary. Re-bundle for the next release."
+          fi
+
+      - name: Open failure issue (regressed)
+        if: failure() && steps.v.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ steps.v.outputs.target }}
+        run: |
+          gh issue create \
+            --title "Engine contract FAILED on Codex CLI $TARGET" \
+            --body "The codex app-server contract smoke test failed for \`$TARGET\` (stable) — do NOT bump the bundled Codex engine until it's resolved. Logs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            || true

@@ -1,0 +1,233 @@
+@import 'tailwindcss';
+/* Self-hosted brand type (CSP font-src 'self' forbids CDN fonts; Vite bundles the woff2).
+   Display = Schibsted Grotesk · body = Be Vietnam Pro · code = Spline Sans Mono. */
+@import '@fontsource-variable/schibsted-grotesk';
+@import '@fontsource-variable/spline-sans-mono';
+@import '@fontsource/be-vietnam-pro/400.css';
+@import '@fontsource/be-vietnam-pro/500.css';
+@import '@fontsource/be-vietnam-pro/600.css';
+@import '@fontsource/be-vietnam-pro/700.css';
+@import '@fontsource/be-vietnam-pro/400-italic.css';
+
+/* Class-based dark mode (the ThemeProvider toggles `.dark` on <html>). */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Design tokens — the one place colors are defined; both themes live here so
+   the whole app (and later Monaco/xterm) switches from a single source. */
+:root {
+  /* The floating model (ref: SS1, soft/rounded/conversational): a warm off-white
+     CANVAS with white cards raised on top, separated by soft shadow + radius rather
+     than hard lines. `bg` = canvas, `surface` = the raised card. */
+  --koda-bg: #f4f3f1;
+  --koda-surface: #ffffff;
+  --koda-border: #e9e8e4;
+  --koda-text: #1c1c1e;
+  --koda-text-muted: #5f5f67;
+  /* Ink blue — the single brand accent, kept rare so it's the one cool pop on warm
+     paper. Functional green/red (confirm/danger) live as their own colors, not this. */
+  --koda-accent: #2549a8;
+  /* Aside ("btw" side-question) — a calm, secondary tone, deliberately NOT the ink primary so a side
+     question never reads as an action that touches the project. One place to retune the whole surface. */
+  --koda-aside: #8a7d5c;
+  --koda-aside-tint: #f5f1e6;
+  /* Popover elevation (`shadow-pop`) — for anchored menus/dropdowns that float OVER
+     a raised card, where `shadow-soft` (same as the card) reads same-plane. Layered:
+     a crisp near contact shadow + a diffuse far one, so it clearly sits on top. */
+  --koda-shadow-pop: 0 1px 1px rgba(17, 17, 20, 0.05), 0 6px 14px -4px rgba(17, 17, 20, 0.18),
+    0 14px 34px -10px rgba(17, 17, 20, 0.22);
+
+  /* Syntax highlighting (highlight.js classes) — light. */
+  --koda-hljs-comment: #9aa0aa;
+  --koda-hljs-keyword: #7c3aed;
+  --koda-hljs-string: #2e7d32;
+  --koda-hljs-number: #c2410c;
+  --koda-hljs-function: #1d4ed8;
+  --koda-hljs-type: #b45309;
+  --koda-hljs-variable: #be123c;
+}
+
+.dark {
+  /* Same floating model, dark: depth comes from the surface lift + soft border
+     (shadows read faintly on near-black), keeping the calm/airy feel. */
+  --koda-bg: #0d0d0f;
+  --koda-surface: #17171a;
+  --koda-border: #26262b;
+  --koda-text: #ededee;
+  --koda-text-muted: #9a9aa0;
+  /* Brighter ink so links stay legible on near-black (still the same brand hue). */
+  --koda-accent: #6a93e6;
+  /* Aside, dark — lifted so it stays legible on near-black, same warm secondary family. */
+  --koda-aside: #c9b888;
+  --koda-aside-tint: #211f18;
+  /* On near-black, same-tone-over-same-tone needs a stronger, deeper shadow than light
+     to separate a floating menu from the card beneath it. */
+  --koda-shadow-pop: 0 1px 1px rgba(0, 0, 0, 0.4), 0 6px 14px -4px rgba(0, 0, 0, 0.5),
+    0 16px 36px -10px rgba(0, 0, 0, 0.6);
+
+  /* Syntax highlighting — dark. */
+  --koda-hljs-comment: #6b7280;
+  --koda-hljs-keyword: #c792ea;
+  --koda-hljs-string: #c3e88d;
+  --koda-hljs-number: #f78c6c;
+  --koda-hljs-function: #82aaff;
+  --koda-hljs-type: #ffcb6b;
+  --koda-hljs-variable: #f07178;
+}
+
+/* Expose the tokens to Tailwind as `bg-bg`, `text-text`, `border-border`, … */
+@theme inline {
+  --color-bg: var(--koda-bg);
+  --color-surface: var(--koda-surface);
+  --color-border: var(--koda-border);
+  --color-text: var(--koda-text);
+  --color-text-muted: var(--koda-text-muted);
+  --color-accent: var(--koda-accent);
+  --color-aside: var(--koda-aside);
+  --color-aside-tint: var(--koda-aside-tint);
+  /* Body default (font-sans / inherited), editorial headings (font-display), code (font-mono). */
+  --font-sans: 'Be Vietnam Pro', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-display: 'Schibsted Grotesk Variable', 'Be Vietnam Pro', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'Spline Sans Mono Variable', ui-monospace, 'SF Mono', Menlo, monospace;
+  /* Soft diffuse depth for raised cards (`shadow-soft`) — the floating look.
+     Near-invisible on dark by design; lift there comes from the surface tone. */
+  --shadow-soft: 0 1px 2px rgba(17, 17, 20, 0.04), 0 10px 30px -12px rgba(17, 17, 20, 0.12);
+  /* Popover elevation (`shadow-pop`) — anchored menus/dropdowns floating over a card.
+     Theme-aware (unlike shadow-soft): reads on dark too, where same-tone needs it. */
+  --shadow-pop: var(--koda-shadow-pop);
+
+  /* Motion tokens — mirror of src/motion/tokens.ts, for the CSS-class surfaces (hovers,
+     fades, the existing `transition` utilities). JS surfaces read tokens.ts directly; these
+     keep `duration-fast`/`ease-out-koda` etc. pulling from the same values. */
+  --duration-fast: 120ms;
+  --duration-base: 180ms;
+  --duration-slow: 260ms;
+  --ease-out-koda: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out-koda: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Make the tokens the DEFAULT for every bare `transition`/`transition-colors` utility, so
+     the ~185 class surfaces (hover/opacity/color micro-fades) adopt the system WITHOUT a
+     per-site `duration-*`/`ease-*` class. Tailwind's stock defaults are 150ms + the
+     cubic-bezier(0.4,0,0.2,1) that already equals our `--ease-in-out-koda`; we pin duration to
+     `fast` (these are micro-interactions) and pin the ease explicitly so a future Tailwind
+     default change can't silently drift us off-token. Explicit `duration-*`/`ease-*-koda`
+     classes still override per surface. */
+  --default-transition-duration: 120ms; /* = --duration-fast */
+  --default-transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1); /* = --ease-in-out-koda (two-way hovers; ease.out is for one-directional JS enter/exit) */
+}
+
+/* ── Reading rhythm ─────────────────────────────────────────────────────────────────
+   Two reading surfaces, two RB-tuned rhythms: the session transcript runs tight & dense
+   (preset B); the doc surface runs calm & editorial (preset C). Both scale together with
+   Appearance → Text size — the `data-text-size` attribute on <html> shifts the base px,
+   while the line-height RATIO stays fixed so the rhythm holds at every size. Transcript
+   type derives from --prose-*; the doc surface (surface/doc-theme.css) from --doc-*. The
+   per-element scale (headings, code, tables) is em-relative at the use site, so the whole
+   tree tracks the one base + the setting. */
+:root {
+  --prose-fs: 13.5px; /* session transcript — preset B */
+  --prose-lh: 1.5;
+  --doc-fs: 14.5px; /* doc surface — preset C */
+  --doc-lh: 1.6;
+}
+html[data-text-size='compact'] {
+  --prose-fs: 12.5px;
+  --doc-fs: 13.5px;
+}
+html[data-text-size='comfortable'] {
+  --prose-fs: 15px;
+  --doc-fs: 16px;
+}
+
+.koda-prose {
+  font-size: var(--prose-fs);
+  line-height: var(--prose-lh);
+}
+
+/* highlight.js token classes → our design tokens, so code coloring switches with
+   the app theme from the single source above (rehype-highlight emits these). */
+.hljs-comment,
+.hljs-quote { color: var(--koda-hljs-comment); font-style: italic; }
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-literal,
+.hljs-section,
+.hljs-meta { color: var(--koda-hljs-keyword); }
+.hljs-string,
+.hljs-regexp,
+.hljs-addition { color: var(--koda-hljs-string); }
+.hljs-number,
+.hljs-symbol,
+.hljs-bullet { color: var(--koda-hljs-number); }
+.hljs-title,
+.hljs-title.function_,
+.hljs-name { color: var(--koda-hljs-function); }
+.hljs-built_in,
+.hljs-type,
+.hljs-class .hljs-title { color: var(--koda-hljs-type); }
+.hljs-attr,
+.hljs-attribute,
+.hljs-variable,
+.hljs-template-variable,
+.hljs-tag,
+.hljs-deletion { color: var(--koda-hljs-variable); }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 600; }
+
+/* Window chrome: the custom title bar is the drag handle for the frameless window;
+   interactive children inside it must opt out so clicks register. */
+.app-drag { -webkit-app-region: drag; }
+.app-no-drag { -webkit-app-region: no-drag; }
+
+/* PixelGlyph cell: every cell's base opacity is its glyph target, so when the twinkle overlay is
+   removed each cell settles to that target over this transition — the loader resolves INTO the glyph
+   (forming cells lock solid, the rest fade) instead of cutting. */
+.koda-pixel-cell { transition: opacity 300ms ease; }
+/* Loader (twinkle): inner cells run this on fixed, scattered delays, softly flickering in and out —
+   an organic "thinking" shimmer rather than a marching ring. `backwards` holds the dim 0% frame
+   through each cell's start delay. */
+@keyframes koda-pixel-twinkle {
+  0%, 100% { opacity: 0.12; }
+  50% { opacity: 1; }
+}
+.koda-pixel-twinkle { animation: koda-pixel-twinkle 1.6s ease-in-out infinite backwards; }
+
+/* Hide the scrollbar but keep the element scrollable (wheel/trackpad/drag). For the dock tab strip,
+   where a chunky horizontal bar is noisy and the edge fade already signals "more, scroll this way". */
+@utility no-scrollbar {
+  scrollbar-width: none;
+  &::-webkit-scrollbar { display: none; }
+}
+
+/* Slim, calm scrollbars app-wide — replaces Chromium's chunky default bar (the thick dark
+   one a Finder-launched .app shows when overlay bars are off) with a thin floating thumb tinted
+   from the text token, so it reads on both themes. The 3px transparent border + padding-box clip
+   shrinks the visible thumb to ~4px inside a 10px hit area. `no-scrollbar` still wins where hidden. */
+@layer base {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in srgb, var(--koda-text) 20%, transparent) transparent;
+  }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background-color: color-mix(in srgb, var(--koda-text) 18%, transparent);
+    border: 2.5px solid transparent;
+    background-clip: padding-box;
+    border-radius: 9999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: color-mix(in srgb, var(--koda-text) 32%, transparent);
+  }
+  ::-webkit-scrollbar-corner { background: transparent; }
+}
+
+/* In-transcript find (⌘F) — the CSS Custom Highlight API paints matches without mutating the
+   rendered markdown DOM. Accent-tinted; the active match is solid so it stands out while cycling. */
+::highlight(koda-find) {
+  background-color: color-mix(in srgb, var(--koda-accent) 28%, transparent);
+  border-radius: 2px;
+}
+::highlight(koda-find-active) {
+  background-color: var(--koda-accent);
+  color: #fff;
+}

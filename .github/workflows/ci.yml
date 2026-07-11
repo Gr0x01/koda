@@ -1,0 +1,27 @@
+# The cheap hygiene gate: lint + typecheck + a full bundle build on every push/PR. Runs on Linux
+# (10x cheaper minutes than macOS; nothing here is platform-specific — the Swift helpers and
+# electron-builder packaging are mac-only and stay local). E2E stays local too: driving Electron
+# under xvfb isn't worth the flake budget yet.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      # build = typecheck (all three tsconfigs) + electron-vite build + the mobile client bundle.
+      # Runner default heap (~2GB) OOMs on the combined build; the runner has 16GB, so lift the ceiling.
+      - run: npm run build
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144

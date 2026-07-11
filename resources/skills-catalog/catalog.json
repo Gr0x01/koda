@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "source": "https://github.com/anthropics/skills",
+  "license": "Apache-2.0",
+  "skills": [
+    {
+      "id": "canvas-design",
+      "title": "Poster & visual design",
+      "category": "Design & art",
+      "blurb": "Design original posters, art, and static visuals with real design judgment.",
+      "deps": "none",
+      "defaultActive": true
+    },
+    {
+      "id": "theme-factory",
+      "title": "Style with a theme",
+      "category": "Design & art",
+      "blurb": "Apply a polished color/font theme to slides, docs, and pages — or invent a new one.",
+      "deps": "none",
+      "defaultActive": true
+    },
+    {
+      "id": "brand-guidelines",
+      "title": "Brand look & feel",
+      "category": "Design & art",
+      "blurb": "Apply a consistent brand palette and typography across whatever you're making.",
+      "deps": "none",
+      "defaultActive": true
+    },
+    {
+      "id": "doc-coauthoring",
+      "title": "Co-author a document",
+      "category": "Writing",
+      "blurb": "A guided workflow for writing proposals, specs, and docs that actually land with readers.",
+      "deps": "none",
+      "defaultActive": true
+    },
+    {
+      "id": "algorithmic-art",
+      "title": "Generative art",
+      "category": "Design & art",
+      "blurb": "Make flow fields, particle systems, and other generative art with p5.js.",
+      "deps": "none",
+      "defaultActive": false
+    },
+    {
+      "id": "internal-comms",
+      "title": "Internal comms",
+      "category": "Writing",
+      "blurb": "Draft status reports, leadership updates, and announcements in clean formats.",
+      "deps": "none",
+      "defaultActive": false
+    },
+    {
+      "id": "web-artifacts-builder",
+      "title": "Rich web pages",
+      "category": "Web",
+      "blurb": "Build multi-component pages with React, Tailwind, and shadcn/ui.",
+      "deps": "Uses Node",
+      "defaultActive": false
+    },
+    {
+      "id": "slack-gif-creator",
+      "title": "Slack GIFs",
+      "category": "Fun",
+      "blurb": "Create animated GIFs sized and validated for Slack.",
+      "deps": "Uses Python",
+      "defaultActive": false
+    },
+    {
+      "id": "skill-creator",
+      "title": "Build your own skill",
+      "category": "Advanced",
+      "blurb": "Scaffold, edit, and test new skills from scratch.",
+      "deps": "Uses Python",
+      "defaultActive": false
+    }
+  ]
+}

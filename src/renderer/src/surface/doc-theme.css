@@ -1,0 +1,353 @@
+/*
+ * Crepe (Milkdown) doc surface, themed to Koda.
+ *
+ * We import ONLY Crepe's structural CSS (layout, slash menu, tables, block handles) and define our
+ * own colour variables, mapping each to Koda's design tokens. The tokens already flip under `.dark`
+ * (styles/index.css), so this one mapping gives correct light + dark with no JS theme bridge — and
+ * the doc reads as Koda (ink accent + the type trio), not default Milkdown. See [[visual-design-no-ai-slop]].
+ */
+/*
+ * Crepe's structural CSS, imported part-by-part instead of the `common/style.css` aggregate so we can
+ * SKIP `latex.css` and `ai.css` — features we disable. latex.css `@import`s KaTeX's CSS, whose small
+ * fonts Vite inlines as `data:` URIs, which Koda's `font-src 'self'` CSP (correctly) blocks. Dropping
+ * it removes the only data: font and trims unused KaTeX weight. (Keep this list in sync with Crepe's
+ * common/style.css on upgrade.)
+ */
+@import '@milkdown/crepe/theme/common/reset.css';
+@import '@milkdown/crepe/theme/common/prosemirror.css';
+@import '@milkdown/crepe/theme/common/block-edit.css';
+@import '@milkdown/crepe/theme/common/code-mirror.css';
+@import '@milkdown/crepe/theme/common/cursor.css';
+@import '@milkdown/crepe/theme/common/image-block.css';
+@import '@milkdown/crepe/theme/common/link-tooltip.css';
+@import '@milkdown/crepe/theme/common/list-item.css';
+@import '@milkdown/crepe/theme/common/placeholder.css';
+@import '@milkdown/crepe/theme/common/toolbar.css';
+@import '@milkdown/crepe/theme/common/table.css';
+@import '@milkdown/crepe/theme/common/top-bar.css';
+
+.milkdown {
+  /* The doc reads as a page: white surface, not the cream app canvas. Flips correctly in dark. */
+  --crepe-color-background: var(--koda-surface);
+  --crepe-color-on-background: var(--koda-text);
+  --crepe-color-surface: var(--koda-surface);
+  --crepe-color-surface-low: var(--koda-bg);
+  --crepe-color-on-surface: var(--koda-text);
+  --crepe-color-on-surface-variant: var(--koda-text-muted);
+  --crepe-color-outline: var(--koda-border);
+  --crepe-color-primary: var(--koda-accent);
+  --crepe-color-secondary: color-mix(in srgb, var(--koda-accent) 16%, transparent);
+  --crepe-color-on-secondary: var(--koda-text);
+  --crepe-color-inverse: var(--koda-text);
+  --crepe-color-on-inverse: var(--koda-bg);
+  --crepe-color-inline-code: var(--koda-accent);
+  --crepe-color-error: #e5484d;
+  --crepe-color-hover: color-mix(in srgb, var(--koda-text) 6%, transparent);
+  --crepe-color-selected: color-mix(in srgb, var(--koda-accent) 20%, transparent);
+  --crepe-color-inline-area: color-mix(in srgb, var(--koda-text) 8%, transparent);
+
+  /* We import only Crepe's structural CSS, so its theme files (which define these) never load — leaving
+   * popups with `box-shadow: var(--crepe-shadow-1)` resolving to nothing. Map to our soft shadow so the
+   * slash menu / tooltips read as raised cards, not bare white floating in space. */
+  --crepe-shadow-1: var(--shadow-pop);
+  --crepe-shadow-2: var(--shadow-pop);
+
+  --crepe-font-title: var(--font-display);
+  --crepe-font-default: var(--font-sans);
+  --crepe-font-code: var(--font-mono);
+
+  background: var(--koda-surface);
+}
+
+/*
+ * The editable area: a comfortable reading column with generous gutters (a document, not a textarea).
+ * The horizontal padding must stay ≥ the block handle's width (~46px): the `+`/drag handle is absolutely
+ * positioned just left of the text block, so when the pane narrows a too-small gutter pushes it to a
+ * negative offset where the overflow-auto host clips it (and it crowds the text). 3.25rem keeps it
+ * in-gutter at any width.
+ */
+.milkdown .ProseMirror {
+  max-width: 46rem;
+  margin: 0 auto;
+  /* Tight top pad: the page-chrome title (DocPageChrome) sits directly above in the same scroll host
+     and owns the top breathing room (its pt-9), so the body just needs to clear the title — not add a
+     second big gap. The first-child margin reset below removes the leading heading's own top margin. */
+  padding: 0.75rem 3.25rem 6rem;
+  /* The doc's reading base — preset C (calm/editorial). Headings + body below are em-relative to this,
+     so Appearance → Text size (which shifts --doc-fs) scales the whole document proportionally. */
+  font-size: var(--doc-fs);
+  line-height: var(--doc-lh);
+}
+
+/*
+ * Type scale — Crepe's defaults (h1 42px … body 16px) are sized for a full-width web page and read as
+ * "made for grandmas" inside an app pane. Tighten to an app-document scale: clear hierarchy, comfortable
+ * but not shouty. Sizes are em-relative to the --doc-fs base above (so they track the Text-size setting);
+ * same selector + later source order as reset.css → these win without !important.
+ */
+/* The leading block sits right under the page title — drop its top margin so the doc opens flush. */
+.milkdown .ProseMirror > :first-child {
+  margin-top: 0;
+}
+.milkdown .ProseMirror h1 {
+  font-size: 1.85em;
+  line-height: 1.2;
+  font-weight: 600;
+  margin-top: 1.6rem;
+}
+.milkdown .ProseMirror h2 {
+  font-size: 1.45em;
+  line-height: 1.25;
+  font-weight: 600;
+  margin-top: 1.4rem;
+}
+.milkdown .ProseMirror h3 {
+  font-size: 1.2em;
+  line-height: 1.3;
+  font-weight: 600;
+  margin-top: 1.1rem;
+}
+.milkdown .ProseMirror h4 {
+  font-size: 1.05em;
+  line-height: 1.35;
+  font-weight: 600;
+  margin-top: 1rem;
+}
+.milkdown .ProseMirror h5 {
+  font-size: 0.95em;
+  line-height: 1.4;
+  margin-top: 0.9rem;
+}
+.milkdown .ProseMirror h6 {
+  font-size: 0.9em;
+  line-height: 1.4;
+  margin-top: 0.9rem;
+}
+.milkdown .ProseMirror p,
+.milkdown .ProseMirror li {
+  font-size: 1em;
+  line-height: var(--doc-lh);
+}
+
+/*
+ * Block handle (the floating `+` add + ⠿ drag affordance in the left gutter). Crepe's defaults are
+ * 32px hit targets with 24px glyphs filled with --crepe-color-outline (the BORDER token — near
+ * invisible). Make them smaller and use the muted-text token so they're legible without dominating.
+ */
+.milkdown .milkdown-block-handle .operation-item {
+  width: 22px;
+  height: 22px;
+  padding: 3px;
+}
+.milkdown .milkdown-block-handle .operation-item svg {
+  width: 16px;
+  height: 16px;
+  fill: var(--koda-text-muted);
+}
+
+/*
+ * Slash / block-insert menu (opened by the + handle). Crepe's defaults are oversized for an app pane
+ * (24px icons, 14px labels, 220px-wide rows, fat padding). Tighten the whole scale, add a border so it
+ * has an edge against the white doc, and darken the faint outline-token icons to muted text.
+ */
+.milkdown .milkdown-slash-menu {
+  border: 1px solid var(--koda-border);
+  border-radius: 10px;
+}
+.milkdown .milkdown-slash-menu .tab-group {
+  padding: 8px 8px 0;
+}
+.milkdown .milkdown-slash-menu .tab-group ul li {
+  font-size: 12px;
+  line-height: 16px;
+  padding: 5px 9px;
+}
+.milkdown .milkdown-slash-menu .menu-groups {
+  padding: 0 8px 8px;
+  max-height: 320px;
+}
+.milkdown .milkdown-slash-menu .menu-groups .menu-group h6 {
+  font-size: 10px;
+  line-height: 14px;
+  padding: 10px 8px 4px;
+}
+.milkdown .milkdown-slash-menu .menu-groups .menu-group li {
+  min-width: 180px;
+  gap: 10px;
+  padding: 7px 8px;
+}
+.milkdown .milkdown-slash-menu .menu-groups .menu-group li svg {
+  width: 17px;
+  height: 17px;
+  color: var(--koda-text-muted);
+  fill: var(--koda-text-muted);
+}
+.milkdown .milkdown-slash-menu .menu-groups .menu-group li > span {
+  font-size: 13px;
+  line-height: 18px;
+}
+
+/*
+ * Table column resize handles (useTableColumnResize.ts overlays these on column borders). A thin
+ * invisible grab strip straddling the border; on hover/drag an ink line marks the seam. Sits above the
+ * cells but below Crepe's row/col drag handles (.cell-handle, z 50) so those stay clickable.
+ */
+.milkdown .milkdown-table-block .koda-col-resize {
+  width: 9px;
+  margin-left: -4px;
+  z-index: 15;
+  cursor: col-resize;
+  touch-action: none;
+}
+.milkdown .milkdown-table-block .koda-col-resize::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 2px;
+  transform: translateX(-50%);
+  background: var(--koda-accent);
+  opacity: 0;
+  transition: opacity 0.12s ease-in-out;
+}
+.milkdown .milkdown-table-block .koda-col-resize:hover::after {
+  opacity: 0.55;
+}
+
+/*
+ * Callout block (blocks/callout.ts) — a Notion-style tinted aside, stored on disk as a GitHub-alert
+ * blockquote (`> [!NOTE]` …). One `--cal` accent per kind drives the left bar, label and tint, all
+ * derived from Koda tokens / a small muted set so it reads right in light AND dark (--koda-surface
+ * flips, color-mix re-tints). No garish fills — muted mid-tones only. See [[visual-design-no-ai-slop]].
+ */
+.milkdown .ProseMirror .koda-callout {
+  --cal: var(--koda-accent);
+  position: relative;
+  margin: 1rem 0;
+  padding: 0.7rem 1rem;
+  border: 1px solid color-mix(in srgb, var(--cal) 28%, var(--koda-border));
+  border-left: 3px solid var(--cal);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--cal) 7%, var(--koda-surface));
+}
+/* The kind label (Note / Tip / …) — a small tinted caption above the body. */
+.milkdown .ProseMirror .koda-callout::before {
+  content: 'Note';
+  display: block;
+  margin-bottom: 0.3rem;
+  font-size: 0.72em;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--cal);
+}
+/* Tighten body spacing so a one-line callout isn't airy; first/last children flush to the box. */
+.milkdown .ProseMirror .koda-callout > :first-child {
+  margin-top: 0;
+}
+.milkdown .ProseMirror .koda-callout > :last-child {
+  margin-bottom: 0;
+}
+
+.milkdown .ProseMirror .koda-callout[data-callout-kind='note'] {
+  --cal: var(--koda-accent);
+}
+.milkdown .ProseMirror .koda-callout[data-callout-kind='note']::before {
+  content: 'Note';
+}
+.milkdown .ProseMirror .koda-callout[data-callout-kind='tip'] {
+  --cal: #2f9e63;
+}
+.milkdown .ProseMirror .koda-callout[data-callout-kind='tip']::before {
+  content: 'Tip';
+}
+.milkdown .ProseMirror .koda-callout[data-callout-kind='important'] {
+  --cal: #6d5bd0;
+}
+.milkdown .ProseMirror .koda-callout[data-callout-kind='important']::before {
+  content: 'Important';
+}
+.milkdown .ProseMirror .koda-callout[data-callout-kind='warning'] {
+  --cal: #c2871a;
+}
+.milkdown .ProseMirror .koda-callout[data-callout-kind='warning']::before {
+  content: 'Warning';
+}
+.milkdown .ProseMirror .koda-callout[data-callout-kind='caution'] {
+  --cal: #d2544e;
+}
+.milkdown .ProseMirror .koda-callout[data-callout-kind='caution']::before {
+  content: 'Caution';
+}
+/* In dark mode the mid-tone accents sit on a dark tint; lift them slightly for legible label/border. */
+.dark .milkdown .ProseMirror .koda-callout[data-callout-kind='tip'] {
+  --cal: #46b377;
+}
+.dark .milkdown .ProseMirror .koda-callout[data-callout-kind='important'] {
+  --cal: #8b7ce8;
+}
+.dark .milkdown .ProseMirror .koda-callout[data-callout-kind='warning'] {
+  --cal: #d99e2b;
+}
+.dark .milkdown .ProseMirror .koda-callout[data-callout-kind='caution'] {
+  --cal: #e0716c;
+}
+
+/*
+ * Toggle block (blocks/toggle.ts) — a Notion-style collapsible, stored on disk as `<details>` HTML
+ * passthrough. The caret (a non-editable NodeView sibling) flips `data-open`; the summary + body are
+ * ProseMirror content. Muted ink affordance, no fills. Open/closed is presentation only (not saved).
+ */
+.milkdown .ProseMirror .koda-toggle {
+  position: relative;
+  margin: 0.6rem 0;
+  padding-left: 1.5rem;
+}
+.milkdown .ProseMirror .koda-toggle-caret {
+  position: absolute;
+  left: 0;
+  top: 0.05em;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25rem;
+  height: 1.55em;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--koda-text-muted);
+  cursor: pointer;
+  border-radius: 6px;
+  transition:
+    transform 0.15s ease,
+    color 0.12s ease,
+    background-color 0.12s ease;
+}
+.milkdown .ProseMirror .koda-toggle-caret:hover {
+  color: var(--koda-text);
+  background: color-mix(in srgb, var(--koda-text) 7%, transparent);
+}
+.milkdown .ProseMirror .koda-toggle[data-open='true'] .koda-toggle-caret {
+  transform: rotate(90deg);
+}
+/* The title line: a touch heavier than body so the toggle reads as a header. */
+.milkdown .ProseMirror .koda-toggle-summary {
+  font-weight: 600;
+}
+.milkdown .ProseMirror .koda-toggle-summary:empty::before {
+  content: 'Toggle';
+  color: var(--koda-text-muted);
+  pointer-events: none;
+}
+/* Collapsed: keep the title, hide the body blocks. */
+.milkdown .ProseMirror .koda-toggle[data-open='false'] .koda-toggle-body > :not(.koda-toggle-summary) {
+  display: none;
+}
+/* Tighten body spacing inside the toggle so it reads as one grouped block. */
+.milkdown .ProseMirror .koda-toggle-body > :first-child {
+  margin-top: 0;
+}
+.milkdown .ProseMirror .koda-toggle-body > .koda-toggle-summary + * {
+  margin-top: 0.25rem;
+}

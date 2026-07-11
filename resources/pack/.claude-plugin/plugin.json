@@ -1,0 +1,7 @@
+{
+  "name": "koda",
+  "description": "Koda's curated behavior layer — the skills and specialist subagents that ship with the app. Always-on judgment rules are delivered separately via the system prompt (see rules/rules.json).",
+  "version": "0.0.1",
+  "author": { "name": "Koda" },
+  "license": "MIT"
+}
