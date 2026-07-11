@@ -5,7 +5,7 @@
  * ethos). Distinct from the bundled `claude` engine, which is pinned and forbidden from self-updating
  * (engine-updates.md); this updates the whole signed .app wholesale, only ever on relaunch.
  *
- * Squirrel.Mac updates from the .zip in the release (not the .dmg), read via the koda-public
+ * Squirrel.Mac updates from the .zip in the release (not the .dmg), read via the koda repo's
  * `latest-mac.yml` feed baked in as app-update.yml by electron-builder's `publish` block.
  */
 import { app, BrowserWindow } from 'electron'

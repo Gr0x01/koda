@@ -2008,7 +2008,7 @@ export interface KodaApi {
   onUpdateStatus: (listener: (status: UpdateStatus) => void) => () => void
   /** The current version's release notes, once per update (null otherwise) → the "What's New" popup. */
   getWhatsNew: () => Promise<WhatsNew>
-  /** Post in-app feedback as a public koda-public issue; resolves with the issue URL or a friendly error. */
+  /** Post in-app feedback to the private Supabase inbox; resolves ok or a friendly error. */
   submitFeedback: (args: FeedbackRequest) => Promise<FeedbackResult>
   // Engine adapter.
   startSession: (args: StartSessionRequest) => Promise<StartSessionResponse>

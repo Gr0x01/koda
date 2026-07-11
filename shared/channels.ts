@@ -308,7 +308,7 @@ export const IpcChannels = {
   updateStatus: 'update:status',
   updateWhatsNew: 'update:whatsNew',
   // In-app feedback — invoke: post the user's typed feedback (message + optional email) to the
-  // Supabase `feedback` edge fn, which opens a public issue on koda-public. See main/feedback.ts.
+  // Supabase `feedback` edge fn, which writes a row to the private feedback inbox. See main/feedback.ts.
   feedbackSubmit: 'feedback:submit',
   // Terminal surface (a Dock tool) — a real interactive shell in the window's project, for the
   // power user who needs to run things themselves. start = invoke (spawn/ensure the window's pty at

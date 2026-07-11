@@ -73,9 +73,9 @@ mac:
 dmg:
   artifactName: ${productName}-${version}-${arch}.dmg
 # Auto-update feed. electron-builder writes app-update.yml into the packaged app from this block, and
-# electron-updater's `github` provider reads signed releases from the koda-public repo with NO baked
-# token. Cutting a release with `--publish` needs a GH_TOKEN with write to koda-public in the local env.
+# electron-updater's `github` provider reads signed releases from the koda repo with NO baked token.
+# Cutting a release with `--publish` needs a GH_TOKEN with write to koda in the local env.
 publish:
   provider: github
   owner: Gr0x01
-  repo: koda-public
+  repo: koda

@@ -23,5 +23,5 @@ _First versioned build — the baseline the auto-updater ships from._
 - Settings now shows the Koda version, the bundled Claude engine version, and a
   "Check for updates" button.
 
-[Unreleased]: https://github.com/Gr0x01/koda-public/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/Gr0x01/koda-public/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Gr0x01/koda/releases/tag/v0.1.0
