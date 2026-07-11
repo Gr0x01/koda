@@ -10,6 +10,14 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-11
+
+_A maintenance update. Nothing changes in how you use Koda._
+
+### Changed
+
+- Internal update to how Koda delivers new versions. No action needed.
+
 ## [0.1.0] - 2026-07-09
 
 _First versioned build — the baseline the auto-updater ships from._
@@ -23,5 +31,6 @@ _First versioned build — the baseline the auto-updater ships from._
 - Settings now shows the Koda version, the bundled Claude engine version, and a
   "Check for updates" button.
 
-[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/Gr0x01/koda/releases/tag/v0.1.1
 [0.1.0]: https://github.com/Gr0x01/koda/releases/tag/v0.1.0
