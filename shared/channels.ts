@@ -45,6 +45,9 @@ export const IpcChannels = {
   // main forwards the request and the renderer archives it (store.archiveSession → its normal persist).
   // main→renderer push. Windowless projects skip this: main writes the store directly (archiveRemote).
   sessionArchiveRequested: 'sessions:archiveRequested',
+  // Same two-owner rule for a phone RENAME of a live session in a windowed project: main forwards,
+  // the renderer renames (store.renameSession → its normal persist). main→renderer push.
+  sessionRenameRequested: 'sessions:renameRequested',
   // A phone turn landed on a session a window already OWNS (it adopted the session empty, before this
   // turn). The engine stream never echoes the human's prompt, so main forwards it to that window only
   // (not the remote sinks — the sending phone shows its own optimistic bubble) → the renderer appends
@@ -85,6 +88,15 @@ export const IpcChannels = {
   fsRenamePath: 'fs:renamePath',
   fsDeletePath: 'fs:deletePath',
   fsCreateDir: 'fs:createDir',
+  // Duplicate a file/folder ("<name> copy"), and import files dragged in from Finder into a folder
+  // (or Documents/). Both add files → checkpoint via safety-git first (recoverable). Path-contained
+  // to the project root; import writes external bytes, never follows an external path. invoke.
+  fsDuplicatePath: 'fs:duplicatePath',
+  fsImportFiles: 'fs:importFiles',
+  // Basic Mac QoL from the Files right-click: reveal a file/folder in Finder, or open it in the OS
+  // default app. Read-only shell actions, path-contained to the project root. invoke.
+  fsRevealPath: 'fs:revealPath',
+  fsOpenPath: 'fs:openPath',
   // Live-edits diff: a file's pre-edit state (safety-git HEAD) vs its current contents. Read-only.
   fsDiffFile: 'fs:diffFile',
   // Project-wide find (the Find overlay) — filename + content matches across the project root,

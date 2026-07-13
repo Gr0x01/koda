@@ -11,9 +11,9 @@
  * registry — one-project-per-window). This module just enforces containment within whatever root
  * it's given; it has no notion of "the" project.
  */
-import { existsSync, realpathSync } from 'node:fs'
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
-import { basename, dirname, join, relative, resolve, sep } from 'node:path'
+import { existsSync, mkdirSync, realpathSync } from 'node:fs'
+import { cp, mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path'
 import type {
   DiffFileResult,
   ProjectDoc,
@@ -375,6 +375,29 @@ export async function listProjectDocs(root: string): Promise<ProjectDoc[]> {
 }
 
 /**
+ * The first ~`maxChars` of a doc — the phone's page-preview cards render this miniature so the user
+ * recognizes their document by its content, not its filename. Contained like every other access;
+ * fail-soft (missing/unreadable → undefined) because a preview is decoration, never worth an error.
+ * Partial read (never the whole file) so a huge doc costs one small disk hit per listing.
+ */
+export async function docExcerpt(root: string, rel: string, maxChars = 600): Promise<string | undefined> {
+  try {
+    const target = containedReal(root, rel)
+    const fh = await open(target, 'r')
+    try {
+      // ×4: UTF-8 worst case, so maxChars of text survives the byte→string cut.
+      const buf = Buffer.alloc(maxChars * 4)
+      const { bytesRead } = await fh.read(buf, 0, buf.length, 0)
+      return buf.subarray(0, bytesRead).toString('utf8').slice(0, maxChars)
+    } finally {
+      await fh.close()
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Rename or move a file/folder. `from` must exist; `to` is a new path whose parent exists, both
  * within the project root. Refuses to clobber an existing target (so a rename can't silently
  * overwrite another file). One `fs.rename` covers both rename (same dir) and move (different dir) —
@@ -401,17 +424,85 @@ export async function deleteProjectPath(root: string, target: string): Promise<v
 }
 
 /**
- * Create a new folder. `parent` (an existing dir within root) nests it; omitted ⇒ the project root.
- * Name defaults to "New folder", sanitised + deduped. No checkpoint — an empty dir is trivially
- * discardable and git wouldn't track it anyway.
+ * Create a new folder. `parent` (an existing dir within root) nests it; `home` lands it in the
+ * user's `Documents/` (where New document goes — so a folder made from the doc-first view is where
+ * they expect); omitted ⇒ the project root. Name defaults to "New folder", sanitised + deduped. No
+ * checkpoint — an empty dir is trivially discardable and git wouldn't track it anyway.
  */
-export async function createProjectDir(root: string, name?: string, parent?: string): Promise<string> {
-  const parentDir = parent ? containedReal(root, parent) : realpathSync(root)
-  const base = (name ?? 'New folder').replace(/[/\\]/g, '').trim() || 'New folder'
+export async function createProjectDir(
+  root: string,
+  name?: string,
+  parent?: string,
+  home?: boolean,
+): Promise<string> {
+  const parentDir = parent ? containedReal(root, parent) : home ? docsHome(root) : realpathSync(root)
+  const base = safeSegment(name, 'New folder')
   let dir = join(parentDir, base)
   for (let n = 2; existsSync(dir); n++) dir = join(parentDir, `${base} ${n}`)
   await mkdir(dir)
   return realpathSync(dir)
+}
+
+/** Sanitise a user/OS-supplied name into a single safe path segment: strip path separators, and
+ *  never let `.`/`..` through (they'd resolve to the parent/self and confuse the dedup loop). Falls
+ *  back to `dflt` when empty. Containment doesn't depend on this — dest is always range-checked — but
+ *  it keeps a crafted name from producing a `.. 2` folder or an EEXIST-on-parent error. */
+function safeSegment(name: string | undefined, dflt: string): string {
+  const clean = (name ?? '').replace(/[/\\]/g, '').trim()
+  return !clean || clean === '.' || clean === '..' ? dflt : clean
+}
+
+/** The user's `Documents/` home, created if missing and range-checked against root (a pre-existing
+ *  `Documents` symlink pointing outside must not smuggle writes out of bounds — same defense as
+ *  createProjectFile). Shared by every "lands in Documents/" action. */
+function docsHome(root: string): string {
+  const realRoot = realpathSync(root)
+  const home = join(realRoot, DOCS_HOME)
+  if (!existsSync(home)) mkdirSync(home, { recursive: true })
+  const real = realpathSync(home)
+  if (real !== realRoot && !real.startsWith(realRoot + sep)) throw new Error('path escapes the project root')
+  return real
+}
+
+/**
+ * Duplicate a file or folder alongside itself as "<name> copy" (deduped, extension preserved).
+ * Contained to root; the root itself can't be duplicated. The caller checkpoints first, so the new
+ * copy is recoverable from the timeline.
+ */
+export async function duplicateProjectPath(root: string, target: string): Promise<string> {
+  const src = containedReal(root, target)
+  if (src === realpathSync(root)) throw new Error('cannot duplicate the project root')
+  const dir = dirname(src)
+  const ext = extname(src)
+  const stem = basename(src, ext)
+  let dest = join(dir, `${stem} copy${ext}`)
+  for (let n = 2; existsSync(dest); n++) dest = join(dir, `${stem} copy ${n}${ext}`)
+  await cp(src, dest, { recursive: true })
+  return realpathSync(dest)
+}
+
+/**
+ * Import files dragged in from Finder: write each into `destDir` (an existing dir within root) or,
+ * omitted, the user's `Documents/` home. Filenames are sanitised + deduped so a drop never clobbers
+ * an existing file. The caller checkpoints first, so an import is recoverable from the timeline.
+ */
+export async function importFilesIntoProject(
+  root: string,
+  destDir: string | undefined,
+  files: { name: string; data: Uint8Array }[],
+): Promise<string[]> {
+  const target = destDir ? containedReal(root, destDir) : docsHome(root)
+  const out: string[] = []
+  for (const f of files) {
+    const clean = safeSegment(basename(f.name), 'file')
+    const ext = extname(clean)
+    const stem = clean.slice(0, clean.length - ext.length) || clean
+    let dest = join(target, clean)
+    for (let n = 2; existsSync(dest); n++) dest = join(target, `${stem} ${n}${ext}`)
+    await writeFile(dest, f.data, { flag: 'wx' })
+    out.push(realpathSync(dest))
+  }
+  return out
 }
 
 /**

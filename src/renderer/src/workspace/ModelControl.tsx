@@ -6,6 +6,13 @@ import { BusyText } from '../ui'
 import { useWorkspace } from './store'
 import { QUICK_ALIASES, isModelAlias, prettyModel } from './models'
 
+// Codex model list + auth are fetched async; the menu opens UPWARD (`bottom-full`), so if they resolve
+// after open the menu grows taller and the Claude rows shift up under the cursor. Cache the last-known
+// values module-wide so repeat opens render at full height immediately — the open still refreshes them,
+// but from a stable starting point instead of an empty one.
+let cachedCodexModels: CodexModel[] = []
+let cachedCodexSignedIn: boolean | null = null
+
 /**
  * Per-session model + engine picker — a compact pill (active model + chevron) beside the approval-mode
  * pill. The dropdown groups models by ENGINE (Claude / OpenAI); picking a model under an engine sets
@@ -39,17 +46,24 @@ export function ModelControl({
   const locked = !!busy || hasPending
   const [open, setOpen] = useState(false)
   const [recent, setRecent] = useState<string[]>([])
-  const [codexModels, setCodexModels] = useState<CodexModel[]>([])
-  const [codexSignedIn, setCodexSignedIn] = useState<boolean | null>(null)
+  const [codexModels, setCodexModels] = useState<CodexModel[]>(cachedCodexModels)
+  const [codexSignedIn, setCodexSignedIn] = useState<boolean | null>(cachedCodexSignedIn)
   const [showCustom, setShowCustom] = useState(false)
   const [custom, setCustom] = useState('')
   const ref = useRef<HTMLDivElement>(null)
 
+  // Warm the Codex cache once so the first open already renders at full height (no upward shift).
+  useEffect(() => {
+    if (cachedCodexSignedIn !== null) return
+    window.koda.getCodexModels().then((m) => { cachedCodexModels = m; setCodexModels(m) }).catch(() => {})
+    window.koda.getCodexAuthStatus().then((s) => { cachedCodexSignedIn = s.signedIn; setCodexSignedIn(s.signedIn) }).catch(() => { cachedCodexSignedIn = false; setCodexSignedIn(false) })
+  }, [])
+
   useEffect(() => {
     if (!open) return
     window.koda.getRecentModels().then(setRecent).catch(() => {})
-    window.koda.getCodexModels().then(setCodexModels).catch(() => setCodexModels([]))
-    window.koda.getCodexAuthStatus().then((s) => setCodexSignedIn(s.signedIn)).catch(() => setCodexSignedIn(false))
+    window.koda.getCodexModels().then((m) => { cachedCodexModels = m; setCodexModels(m) }).catch(() => {})
+    window.koda.getCodexAuthStatus().then((s) => { cachedCodexSignedIn = s.signedIn; setCodexSignedIn(s.signedIn) }).catch(() => { cachedCodexSignedIn = false; setCodexSignedIn(false) })
     const onDown = (e: MouseEvent) => {
       if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
     }

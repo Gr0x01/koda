@@ -50,8 +50,10 @@ test('first run shows the onboarding wizard and detects sign-in', async () => {
     const window = await app.firstWindow()
     await expect(window.getByRole('heading', { name: 'Welcome to Koda' })).toBeVisible({ timeout: 15_000 })
     await window.getByRole('button', { name: 'Continue' }).click()
-    // The sign-in step detects the existing login and shows the signed-in heading (curly apostrophe).
-    await expect(window.getByRole('heading', { name: /signed in/i })).toBeVisible({ timeout: 15_000 })
+    // The sign-in step detects the existing login and flips its heading to the connected state
+    // ("You're connected", vs "Connect your AI" when logged out) — proving detectAuth resolved through
+    // the IPC chain, not just that the wizard painted.
+    await expect(window.getByRole('heading', { name: /connected/i })).toBeVisible({ timeout: 15_000 })
   } finally {
     await app.close()
   }

@@ -283,7 +283,7 @@ export function resolveThemeId(id: string | null, mode: ThemeMode): string {
 // right elevation for its mode — packs only declare flat colors, not shadows.
 const POP_SHADOW: Record<ThemeMode, string> = {
   light:
-    '0 1px 1px rgba(17, 17, 20, 0.05), 0 6px 14px -4px rgba(17, 17, 20, 0.18), 0 14px 34px -10px rgba(17, 17, 20, 0.22)',
+    '0 0 0 1px rgba(17, 17, 20, 0.09), 0 1px 2px rgba(17, 17, 20, 0.06), 0 8px 20px -4px rgba(17, 17, 20, 0.22), 0 18px 42px -12px rgba(17, 17, 20, 0.26)',
   dark: '0 1px 1px rgba(0, 0, 0, 0.4), 0 6px 14px -4px rgba(0, 0, 0, 0.5), 0 16px 36px -10px rgba(0, 0, 0, 0.6)',
 }
 

@@ -17,10 +17,9 @@ export function MemorySection() {
   const refreshMemoryWeight = useWorkspace((s) => s.refreshMemoryWeight)
   const sendMemoryTidy = useWorkspace((s) => s.sendMemoryTidy)
   const setSettingsOpen = useWorkspace((s) => s.setSettingsOpen)
-  const canSend = useWorkspace((s) => {
-    const id = s.activeId
-    return !!id && !!s.sessions[id] && !s.sessions[id].busy
-  })
+  // Tidy opens its own fresh session, so it only needs a project to be open — it no longer depends on
+  // there being an idle active session to borrow.
+  const canSend = useWorkspace((s) => !!s.projectPath)
   const [hint, setHint] = useState<string | null>(null)
 
   // Re-read on open — the pill's slow ambient poll may be minutes stale.
@@ -35,7 +34,7 @@ export function MemorySection() {
       // Hand the stage back to the conversation so the tidy is watched, not hidden behind Settings.
       setSettingsOpen(false)
     } else {
-      setHint('Open a session first, or wait for the agent to finish what it is doing.')
+      setHint('Open a project first.')
     }
   }
 

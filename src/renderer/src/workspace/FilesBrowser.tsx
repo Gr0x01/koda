@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { AnimatePresence } from '../motion'
 import { useWorkspace } from './store'
 import { TreeContext, DirNode, ContextMenu, DeleteConfirm, type TreeCtx, type Menu } from './FileTree'
@@ -28,8 +28,17 @@ export function FilesBrowser() {
 
   const newFolder = useWorkspace((s) => s.newFolder)
   const deleteEntry = useWorkspace((s) => s.deleteEntry)
+  const duplicateEntry = useWorkspace((s) => s.duplicateEntry)
+  const importFiles = useWorkspace((s) => s.importFiles)
   const treeError = useWorkspace((s) => s.treeError)
   const clearTreeError = useWorkspace((s) => s.clearTreeError)
+
+  // Finder-drag import: light up the panel while external files hover, and drop-anywhere imports to
+  // the project root (a drop landing on a folder row is handled by that row → into that folder).
+  // dragenter/leave fire per child, so count depth rather than toggle.
+  const [dropActive, setDropActive] = useState(false)
+  const dropDepth = useRef(0)
+  const isFileDrag = (e: React.DragEvent): boolean => e.dataTransfer.types.includes('Files')
 
   useEffect(() => {
     let alive = true
@@ -76,7 +85,36 @@ export function FilesBrowser() {
           </button>
         )}
 
-        <div className="min-h-0 flex-1 overflow-y-auto px-1.5 pb-3 pt-2 font-mono text-xs">
+        <div
+          onDragEnter={(e) => {
+            if (!isFileDrag(e)) return
+            dropDepth.current += 1
+            setDropActive(true)
+          }}
+          onDragLeave={(e) => {
+            if (!isFileDrag(e)) return
+            dropDepth.current = Math.max(0, dropDepth.current - 1)
+            if (dropDepth.current === 0) setDropActive(false)
+          }}
+          onDragOver={(e) => {
+            if (isFileDrag(e)) e.preventDefault()
+          }}
+          // Capture always fires, even when a folder row handles the drop and stops propagation — so
+          // the highlight always clears. The bubble handler below imports only a background drop.
+          onDropCapture={(e) => {
+            if (!isFileDrag(e)) return
+            dropDepth.current = 0
+            setDropActive(false)
+          }}
+          onDrop={(e) => {
+            if (!isFileDrag(e)) return
+            e.preventDefault()
+            if (e.dataTransfer.files.length) void importFiles(root, e.dataTransfer.files)
+          }}
+          className={`min-h-0 flex-1 overflow-y-auto px-1.5 pb-3 pt-2 font-mono text-xs ${
+            dropActive ? 'rounded-md bg-accent/5 ring-1 ring-inset ring-accent/30' : ''
+          }`}
+        >
           <DirNode path={root} name={basename(root)} depth={0} isRoot defaultOpen />
         </div>
       </div>
@@ -85,10 +123,26 @@ export function FilesBrowser() {
         <ContextMenu
           menu={menu}
           onClose={() => setMenu(null)}
+          onOpen={() => {
+            setMenu(null)
+            void window.koda.openPath({ path: menu.path })
+          }}
+          onReveal={() => {
+            setMenu(null)
+            void window.koda.revealPath({ path: menu.path })
+          }}
+          onCopyPath={() => {
+            setMenu(null)
+            void navigator.clipboard.writeText(menu.path)
+          }}
           onRename={() => ctx.startRename(menu.path)}
           onNewFolder={() => {
             setMenu(null)
             void newFolder(menu.path)
+          }}
+          onDuplicate={() => {
+            setMenu(null)
+            void duplicateEntry(menu.path)
           }}
           onDelete={() => {
             setMenu(null)

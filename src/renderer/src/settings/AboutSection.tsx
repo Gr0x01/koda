@@ -77,9 +77,13 @@ function UpdatesRow() {
             Restart to update
           </Button>
         ) : status.state === 'downloading' ? (
-          <BusyText className="text-text-muted">Downloading… {status.percent}%</BusyText>
+          <BusyText size={11} className="text-[12.5px] text-text-muted">
+            Downloading… {status.percent}%
+          </BusyText>
         ) : busy ? (
-          <BusyText className="text-text-muted">Checking…</BusyText>
+          <BusyText size={11} className="text-[12.5px] text-text-muted">
+            Checking…
+          </BusyText>
         ) : (
           <Button variant="secondary" onClick={() => void window.koda.checkForUpdates()}>
             Check for updates

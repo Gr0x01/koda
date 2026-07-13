@@ -173,8 +173,8 @@ function SessionsSection({
  * The lower sidebar section. Doc-first by default — a flat **Documents** list (find your writing by
  * glancing) — with a segmented **Docs ⇄ Files** switch to the full file tree (the organize/code view).
  * The switch lives on the header *title* (a mode-switch, the surface's Doc/Markdown/Diff pattern), so
- * the right slot stays pure actions: New folder is tree-only (folders are an organize concept); New
- * document + Find live in both.
+ * the right slot stays pure actions (Find, New document, New folder) — all live in both views; New
+ * folder just lands in Documents/ from the doc view and at the project root from the tree.
  */
 function FilesSection() {
   const filesView = useWorkspace((s) => s.filesView)
@@ -196,12 +196,16 @@ function FilesSection() {
             <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
             <path d="M14 2v4a2 2 0 0 0 2 2h4M9 15h6M12 18v-6" />
           </HeaderIconButton>
-          {!docs && (
-            <HeaderIconButton onClick={() => void newFolder()} title="New folder" aria-label="New folder">
-              <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
-              <path d="M12 10v6M9 13h6" />
-            </HeaderIconButton>
-          )}
+          {/* New folder lands at the project root in the tree, and in the user's Documents/ from the
+              doc-first view (where their writing lives, so it appears where they expect). */}
+          <HeaderIconButton
+            onClick={() => void newFolder(undefined, docs)}
+            title="New folder"
+            aria-label="New folder"
+          >
+            <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
+            <path d="M12 10v6M9 13h6" />
+          </HeaderIconButton>
         </div>
       </PanelHeader>
       {docs ? <DocsBrowser /> : <FilesBrowser />}

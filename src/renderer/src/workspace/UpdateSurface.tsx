@@ -42,25 +42,29 @@ export function UpdateSurface() {
             transition={{ type: 'spring', stiffness: 420, damping: 34 }}
             className="fixed bottom-4 left-1/2 z-40 -translate-x-1/2"
           >
-            {/* w-max + nowrap children: the pill hugs its content and never wraps, even in a narrow pane. */}
-            <div className="flex w-max items-center gap-3 rounded-2xl border border-border bg-surface px-4 py-2.5 shadow-soft">
+            {/* w-max + nowrap children: the pill hugs its content and never wraps, even in a narrow pane.
+                The message gets left breathing room (pl-5); the two actions are grouped on the right so the
+                CTA never reads as jammed against the text. */}
+            <div className="flex w-max items-center gap-5 rounded-2xl border border-border bg-surface py-2.5 pl-5 pr-2.5 shadow-soft">
               <span className="whitespace-nowrap text-[13px] text-text">
                 A new version of Koda is ready.
               </span>
-              <Button
-                variant="primary"
-                className="shrink-0 whitespace-nowrap"
-                onClick={() => void window.koda.quitAndInstallUpdate()}
-              >
-                Restart to update
-              </Button>
-              <button
-                onClick={() => setBannerDismissed(true)}
-                className="ml-1 shrink-0 whitespace-nowrap text-[13px] text-text-muted hover:text-text"
-                aria-label="Dismiss"
-              >
-                Later
-              </button>
+              <div className="flex shrink-0 items-center gap-1">
+                <button
+                  onClick={() => setBannerDismissed(true)}
+                  className="whitespace-nowrap rounded-lg px-3 py-1.5 text-[12.5px] font-medium text-text-muted transition-colors hover:bg-text/5 hover:text-text"
+                  aria-label="Dismiss"
+                >
+                  Later
+                </button>
+                <Button
+                  variant="primary"
+                  className="whitespace-nowrap"
+                  onClick={() => void window.koda.quitAndInstallUpdate()}
+                >
+                  Restart to update
+                </Button>
+              </div>
             </div>
           </motion.div>
         )}

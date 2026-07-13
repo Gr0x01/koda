@@ -193,12 +193,14 @@ function readMemoryPair(cwd: string): { index: string; active: string } {
 
 /**
  * Heaviness threshold for the always-injected pair (index + active-context), in characters —
- * ~5k tokens at ~4 chars/token. Past it the injected memory starts weighing down every turn of every
- * session, which is the documented failure mode for always-loaded context (bloat degrades compliance).
- * The status bar warns at this line and offers a tidy; it does NOT stop injection — memory still loads
- * in full, heavy or not.
+ * ~7.5k tokens at ~4 chars/token, under 4% of the context window. Past it the injected memory starts
+ * weighing down every turn of every session, which is the documented failure mode for always-loaded
+ * context (bloat degrades compliance). Sized so a freshly-tidied heavy project (~13k measured on the
+ * Koda repo) has weeks of normal growth before the pill fires — at 20k it re-fired within a day, a
+ * nag instead of a signal. The status bar warns at this line and offers a tidy; it does NOT stop
+ * injection — memory still loads in full, heavy or not.
  */
-export const MEMORY_HEAVY_CHARS = 20_000
+export const MEMORY_HEAVY_CHARS = 30_000
 
 /** How much always-injected memory this project carries, for the status-bar pill + Settings → Memory. */
 export function projectMemoryWeight(cwd: string): { present: boolean; chars: number; heavy: boolean } {

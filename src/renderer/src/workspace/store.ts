@@ -390,6 +390,31 @@ function fmtClock(unixSeconds: number): string {
   return new Date(unixSeconds * 1000).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
 }
 
+/** Restore the full relative path behind `@`-mentions before the text reaches the engine. The composer
+ *  inserts the pretty name (`@ship-checklist-iphone`) for readability; the agent needs an exact location
+ *  to Read. We resolve each bare-name token (no slash) against the project's live doc list. Path-shaped
+ *  tokens the user typed by hand, and names that match no doc, are left untouched. Runs only when the
+ *  text actually contains an `@`, so the common no-mention turn skips the listDocs round-trip. */
+async function expandDocMentions(text: string): Promise<string> {
+  if (!text.includes('@')) return text
+  // Bare-name tokens only: `@` at a word boundary, no slash (a slash means it's already a path).
+  const re = /(^|\s)@([^\s/]+)/g
+  if (!re.test(text)) return text
+  const res = await window.koda.listDocs({}).catch(() => null)
+  const docs = res?.docs ?? []
+  if (!docs.length) return text
+  // displayName → rel; docs arrive most-recent-first, so on a name collision the freshest doc wins.
+  const byLabel = new Map<string, string>()
+  for (const d of docs) {
+    const label = d.name.replace(/\.[^.]+$/, '')
+    if (!byLabel.has(label)) byLabel.set(label, d.rel)
+  }
+  return text.replace(/(^|\s)@([^\s/]+)/g, (m, pre: string, name: string) => {
+    const rel = byLabel.get(name)
+    return rel ? `${pre}@${rel}` : m
+  })
+}
+
 /** Plain-language footer for an ABNORMAL turn end (the engine `result.subtype`). A clean 'success'
  *  (or absent) subtype returns null → no footer at all. Only the truncating/error cases surface, so a
  *  cut-off answer isn't left unexplained. No dollar figure — running spend lives in the Usage view. */
@@ -714,8 +739,9 @@ interface WorkspaceStore {
   openFile: (path: string, gotoLine?: number, opts?: { view?: FileSurface['view'] }) => void
   /** Create a new empty document at the project root and open it (focused, in the Doc view). */
   newDocument: () => Promise<void>
-  /** Create a new folder — at the project root, or inside `parent` (which is then expanded). */
-  newFolder: (parent?: string) => Promise<void>
+  /** Create a new folder — at the project root, or inside `parent` (which is then expanded), or in
+   *  the user's Documents/ home when `home` (the doc-first view's New folder). */
+  newFolder: (parent?: string, home?: boolean) => Promise<void>
   /** Rename a file/folder in place (new basename in the same folder). Rebases any open tab + the
    *  Files tree's expansion to the new path on success. */
   renameEntry: (path: string, newName: string) => Promise<void>
@@ -724,6 +750,11 @@ interface WorkspaceStore {
   moveEntry: (from: string, toDir: string) => Promise<void>
   /** Delete a file/folder (recursive). Closes any open tab under it. Checkpointed, so undoable. */
   deleteEntry: (path: string) => Promise<void>
+  /** Duplicate a file/folder as "<name> copy" alongside it. Checkpointed, so undoable. */
+  duplicateEntry: (path: string) => Promise<void>
+  /** Import Finder-dragged files into `destDir` (an existing folder) or, omitted, Documents/. Reads
+   *  the dropped File bytes and hands them to main, which writes deduped, contained + checkpointed. */
+  importFiles: (destDir: string | undefined, files: Iterable<File>) => Promise<void>
   /** Clear the transient Files-browser error line. */
   clearTreeError: () => void
   /** Rebase open tabs + tree expansion after a rename/move (carries folder descendants). */
@@ -1753,10 +1784,13 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       const ed = activeEditor(get())
       const activeFile = ed.surfaces.find((s) => s.path === ed.activeSurfaceId && s.kind !== 'preview')
       const noun = activeFile && isMarkdown(activeFile.path) ? 'document' : 'file'
+      // Engine-facing text restores the full path behind any pretty `@`-mention; the transcript keeps
+      // the clean name (displayItem uses `text` below).
+      const engineText = await expandDocMentions(text)
       const docText =
         activeFile && text.trim()
-          ? `${text}\n\n(I'm currently looking at the ${noun} \`${activeFile.path}\` in Koda — if this is about it, work with that file.)`
-          : text
+          ? `${engineText}\n\n(I'm currently looking at the ${noun} \`${activeFile.path}\` in Koda — if this is about it, work with that file.)`
+          : engineText
       // Clear the composer optimistically; dispatchTurn pushes the transcript item + drives the send.
       // Naming from the first prompt happens inside dispatchTurn (nameFromText).
       patchSession(id, (s) => ({ ...s, draft: '', attachments: [], replyStaged: false }))
@@ -1900,9 +1934,11 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     },
 
     sendMemoryTidy: async () => {
-      const { activeId, sessions } = get()
-      const id = activeId
-      if (!id || !sessions[id] || sessions[id].busy) return false
+      // Tidy runs in its OWN fresh session so it never interrupts (or gets tangled up in) whatever the
+      // active session is mid-way through. startSession sets the new session active; dispatch into that.
+      await get().startSession()
+      const id = get().activeId
+      if (!id) return false
       // The recipe itself lives in the memory skill (the pack's content, versioned with the app);
       // this turn just points the agent at the job in the user's terms.
       const sentText =
@@ -1910,11 +1946,14 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         `conversation (the MEMORY.md index and active-context.md) are now big enough to weigh every turn down. ` +
         `Tidy the memory following the memory skill's tidy recipe: distill active-context.md back to a short ` +
         `current-state page, move narrative detail into the right topic notes, archive the old tail of any ` +
-        `log-style notes, mark superseded notes instead of deleting facts, and keep every MEMORY.md index line ` +
-        `in sync with its note. When you're done, tell me in a line or two what you trimmed.`
+        `log-style notes, fold notes about replaced approaches into the note that superseded them (keep the ` +
+        `lesson, delete the leftover), and keep every MEMORY.md index line in sync with its note — a good tidy ` +
+        `leaves the index with fewer lines, not just shorter ones. When you're done, tell me in a line or two ` +
+        `what you trimmed.`
       await dispatchTurn(id, {
         sentText,
         displayItem: { kind: 'user', text: "Tidy this project's memory" },
+        nameFromText: "Tidy this project's memory",
       })
       return true
     },
@@ -1938,12 +1977,15 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         window.koda.cancelAside({ sessionId, asideId: prev.id }).catch(console.error)
       }
       patchSession(sessionId, (s) => ({ ...s, draft: '', aside: { id: asideId, question: q, answer: '', status: 'streaming' } }))
-      window.koda.askAside({ sessionId, asideId, question: q }).catch((err) => {
-        console.error(err)
-        patchSession(sessionId, (s) =>
-          s.aside?.id === asideId ? { ...s, aside: { ...s.aside, status: 'error', answer: "couldn't ask that" } } : s,
-        )
-      })
+      // Overlay shows the pretty `q`; the engine gets `@`-mentions expanded to full paths.
+      expandDocMentions(q)
+        .then((eq) => window.koda.askAside({ sessionId, asideId, question: eq }))
+        .catch((err) => {
+          console.error(err)
+          patchSession(sessionId, (s) =>
+            s.aside?.id === asideId ? { ...s, aside: { ...s.aside, status: 'error', answer: "couldn't ask that" } } : s,
+          )
+        })
     },
 
     dismissAside: (sessionId) => {
@@ -2164,7 +2206,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       // writes its own native guidance file (CLAUDE.md for Claude, AGENTS.md for Codex) — we don't dictate.
       // Three jobs woven in: (1) the project guide [Layer-3 state], (2) a .koda/memory brief [the
       // "what-this-is" half], (3) a just-in-time tool top-up via ensure_tool when the project implies one.
-      const sentText = `I'm setting up this project in Koda. Here's what it's about:\n\n"""\n${desc}${extra}\n"""\n\nHelp me get this project set up. First take a quick look at what's already here (there may be nothing yet), and ask me 2–3 quick clarifying questions only if you genuinely need to. Then:\n\n1. Write a short, friendly project guide as your guidance file at the project root — what we're building, who it's for, what success looks like, and any constraints — as concise guidance for you to follow on later turns. Keep it human and in plain language (this is for a non-engineer).\n2. Jot a brief note in .koda/memory/ capturing what this project is, so you can orient quickly in future sessions.\n3. If this project clearly needs a language runtime or tool that isn't set up yet (for example Python for a data project), set it up with your ensure_tool capability — I'll confirm.\n\nWhen you're done, tell me in one line what you set up.`
+      const sentText = `I'm setting up this project in Koda. Here's what it's about:\n\n"""\n${desc}${extra}\n"""\n\nHelp me get this project set up. First take a quick look at what's already here (there may be nothing yet). Then ask me the two or three questions whose answers would change what you build or how you set it up, and suggest anything I haven't thought of — you've built things like this before; I may not have. Once we've shaped it:\n\n1. Write a short, friendly project guide as your guidance file at the project root — what we're building, who it's for, what success looks like, and any constraints — as concise guidance for you to follow on later turns. Keep it human and in plain language (this is for a non-engineer).\n2. Jot a brief note in .koda/memory/ capturing what this project is, so you can orient quickly in future sessions.\n3. If this project clearly needs a language runtime or tool that isn't set up yet (for example Python for a data project), set it up with your ensure_tool capability — I'll confirm.\n\nWhen you're done, tell me in one line what you set up.`
       await dispatchTurn(id, {
         sentText,
         displayItem: { kind: 'user', text: desc },
@@ -2244,9 +2286,9 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       get().openFile(path)
     },
 
-    newFolder: async (parent) => {
+    newFolder: async (parent, home) => {
       try {
-        await window.koda.createDir(parent ? { parent } : {})
+        await window.koda.createDir(parent ? { parent } : home ? { home: true } : {})
         if (parent) get().setDirOpen(parent, true) // reveal where the new folder landed
         set((state) => ({ filesRev: state.filesRev + 1, treeError: null }))
       } catch (e) {
@@ -2286,6 +2328,30 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         await window.koda.deletePath({ path })
         get().notePathDeleted(path)
         set({ treeError: null })
+      } catch (e) {
+        set({ treeError: humanFsError(e) })
+      }
+    },
+
+    duplicateEntry: async (path) => {
+      try {
+        await window.koda.duplicatePath({ path })
+        set((state) => ({ filesRev: state.filesRev + 1, treeError: null }))
+      } catch (e) {
+        set({ treeError: humanFsError(e) })
+      }
+    },
+
+    importFiles: async (destDir, files) => {
+      // Read the dropped bytes in the renderer (Electron 42 no longer exposes File.path) and hand
+      // them to main to write — deduped, contained, checkpointed. Empty drop = nothing to do.
+      const payload = await Promise.all(
+        [...files].map(async (f) => ({ name: f.name, data: new Uint8Array(await f.arrayBuffer()) })),
+      )
+      if (!payload.length) return
+      try {
+        await window.koda.importFiles({ destDir, files: payload })
+        set((state) => ({ filesRev: state.filesRev + 1, treeError: null }))
       } catch (e) {
         set({ treeError: humanFsError(e) })
       }

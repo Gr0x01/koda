@@ -4,7 +4,7 @@ node_modules/
 # Build output
 dist/
 out/
-release/
+/release/
 *.tsbuildinfo
 
 # Bundled engine binary — fetched by scripts/fetch-engine.mjs, ~206 MB, never committed

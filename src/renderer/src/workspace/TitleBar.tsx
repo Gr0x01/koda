@@ -13,13 +13,20 @@ export function TitleBar() {
     const cwd = s.activeId ? s.sessions[s.activeId]?.cwd : undefined
     return cwd?.replace(/\/+$/, '').split('/').pop() || ''
   })
+  // Under `npm run dev` the strip's bottom divider goes amber so a dev instance reads at a glance
+  // next to the installed .app — a colored seam, not a filled band, so it stays out of the way.
+  const dev = import.meta.env.DEV
   return (
-    <div className="app-drag relative flex h-9 shrink-0 items-center border-b border-border bg-bg px-3">
+    <div
+      className={`app-drag relative flex h-9 shrink-0 items-center bg-bg px-3 ${dev ? 'border-b-2' : 'border-b border-border'}`}
+      style={dev ? { borderBottomColor: '#f4c000' } : undefined}
+    >
       {/* Find moved into the Files panel header, so the label can recenter. Equal flex-1 spacers
           center it across the full bar; at real window widths it never reaches the traffic lights. */}
       <div className="flex-1" />
       <div className="shrink truncate text-center font-display text-xs font-medium text-text-muted">
-        Koda{folder && <span className="text-text-muted/60"> — {folder}</span>}
+        {dev ? 'KODA DEV' : 'Koda'}
+        {folder && <span className="text-text-muted/60"> — {folder}</span>}
       </div>
       <div className="flex-1" />
       {/* Pinned absolute (not in the flex flow) so the title stays truly centered regardless of the

@@ -10,6 +10,68 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-07-13
+
+### Added
+
+- Point the agent at one of your documents by typing `@` in the message box.
+  Start typing the name, pick it from the list, and a reference drops in, so you
+  no longer have to hunt the file down and open it first.
+- Drag files in from Finder to add them to your project. Drop them on a folder
+  to file them there, or anywhere in the panel to bring them in.
+- Right-click a file or document for the everyday Mac shortcuts: Reveal in
+  Finder, Copy path, Open in its usual app, and Duplicate.
+- Manage your writing straight from the Documents list too. Rename or delete a
+  document, drag one onto a folder to file it, and make new folders right there.
+  A deleted document can be brought back from the recovery timeline.
+- Archived sessions (Settings → Archived sessions) now expand to preview the
+  last few messages, so you can recognize which chat is which before you restore
+  it.
+- Koda now tells you when the agent's project notes have grown heavy enough to
+  slow it down. A "memory needs a tidy" notice appears in the status bar, and
+  Settings → Memory shows the size and offers a one-button tidy that asks the
+  agent to condense its own notes. Nothing gets deleted, and the tidy is
+  undoable like any other change.
+
+### Changed
+
+- The agent now keeps its project notes lean as your project grows. It updates
+  the note it already has on a topic instead of piling on a new one, folds notes
+  about replaced approaches into the current one, and keeps its running list of
+  work to one line per item. Long-running projects stay fast instead of slowly
+  filling up.
+- The agent now keeps your Documents organized as they add up. It groups related
+  documents into folders instead of leaving a pile of loose files at the top,
+  puts each new document where it belongs, and offers to tidy up when the folder
+  gets cluttered.
+
+### Fixed
+
+- Right-click menus (like Rename or Archive on a session) now have a clearly
+  defined edge in the light theme, instead of blending into the background.
+
+## [0.1.2] - 2026-07-12
+
+### Added
+
+- When you ask for a whole new app or feature, the agent now helps you shape it
+  first. It asks the few questions that actually change what gets built,
+  suggests things you might not have thought of, and points out what a first
+  version leaves out so you can ask for it next. It also will not talk you out
+  of a big idea just because it sounds like a lot of work.
+
+### Changed
+
+- The update banner and its download progress are cleaner and easier to read.
+
+### Fixed
+
+- The model picker no longer jumps while you are reaching for it. The OpenAI
+  models used to pop in a moment after the menu opened and shove the Claude
+  models up under your cursor. The menu now opens at its full height right away.
+- When a longer background task finishes while you are away, its result now
+  shows up on your next message instead of getting lost.
+
 ## [0.1.1] - 2026-07-11
 
 _A maintenance update. Nothing changes in how you use Koda._
@@ -31,6 +93,8 @@ _First versioned build — the baseline the auto-updater ships from._
 - Settings now shows the Koda version, the bundled Claude engine version, and a
   "Check for updates" button.
 
-[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/Gr0x01/koda/releases/tag/v0.1.3
+[0.1.2]: https://github.com/Gr0x01/koda/releases/tag/v0.1.2
 [0.1.1]: https://github.com/Gr0x01/koda/releases/tag/v0.1.1
 [0.1.0]: https://github.com/Gr0x01/koda/releases/tag/v0.1.0

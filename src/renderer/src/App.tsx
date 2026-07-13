@@ -31,6 +31,11 @@ export default function App() {
       .catch(() => setOnboarded(true)) // fail safe past onboarding rather than trapping the user
   }, [setProjectPath])
 
+  // Settings are app-global and broadcast to every window on write. A second window opened mid-onboarding
+  // reads hasOnboarded:false on boot; without this it would stay trapped in the wizard after another window
+  // finishes. Mirror the flag so onboarding state stays in sync across windows.
+  useEffect(() => window.koda.onSettingsChanged((s) => setOnboarded(s.hasOnboarded)), [])
+
   if (onboarded === null || projectPath === null)
     return <div className="app-drag h-screen w-screen bg-bg" />
   if (!onboarded) return <OnboardingWizard onDone={() => setOnboarded(true)} />

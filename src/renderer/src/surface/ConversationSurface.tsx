@@ -15,6 +15,7 @@ import { SessionHeader } from './conversation/SessionHeader'
 import { AsideOverlay } from './conversation/AsideOverlay'
 import { ComposerError } from './conversation/ComposerError'
 import { VoiceInputButton } from './conversation/VoiceInputButton'
+import { useMentionPicker, inkTokens } from './conversation/useMentionPicker'
 import { stagingFromFiles, baseName } from './conversation/imageAttach'
 
 /**
@@ -68,12 +69,25 @@ export function ConversationSurface() {
   // The composer grows with its content up to a cap (~10 lines), then scrolls — so a pasted paragraph
   // is readable instead of a one-line peephole. The 200px cap is mirrored by max-h on the element.
   const composerRef = useRef<HTMLTextAreaElement>(null)
+  // The ink layer: a div painted exactly over the textarea that renders `@` references in accent
+  // (everything else transparent). Kept in scroll-register with the textarea here and on its onScroll.
+  const inkRef = useRef<HTMLDivElement>(null)
   useLayoutEffect(() => {
     const el = composerRef.current
     if (!el) return
     el.style.height = 'auto'
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`
+    if (inkRef.current) inkRef.current.scrollTop = el.scrollTop
   }, [session?.draft, activeId])
+
+  // The "@" file picker: type @ to reference a project document. Owns its own menu + keyboard nav; the
+  // textarea's handlers below defer to it (onKeyDown consumes nav/select keys, sync re-detects the token).
+  const mentions = useMentionPicker({
+    activeId,
+    draft: session?.draft ?? '',
+    setDraft,
+    textareaRef: composerRef,
+  })
 
   // ⌘F opens find-in-transcript — but only when focus isn't in Monaco (the editor keeps its own ⌘F).
   useEffect(() => {
@@ -371,10 +385,11 @@ export function ConversationSurface() {
         <div
           className={
             asideMode
-              ? 'rounded-2xl border border-aside/50 bg-aside-tint px-3 py-2 shadow-soft'
-              : 'rounded-2xl border border-border bg-surface px-3 py-2 shadow-soft focus-within:border-accent/50'
+              ? 'relative rounded-2xl border border-aside/50 bg-aside-tint px-3 py-2 shadow-soft'
+              : 'relative rounded-2xl border border-border bg-surface px-3 py-2 shadow-soft focus-within:border-accent/50'
           }
         >
+          {mentions.menu}
           {/* A failed turn (API error / fatal engine stop) reports as a quiet section fused onto the top
               of the composer, under a hairline divider — one object, not a floating alert. Try again
               re-sends the last prompt; sending anything clears it. */}
@@ -426,6 +441,7 @@ export function ConversationSurface() {
           {/* The prompt row: the text field with dictate + send kept inside the input box. Buttons
               bottom-align (items-end) so they stay anchored as the textarea grows. */}
           <div className="flex items-end gap-2">
+            <div className="relative min-w-0 flex-1">
             <textarea
               ref={composerRef}
               rows={1}
@@ -434,8 +450,12 @@ export function ConversationSurface() {
               onChange={(e) => {
                 if (!activeId) return
                 setDraft(activeId, e.target.value)
+                mentions.sync()
               }}
               onKeyDown={(e) => {
+                // The @ file picker gets first refusal on nav/select/dismiss keys while it's open — so
+                // Enter picks a file instead of sending, arrows move the list, Esc closes it.
+                if (mentions.onKeyDown(e)) return
                 if (e.key === 'Tab' && e.shiftKey) {
                   e.preventDefault()
                   if (activeId) setSessionApprovalMode(activeId, nextApprovalMode(session.approvalMode, session.busy))
@@ -448,6 +468,13 @@ export function ConversationSurface() {
                   submitComposer()
                 }
               }}
+              // Caret moved by click or arrow keys — re-detect whether we're in an @ token.
+              onKeyUp={() => mentions.sync()}
+              onClick={() => mentions.sync()}
+              onBlur={() => mentions.close()}
+              onScroll={(e) => {
+                if (inkRef.current) inkRef.current.scrollTop = e.currentTarget.scrollTop
+              }}
               onPaste={(e) => {
                 const files = [...e.clipboardData.items]
                   .filter((it) => it.kind === 'file' && it.type.startsWith('image/'))
@@ -459,8 +486,18 @@ export function ConversationSurface() {
                 }
               }}
               placeholder={asideMode ? "Ask a quick question — won't interrupt or change anything" : 'Message the agent…'}
-              className="max-h-[200px] min-w-0 flex-1 resize-none overflow-y-auto bg-transparent px-1 py-1.5 text-sm leading-5 outline-none placeholder:text-text-muted"
+              className="block max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-1 py-1.5 text-sm leading-5 outline-none placeholder:text-text-muted"
             />
+            {/* Color only, never weight — a bolder glyph has a different advance and would drift out
+                of register with the textarea's own text underneath. */}
+            <div
+              ref={inkRef}
+              aria-hidden
+              className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-1 py-1.5 text-sm leading-5 text-transparent"
+            >
+              {inkTokens(session.draft)}
+            </div>
+            </div>
             <VoiceInputButton
               disabled={session.busy}
               draft={session.draft}

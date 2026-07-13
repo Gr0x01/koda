@@ -6,6 +6,7 @@ import type {
   ApprovalRequest,
   ArchiveRequested,
   AsideEvent,
+  RenameRequested,
   EngineEvent,
   HeadlessAppeared,
   KodaApi,
@@ -59,6 +60,11 @@ const api: KodaApi = {
     ipcRenderer.on(IpcChannels.sessionArchiveRequested, handler)
     return () => ipcRenderer.removeListener(IpcChannels.sessionArchiveRequested, handler)
   },
+  onRenameRequested: (listener) => {
+    const handler = (_e: IpcRendererEvent, payload: RenameRequested) => listener(payload)
+    ipcRenderer.on(IpcChannels.sessionRenameRequested, handler)
+    return () => ipcRenderer.removeListener(IpcChannels.sessionRenameRequested, handler)
+  },
   onRemoteUserTurn: (listener) => {
     const handler = (_e: IpcRendererEvent, payload: RemoteUserTurnLive) => listener(payload)
     ipcRenderer.on(IpcChannels.sessionRemoteUserTurn, handler)
@@ -106,6 +112,10 @@ const api: KodaApi = {
   createFile: (args) => ipcRenderer.invoke(IpcChannels.fsCreateFile, args),
   renamePath: (args) => ipcRenderer.invoke(IpcChannels.fsRenamePath, args),
   deletePath: (args) => ipcRenderer.invoke(IpcChannels.fsDeletePath, args),
+  duplicatePath: (args) => ipcRenderer.invoke(IpcChannels.fsDuplicatePath, args),
+  importFiles: (args) => ipcRenderer.invoke(IpcChannels.fsImportFiles, args),
+  revealPath: (args) => ipcRenderer.invoke(IpcChannels.fsRevealPath, args),
+  openPath: (args) => ipcRenderer.invoke(IpcChannels.fsOpenPath, args),
   createDir: (args) => ipcRenderer.invoke(IpcChannels.fsCreateDir, args),
   diffFile: (args) => ipcRenderer.invoke(IpcChannels.fsDiffFile, args),
   search: (args) => ipcRenderer.invoke(IpcChannels.fsSearch, args),

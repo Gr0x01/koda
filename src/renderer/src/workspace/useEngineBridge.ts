@@ -27,6 +27,7 @@ export function useEngineBridge(): void {
   const maybeOfferIntake = useWorkspace((s) => s.maybeOfferIntake)
   const adoptHeadless = useWorkspace((s) => s.adoptHeadless)
   const archiveSession = useWorkspace((s) => s.archiveSession)
+  const renameSession = useWorkspace((s) => s.renameSession)
   const applyRemoteUserTurn = useWorkspace((s) => s.applyRemoteUserTurn)
   const openTerminalShelf = useWorkspace((s) => s.openTerminalShelf)
 
@@ -225,6 +226,12 @@ export function useEngineBridge(): void {
   useEffect(
     () => window.koda.onArchiveRequested(({ sessionId }) => void archiveSession(sessionId)),
     [archiveSession],
+  )
+
+  // Same forwarding rule for a phone rename of a live session this window owns.
+  useEffect(
+    () => window.koda.onRenameRequested(({ sessionId, name }) => renameSession(sessionId, name)),
+    [renameSession],
   )
 
   // A phone turn landed on a session this window already owns (adopted empty, before the turn). The

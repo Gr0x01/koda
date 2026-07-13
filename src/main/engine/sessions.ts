@@ -54,7 +54,7 @@ import {
   restoreVersion,
   UserGitError,
 } from '../user-git'
-import { browseDir, listProjectDocs, readProjectFile } from '../fs-browse'
+import { browseDir, docExcerpt, listProjectDocs, readProjectFile } from '../fs-browse'
 import { noteRateLimit } from './usage-reset-notifier'
 import { noteProviderError, noteTurnOk } from './status-watch'
 import { friendlyEngineError } from '@shared/engine-error'
@@ -87,8 +87,7 @@ import {
 } from '../playwright'
 import { startDevServer, captureWindowPreview, showStaticPreview, getSessionPreview, clearSessionPreview } from '../preview'
 import { showTerminal } from '../terminal'
-import { startPreviewStream, stopPreviewStream, previewInput, previewReload, stopAllPreviewStreams } from '../preview-stream'
-import { PREVIEW_CHANNEL, type PreviewInputEvent, type PreviewViewport } from '@shared/preview'
+import { stopLanForward, stopAllLanForwards } from '../lan-forward'
 import {
   claudeConversationExists,
   claudeConversationMtime,
@@ -138,6 +137,10 @@ export class EngineSessionManager {
   private readonly checkpointChains = new Map<string, Promise<unknown>>()
   /** Live background-workflow journal watchers, keyed by runId (a session may launch several). */
   private readonly workflowWatchers = new Map<string, { sessionId: string; watcher: WorkflowWatcher }>()
+  /** Completed background-workflow results waiting to ride a session's NEXT human turn back into the
+   *  agent's context (a workflow the agent launched returns async, after its turn already ended). Keyed
+   *  by sessionId; drained in sendTurn. Human-steered by design — no unprompted machine turn. */
+  private readonly pendingWorkflowResults = new Map<string, string[]>()
   /** In-flight side questions (btw/aside), keyed `${sessionId}:${asideId}` — so a dismiss can cancel
    *  the throwaway fork, and a session dispose can tear down any aside still streaming. */
   private readonly sideQuestions = new Map<string, SideQuestionHandle>()
@@ -216,6 +219,10 @@ export class EngineSessionManager {
    *  launcher polls, it doesn't subscribe) read this to show a live working/idle glyph per session. Kept
    *  in lockstep with the client-side `busy` reducer: set on a turn's send, cleared when the turn ends. */
   private readonly working = new Set<string>()
+  /** sessionId → the first line of the agent's latest reply, so the phone's project screen can show
+   *  what a live session is doing ("Wiring the date picker…") without an event stream at browse level.
+   *  In-memory, live sessions only — decoration, never persisted. */
+  private readonly lastLines = new Map<string, string>()
   /** Broker auto-recovery: sessions with a reconnect respawn in flight — so a burst of "koda_broker is
    *  not connected" tool errors (the engine keeps trying every queued tool) triggers ONE respawn, not
    *  one per failed tool. Added when recovery starts, removed when the respawn settles. */
@@ -544,7 +551,26 @@ export class EngineSessionManager {
       const sha = await headSha(cwd).catch(() => null)
       if (sha) this.diffBaselines.set(sessionId, sha)
     }
-    session.sendTurn(text, images)
+    // Ride any finished background-workflow results in ahead of the human's words, framed as context so
+    // the agent picks up where it left off. Only what the ENGINE sees is augmented — the user's visible
+    // bubble, replay entry, checkpoint label and titling above all use the untouched `text`.
+    const pending = this.drainWorkflowResults(sessionId)
+    session.sendTurn(pending ? (text ? `${pending}\n\n${text}` : pending) : text, images)
+  }
+
+  /** A finished workflow's result, stashed until this session's next human turn delivers it inline. */
+  private stashWorkflowResult(sessionId: string, resultText: string): void {
+    const arr = this.pendingWorkflowResults.get(sessionId)
+    if (arr) arr.push(resultText)
+    else this.pendingWorkflowResults.set(sessionId, [resultText])
+  }
+
+  /** Take and clear any pending workflow results for a session (joined newest-launched-last). */
+  private drainWorkflowResults(sessionId: string): string {
+    const arr = this.pendingWorkflowResults.get(sessionId)
+    if (!arr || arr.length === 0) return ''
+    this.pendingWorkflowResults.delete(sessionId)
+    return arr.join('\n\n')
   }
 
   /** The pinned live-edits diff baseline for a session (safety-git SHA at the current turn's start),
@@ -831,7 +857,7 @@ export class EngineSessionManager {
 
   /** Live sessions a remote client can pick: id + project dir + the session's human title.
    *  `lastActivityAt` (epoch ms, 0 = no turn yet) rides along so the phone can show ages + day-group. */
-  remoteSessionList(): { id: string; cwd: string; label: string; engineId: EngineId; lastActivityAt: number }[] {
+  remoteSessionList(): { id: string; cwd: string; label: string; engineId: EngineId; lastActivityAt: number; lastLine?: string }[] {
     return [...this.sessions.keys()]
       .sort((a, b) => (this.lastActivityAt.get(b) ?? 0) - (this.lastActivityAt.get(a) ?? 0))
       .map((id) => {
@@ -842,6 +868,7 @@ export class EngineSessionManager {
           label: this.sessionLabel(id, cwd),
           engineId: this.sessionEngines.get(id) ?? 'claude',
           lastActivityAt: this.lastActivityAt.get(id) ?? 0,
+          lastLine: this.lastLines.get(id),
         }
       })
   }
@@ -990,7 +1017,33 @@ export class EngineSessionManager {
    *  a direct file write here would be clobbered — so we forward the request and let the renderer archive
    *  (which also closes the tab). Windowless projects are main's to write directly (persistRemoteTitle's
    *  rule). */
-  archiveRemote(sessionId: string, projectPath: string): void {
+  async archiveRemote(sessionId: string, projectPath: string): Promise<void> {
+    // A LIVE session (the ⋯ sheet's "Archive session"): end it, then archive its stored entry — the
+    // desktop's same move (its sidebar archive also closes the tab). Windowed sessions forward to the
+    // renderer, which owns the store AND the tab; headless ones are main's to end + write directly.
+    if (this.sessions.has(sessionId)) {
+      const cwd = this.remoteCwd(sessionId)
+      if (projectPath && realpathOrSelf(projectPath) !== realpathOrSelf(cwd)) throw new Error('unknown session')
+      const win = windowForProject(realpathOrSelf(cwd))
+      if (win && !win.isDestroyed()) {
+        win.webContents.send(IpcChannels.sessionArchiveRequested, { sessionId })
+        return
+      }
+      const storedId = this.resumedFrom.get(sessionId) ?? sessionId
+      const label = this.sessionLabel(sessionId, cwd) // read before dispose (it needs the live maps)
+      await this.dispose(sessionId)
+      const store = loadProjectSessions(cwd) ?? { version: 2 as const, activeId: null, sessions: [] }
+      // A headless session may have no persisted entry yet (its transcript lives in the replay log) —
+      // archive a minimal one so it still lands in Settings → Archived sessions.
+      const session = store.sessions.find((s) => s.id === storedId) ?? { id: storedId, label, cwd, userNamed: false, items: [] }
+      saveProjectSessions(cwd, {
+        ...store,
+        activeId: store.activeId === storedId ? null : store.activeId,
+        sessions: store.sessions.filter((s) => s.id !== storedId),
+      })
+      saveArchivedSessions(cwd, [{ ...session, archivedAt: Date.now() }, ...loadArchivedSessions(cwd)])
+      return
+    }
     if (!this.remoteHistory().some((h) => h.id === sessionId && h.projectPath === projectPath))
       throw new Error('unknown session')
     const win = windowForProject(realpathOrSelf(projectPath))
@@ -1008,6 +1061,30 @@ export class EngineSessionManager {
     })
     // Archives live in their own cold file now — never in the hot store above.
     saveArchivedSessions(projectPath, [{ ...session, archivedAt: Date.now() }, ...loadArchivedSessions(projectPath)])
+  }
+
+  /** Rename a live session from the phone — the desktop right-click's same move. Two write paths (the
+   *  store's two-owner rule, same as archiveRemote): a windowed project's renderer owns the blob, so
+   *  main forwards and the renderer renames (by the LIVE id it knows the session as); a windowless
+   *  session is main's to write directly under its stored id. `userNamed` locks the label against the
+   *  auto-titler on both paths. */
+  renameRemote(sessionId: string, name: string): void {
+    const label = name.trim()
+    if (!label) throw new Error('name required')
+    const cwd = this.remoteCwd(sessionId) // throws on an unknown / not-live session
+    const win = windowForProject(realpathOrSelf(cwd))
+    if (win && !win.isDestroyed()) {
+      win.webContents.send(IpcChannels.sessionRenameRequested, { sessionId, name: label })
+      return
+    }
+    const storedId = this.resumedFrom.get(sessionId) ?? sessionId
+    const store = loadProjectSessions(cwd) ?? { version: 2 as const, activeId: null, sessions: [] }
+    const existing = store.sessions.find((s) => s.id === storedId)
+    if (existing) {
+      existing.label = label
+      existing.userNamed = true
+    } else store.sessions.push({ id: storedId, label, cwd, userNamed: true, items: [] })
+    saveProjectSessions(cwd, store)
   }
 
   // ── Desktop adoption of headless (phone-started) sessions ─────────────────────────────────────────
@@ -1212,45 +1289,68 @@ export class EngineSessionManager {
     }
   }
 
-  /** The phone's file browser — one directory's entries in the session's project. `path` is
-   *  project-relative ('' = root); fs-browse contains every access to the project root (realpath +
-   *  escape refusal), so the phone can't read elsewhere on disk. Returns relative paths (never leaks
-   *  the Mac's absolute layout). Read-only by construction — the phone edits nothing. */
+  /** Resolve a phone-supplied browse target to a project root: a live session's cwd, or a known recent
+   *  project's path directly — so the project screen can browse docs/files WITHOUT a session running.
+   *  Same trust rule as startNewRemote: a phone-named path must match a known recent project; the phone
+   *  can never browse an arbitrary directory. */
+  private remoteRoot(ref: { sessionId?: string; projectPath?: string }): string {
+    if (ref.sessionId) return this.remoteCwd(ref.sessionId)
+    const p = ref.projectPath ?? ''
+    if (!this.recentProjectsForRemote().some((r) => r.path === p)) throw new Error('unknown project')
+    return p
+  }
+
+  /** The phone's file browser — one directory's entries in the ref'd project (a live session's, or a
+   *  known project by path). `path` is project-relative ('' = root); fs-browse contains every access to
+   *  the project root (realpath + escape refusal), so the phone can't read elsewhere on disk. Returns
+   *  relative paths (never leaks the Mac's absolute layout). Read-only by construction. */
   async remoteBrowse(
-    sessionId: string,
+    ref: { sessionId?: string; projectPath?: string },
     path?: string,
   ): Promise<{ path: string; entries: { name: string; kind: 'file' | 'dir' }[] }> {
-    const cwd = this.remoteCwd(sessionId)
+    const cwd = this.remoteRoot(ref)
     const r = await browseDir(cwd, path || undefined)
     return { path: relative(cwd, r.path), entries: r.entries }
   }
 
-  /** Read one text file in the session's project (capped; binary refused). Path is project-relative,
+  /** Read one text file in the ref'd project (capped; binary refused). Path is project-relative,
    *  contained to the root by fs-browse. */
   async remoteReadFile(
-    sessionId: string,
+    ref: { sessionId?: string; projectPath?: string },
     path: string,
   ): Promise<{ path: string; content: string; truncated: boolean; binary: boolean }> {
-    const cwd = this.remoteCwd(sessionId)
+    const cwd = this.remoteRoot(ref)
     const r = await readProjectFile(cwd, path)
     return { path: relative(cwd, r.path), content: r.content, truncated: r.truncated, binary: r.binary }
   }
 
   /** The project's Documents — the user's deliverable docs (Documents/ + loose .md), the phone's
-   *  Notion-style read surface. Same list the desktop's doc-first sidebar shows. */
+   *  Notion-style read surface. Same list the desktop's doc-first sidebar shows. Each doc carries a
+   *  short excerpt so the phone can render page-preview cards (recognize the content, not a filename);
+   *  capped to the newest few so a huge project doesn't turn one listing into dozens of reads. */
   async remoteDocs(
-    sessionId: string,
-  ): Promise<{ docs: { rel: string; name: string; mtimeMs: number }[] }> {
-    const cwd = this.remoteCwd(sessionId)
+    ref: { sessionId?: string; projectPath?: string },
+  ): Promise<{ docs: { rel: string; name: string; mtimeMs: number; excerpt?: string }[] }> {
+    const cwd = this.remoteRoot(ref)
     const list = await listProjectDocs(cwd)
-    return { docs: list.map((d) => ({ rel: d.rel, name: d.name, mtimeMs: d.mtimeMs })) }
+    const EXCERPTS = 24
+    return {
+      docs: await Promise.all(
+        list.map(async (d, i) => ({
+          rel: d.rel,
+          name: d.name,
+          mtimeMs: d.mtimeMs,
+          ...(i < EXCERPTS ? { excerpt: await docExcerpt(cwd, d.rel) } : {}),
+        })),
+      ),
+    }
   }
 
   /** The remote tier was disabled: reap any headless session a remote client kept alive whose window is
    *  already gone (so its `claude` child doesn't linger unreachable), then forget all attachments. A
    *  session whose window is still open keeps running — it's still usable locally. */
   async disposeHeadlessRemote(): Promise<void> {
-    stopAllPreviewStreams() // no phone can be watching once the tier is off
+    stopAllLanForwards() // no phone can be watching once the tier is off
     for (const id of [...this.remoteAttached]) {
       if (!contextForSession(id)) await this.dispose(id)
     }
@@ -1300,43 +1400,6 @@ export class EngineSessionManager {
     const ctx = contextForSession(sessionId)
     if (!ctx) throw new Error('no project window for this session')
     showTerminal(ctx.win.id, sessionId, command)
-  }
-
-  // ── Preview over relay (preview-over-relay.md): stream the session's preview to the phone ─────
-  /** Push a frame/chunk to the remote transports only (NOT the local window — preview frames are
-   *  phone-bound). Each transport filters by its own per-client subscription; a throwing sink is isolated. */
-  private emitRemote(channel: string, sessionId: string, payload: unknown): void {
-    for (const sink of this.remoteSinks) {
-      try {
-        sink(channel, sessionId, payload)
-      } catch (err) {
-        log.warn('remote', 'remote sink threw', err instanceof Error ? err.message : err)
-      }
-    }
-  }
-
-  /** Start streaming the session's live preview to whichever phone is watching it. Renders the current
-   *  preview URL offscreen (works even for a windowless session) and fans frames out on the preview
-   *  channel. Returns whether there's a preview to show (false ⇒ the phone shows "ask the agent to run it"). */
-  startPreviewStream(sessionId: string, viewport: PreviewViewport): { hasPreview: boolean } {
-    const preview = getSessionPreview(sessionId)
-    if (!preview) return { hasPreview: false }
-    const ok = startPreviewStream(sessionId, preview.url, viewport, (chunk) =>
-      this.emitRemote(PREVIEW_CHANNEL, sessionId, chunk),
-    )
-    return { hasPreview: ok }
-  }
-
-  stopPreviewStream(sessionId: string): void {
-    stopPreviewStream(sessionId)
-  }
-
-  previewInput(sessionId: string, ev: PreviewInputEvent): void {
-    previewInput(sessionId, ev)
-  }
-
-  previewReload(sessionId: string): void {
-    previewReload(sessionId)
   }
 
   // ── Per-project persistence (a project's sessions survive an app restart) ────
@@ -1497,7 +1560,12 @@ export class EngineSessionManager {
     this.remoteTitled.delete(sessionId)
     this.lastActivityAt.delete(sessionId)
     this.working.delete(sessionId)
-    stopPreviewStream(sessionId) // reap any offscreen preview render + forget its (now dead) URL
+    this.lastLines.delete(sessionId)
+    // NB: pendingWorkflowResults is NOT cleared here — like recoveringBroker, it must SURVIVE a respawn
+    // (dispose() is also the broker-recovery / model-effort teardown, and a workflow result stashed
+    // before the respawn still needs to ride the next human turn). It's drained on delivery; a truly
+    // abandoned entry is one small string that evaporates with the process — no unbounded growth.
+    stopLanForward(sessionId) // reap any LAN preview forwarder + forget its (now dead) URL
     clearSessionPreview(sessionId)
     // NB: recoveringBroker is NOT cleared here — a broker recovery calls start()→dispose() on the old
     // child mid-flight, and its own finally removes the flag once the respawn settles. Clearing it here
@@ -1670,6 +1738,12 @@ export class EngineSessionManager {
     else if (event.type === 'TurnComplete' || (event.type === 'EngineError' && event.fatal))
       this.working.delete(event.sessionId)
 
+    // The launcher's "what is it doing" line — the first non-empty line of the latest finalized reply.
+    if (event.type === 'AssistantBlock') {
+      const line = event.markdown.split('\n').find((l) => l.trim())
+      if (line) this.lastLines.set(event.sessionId, line.trim().slice(0, 140))
+    }
+
     // Broker self-heal: the engine's MCP client dropped our in-process permission/capability server
     // (typically a long-idle stream — the keepalive in broker/server.ts is the prevention). Once that
     // happens EVERY tool fails "koda_broker is not connected", the gate included, so the session is
@@ -1731,6 +1805,8 @@ export class EngineSessionManager {
         event.dir,
         (e) => this.forward(e), // the watcher's own WorkflowAgent/Completed events route back through here
         (runId) => this.workflowWatchers.delete(runId),
+        // Stash the finished workflow's result for delivery on this session's next human turn.
+        (resultText) => this.stashWorkflowResult(event.sessionId, resultText),
       )
       this.workflowWatchers.set(event.runId, { sessionId: event.sessionId, watcher })
       watcher.start()

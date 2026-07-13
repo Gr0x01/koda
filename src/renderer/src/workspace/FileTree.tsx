@@ -4,8 +4,9 @@ import { Overlay, cardVariants, motion } from '../motion'
 import { Caret } from '../Caret'
 import { useWorkspace, activeEditor } from './store'
 
-/** Drag-and-drop carries the source path on a private MIME type so unrelated drops are ignored. */
-const DRAG_MIME = 'application/x-koda-path'
+/** Drag-and-drop carries the source path on a private MIME type so unrelated drops are ignored.
+ *  Shared with the Documents surface so a drag reads the same across both file views. */
+export const DRAG_MIME = 'application/x-koda-path'
 
 export interface TreeCtx {
   renamingPath: string | null
@@ -46,6 +47,7 @@ export function DirNode({
   const open = useWorkspace((s) => s.openDirs.includes(path))
   const setDirOpen = useWorkspace((s) => s.setDirOpen)
   const moveEntry = useWorkspace((s) => s.moveEntry)
+  const importFiles = useWorkspace((s) => s.importFiles)
   // Re-read open dirs when the tree's contents change (new file/folder, rename, move, delete).
   const filesRev = useWorkspace((s) => s.filesRev)
   const [entries, setEntries] = useState<FsEntry[] | null>(null)
@@ -69,20 +71,29 @@ export function DirNode({
     }
   }, [open, path, filesRev])
 
-  // A drop is valid unless it's a no-op (already here) or a folder onto itself/a descendant.
+  // A drop is valid unless it's a no-op (already here) or a folder onto itself/a descendant. A Finder
+  // drag (external files) is always a valid target — it imports INTO this folder.
   const from = tree.draggingPath
   const dropValid = !!from && parentDir(from) !== path && from !== path && !path.startsWith(from + '/')
-  const isDropTarget = tree.dropTarget === path && dropValid
+  const isDropTarget = tree.dropTarget === path
 
   return (
     <div
       onDragOver={(e) => {
-        if (!dropValid) return
+        const external = e.dataTransfer.types.includes('Files')
+        if (!external && !dropValid) return
         e.preventDefault()
         e.stopPropagation()
         if (tree.dropTarget !== path) tree.setDropTarget(path)
       }}
       onDrop={(e) => {
+        if (e.dataTransfer.files.length) {
+          e.preventDefault()
+          e.stopPropagation()
+          tree.setDropTarget(null)
+          void importFiles(path, e.dataTransfer.files)
+          return
+        }
         if (!dropValid) return
         e.preventDefault()
         e.stopPropagation()
@@ -254,16 +265,27 @@ function Row({
 export function ContextMenu({
   menu,
   onClose,
+  onOpen,
+  onReveal,
+  onCopyPath,
   onRename,
   onNewFolder,
+  onDuplicate,
   onDelete,
 }: {
   menu: Menu
   onClose: () => void
+  onOpen: () => void
+  onReveal: () => void
+  onCopyPath: () => void
   onRename: () => void
   onNewFolder: () => void
+  onDuplicate: () => void
   onDelete: () => void
 }) {
+  // A file gets "Open" (default app); folders lean on "Reveal in Finder" instead. Both, plus
+  // "Copy path", are the Mac table-stakes that work everywhere — including the project root.
+  const hasManageRow = menu.kind === 'dir' || !menu.isRoot
   return (
     <div className="fixed inset-0 z-50" onClick={onClose} onContextMenu={(e) => e.preventDefault()}>
       {/* Enter-only scale-fade from the cursor corner; menus dismiss instantly (no exit anim needed). */}
@@ -275,8 +297,13 @@ export function ContextMenu({
         onClick={(e) => e.stopPropagation()}
         className="absolute min-w-[160px] overflow-hidden rounded-lg border border-border bg-bg py-1 text-xs shadow-pop"
       >
+        {menu.kind === 'file' && <MenuItem label="Open" onClick={onOpen} />}
+        <MenuItem label="Reveal in Finder" onClick={onReveal} />
+        <MenuItem label="Copy path" onClick={onCopyPath} />
+        {hasManageRow && <div className="my-1 border-t border-border" />}
         {menu.kind === 'dir' && <MenuItem label="New folder" onClick={onNewFolder} />}
         {!menu.isRoot && <MenuItem label="Rename" onClick={onRename} />}
+        {!menu.isRoot && <MenuItem label="Duplicate" onClick={onDuplicate} />}
         {!menu.isRoot && <MenuItem label="Delete" danger onClick={onDelete} />}
       </motion.div>
     </div>

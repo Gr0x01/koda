@@ -11,7 +11,7 @@
  * manager and stopped when the session ends; a hard lifetime cap backstops a workflow that hangs.
  */
 import { existsSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import type { EngineEvent } from '@shared/ipc'
 import { log } from '../logger'
 
@@ -26,6 +26,10 @@ const STOP_AFTER_QUIET_MS = 90_000
 const MAX_LIFETIME_MS = 30 * 60 * 1000
 /** Trim an agent result so a verbose return can't bloat the IPC payload / card. */
 const RESULT_CAP = 2000
+/** Trim the workflow's final return before it rides the next turn into the agent's context. */
+const WORKFLOW_RESULT_CAP = 4000
+/** How far up from the journal dir to look for the engine's `<sessionRoot>/workflows/<runId>.json`. */
+const RESULT_FILE_MAX_WALK = 6
 
 export class WorkflowWatcher {
   private timer: ReturnType<typeof setInterval> | null = null
@@ -34,6 +38,7 @@ export class WorkflowWatcher {
   private lastChange = Date.now()
   private readonly startedAt = Date.now()
   private done = false
+  private resultDelivered = false
 
   constructor(
     private readonly sessionId: string,
@@ -42,6 +47,10 @@ export class WorkflowWatcher {
     private readonly emit: (event: EngineEvent) => void,
     /** Called once the watcher finishes (completed or timed out) so the owner can drop it. */
     private readonly onFinished: (runId: string) => void,
+    /** Called once, when the workflow's own result file reports `status:completed`, with the framed
+     *  result text to ride the session's NEXT human turn back into the agent's context. Optional so
+     *  callers that only want the user-facing card/notification can skip result delivery. */
+    private readonly onResult?: (resultText: string) => void,
   ) {}
 
   start(): void {
@@ -59,6 +68,11 @@ export class WorkflowWatcher {
     } catch (err) {
       log.warn('workflow', 'journal read failed', { runId: this.runId, err: err instanceof Error ? err.message : err })
     }
+    // Deliver the workflow's final return to the agent, keyed off the AUTHORITATIVE `status:completed`
+    // in the engine's own result file — not the journal-quiet heuristic below (which only drives the
+    // user-facing card + notification). Best-effort and fire-once; if the file's absent/partial we just
+    // never deliver (falls back to notify-only), never crash.
+    if (this.onResult && !this.resultDelivered) this.maybeDeliverResult()
     const quietFor = Date.now() - this.lastChange
     const expired = Date.now() - this.startedAt > MAX_LIFETIME_MS
 
@@ -106,6 +120,46 @@ export class WorkflowWatcher {
     this.lastChange = Date.now()
     // NB: do NOT re-arm `done` here. A late wave's agents still surface (emitted above), but we
     // notify "complete" only ONCE — re-completing per wave would spam the user with notifications.
+  }
+
+  /** The journal we poll lives at `<sessionRoot>/subagents/workflows/<runId>/journal.jsonl`, but the
+   *  workflow's final return + explicit `status` land in a SIBLING `<sessionRoot>/workflows/<runId>.json`.
+   *  Walk up from the journal dir (layout can shift across engine versions) until we find it. */
+  private locateResultFile(): string | null {
+    let cur = this.dir
+    for (let i = 0; i < RESULT_FILE_MAX_WALK; i++) {
+      const candidate = join(cur, 'workflows', `${this.runId}.json`)
+      if (existsSync(candidate)) return candidate
+      const parent = dirname(cur)
+      if (parent === cur) break
+      cur = parent
+    }
+    return null
+  }
+
+  private maybeDeliverResult(): void {
+    const path = this.locateResultFile()
+    if (!path) return
+    let rec: { status?: string; result?: unknown; summary?: unknown; workflowName?: unknown }
+    try {
+      rec = JSON.parse(readFileSync(path, 'utf8'))
+    } catch {
+      return // half-written / not JSON yet — try again next tick
+    }
+    if (rec.status !== 'completed') return // still running (e.g. a long pause between waves)
+    this.resultDelivered = true
+    const label =
+      (typeof rec.workflowName === 'string' && rec.workflowName) ||
+      (typeof rec.summary === 'string' && rec.summary) ||
+      'workflow'
+    const body =
+      typeof rec.result === 'string' ? rec.result : JSON.stringify(rec.result ?? null, null, 2)
+    const text =
+      `<workflow-result runId="${this.runId}">\n` +
+      `The background workflow "${label}" you launched earlier has completed. Its result:\n\n` +
+      `${body.slice(0, WORKFLOW_RESULT_CAP)}\n` +
+      `</workflow-result>`
+    this.onResult?.(text)
   }
 
   private finish(): void {

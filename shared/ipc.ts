@@ -525,6 +525,11 @@ export type HeadlessAppeared = z.infer<typeof HeadlessAppearedSchema>
 export const ArchiveRequestedSchema = z.object({ sessionId: z.string() })
 export type ArchiveRequested = z.infer<typeof ArchiveRequestedSchema>
 
+/** Push payload asking a window to rename one of its live sessions (a phone rename) — same
+ *  renderer-owns-the-store rule as ArchiveRequested. */
+export const RenameRequestedSchema = z.object({ sessionId: z.string(), name: z.string() })
+export type RenameRequested = z.infer<typeof RenameRequestedSchema>
+
 /** Push payload carrying a phone turn's user text into the window that ALREADY owns the session — sent
  *  live when a window adopted the session before this turn (it was open on the project when the phone
  *  started it, so it adopted empty). The engine stream never echoes the human's prompt, so without this
@@ -1600,12 +1605,43 @@ export type RenamePathResult = z.infer<typeof RenamePathResultSchema>
 export const DeletePathRequestSchema = z.object({ path: z.string() })
 export type DeletePathRequest = z.infer<typeof DeletePathRequestSchema>
 
+/** fs:revealPath — reveal a file/folder in Finder. fs:openPath — open it in the OS default app.
+ *  Both are read-only shell actions, path-contained to the project root. */
+export const RevealPathRequestSchema = z.object({ path: z.string() })
+export type RevealPathRequest = z.infer<typeof RevealPathRequestSchema>
+export const OpenPathRequestSchema = z.object({ path: z.string() })
+export type OpenPathRequest = z.infer<typeof OpenPathRequestSchema>
+
 /** fs:createDir — create a new folder (name optional ⇒ "New folder", deduped). `parent` (an existing
  *  dir within the root) places it inside that folder; omitted ⇒ the project root. Returns the path. */
-export const CreateDirRequestSchema = z.object({ name: z.string().optional(), parent: z.string().optional() })
+export const CreateDirRequestSchema = z.object({
+  name: z.string().optional(),
+  parent: z.string().optional(),
+  // Land the folder in the user's Documents/ (where New document goes) instead of the project root —
+  // used by the doc-first view's New-folder button so it appears where they expect.
+  home: z.boolean().optional(),
+})
 export type CreateDirRequest = z.infer<typeof CreateDirRequestSchema>
 export const CreateDirResultSchema = z.object({ path: z.string() })
 export type CreateDirResult = z.infer<typeof CreateDirResultSchema>
+
+/** fs:duplicatePath — copy a file/folder alongside itself as "<name> copy" (deduped). Contained to
+ *  the project root; main checkpoints first, so the copy is undoable from the recovery timeline. */
+export const DuplicatePathRequestSchema = z.object({ path: z.string() })
+export type DuplicatePathRequest = z.infer<typeof DuplicatePathRequestSchema>
+export const DuplicatePathResultSchema = z.object({ path: z.string() })
+export type DuplicatePathResult = z.infer<typeof DuplicatePathResultSchema>
+
+/** fs:importFiles — write files dragged in from Finder into `destDir` (an existing folder within the
+ *  root) or, omitted, the user's Documents/ home. Bytes ride over IPC (no external path is followed);
+ *  names are deduped so a drop never clobbers. Main checkpoints first, so an import is undoable. */
+export const ImportFilesRequestSchema = z.object({
+  destDir: z.string().optional(),
+  files: z.array(z.object({ name: z.string(), data: z.instanceof(Uint8Array) })).min(1),
+})
+export type ImportFilesRequest = z.infer<typeof ImportFilesRequestSchema>
+export const ImportFilesResultSchema = z.object({ paths: z.array(z.string()) })
+export type ImportFilesResult = z.infer<typeof ImportFilesResultSchema>
 
 /** fs:diffFile — the before/after pair that powers the live-edits diff. `before` is the file's
  *  contents at the turn-start safety-git baseline for `sessionId` (cumulative-this-turn diff); empty
@@ -2030,6 +2066,8 @@ export interface KodaApi {
   onHeadlessAppeared: (listener: (payload: HeadlessAppeared) => void) => () => void
   /** The phone asked to archive a past session in this window's project → store.archiveSession. */
   onArchiveRequested: (listener: (payload: ArchiveRequested) => void) => () => void
+  /** The phone asked to rename a live session in this window's project → store.renameSession. */
+  onRenameRequested: (listener: (payload: RenameRequested) => void) => () => void
   /** A phone turn on a session THIS window already owns (adopted before the turn) → append + auto-title. */
   onRemoteUserTurn: (listener: (payload: RemoteUserTurnLive) => void) => () => void
   /** Subscribe to the normalized event stream; returns an unsubscribe fn. */
@@ -2079,6 +2117,14 @@ export interface KodaApi {
   renamePath: (args: RenamePathRequest) => Promise<RenamePathResult>
   /** Delete a file/folder, recursive (checkpointed first). */
   deletePath: (args: DeletePathRequest) => Promise<void>
+  /** Duplicate a file/folder as "<name> copy" (checkpointed first). Returns the new path. */
+  duplicatePath: (args: DuplicatePathRequest) => Promise<DuplicatePathResult>
+  /** Import Finder-dragged files into a folder (or Documents/), checkpointed first. Returns new paths. */
+  importFiles: (args: ImportFilesRequest) => Promise<ImportFilesResult>
+  /** Reveal a file/folder in Finder. */
+  revealPath: (args: RevealPathRequest) => Promise<void>
+  /** Open a file/folder in the OS default app. */
+  openPath: (args: OpenPathRequest) => Promise<void>
   /** Create a new folder (at the root, or inside `parent`). */
   createDir: (args: CreateDirRequest) => Promise<CreateDirResult>
   /** Read a file's pinned pre-turn + current contents for the live-edits diff view. */

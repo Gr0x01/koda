@@ -46,7 +46,16 @@ export function ProjectHome() {
     // screen, so add the same top drag strip here. A full-screen drag region would swallow the OS
     // edge-resize border on macOS — keep it a top bar (matching Chassis) so the window still resizes.
     <div className="relative flex h-screen w-screen flex-col items-center justify-center gap-7 bg-bg px-6 text-text">
-      <div className="app-drag absolute inset-x-0 top-0 h-9" />
+      <div
+        className={`app-drag absolute inset-x-0 top-0 flex h-9 items-center justify-center ${import.meta.env.DEV ? 'border-b-2' : ''}`}
+        style={import.meta.env.DEV ? { borderBottomColor: '#f4c000' } : undefined}
+      >
+        {import.meta.env.DEV && (
+          <span className="font-display text-xs font-semibold tracking-wide text-text-muted">
+            KODA DEV
+          </span>
+        )}
+      </div>
       {creating && (
         <NewProjectModal
           onClose={() => setCreating(false)}

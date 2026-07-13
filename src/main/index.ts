@@ -24,16 +24,18 @@ import {
   registerPreviewCaptureResponder,
   killDevServer,
 } from './preview'
-import { stopAllPreviewStreams } from './preview-stream'
+import { stopAllLanForwards } from './lan-forward'
 import { voiceController } from './voice'
 import { resumePlaywrightIfEnabled } from './playwright'
 import { killTerminal, registerTerminalIpc } from './terminal'
 import { track } from './telemetry'
 
-// Pin the app name so the log dir resolves to ~/Library/Logs/Koda in dev too
-// (unpackaged Electron would otherwise name it "Electron"). Must precede any
-// getPath() call. No other path is resolved before this.
-app.setName('Koda')
+// Pin the app name before any getPath() call (unpackaged Electron would otherwise name it
+// "Electron"). In dev we deliberately use a DISTINCT name so a `npm run dev` instance and the
+// installed .app can run side by side: it drives the dock label + menu-bar name (so you can tell
+// them apart at a glance) AND forks userData/Logs to `Koda Dev`, so the two live processes never
+// stomp each other's session stores or safety-git checkpoints.
+app.setName(process.env.ELECTRON_RENDERER_URL ? 'Koda Dev' : 'Koda')
 
 // Register the preview scheme as a privileged web origin — MUST run before app `ready` (Electron
 // requirement), so it's a module-level call, not inside whenReady. The request handler is wired
@@ -392,7 +394,7 @@ app.on('before-quit', (event) => {
     killTerminal(win.id)
     voiceController.killForWindow(win.id)
   }
-  stopAllPreviewStreams()
+  stopAllLanForwards()
   // Flush the renderers' pending saves in parallel with engine teardown — both are bounded.
   Promise.allSettled([flushRendererState(), disposeEngineSessions()]).then(() => {
     clearTimeout(backstop)

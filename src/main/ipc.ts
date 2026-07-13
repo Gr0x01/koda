@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, type WebContents } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, shell, type WebContents } from 'electron'
 import { existsSync, realpathSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -58,6 +58,12 @@ import {
   RenamePathRequestSchema,
   RenamePathResultSchema,
   DeletePathRequestSchema,
+  DuplicatePathRequestSchema,
+  DuplicatePathResultSchema,
+  ImportFilesRequestSchema,
+  ImportFilesResultSchema,
+  RevealPathRequestSchema,
+  OpenPathRequestSchema,
   CreateDirRequestSchema,
   CreateDirResultSchema,
   SearchRequestSchema,
@@ -135,6 +141,8 @@ import {
   createProjectDir,
   createProjectFile,
   deleteProjectPath,
+  duplicateProjectPath,
+  importFilesIntoProject,
   diffProjectFile,
   listProjectDocs,
   readProjectFile,
@@ -987,10 +995,45 @@ export function registerIpcHandlers(): void {
     await deleteProjectPath(root, path)
   })
 
+  // Duplicate a file/folder as "<name> copy". Checkpoint first so the copy is undoable. Returns the
+  // new path so the renderer can nudge its tree/docs list to re-read.
+  ipcMain.handle(IpcChannels.fsDuplicatePath, async (event, rawArgs: unknown) => {
+    const { path } = DuplicatePathRequestSchema.parse(rawArgs)
+    const root = rootForSender(event.sender)
+    await getEngineSessions().checkpointProjectEdit(root, `duplicate ${basename(path)}`)
+    return DuplicatePathResultSchema.parse({ path: await duplicateProjectPath(root, path) })
+  })
+
+  // Import Finder-dragged files into a folder (or Documents/). Checkpoint first so the import is
+  // undoable. Bytes ride over IPC; no external path is ever followed. Returns the new paths.
+  ipcMain.handle(IpcChannels.fsImportFiles, async (event, rawArgs: unknown) => {
+    const { destDir, files } = ImportFilesRequestSchema.parse(rawArgs)
+    const root = rootForSender(event.sender)
+    await getEngineSessions().checkpointProjectEdit(root, `import ${files.length} file(s)`)
+    return ImportFilesResultSchema.parse({ paths: await importFilesIntoProject(root, destDir, files) })
+  })
+
+  // Reveal a file/folder in Finder. containedReal refuses any path outside the project root (and
+  // resolves the symlinked root), so the renderer can only surface its own project's files.
+  ipcMain.handle(IpcChannels.fsRevealPath, async (event, rawArgs: unknown) => {
+    const { path } = RevealPathRequestSchema.parse(rawArgs)
+    shell.showItemInFolder(containedReal(rootForSender(event.sender), path))
+  })
+
+  // Open a file/folder in the OS default app. Contained like reveal; shell.openPath returns a
+  // non-empty string on failure (e.g. no handler) — surface it as an error the renderer can show.
+  ipcMain.handle(IpcChannels.fsOpenPath, async (event, rawArgs: unknown) => {
+    const { path } = OpenPathRequestSchema.parse(rawArgs)
+    const err = await shell.openPath(containedReal(rootForSender(event.sender), path))
+    if (err) throw new Error(err)
+  })
+
   // Create a new folder (at the root, or inside `parent`) and return its path. No checkpoint.
   ipcMain.handle(IpcChannels.fsCreateDir, async (event, rawArgs: unknown) => {
-    const { name, parent } = CreateDirRequestSchema.parse(rawArgs)
-    return CreateDirResultSchema.parse({ path: await createProjectDir(rootForSender(event.sender), name, parent) })
+    const { name, parent, home } = CreateDirRequestSchema.parse(rawArgs)
+    return CreateDirResultSchema.parse({
+      path: await createProjectDir(rootForSender(event.sender), name, parent, home),
+    })
   })
 
   // Project-wide find (the Find overlay): fuzzy filename + substring content matches, scope-filtered,

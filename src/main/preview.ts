@@ -28,10 +28,10 @@ import { log } from './logger'
 export const PREVIEW_SCHEME = 'koda-preview'
 
 /**
- * The current preview URL per session — the one fact preview-over-relay needs that main didn't keep
- * (the URL was pushed to the renderer and forgotten). Written when a dev server confirms serving or a
- * static file is shown; read by preview-stream.ts to render that session's preview offscreen for the
- * phone. `kind` distinguishes a live dev server from a static koda-preview:// file.
+ * The current preview URL per session — the one fact phone preview needs that main didn't keep (the URL
+ * was pushed to the renderer and forgotten). Written when a dev server confirms serving or a static file
+ * is shown; read by remote-control.ts to expose that session's dev server to the phone (LAN forwarder or
+ * WG tunnel). `kind` distinguishes a live dev server from a static koda-preview:// file.
  */
 const sessionPreviews = new Map<string, { url: string; kind: 'dev' | 'static'; winId: number }>()
 
