@@ -10,6 +10,43 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
 
 ## [Unreleased]
 
+### Added
+
+- Edit your documents from your phone, not just read them. Open a document in the
+  phone app and tap the edit button to write in it like a normal page — headings,
+  lists, checklists, tables, and callouts all work, the same as on your Mac. Your
+  changes save back to your Mac on their own when you tap Done, and every save can
+  be undone.
+
+## [0.1.4] - 2026-07-15
+
+### Changed
+
+- Organizing Documents now works like a proper Mac file list. Folders can be
+  renamed, duplicated, revealed in Finder, or deleted from their visible menu;
+  new documents and folders land inside the folder you selected, and new
+  folders ask for a name right away. Arrow-key navigation and familiar rename,
+  duplicate, delete, and new-document shortcuts work too.
+- Sub-folders in the Documents list now nest and indent under their parent, so a
+  folder inside a folder reads as a tidy tree instead of a full path written out
+  on one line.
+- Selecting text in a document now opens one clear editing control instead of
+  separate formatting and agent-action bubbles. Format the text normally, or
+  switch the same control into Koda's rewrite actions without losing your
+  selection.
+
+### Fixed
+
+- Images in a document now show up in the document view. A picture you reference
+  by its file (like one in an `assets` folder next to the document) used to come
+  up blank; now it renders inline where you wrote it.
+- Making a new folder in Documents no longer drops it inside a folder just
+  because you opened that folder to look inside. Use a folder's arrow to open and
+  browse it, and click its name when you want new items to go there. The New
+  folder and New document buttons now show where the new item will land.
+- The live Preview now opens when you use the Codex engine, not only the Claude
+  engine.
+
 ## [0.1.3] - 2026-07-13
 
 ### Added
@@ -93,7 +130,8 @@ _First versioned build — the baseline the auto-updater ships from._
 - Settings now shows the Koda version, the bundled Claude engine version, and a
   "Check for updates" button.
 
-[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/Gr0x01/koda/releases/tag/v0.1.4
 [0.1.3]: https://github.com/Gr0x01/koda/releases/tag/v0.1.3
 [0.1.2]: https://github.com/Gr0x01/koda/releases/tag/v0.1.2
 [0.1.1]: https://github.com/Gr0x01/koda/releases/tag/v0.1.1

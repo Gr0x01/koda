@@ -383,7 +383,12 @@ export function RemoteSection() {
   const connected = state?.connectedClients ?? 0
   // Encode address + code in one QR so the phone's native camera opens the client and pairs in one tap —
   // no typing the URL or the 6 digits. The code is single-use, so this updates after each pair.
-  const pairUrl = state?.url && state?.code ? `${state.url}/?code=${state.code}` : null
+  // hosts[0] already is state.url's address; bundle the rest so the phone can try every reachable IP.
+  const altHosts = (state?.hosts ?? []).slice(1)
+  const pairUrl =
+    state?.url && state?.code
+      ? `${state.url}/?code=${state.code}${altHosts.length ? `&hosts=${encodeURIComponent(altHosts.join(','))}` : ''}`
+      : null
 
   return (
     <>

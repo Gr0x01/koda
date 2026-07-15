@@ -55,11 +55,22 @@ function homeSubfolder(rel: string): string {
   return slash === -1 ? '' : inner.slice(0, slash)
 }
 
-/** Row interactions shared by every DocRow / FolderHeader without prop-drilling — mirrors FileTree's
- *  TreeContext, but this surface renames inline and only moves docs *into* folders. */
+/** A `Documents/` sub-folder folded into a tree so nesting renders as indentation, not `a/b` flat rows.
+ *  `key` is the full rel path within Documents/ ("smart-home/plans"); `name` is just its last segment. */
+interface FolderNode {
+  key: string
+  name: string
+  path: string | null
+  docs: ProjectDoc[]
+  children: FolderNode[]
+}
+
+/** Row interactions shared by every DocRow / FolderHeader / FolderTree without prop-drilling — mirrors
+ *  FileTree's TreeContext, but this surface renames inline and only moves docs *into* folders. */
 interface DocsCtx {
-  openMenu: (e: React.MouseEvent, path: string) => void
+  openMenu: (e: React.MouseEvent, path: string, kind?: 'file' | 'dir') => void
   renamingPath: string | null
+  startRename: (path: string) => void
   commitRename: (path: string, name: string) => void
   cancelRename: () => void
   draggingPath: string | null
@@ -68,6 +79,10 @@ interface DocsCtx {
   setDropTarget: (path: string | null) => void
   moveDoc: (from: string, toDir: string) => void
   importDocs: (destDir: string, files: Iterable<File>) => void
+  setSelected: (path: string, kind: 'file' | 'dir') => void
+  selectedPath: string | null
+  collapsed: Set<string>
+  toggle: (key: string) => void
 }
 const DocsContext = createContext<DocsCtx | null>(null)
 const useDocs = (): DocsCtx => {
@@ -89,6 +104,7 @@ export function DocsBrowser(): React.JSX.Element {
   const [root, setRoot] = useState<string | null>(null)
   const [subdirs, setSubdirs] = useState<string[]>([])
   const [dropActive, setDropActive] = useState(false)
+  const [selected, setSelected] = useState<{ path: string; kind: 'file' | 'dir' } | null>(null)
   const dropDepth = useRef(0)
   const filesRev = useWorkspace((s) => s.filesRev)
   const setFilesView = useWorkspace((s) => s.setFilesView)
@@ -97,6 +113,8 @@ export function DocsBrowser(): React.JSX.Element {
   const renameEntry = useWorkspace((s) => s.renameEntry)
   const moveEntry = useWorkspace((s) => s.moveEntry)
   const importFiles = useWorkspace((s) => s.importFiles)
+  const newDocument = useWorkspace((s) => s.newDocument)
+  const newFolder = useWorkspace((s) => s.newFolder)
   const treeError = useWorkspace((s) => s.treeError)
   const clearTreeError = useWorkspace((s) => s.clearTreeError)
 
@@ -120,11 +138,28 @@ export function DocsBrowser(): React.JSX.Element {
   // holds any docs. Re-read with the doc list. A missing Documents/ (new project) settles to none.
   useEffect(() => {
     let alive = true
-    window.koda.readDir({}).then((r) => alive && setRoot(r.path)).catch(() => {})
-    window.koda
-      .readDir({ path: HOME.slice(0, -1) })
-      .then((r) => alive && setSubdirs(r.entries.filter((e) => e.kind === 'dir').map((e) => e.name)))
-      .catch(() => alive && setSubdirs([]))
+    window.koda.readDir({}).then(async (r) => {
+      if (!alive) return
+      setRoot(r.path)
+      const base = `${r.path}/${HOME.slice(0, -1)}`
+      const pending: Array<{ path: string; rel: string }> = [{ path: base, rel: '' }]
+      const found: string[] = []
+      while (pending.length && found.length < 200) {
+        const current = pending.shift()!
+        try {
+          const listed = await window.koda.readDir({ path: current.path })
+          for (const entry of listed.entries) {
+            if (entry.kind !== 'dir') continue
+            const rel = current.rel ? `${current.rel}/${entry.name}` : entry.name
+            found.push(rel)
+            pending.push({ path: `${current.path}/${entry.name}`, rel })
+          }
+        } catch {
+          // A missing Documents/ is normal in a new project.
+        }
+      }
+      if (alive) setSubdirs(found)
+    }).catch(() => alive && setSubdirs([]))
     return () => {
       alive = false
     }
@@ -140,14 +175,26 @@ export function DocsBrowser(): React.JSX.Element {
     }
   }, [])
 
+  useEffect(() => {
+    const onRename = (e: Event): void => {
+      const path = (e as CustomEvent<string>).detail
+      setSelected({ path, kind: 'dir' })
+      window.dispatchEvent(new CustomEvent('koda:docs-folder-selected', { detail: path }))
+      setRenamingPath(path)
+    }
+    window.addEventListener('koda:rename-doc-folder', onRename)
+    return () => window.removeEventListener('koda:rename-doc-folder', onRename)
+  }, [])
+
   if (error)
     return <p className="px-4 py-3 text-xs leading-relaxed text-red-400">Couldn't list documents: {error}</p>
   if (!docs) return <p className="px-4 py-3 text-xs text-text-muted">Loading…</p>
 
   // The user's writing (Documents/ + loose root) is the list; everything else is repo markdown that
-  // only earns a footer pointer to Files. Group home docs by sub-folder, keeping main's newest-first.
+  // only earns a footer pointer to Files. Group home docs by their sub-folder (a full rel path within
+  // Documents/, e.g. "smart-home/plans"), keeping main's newest-first within each folder.
   const loose: ProjectDoc[] = []
-  const folders = new Map<string, ProjectDoc[]>()
+  const docsByFolder = new Map<string, ProjectDoc[]>()
   let strayCount = 0
   for (const d of docs) {
     if (!isHomeDoc(d.rel)) {
@@ -158,23 +205,64 @@ export function DocsBrowser(): React.JSX.Element {
     if (!sub) {
       loose.push(d)
     } else {
-      const bucket = folders.get(sub) ?? []
+      const bucket = docsByFolder.get(sub) ?? []
       bucket.push(d)
-      folders.set(sub, bucket)
+      docsByFolder.set(sub, bucket)
     }
   }
-  // Surface empty Documents/ sub-folders too (a folder made here, or by the agent, before it holds
-  // docs) — otherwise "New folder" would create something invisible with nowhere to drop into. Skip
-  // any that already have docs under them (they're built above) so a folder never shows up twice.
-  for (const name of subdirs) {
-    const hasDocs = folders.has(name) || [...folders.keys()].some((k) => k.startsWith(name + '/'))
-    if (!hasDocs) folders.set(name, [])
+  // Every folder we show: those holding docs, plus every walked sub-dir (so a just-made / empty folder
+  // still appears), plus every ANCESTOR of those — a nested folder can't render without its parent node.
+  const folderKeys = new Set<string>([...docsByFolder.keys(), ...subdirs])
+  for (const key of [...folderKeys]) {
+    const parts = key.split('/')
+    for (let i = 1; i < parts.length; i++) folderKeys.add(parts.slice(0, i).join('/'))
   }
-  const folderKeys = [...folders.keys()].sort((a, b) => a.localeCompare(b))
-  const homeEmpty = loose.length === 0 && folderKeys.length === 0
 
   // Absolute `Documents/` path, so a drop onto a folder can name its destination.
   const docsBase = root ? `${root}/${HOME.slice(0, -1)}` : null
+
+  // Fold the flat rel-keys into a real tree so sub-folders nest & indent instead of showing as
+  // "smart-home/Default" flat rows. Each node carries its own direct docs; children sort by name.
+  const nodeByKey = new Map<string, FolderNode>()
+  for (const key of folderKeys) {
+    nodeByKey.set(key, {
+      key,
+      name: key.split('/').pop()!,
+      path: docsBase ? `${docsBase}/${key}` : null,
+      docs: docsByFolder.get(key) ?? [],
+      children: [],
+    })
+  }
+  const rootFolders: FolderNode[] = []
+  for (const node of nodeByKey.values()) {
+    const slash = node.key.lastIndexOf('/')
+    const parent = slash === -1 ? null : nodeByKey.get(node.key.slice(0, slash))
+    if (parent) parent.children.push(node)
+    else rootFolders.push(node)
+  }
+  const sortTree = (nodes: FolderNode[]): void => {
+    nodes.sort((a, b) => a.name.localeCompare(b.name))
+    for (const n of nodes) sortTree(n.children)
+  }
+  sortTree(rootFolders)
+
+  const homeEmpty = loose.length === 0 && rootFolders.length === 0
+
+  // The flattened, in-render-order list (honoring collapse) that arrow-key nav walks — docs first, then
+  // each folder followed by its docs and expanded descendants, matching what's painted below.
+  const visibleItems: Array<{ path: string; kind: 'file' | 'dir'; folderKey?: string }> = [
+    ...loose.map((doc) => ({ path: doc.path, kind: 'file' as const })),
+  ]
+  const walkVisible = (nodes: FolderNode[]): void => {
+    for (const node of nodes) {
+      if (node.path) visibleItems.push({ path: node.path, kind: 'dir', folderKey: node.key })
+      if (!collapsed.has(node.key)) {
+        for (const d of node.docs) visibleItems.push({ path: d.path, kind: 'file' })
+        walkVisible(node.children)
+      }
+    }
+  }
+  walkVisible(rootFolders)
 
   const toggle = (key: string): void =>
     setCollapsed((prev) => {
@@ -185,13 +273,17 @@ export function DocsBrowser(): React.JSX.Element {
     })
 
   const ctx: DocsCtx = {
-    openMenu: (e, path) => {
+    openMenu: (e, path, kind = 'file') => {
       e.preventDefault()
-      setMenu({ path, kind: 'file', isRoot: false, x: e.clientX, y: e.clientY })
+      setSelected({ path, kind })
+      setMenu({ path, kind, isRoot: false, x: e.clientX, y: e.clientY })
     },
     renamingPath,
+    startRename: (path) => setRenamingPath(path),
     commitRename: (path, name) => {
       setRenamingPath(null)
+      setSelected(null)
+      window.dispatchEvent(new CustomEvent('koda:docs-folder-selected', { detail: null }))
       void renameEntry(path, name)
     },
     cancelRename: () => setRenamingPath(null),
@@ -201,6 +293,13 @@ export function DocsBrowser(): React.JSX.Element {
     setDropTarget,
     moveDoc: (from, toDir) => void moveEntry(from, toDir),
     importDocs: (destDir, files) => void importFiles(destDir, files),
+    setSelected: (path, kind) => {
+      setSelected({ path, kind })
+      window.dispatchEvent(new CustomEvent('koda:docs-folder-selected', { detail: kind === 'dir' ? path : null }))
+    },
+    selectedPath: selected?.path ?? null,
+    collapsed,
+    toggle,
   }
 
   // Finder-drag import onto the panel background lands in Documents/ (a drop onto a folder row is
@@ -210,6 +309,44 @@ export function DocsBrowser(): React.JSX.Element {
   return (
     <DocsContext.Provider value={ctx}>
       <div
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (renamingPath) return
+          const selectedIndex = selected ? visibleItems.findIndex((item) => item.path === selected.path) : -1
+          if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+            e.preventDefault()
+            if (!visibleItems.length) return
+            const delta = e.key === 'ArrowDown' ? 1 : -1
+            const index = selectedIndex < 0 ? (delta > 0 ? 0 : visibleItems.length - 1) : Math.max(0, Math.min(visibleItems.length - 1, selectedIndex + delta))
+            const item = visibleItems[index]
+            ctx.setSelected(item.path, item.kind)
+            return
+          }
+          if (!selected) return
+          if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && selected.kind === 'dir') {
+            e.preventDefault()
+            const item = visibleItems[selectedIndex]
+            if (item?.folderKey) setCollapsed((prev) => {
+              const next = new Set(prev)
+              if (e.key === 'ArrowLeft') next.add(item.folderKey!)
+              else next.delete(item.folderKey!)
+              return next
+            })
+          } else
+          if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'n' && selected.kind === 'dir') {
+            e.preventDefault()
+            void newDocument(selected.path)
+          } else if (e.key === 'Enter' || e.key === 'F2') {
+            e.preventDefault()
+            setRenamingPath(selected.path)
+          } else if (e.key === 'Backspace' || e.key === 'Delete') {
+            e.preventDefault()
+            setConfirmDel({ path: selected.path, name: basename(selected.path) })
+          } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'd') {
+            e.preventDefault()
+            void duplicateEntry(selected.path)
+          }
+        }}
         onDragEnter={(e) => {
           if (!isFileDrag(e)) return
           dropDepth.current += 1
@@ -257,32 +394,13 @@ export function DocsBrowser(): React.JSX.Element {
           <>
             <ul className="flex flex-col">
               {loose.map((d) => (
-                <DocRow key={d.path} doc={d} />
+                <DocRow key={d.path} doc={d} depth={0} />
               ))}
             </ul>
 
-            {folderKeys.map((key) => {
-              const open = !collapsed.has(key)
-              const destDir = docsBase ? `${docsBase}/${key}` : null
-              return (
-                <div key={key} className="mt-1">
-                  <FolderHeader
-                    label={key}
-                    open={open}
-                    count={folders.get(key)!.length}
-                    destDir={destDir}
-                    onClick={() => toggle(key)}
-                  />
-                  {open && (
-                    <ul className="flex flex-col">
-                      {folders.get(key)!.map((d) => (
-                        <DocRow key={d.path} doc={d} indent />
-                      ))}
-                    </ul>
-                  )}
-                </div>
-              )
-            })}
+            {rootFolders.map((node) => (
+              <FolderTree key={node.key} node={node} depth={0} />
+            ))}
           </>
         )}
 
@@ -326,7 +444,10 @@ export function DocsBrowser(): React.JSX.Element {
             setMenu(null)
             setRenamingPath(menu.path)
           }}
-          onNewFolder={() => setMenu(null)}
+          onNewFolder={() => {
+            setMenu(null)
+            void newFolder(menu.path).then((path) => path && setRenamingPath(path))
+          }}
           onDuplicate={() => {
             setMenu(null)
             void duplicateEntry(menu.path)
@@ -345,6 +466,8 @@ export function DocsBrowser(): React.JSX.Element {
             onCancel={() => setConfirmDel(null)}
             onConfirm={() => {
               void deleteEntry(confirmDel.path)
+              setSelected(null)
+              window.dispatchEvent(new CustomEvent('koda:docs-folder-selected', { detail: null }))
               setConfirmDel(null)
             }}
           />
@@ -354,21 +477,79 @@ export function DocsBrowser(): React.JSX.Element {
   )
 }
 
+/** One folder node and its descendants — the header plus, when open, its direct docs and child folders
+ *  (each one level deeper). Recursion is what turns the flat rel-keys into a real indented tree. */
+function FolderTree({ node, depth }: { node: FolderNode; depth: number }): React.JSX.Element {
+  const docs = useDocs()
+  const open = !docs.collapsed.has(node.key)
+  const destDir = node.path
+  return (
+    <div className={depth === 0 ? 'mt-1' : undefined}>
+      <FolderHeader
+        label={node.name}
+        depth={depth}
+        open={open}
+        count={node.docs.length}
+        destDir={destDir}
+        onClick={() => docs.toggle(node.key)}
+        selected={docs.selectedPath === destDir}
+        renaming={docs.renamingPath === destDir}
+        onSelect={() => destDir && docs.setSelected(destDir, 'dir')}
+        onMenu={(e) => destDir && docs.openMenu(e, destDir, 'dir')}
+        onStartRename={() => destDir && docs.startRename(destDir)}
+        onRename={(name) => destDir && docs.commitRename(destDir, name)}
+        onCancelRename={docs.cancelRename}
+      />
+      {open && (
+        <>
+          <ul className="flex flex-col">
+            {node.docs.map((d) => (
+              <DocRow key={d.path} doc={d} depth={depth + 1} />
+            ))}
+          </ul>
+          {node.children.map((child) => (
+            <FolderTree key={child.key} node={child} depth={depth + 1} />
+          ))}
+        </>
+      )}
+    </div>
+  )
+}
+
 /** A collapsible sub-folder disclosure — part of the list (a chevron + folder glyph + name), NOT a
  *  panel section header, so the user's own `Documents/` sub-folders read as structure, not a divider.
- *  Doubles as a drop target: dragging a doc onto it files that doc into the folder. */
+ *  Indents by `depth` so nesting is visible. Doubles as a drop target: dragging a doc onto it files
+ *  that doc into the folder. The chevron toggles expand *without* selecting — so merely opening a
+ *  folder to look inside doesn't silently make it the "New folder/document" target; clicking the name
+ *  does (which also opens it), and that target is shown in the panel's create-button tooltips. */
 function FolderHeader({
   label,
+  depth,
   open,
   count,
   destDir,
   onClick,
+  selected,
+  renaming,
+  onSelect,
+  onMenu,
+  onStartRename,
+  onRename,
+  onCancelRename,
 }: {
   label: string
+  depth: number
   open: boolean
   count: number
   destDir: string | null
   onClick: () => void
+  selected: boolean
+  renaming: boolean
+  onSelect: () => void
+  onMenu: (e: React.MouseEvent) => void
+  onStartRename: () => void
+  onRename: (name: string) => void
+  onCancelRename: () => void
 }): React.JSX.Element {
   const docs = useDocs()
   // Internal move is valid unless the dragged doc already lives here (moveEntry no-ops it anyway; this
@@ -376,16 +557,35 @@ function FolderHeader({
   // INTO it. We only ever drag docs (files), so the folder-into-itself case can't arise.
   const from = docs.draggingPath
   const internalValid = !!from && !!destDir && parentDir(from) !== destDir
-  const isDropTarget = docs.dropTarget === label
+  // Identify the drop target by its unique path, not the display name (two folders can share a name).
+  const isDropTarget = !!destDir && docs.dropTarget === destDir
+
+  if (renaming && destDir)
+    return (
+      <FolderRenameRow
+        name={basename(destDir)}
+        depth={depth}
+        onCommit={onRename}
+        onCancel={onCancelRename}
+      />
+    )
 
   return (
     <button
-      onClick={onClick}
+      onClick={() => {
+        onSelect()
+        if (!open) onClick() // clicking the name selects + opens; the chevron alone toggles closed
+      }}
+      onDoubleClick={(e) => {
+        e.preventDefault()
+        onStartRename()
+      }}
+      onContextMenu={onMenu}
       onDragOver={(e) => {
         if (!destDir) return
         if (!e.dataTransfer.types.includes('Files') && !internalValid) return
         e.preventDefault()
-        if (docs.dropTarget !== label) docs.setDropTarget(label)
+        if (docs.dropTarget !== destDir) docs.setDropTarget(destDir)
       }}
       onDrop={(e) => {
         if (!destDir) return
@@ -404,23 +604,73 @@ function FolderHeader({
         docs.setDropTarget(null)
         if (src) docs.moveDoc(src, destDir)
       }}
-      className={`flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left transition-colors ${
+      style={{ paddingLeft: depth * 12 + 8 }}
+      className={`group flex w-full items-center gap-1.5 rounded-md py-1.5 pr-2 text-left transition-colors ${
         isDropTarget
           ? 'bg-accent/15 text-text ring-1 ring-inset ring-accent/40'
-          : 'text-text-muted hover:bg-surface hover:text-text'
+          : selected
+            ? 'bg-surface text-text'
+            : 'text-text-muted hover:bg-surface hover:text-text'
       }`}
     >
-      <Caret dir={open ? 'down' : 'right'} size={12} />
+      <span
+        role="button"
+        aria-label={open ? `Collapse ${label}` : `Expand ${label}`}
+        onClick={(e) => {
+          e.stopPropagation()
+          onClick()
+        }}
+        className="-my-1 flex h-6 w-4 shrink-0 items-center justify-center"
+      >
+        <Caret dir={open ? 'down' : 'right'} size={12} />
+      </span>
       <FolderGlyph />
       <span className="truncate text-[12px] font-medium leading-tight">{label}</span>
       <span className="ml-auto shrink-0 text-[11px] tabular-nums text-text-muted/60">{count}</span>
+      <span
+        role="button"
+        aria-label={`More actions for ${label}`}
+        title="More actions"
+        onClick={(e) => {
+          e.stopPropagation()
+          onMenu(e)
+        }}
+        className="-mr-1 hidden rounded px-1 text-base leading-none text-text-muted hover:bg-bg hover:text-text group-hover:block"
+      >
+        ···
+      </span>
     </button>
+  )
+}
+
+function FolderRenameRow({ name, depth, onCommit, onCancel }: { name: string; depth: number; onCommit: (name: string) => void; onCancel: () => void }) {
+  const ref = useRef<HTMLInputElement>(null)
+  const done = useRef(false)
+  useEffect(() => {
+    ref.current?.focus()
+    ref.current?.select()
+  }, [])
+  const commit = (): void => {
+    if (done.current) return
+    done.current = true
+    const next = ref.current?.value.trim() ?? ''
+    if (next && next !== name) onCommit(next)
+    else onCancel()
+  }
+  return (
+    <div className="flex items-center gap-1.5 py-1.5 pr-2" style={{ paddingLeft: depth * 12 + 8 }}>
+      <FolderGlyph />
+      <input ref={ref} defaultValue={name} onBlur={commit} onKeyDown={(e) => {
+        if (e.key === 'Enter') commit()
+        else if (e.key === 'Escape') { done.current = true; onCancel() }
+      }} className="min-w-0 flex-1 rounded border border-accent bg-bg px-1 py-0.5 text-xs text-text outline-none" />
+    </div>
   )
 }
 
 /** One document row — a muted page glyph + title. Opens (markdown ⇒ Doc view) on click; right-click
  *  for the manage menu, drag onto a folder to file it, and becomes an inline editor while renaming. */
-function DocRow({ doc, indent = false }: { doc: ProjectDoc; indent?: boolean }): React.JSX.Element {
+function DocRow({ doc, depth }: { doc: ProjectDoc; depth: number }): React.JSX.Element {
   const openFile = useWorkspace((s) => s.openFile)
   const active = useWorkspace((s) => activeEditor(s).activeSurfaceId === doc.path)
   const docs = useDocs()
@@ -428,14 +678,17 @@ function DocRow({ doc, indent = false }: { doc: ProjectDoc; indent?: boolean }):
   if (docs.renamingPath === doc.path)
     return (
       <li>
-        <RenameRow doc={doc} indent={indent} onCommit={docs.commitRename} onCancel={docs.cancelRename} />
+        <RenameRow doc={doc} depth={depth} onCommit={docs.commitRename} onCancel={docs.cancelRename} />
       </li>
     )
 
   return (
     <li>
       <button
-        onClick={() => openFile(doc.path)}
+        onClick={() => {
+          docs.setSelected(doc.path, 'file')
+          openFile(doc.path)
+        }}
         onContextMenu={(e) => docs.openMenu(e, doc.path)}
         draggable
         onDragStart={(e) => {
@@ -448,14 +701,27 @@ function DocRow({ doc, indent = false }: { doc: ProjectDoc; indent?: boolean }):
           docs.setDropTarget(null)
         }}
         title={doc.rel}
-        className={`flex w-full items-center gap-2 rounded-md py-1.5 pr-2 text-left transition-colors ${
-          indent ? 'pl-5' : 'pl-2'
-        } ${active ? 'bg-surface text-text' : 'text-text-muted hover:bg-surface hover:text-text'}`}
+        style={{ paddingLeft: depth * 12 + 8 }}
+        className={`group flex w-full items-center gap-2 rounded-md py-1.5 pr-2 text-left transition-colors ${
+          active ? 'bg-surface text-text' : 'text-text-muted hover:bg-surface hover:text-text'
+        }`}
       >
         <span className="flex h-4 w-4 shrink-0 items-center justify-center leading-none">
           <DefaultDocGlyph />
         </span>
         <span className="truncate text-[13px] leading-tight">{titleOf(doc.name)}</span>
+        <span
+          role="button"
+          aria-label={`More actions for ${titleOf(doc.name)}`}
+          title="More actions"
+          onClick={(e) => {
+            e.stopPropagation()
+            docs.openMenu(e, doc.path)
+          }}
+          className="ml-auto hidden rounded px-1 text-base leading-none text-text-muted hover:bg-bg hover:text-text group-hover:block"
+        >
+          ···
+        </span>
       </button>
     </li>
   )
@@ -466,12 +732,12 @@ function DocRow({ doc, indent = false }: { doc: ProjectDoc; indent?: boolean }):
  *  Escape. Reuses the store's project-wide `renameEntry` via the parent. */
 function RenameRow({
   doc,
-  indent,
+  depth,
   onCommit,
   onCancel,
 }: {
   doc: ProjectDoc
-  indent: boolean
+  depth: number
   onCommit: (path: string, name: string) => void
   onCancel: () => void
 }): React.JSX.Element {
@@ -495,7 +761,7 @@ function RenameRow({
   }
 
   return (
-    <div className={`flex items-center gap-2 py-1.5 pr-2 ${indent ? 'pl-5' : 'pl-2'}`}>
+    <div className="flex items-center gap-2 py-1.5 pr-2" style={{ paddingLeft: depth * 12 + 8 }}>
       <span className="flex h-4 w-4 shrink-0 items-center justify-center leading-none">
         <DefaultDocGlyph />
       </span>

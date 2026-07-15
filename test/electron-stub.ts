@@ -24,4 +24,16 @@ export class Notification {
   show(): void {}
 }
 
-export default { app, Notification }
+// vault-key (backup) imports safeStorage; unit tests only exercise the pure recovery-code/crypto
+// paths, so "encryption unavailable" keeps the persistence paths inert (they fail-soft to null).
+export const safeStorage = {
+  isEncryptionAvailable: (): boolean => false,
+  encryptString: (_s: string): Buffer => {
+    throw new Error('safeStorage unavailable in tests')
+  },
+  decryptString: (_b: Buffer): string => {
+    throw new Error('safeStorage unavailable in tests')
+  },
+}
+
+export default { app, Notification, safeStorage }

@@ -32,6 +32,7 @@ describe('assembleGuardrailText (shared by both engine drivers)', () => {
     expect(claude).toContain('mcp__koda_broker__preview')
     expect(codex).toContain('koda_broker__preview')
     expect(codex).not.toContain('mcp__koda_broker__')
+    expect(codex).toContain('A declined call does not remove the Preview tools')
   })
 
   it('folds the project memory index + active-context into the prompt (no "read on start" dependency)', () => {

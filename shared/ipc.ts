@@ -960,6 +960,9 @@ export type RemoteDevice = z.infer<typeof RemoteDeviceSchema>
 export const RemoteStateSchema = z.object({
   running: z.boolean(),
   url: z.string().nullable(),
+  /** Every LAN address the phone could reach the Mac at (multi-homed Macs expose several). The QR bundles
+   *  the alternates so the phone tries each — a stale alias or tunnel IP winning `url` no longer strands it. */
+  hosts: z.array(z.string()),
   code: z.string().nullable(),
   devices: z.array(RemoteDeviceSchema),
   connectedClients: z.number(),
@@ -1185,9 +1188,11 @@ export type WriteFileRequest = z.infer<typeof WriteFileRequestSchema>
 export const WriteFileResultSchema = z.object({ path: z.string() })
 export type WriteFileResult = z.infer<typeof WriteFileResultSchema>
 
-/** fs:createFile — create a new empty document at the project root (name optional; deduped). The
- *  everyday-user "New document" entry point. Returns the created file's path so the renderer opens it. */
-export const CreateFileRequestSchema = z.object({ name: z.string().optional() })
+/** fs:createFile — create a new empty document in Documents/ or an existing contained folder. */
+export const CreateFileRequestSchema = z.object({
+  name: z.string().optional(),
+  parent: z.string().optional(),
+})
 export type CreateFileRequest = z.infer<typeof CreateFileRequestSchema>
 
 export const CreateFileResultSchema = z.object({ path: z.string() })
@@ -1287,6 +1292,51 @@ export const MemoryWeightSchema = z.object({
   heavy: z.boolean(),
 })
 export type MemoryWeight = z.infer<typeof MemoryWeightSchema>
+
+/** backup:* — encrypted cloud backup (blind E2E: the server only ever holds ciphertext; the vault
+ *  key + recovery code never leave the user's side). Dogfood-flagged. See main/backup/index.ts. */
+export const BackupStatusSchema = z.object({
+  /** The dogfood flag (`backupEnabled` / KODA_BACKUP=1). Off ⇒ the section shows a quiet inert note. */
+  enabled: z.boolean(),
+  /** Backup rides the same Supabase account as remote control; signed-out ⇒ point at Koda account. */
+  signedIn: z.boolean(),
+  state: z.enum(['idle', 'backing-up', 'error', 'too-large']),
+  lastBackupAt: z.number().nullable(),
+  sizeBytes: z.number().nullable(),
+  error: z.string().optional(),
+})
+export type BackupStatus = z.infer<typeof BackupStatusSchema>
+
+/** One backed-up project, as listed from the cloud (metadata only — name/time/size, never content).
+ *  Bundle fields absent = only the docs replica has uploaded; replica fields absent = vice versa. */
+export const BackupManifestSchema = z.object({
+  schemaVersion: z.literal(1),
+  projectHash: z.string(),
+  projectName: z.string(),
+  lastBackupAt: z.number().optional(),
+  sizeBytes: z.number().optional(),
+  replicaAt: z.number().optional(),
+  replicaSizeBytes: z.number().optional(),
+  docCount: z.number().optional(),
+})
+export type BackupManifest = z.infer<typeof BackupManifestSchema>
+
+export const BackupRestoreRequestSchema = z.object({
+  /** 16 hex chars (sha256 prefix of the source path) — shape-checked so it can never smuggle path
+   *  segments into the storage object key. */
+  sourceProjectHash: z.string().regex(/^[0-9a-f]{16}$/),
+  /** Must be a fresh/empty folder — restore never writes over a live project (main enforces too). */
+  targetDir: z.string().min(1),
+  /** Fresh-Mac path: decodes to the vault key (and becomes this Mac's key on success). */
+  recoveryCode: z.string().optional(),
+})
+export type BackupRestoreRequest = z.infer<typeof BackupRestoreRequestSchema>
+
+export const BackupRestoreResultSchema = z.union([
+  z.object({ ok: z.literal(true) }),
+  z.object({ ok: z.literal(false), error: z.string() }),
+])
+export type BackupRestoreResult = z.infer<typeof BackupRestoreResultSchema>
 
 /** guardrails:save — write a typed/pasted rule/skill/subagent straight to this project (no agent
  *  round-trip; the "Save" path of the authoring composer). A rule appends to the project CLAUDE.md;
@@ -2239,6 +2289,9 @@ export interface KodaApi {
    *  `index.html`. Null if no project OR the target file doesn't exist (so the manual "Preview" button
    *  can hide itself rather than open onto the blank "nothing to preview" placeholder). */
   previewStaticUrl: (filePath?: string) => Promise<string | null>
+  /** Resolve a doc-relative image `ref` (against the doc at `docPath`) to a `koda-preview://` URL the
+   *  renderer can load; null if it escapes the project or doesn't exist. */
+  docAssetUrl: (docPath: string, ref: string) => Promise<string | null>
   /** Re-run a session's last preview (dev command or static file) when it's been torn down — the
    *  "Restart preview" button. Resolves with the served URL (main also pushes `preview:show`), or
    *  rejects if the command fails to come up / the file is gone. */
@@ -2265,6 +2318,16 @@ export interface KodaApi {
   setDocMeta: (args: DocMetaSetRequest) => Promise<void>
   /** How heavy this project's always-injected memory pair is (status-bar pill + Settings → Memory). */
   getMemoryWeight: () => Promise<MemoryWeight>
+  /** Cloud-backup status for THIS project (Settings → Backup). Cheap; safe to poll on section open. */
+  getBackupStatus: () => Promise<BackupStatus>
+  /** Bundle + seal + upload this project now (the "Back up now" button). Resolves to fresh status. */
+  backupNow: () => Promise<BackupStatus>
+  /** The full recovery code — only ever called from a user-initiated reveal, never auto-shown. */
+  getBackupRecoveryCode: () => Promise<string | null>
+  /** Every backed-up project on this account (the restore picker; metadata only). */
+  listCloudBackups: () => Promise<BackupManifest[]>
+  /** Rebuild a backed-up project into a fresh folder (disaster recovery / fresh Mac). */
+  restoreCloudBackup: (args: BackupRestoreRequest) => Promise<BackupRestoreResult>
   /** The behavior layer (Settings → Guardrails): the curated Koda pack + this project's rules/skills/subagents. */
   listGuardrails: () => Promise<GuardrailsLayer>
   /** Write a typed/pasted rule/skill/subagent straight to this project (the "Save" authoring path). */

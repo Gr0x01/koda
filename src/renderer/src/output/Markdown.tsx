@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from 'react'
-import ReactMarkdown, { type Components } from 'react-markdown'
+import ReactMarkdown, { defaultUrlTransform, type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import { copyText } from './copy'
@@ -13,7 +13,15 @@ import { copyText } from './copy'
 export function Markdown({ children }: { children: string }) {
   return (
     <div className="koda-prose text-text/90">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]} components={COMPONENTS}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[rehypeHighlight]}
+        components={COMPONENTS}
+        // The default transform drops `data:` URLs as unsafe — but the offline docs replica inlines a
+        // doc's images as `data:image/…` (the Mac files aren't reachable from the phone). Let those
+        // through; everything else keeps the default protocol allowlist.
+        urlTransform={(url) => (url.startsWith('data:image/') ? url : defaultUrlTransform(url))}
+      >
         {children}
       </ReactMarkdown>
     </div>

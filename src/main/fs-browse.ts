@@ -218,6 +218,44 @@ export async function readProjectFile(root: string, requested: string): Promise<
   return { path: file, content: slice.toString('utf8'), truncated, binary: false }
 }
 
+/** Image extensions the phone's live doc viewer can inline as a `data:` URL, with their media types.
+ *  A doc's local images (`![](assets/pic.png)`) can't be reached from the phone otherwise — the live
+ *  reader fetches these over the connection and inlines them, the online sibling of the offline
+ *  replica's webp inlining. SVG is inlined verbatim (text), the rest as their raw bytes. */
+const IMAGE_MIME: Record<string, string> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  bmp: 'image/bmp',
+  webp: 'image/webp',
+  avif: 'image/avif',
+  svg: 'image/svg+xml',
+  tif: 'image/tiff',
+  tiff: 'image/tiff',
+  ico: 'image/x-icon',
+}
+/** Cap on a single inlined image — big enough for a normal doc picture, bounded so a huge asset can't
+ *  bloat one doc read (over the wire the base64 costs ~1.33×). Oversized/non-image → null (the phone
+ *  keeps the original ref → a broken image, never a crash). */
+const MAX_IMAGE_BYTES = 8_000_000
+
+/** One image file for the live doc viewer: contained + size-capped raw bytes + media type. Returns null
+ *  for a non-image extension or an oversized file. The phone-serving layer (sessions.remoteReadImage)
+ *  webp-downscales these for the wire, the same as the offline replica. */
+export async function readProjectImage(
+  root: string,
+  requested: string,
+): Promise<{ mediaType: string; buf: Buffer } | null> {
+  const ext = extname(requested).replace(/^\./, '').toLowerCase()
+  const mediaType = IMAGE_MIME[ext]
+  if (!mediaType) return null
+  const file = containedReal(root, requested)
+  const st = await stat(file)
+  if (!st.isFile() || st.size > MAX_IMAGE_BYTES) return null
+  return { mediaType, buf: await readFile(file) }
+}
+
 /**
  * The before/after pair for the live-edits diff (ui-workspace.md §4). `after` is the current file
  * (same read path as readProjectFile). `before` is its contents at `baseSha` — the safety-git SHA
@@ -266,21 +304,20 @@ export async function writeProjectFile(root: string, requested: string, content:
 }
 
 /**
- * Create a new empty document and return its path. The everyday-user "New document" entry point — so
- * creating doesn't require a terminal or a file dialog. New docs land in Koda's `Documents/` home (the
- * vibecoder's deliverables live there, kept out of code/config clutter; the agent is taught the same
- * convention). We control the name (a sanitised basename, no separators/traversal) and the `.md`
+ * Create a new empty document and return its path. New docs land in Koda's `Documents/` home unless
+ * the user selected one of its folders. We control the name (a sanitised basename, no traversal) and the `.md`
  * extension, deduping within the home; `wx` makes the write fail rather than clobber if something
  * raced in. No safety checkpoint here — an empty new file is trivially discardable; the first real
  * save checkpoints.
  */
-export async function createProjectFile(root: string, name?: string): Promise<string> {
+export async function createProjectFile(root: string, name?: string, parent?: string): Promise<string> {
   const realRoot = realpathSync(root)
   await mkdir(join(realRoot, DOCS_HOME), { recursive: true })
   // realpath the home AFTER creating it and range-check against root: a pre-existing `Documents`
   // symlink pointing outside the project would otherwise pass a lexical check yet have writeFile follow
   // it out of bounds. (Same defense containedNewPath uses for the rest of the module.)
-  const home = realpathSync(join(realRoot, DOCS_HOME))
+  const home = parent ? containedReal(root, parent) : realpathSync(join(realRoot, DOCS_HOME))
+  if ((await stat(home)).isDirectory() === false) throw new Error('not a folder')
   if (home !== realRoot && !home.startsWith(realRoot + sep)) throw new Error('path escapes the project root')
   const base = (name ?? 'Untitled').replace(/[/\\]/g, '').replace(/\.(md|markdown)$/i, '').trim() || 'Untitled'
   let file = join(home, `${base}.md`)

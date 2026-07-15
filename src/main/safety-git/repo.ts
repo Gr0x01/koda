@@ -134,6 +134,18 @@ export async function excludeKodaFromUserGit(projectDir: string): Promise<void> 
     return // not a git repo (or bare repo: empty toplevel → realpath throws) — nothing to ignore
   }
 
+  // If the repo's own rules already keep the safety store out (e.g. a .gitignore with `.koda/*`
+  // plus a deliberate `!.koda/memory/` carve-out — this very repo dogfoods that), leave it alone:
+  // a directory-level `.koda/` in info/exclude would override the carve-out and silently hide
+  // every NEW memory note from the user's git. Our job is "safety store not committable", which
+  // check-ignore proves is already true — not to impose the blanket exclude.
+  try {
+    await execFileP('git', ['check-ignore', '-q', '.koda/safety.git'], { cwd: projectDir })
+    return // already ignored by the repo's own rules
+  } catch {
+    /* not ignored yet — fall through and add our exclude */
+  }
+
   let current = ''
   try {
     current = await readFile(excludePath, 'utf8')

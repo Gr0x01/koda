@@ -117,6 +117,15 @@ export function IconArchive() {
     </Svg>
   )
 }
+export function IconCloudLock() {
+  return (
+    <Svg>
+      <path d="M17.5 18H7a4 4 0 0 1-.6-7.95 5.5 5.5 0 0 1 10.7-1.4A4.2 4.2 0 0 1 17.5 18Z" />
+      <path d="M10.5 13.5v-1a1.5 1.5 0 0 1 3 0v1" />
+      <rect x="9.75" y="13.5" width="4.5" height="3" rx="0.75" />
+    </Svg>
+  )
+}
 export function IconTrash() {
   return (
     <svg

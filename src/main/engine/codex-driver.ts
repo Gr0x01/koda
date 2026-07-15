@@ -92,6 +92,36 @@ interface PendingCall {
   reject: (err: Error) => void
 }
 
+interface McpToolElicitation {
+  toolName: string
+  input: unknown
+}
+
+type McpElicitationResponse = {
+  action: 'accept' | 'decline'
+  content: null
+  _meta: null
+}
+
+/** Codex represents MCP tool approval as a form elicitation. Recover the original MCP tool name from
+ * its deterministic fallback question and route it through Koda's existing gate. Other MCP
+ * elicitations are genuine server-supplied forms/URLs; Koda has no renderer for those yet, so they
+ * fail safe instead of being silently accepted. */
+export function parseMcpToolElicitation(params: unknown): McpToolElicitation | null {
+  const p = (params ?? {}) as Record<string, unknown>
+  const meta = (p._meta ?? {}) as Record<string, unknown>
+  if (p.mode !== 'form' || meta.codex_approval_kind !== 'mcp_tool_call') return null
+  const server = typeof p.serverName === 'string' ? p.serverName : ''
+  const message = typeof p.message === 'string' ? p.message : ''
+  const tool = /run tool "([^"]+)"\??$/.exec(message)?.[1]
+  if (!server || !tool) return null
+  return { toolName: `mcp__${server}__${tool}`, input: meta.tool_params }
+}
+
+export function mcpElicitationResponse(accepted: boolean): McpElicitationResponse {
+  return { action: accepted ? 'accept' : 'decline', content: null, _meta: null }
+}
+
 class CodexSession implements EngineSession {
   readonly id: string
   private readonly cwd: string
@@ -474,6 +504,16 @@ class CodexSession implements EngineSession {
         }
         case 'item/tool/requestUserInput': {
           await this.handleUserInput(id, p)
+          break
+        }
+        case 'mcpServer/elicitation/request': {
+          const elicitation = parseMcpToolElicitation(p)
+          if (!elicitation) {
+            this.reply(id, mcpElicitationResponse(false))
+            break
+          }
+          const decision = await this.gateDecision(elicitation.toolName, elicitation.input, String(id))
+          this.reply(id, mcpElicitationResponse(decision === 'accept'))
           break
         }
         // An UNRECOGNIZED approval method (the protocol is versioned/evolving) must fail SAFE — deny,

@@ -737,11 +737,11 @@ interface WorkspaceStore {
    *  hit) reveals that line in the Monaco editor view. `view` forces a starting view (e.g. open a
    *  `.md` skill/subagent as raw Markdown, not the WYSIWYG doc — those files are technical). */
   openFile: (path: string, gotoLine?: number, opts?: { view?: FileSurface['view'] }) => void
-  /** Create a new empty document at the project root and open it (focused, in the Doc view). */
-  newDocument: () => Promise<void>
+  /** Create a new empty document in Documents/, or in the selected Documents folder. */
+  newDocument: (parent?: string) => Promise<void>
   /** Create a new folder — at the project root, or inside `parent` (which is then expanded), or in
    *  the user's Documents/ home when `home` (the doc-first view's New folder). */
-  newFolder: (parent?: string, home?: boolean) => Promise<void>
+  newFolder: (parent?: string, home?: boolean) => Promise<string | null>
   /** Rename a file/folder in place (new basename in the same folder). Rebases any open tab + the
    *  Files tree's expansion to the new path on success. */
   renameEntry: (path: string, newName: string) => Promise<void>
@@ -2279,8 +2279,8 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         }
       }),
 
-    newDocument: async () => {
-      const { path } = await window.koda.createFile({})
+    newDocument: async (parent) => {
+      const { path } = await window.koda.createFile(parent ? { parent } : {})
       // Nudge the Files tree to re-read so the new doc appears, then open it (markdown ⇒ Doc view).
       set((state) => ({ filesRev: state.filesRev + 1 }))
       get().openFile(path)
@@ -2288,11 +2288,13 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
 
     newFolder: async (parent, home) => {
       try {
-        await window.koda.createDir(parent ? { parent } : home ? { home: true } : {})
+        const { path } = await window.koda.createDir(parent ? { parent } : home ? { home: true } : {})
         if (parent) get().setDirOpen(parent, true) // reveal where the new folder landed
         set((state) => ({ filesRev: state.filesRev + 1, treeError: null }))
+        return path
       } catch (e) {
         set({ treeError: humanFsError(e) })
+        return null
       }
     },
 

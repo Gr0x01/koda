@@ -201,6 +201,8 @@ const api: KodaApi = {
   },
   previewStaticUrl: (filePath?: string) =>
     ipcRenderer.invoke(IpcChannels.previewStaticUrl, filePath),
+  docAssetUrl: (docPath: string, ref: string) =>
+    ipcRenderer.invoke(IpcChannels.docAssetUrl, { docPath, ref }),
   previewRestart: (sessionId, restart) =>
     ipcRenderer.invoke(IpcChannels.previewRestart, { sessionId, restart }),
   onPreviewShow: (listener) => {
@@ -224,6 +226,11 @@ const api: KodaApi = {
   getDocMeta: (args) => ipcRenderer.invoke(IpcChannels.docmetaGet, args),
   setDocMeta: (args) => ipcRenderer.invoke(IpcChannels.docmetaSet, args),
   getMemoryWeight: () => ipcRenderer.invoke(IpcChannels.memoryWeight),
+  getBackupStatus: () => ipcRenderer.invoke(IpcChannels.backupStatus),
+  backupNow: () => ipcRenderer.invoke(IpcChannels.backupNow),
+  getBackupRecoveryCode: () => ipcRenderer.invoke(IpcChannels.backupRecoveryCode),
+  listCloudBackups: () => ipcRenderer.invoke(IpcChannels.backupList),
+  restoreCloudBackup: (args) => ipcRenderer.invoke(IpcChannels.backupRestore, args),
   listGuardrails: () => ipcRenderer.invoke(IpcChannels.guardrailsList),
   saveGuardrail: (args) => ipcRenderer.invoke(IpcChannels.guardrailsSave, args),
   setGuardrailEnabled: (args) => ipcRenderer.invoke(IpcChannels.guardrailsSetEnabled, args),

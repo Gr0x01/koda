@@ -60,6 +60,20 @@ export function staticPreviewUrl(winId: number, relPath?: string): string | unde
   return `${PREVIEW_SCHEME}://${token}/${entry}`
 }
 
+/** Build a `koda-preview://` URL for any project-relative asset (not just `.html`) — used to make a
+ *  doc's local images loadable in the WYSIWYG surface. The protocol handler realpath-contains every
+ *  request, so an escaping relPath just 404s. Returns undefined for an unknown/project-less window. */
+export function previewAssetUrl(winId: number, relPath: string): string | undefined {
+  const token = previewTokenForWindow(winId)
+  if (!token) return undefined
+  const entry = relPath
+    .replace(/^\/+/, '')
+    .split('/')
+    .map(encodeURIComponent)
+    .join('/')
+  return `${PREVIEW_SCHEME}://${token}/${entry}`
+}
+
 /**
  * Agent-facing static preview (preview-surface.md, Rung 1): point the window's preview at a specific
  * project-relative `.html` file the agent has produced (a mock, a generated report, a built page) and

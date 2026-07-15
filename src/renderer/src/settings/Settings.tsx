@@ -9,6 +9,7 @@ import { AppearanceSection } from './AppearanceSection'
 import { ApprovalsSection } from './ApprovalsSection'
 import { ToolsSection } from './ToolsSection'
 import { ArchivedSection } from './ArchivedSection'
+import { BackupSection } from './BackupSection'
 import { AboutSection, DeveloperSection } from './AboutSection'
 import { ProvidersSection } from './ProvidersSection'
 import { GuardrailsSection, SkillsSection } from './GuardrailsSection'
@@ -30,6 +31,7 @@ import {
   IconPlug,
   IconRewind,
   IconArchive,
+  IconCloudLock,
   IconInfo,
   IconCode,
   IconChat,
@@ -56,6 +58,7 @@ type CategoryId =
   | 'remote'
   | 'archived'
   | 'recovery'
+  | 'backup'
   | 'about'
   | 'feedback'
   | 'developer'
@@ -103,6 +106,7 @@ const NAV_GROUPS: { title: string; items: NavItemDef[] }[] = [
     title: 'History & recovery',
     items: [
       { id: 'recovery', label: 'Recovery', icon: <IconRewind /> },
+      { id: 'backup', label: 'Backup', icon: <IconCloudLock /> },
       { id: 'archived', label: 'Archived sessions', icon: <IconArchive /> },
     ],
   },
@@ -134,6 +138,20 @@ export function Settings() {
   // Attention dot on the Memory row when this project's always-injected memory has grown heavy —
   // the same signal the status-bar pill rides, so the cue survives once Settings is open.
   const memoryHeavy = useWorkspace((s) => s.memoryWeight?.heavy ?? false)
+
+  // Backup is dogfood-flagged: with the flag off the nav row doesn't exist at all — a visible
+  // section that only says "not switched on" is for nobody (RB, 07-13).
+  const [backupOn, setBackupOn] = useState(false)
+  useEffect(() => {
+    window.koda
+      .getBackupStatus()
+      .then((s) => setBackupOn(s.enabled))
+      .catch(() => {})
+  }, [])
+  const navGroups = NAV_GROUPS.map((group) => ({
+    ...group,
+    items: group.items.filter((item) => item.id !== 'backup' || backupOn),
+  }))
 
   // Honor a deep link set while Settings was already mounted (e.g. the Remote menu's "Open settings").
   useEffect(() => {
@@ -183,7 +201,7 @@ export function Settings() {
           }
         />
         <nav className="min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-1">
-          {NAV_GROUPS.map((group) => (
+          {navGroups.map((group) => (
             <div key={group.title} className="mb-1.5 last:mb-0">
               <div className="px-2.5 pb-1 pt-3 text-[10px] font-medium uppercase tracking-wider text-text-muted/55">
                 {group.title}
@@ -239,6 +257,7 @@ export function Settings() {
             {active === 'tools' && <ToolsSection />}
             {active === 'remote' && <RemoteSection />}
             {active === 'archived' && <ArchivedSection />}
+            {active === 'backup' && <BackupSection />}
             {active === 'about' && <AboutSection />}
             {active === 'feedback' && <FeedbackSection />}
             {active === 'developer' && <DeveloperSection />}

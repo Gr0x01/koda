@@ -192,6 +192,9 @@ export const IpcChannels = {
   // Preview surface — the window's static-preview entry URL (invoke); and a main→renderer push telling
   // the renderer to show a preview URL (the agent started the managed dev server). See preview.ts.
   previewStaticUrl: 'preview:staticUrl',
+  // Resolve a doc's relative image reference (e.g. `assets/pic.png`) to a loadable `koda-preview://`
+  // URL so local images render in the WYSIWYG doc surface. See preview.ts / CrepeDocEditor.
+  docAssetUrl: 'doc:assetUrl',
   previewShow: 'preview:show',
   // Re-run a session's last preview (dev command or static file) when it's gone — the user-facing
   // "Restart preview" button. A window-direct invoke (like previewStaticUrl), NOT the agent's gated
@@ -213,6 +216,14 @@ export const IpcChannels = {
   // How heavy this project's always-injected memory pair (MEMORY.md + active-context.md) is — powers
   // the status-bar tidy pill + Settings → Memory. Read-only. invoke. See engine/pack.ts.
   memoryWeight: 'memory:weight',
+  // Encrypted cloud backup (dogfood-flagged; Documents/release/ship-checklist-backup-sync.md).
+  // Status/now are project-scoped (sender's root); list/restore/recovery-code are app-global.
+  // All invoke. See main/backup/.
+  backupStatus: 'backup:status',
+  backupNow: 'backup:now',
+  backupRecoveryCode: 'backup:recoveryCode',
+  backupList: 'backup:list',
+  backupRestore: 'backup:restore',
   // The behavior layer (Settings → Guardrails) — enumerates the curated Koda pack + this project's
   // own rules/skills/subagents shaping the agent. Read-only. invoke. See guardrails.ts.
   guardrailsList: 'guardrails:list',

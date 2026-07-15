@@ -54,12 +54,14 @@ import {
   restoreVersion,
   UserGitError,
 } from '../user-git'
-import { browseDir, docExcerpt, listProjectDocs, readProjectFile } from '../fs-browse'
+import { browseDir, docExcerpt, listProjectDocs, readProjectFile, readProjectImage, writeProjectFile } from '../fs-browse'
+import { encodeWebp } from '../backup/webp'
 import { noteRateLimit } from './usage-reset-notifier'
 import { noteProviderError, noteTurnOk } from './status-watch'
 import { friendlyEngineError } from '@shared/engine-error'
 import { track } from '../telemetry'
 import { resolveGlobalSkillsPlugin } from './skills-catalog'
+import { noteMomentCheckpoint } from '../backup'
 import { ensureRepo } from '../safety-git/repo'
 import { checkpoint, checkpointKind, headSha, listCheckpoints, type Checkpoint } from '../safety-git/checkpoint'
 import { restore } from '../safety-git/restore'
@@ -112,6 +114,9 @@ const BROKER_UNREACHABLE_PREFIX = (name: string): string => `MCP server "${name}
 const BROKER_DROP_SIGNATURE = /is not connected|transport dropped|was lost/
 /** After a broker reconnect, ignore further drop errors for this long — absorbs late "not connected"
  *  results still draining from the disposed old child, and stops us thrashing. */
+/** A phone doc-edit write with a longer gap than this since the last one starts a new "editing burst" and
+ *  gets a fresh safety-git checkpoint; the rapid autosaves within a burst just write (see remoteWriteFile). */
+const REMOTE_WRITE_BURST_MS = 20_000
 const BROKER_RECOVERY_COOLDOWN_MS = 30_000
 /** Give up (surface a fatal "please restart") after this many recoveries inside the window below — a
  *  broker that flaps this hard is a persistent fault, not a transient idle drop, so looping won't help. */
@@ -135,6 +140,8 @@ export class EngineSessionManager {
   /** Per-project-dir serialization tail: checkpoints on one safety.git MUST NOT run concurrently
    *  (git's index.lock would collide) — and a per-tool snapshot must capture a settled tree. */
   private readonly checkpointChains = new Map<string, Promise<unknown>>()
+  /** Last phone-write time per project dir — drives autosave checkpoint coalescing in remoteWriteFile. */
+  private readonly lastRemoteWriteAt = new Map<string, number>()
   /** Live background-workflow journal watchers, keyed by runId (a session may launch several). */
   private readonly workflowWatchers = new Map<string, { sessionId: string; watcher: WorkflowWatcher }>()
   /** Completed background-workflow results waiting to ride a session's NEXT human turn back into the
@@ -619,8 +626,14 @@ export class EngineSessionManager {
       // "before Edit: …" text is exactly what the on-device model flattens to "Editing the file"
       // — so never spend a model call on them. Skip a no-op checkpoint too (its `id` is the
       // PRIOR commit, already humanized under its own prompt).
-      if (!result.skipped && checkpointKind(result.label) === 'moment') {
-        humanizeCheckpointLabel(result.id, result.label)
+      if (checkpointKind(result.label) === 'moment') {
+        if (!result.skipped) humanizeCheckpointLabel(result.id, result.label)
+        // Cloud backup/replica ride the same turn boundary: debounced, flag-gated, fire-and-forget —
+        // noteMomentCheckpoint only arms a timer, so the turn path never waits on the network.
+        // Armed even when the checkpoint was a no-op: a doc save checkpoints the PRE-edit tree, so
+        // "skipped" is exactly the hand-edit-right-after-a-turn case — the edit itself still needs
+        // to reach the cloud copy.
+        noteMomentCheckpoint(cwd)
       }
       return true
     } catch (err) {
@@ -1322,6 +1335,43 @@ export class EngineSessionManager {
     const cwd = this.remoteRoot(ref)
     const r = await readProjectFile(cwd, path)
     return { path: relative(cwd, r.path), content: r.content, truncated: r.truncated, binary: r.binary }
+  }
+
+  /** Save one text file in the ref'd project from the phone. Like the desktop editor save, it checkpoints
+   *  the pre-edit tree (recoverable like an engine write — the dual-git thesis) THEN writes, path-contained
+   *  by fs-browse. But the phone autosaves as you type, so checkpointing every write would flood the undo
+   *  timeline. Coalesce: only the FIRST write of an editing burst (a gap since the last write) checkpoints —
+   *  it captures "before I started editing," and the rapid autosaves that follow just write. So one phone
+   *  editing session is one recovery point, matching the desktop's one-save-one-checkpoint granularity. */
+  async remoteWriteFile(
+    ref: { sessionId?: string; projectPath?: string },
+    path: string,
+    content: string,
+  ): Promise<{ path: string }> {
+    const cwd = this.remoteRoot(ref)
+    const now = Date.now()
+    const startsNewBurst = now - (this.lastRemoteWriteAt.get(cwd) ?? 0) > REMOTE_WRITE_BURST_MS
+    this.lastRemoteWriteAt.set(cwd, now)
+    if (startsNewBurst) await this.checkpointProjectEdit(cwd, `edit to ${basename(path)}`)
+    return { path: relative(cwd, await writeProjectFile(cwd, path, content)) }
+  }
+
+  /** One of a doc's local images, base64 + media type, so the phone's live doc viewer can inline it
+   *  (a `data:` URL). Null for a non-image or oversized file. Contained to the project root. Downscaled
+   *  + webp-encoded for the wire — the same `encodeWebp` the offline replica uses — so a full-res PNG
+   *  photo doesn't cross the connection at full size; SVG (vector/text) and any encode failure fall
+   *  back to the raw bytes. */
+  async remoteReadImage(
+    ref: { sessionId?: string; projectPath?: string },
+    path: string,
+  ): Promise<{ mediaType: string; dataBase64: string } | null> {
+    const raw = await readProjectImage(this.remoteRoot(ref), path)
+    if (!raw) return null
+    if (raw.mediaType !== 'image/svg+xml') {
+      const webp = await encodeWebp(raw.buf)
+      if (webp) return { mediaType: 'image/webp', dataBase64: webp.toString('base64') }
+    }
+    return { mediaType: raw.mediaType, dataBase64: raw.buf.toString('base64') }
   }
 
   /** The project's Documents — the user's deliverable docs (Documents/ + loose .md), the phone's

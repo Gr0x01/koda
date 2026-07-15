@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Crepe } from '@milkdown/crepe'
+import { editorViewCtx } from '@milkdown/kit/core'
 import { replaceAll } from '@milkdown/kit/utils'
 import { useWorkspace } from '../workspace/store'
 import { useTableColumnResize } from './useTableColumnResize'
@@ -7,8 +8,11 @@ import { buildDocBlockMenu, docBlockPlugins } from './blocks'
 import { DocPageChrome } from './DocPageChrome'
 import './doc-theme.css'
 
-/** A frozen text selection inside the doc + where to float the Canvas toolbar (wrapper-relative px). */
+/** A frozen text selection inside the doc + where to join the Canvas controls beneath Crepe's toolbar. */
 type CanvasSelection = { text: string; top: number; left: number }
+
+const KODA_AI_ICON =
+  '<svg viewBox="0 0 24 24"><path d="m12 3 1.1 3.4a6 6 0 0 0 3.8 3.8l3.4 1.1-3.4 1.1a6 6 0 0 0-3.8 3.8L12 19.6l-1.1-3.4a6 6 0 0 0-3.8-3.8l-3.4-1.1 3.4-1.1a6 6 0 0 0 3.8-3.8L12 3Z"/><path d="m19 3 .4 1.2a2 2 0 0 0 1.3 1.3l1.2.4-1.2.4a2 2 0 0 0-1.3 1.3L19 8.8l-.4-1.2a2 2 0 0 0-1.3-1.3l-1.2-.4 1.2-.4a2 2 0 0 0 1.3-1.3L19 3Z"/></svg>'
 
 /**
  * Split a leading YAML frontmatter block off the raw file. Milkdown has no frontmatter node, so a bare
@@ -60,6 +64,7 @@ export function CrepeDocEditor({
   const sendCanvasEdit = useWorkspace((s) => s.sendCanvasEdit)
   // The live "point at a passage → ask the agent" affordance: a frozen selection + a floating toolbar.
   const [sel, setSel] = useState<CanvasSelection | null>(null)
+  const [aiOpen, setAiOpen] = useState(false)
   // Pending agent edit awaiting the user's Keep/Revert. Holds the doc body from BEFORE the edit (the
   // revert target); null = nothing to review. Stays stable across a multi-write turn until the user acts.
   const [review, setReview] = useState<string | null>(null)
@@ -101,7 +106,18 @@ export function CrepeDocEditor({
       // drop math — no everyday-doc need and it spares the KaTeX weight.
       features: { [Crepe.Feature.Latex]: false },
       // Koda's custom blocks (callout, …) appear in the slash / `+` insert menu.
-      featureConfigs: { [Crepe.Feature.BlockEdit]: { buildMenu: buildDocBlockMenu } },
+      featureConfigs: {
+        [Crepe.Feature.BlockEdit]: { buildMenu: buildDocBlockMenu },
+        [Crepe.Feature.Toolbar]: {
+          buildToolbar: (builder) => {
+            builder.addGroup('koda', 'Koda').addItem('ask-koda', {
+              icon: KODA_AI_ICON,
+              active: () => false,
+              onRun: () => setAiOpen(true),
+            })
+          },
+        },
+      },
     })
     // Register Koda's block schemas + remark transformers before the editor is created.
     crepe.editor.use(docBlockPlugins)
@@ -128,6 +144,56 @@ export function CrepeDocEditor({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path])
+
+  // Local images: a doc's markdown keeps plain relative refs (`assets/pic.png`), but the renderer's
+  // origin can't load them. Rewrite each `<img>`'s src in place to a `koda-preview://` URL that serves
+  // the contained project file — display only; the ProseMirror model + on-disk markdown stay untouched
+  // (so the doc never dirties). A MutationObserver re-resolves images the agent inserts or PM re-renders.
+  useEffect(() => {
+    const rootEl = crepeRootRef.current
+    if (!rootEl || !ready) return
+    let cancelled = false
+    const cache = new Map<string, string>()
+    // Skip anything already loadable: a scheme (data:/http:/blob:/koda-preview:) or a protocol-relative URL.
+    const hasScheme = (s: string): boolean => /^[a-z][a-z0-9+.-]*:/i.test(s) || s.startsWith('//')
+    const resolveImg = async (img: HTMLImageElement): Promise<void> => {
+      const ref = img.getAttribute('src') ?? ''
+      if (!ref || hasScheme(ref)) return
+      let url = cache.get(ref)
+      if (!url) {
+        const r = await window.koda.docAssetUrl(path, ref)
+        if (!r || cancelled) return
+        cache.set(ref, r)
+        url = r
+      }
+      if (img.getAttribute('src') === ref) img.src = url // guard against a concurrent PM re-render
+    }
+    const scan = (el: ParentNode): void =>
+      el.querySelectorAll?.('img').forEach((i) => void resolveImg(i as HTMLImageElement))
+    scan(rootEl)
+    const obs = new MutationObserver((records) => {
+      for (const rec of records) {
+        if (rec.type === 'attributes' && rec.target instanceof HTMLImageElement) {
+          void resolveImg(rec.target)
+        } else {
+          rec.addedNodes.forEach((n) => {
+            if (n instanceof HTMLImageElement) void resolveImg(n)
+            else if (n instanceof Element) scan(n)
+          })
+        }
+      }
+    })
+    obs.observe(rootEl, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ['src'],
+    })
+    return () => {
+      cancelled = true
+      obs.disconnect()
+    }
+  }, [ready, path])
 
   // Live agent edits: `body` only changes when the engine rewrites the file on disk (the user's own
   // edits live in Crepe, not this prop), so a change means the agent edited — swap the editor content
@@ -228,30 +294,45 @@ export function CrepeDocEditor({
     return () => host.removeEventListener('keydown', onKey)
   }, [])
 
-  // Canvas affordance: detect a non-empty selection inside the doc → freeze its text + anchor the
-  // toolbar above it. We capture on pointer/key release (not every selectionchange, to avoid thrash)
-  // and dismiss on scroll (the toolbar is pinned to the wrapper, not the scrolling content) or collapse.
+  // Canvas affordance: detect a non-empty selection and remember Crepe's own bubble geometry. The
+  // formatting toolbar includes one Koda action; choosing it transforms that same popover position
+  // into the agent controls instead of showing a competing second bubble.
   useEffect(() => {
     const host = hostRef.current
     const wrap = wrapRef.current
     if (!host || !wrap || readOnly) return
-    const capture = (): void => {
+    let positionTimer: number | null = null
+    const capture = (event: MouseEvent | KeyboardEvent): void => {
+      // Crepe runs toolbar commands on pointerdown. Don't let that same interaction's mouseup bubble
+      // into this selection observer and immediately reset the Koda mode it just opened.
+      if (event.target instanceof Element && event.target.closest('.milkdown-toolbar')) return
       const s = window.getSelection()
       const text = s && !s.isCollapsed && s.rangeCount > 0 ? s.toString().trim() : ''
       const anchor = s?.anchorNode ?? null
       if (!text || !anchor || !host.contains(anchor)) {
         setSel(null)
+        setAiOpen(false)
         return
       }
-      const rect = s!.getRangeAt(0).getBoundingClientRect()
-      const wr = wrap.getBoundingClientRect()
-      setSel({ text, top: rect.top - wr.top, left: rect.left - wr.left + rect.width / 2 })
+      setAiOpen(false)
+      if (positionTimer !== null) window.clearTimeout(positionTimer)
+      positionTimer = window.setTimeout(() => {
+        const toolbar = crepeRootRef.current?.querySelector<HTMLElement>('.milkdown-toolbar[data-show="true"]')
+        if (!toolbar) return
+        const tr = toolbar.getBoundingClientRect()
+        const wr = wrap.getBoundingClientRect()
+        setSel({ text, top: tr.top - wr.top, left: tr.left - wr.left + tr.width / 2 })
+      }, 30)
     }
-    const dismiss = (): void => setSel(null)
+    const dismiss = (): void => {
+      setSel(null)
+      setAiOpen(false)
+    }
     host.addEventListener('mouseup', capture)
     host.addEventListener('keyup', capture)
     host.addEventListener('scroll', dismiss)
     return () => {
+      if (positionTimer !== null) window.clearTimeout(positionTimer)
       host.removeEventListener('mouseup', capture)
       host.removeEventListener('keyup', capture)
       host.removeEventListener('scroll', dismiss)
@@ -268,19 +349,35 @@ export function CrepeDocEditor({
     await sendCanvasEdit({ path, selection, instruction: instruction.trim() })
   }
 
+  function backToFormatting(): void {
+    setAiOpen(false)
+    // The AI input can own DOM focus while the ProseMirror selection remains intact. Restore editor
+    // focus and issue a no-op transaction so Crepe's tooltip recalculates and reopens at that selection.
+    requestAnimationFrame(() => {
+      const view = crepeRef.current?.editor.ctx.get(editorViewCtx)
+      if (!view) return
+      view.focus()
+      view.dispatch(view.state.tr)
+    })
+  }
+
   return (
     <div className={`flex flex-col overflow-hidden ${className}`}>
-      <div ref={wrapRef} className="relative min-h-0 flex-1">
+      <div ref={wrapRef} className={`relative min-h-0 flex-1 ${aiOpen ? 'koda-ai-toolbar-open' : ''}`}>
         <div ref={hostRef} className="h-full overflow-auto bg-surface">
           <DocPageChrome path={path} readOnly={readOnly} />
           <div ref={crepeRootRef} />
         </div>
-        {sel && !readOnly && (
+        {sel && aiOpen && !readOnly && (
           <CanvasToolbar
             top={sel.top}
             left={sel.left}
             onAsk={(instruction) => void askCanvas(instruction)}
-            onClose={() => setSel(null)}
+            onBack={backToFormatting}
+            onClose={() => {
+              setSel(null)
+              setAiOpen(false)
+            }}
           />
         )}
       </div>
@@ -329,27 +426,41 @@ function CanvasToolbar({
   top,
   left,
   onAsk,
+  onBack,
   onClose,
 }: {
   top: number
   left: number
   onAsk: (instruction: string) => void
+  onBack: () => void
   onClose: () => void
 }) {
   const [text, setText] = useState('')
   const QUICK = ['Rewrite', 'Shorten', 'Expand', 'Fix grammar']
   return (
     <div
-      className="absolute z-20 -translate-x-1/2 -translate-y-full"
-      style={{ top: Math.max(30, top) - 8, left }}
+      className="absolute z-20 -translate-x-1/2"
+      style={{ top, left }}
     >
-      <div className="flex items-center gap-1 rounded-xl border border-border bg-surface p-1 shadow-pop">
+      <div className="flex h-11 items-center gap-1 rounded-lg bg-surface px-1 shadow-pop">
+        <button
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={onBack}
+          title="Back to formatting"
+          aria-label="Back to formatting"
+          className="grid h-8 w-8 shrink-0 place-items-center rounded-md text-text-muted transition-colors hover:bg-bg hover:text-text"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            <path d="m15 18-6-6 6-6" />
+          </svg>
+        </button>
+        <span className="mx-1 h-6 w-px bg-border" />
         {QUICK.map((q) => (
           <button
             key={q}
             onMouseDown={(e) => e.preventDefault()}
             onClick={() => onAsk(q)}
-            className="rounded-lg px-2 py-1 text-[11px] font-medium text-text-muted transition-colors hover:bg-bg hover:text-text"
+            className="rounded-lg px-2 py-1 text-[11px] font-medium text-text transition-colors hover:bg-bg"
           >
             {q}
           </button>
@@ -367,7 +478,7 @@ function CanvasToolbar({
             }
           }}
           placeholder="Ask the agent to edit this…"
-          className="w-52 rounded-lg bg-bg px-2 py-1 text-[12px] text-text outline-none placeholder:text-text-muted"
+          className="w-52 rounded-lg bg-bg px-2 py-1 text-[12px] text-text outline-none placeholder:text-text-muted/80"
         />
       </div>
     </div>

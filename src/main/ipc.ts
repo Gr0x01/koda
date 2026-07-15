@@ -107,6 +107,10 @@ import {
   KodaSettingsPatchSchema,
   GuardrailsLayerSchema,
   MemoryWeightSchema,
+  BackupStatusSchema,
+  BackupManifestSchema,
+  BackupRestoreRequestSchema,
+  BackupRestoreResultSchema,
   GuardrailSaveRequestSchema,
   GuardrailSaveResultSchema,
   GuardrailSetEnabledRequestSchema,
@@ -129,8 +133,9 @@ import {
   ApiFallbackRequestSchema,
   PreviewRestartRequestSchema,
 } from '@shared/ipc'
-import { basename, isAbsolute, join, relative } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { projectMemoryWeight } from './engine/pack'
+import { backupNow, getBackupStatus, listCloudBackups, restoreCloudBackup, revealRecoveryCode } from './backup'
 import { probeEngine } from './engine/probe'
 import { EngineSessionManager } from './engine/sessions'
 import { loadUsageHistory } from './engine/usage-history'
@@ -198,7 +203,7 @@ import {
   remoteStatusWatchHooks,
   disposeRemoteControl,
 } from './remote-control'
-import { staticPreviewUrl, startDevServer, showStaticPreview } from './preview'
+import { staticPreviewUrl, previewAssetUrl, startDevServer, showStaticPreview } from './preview'
 import { saveScratchImage, listScratchImages } from './scratch'
 import { readDocMeta, writeDocMeta } from './docmeta'
 import {
@@ -516,6 +521,35 @@ export function registerIpcHandlers(): void {
     return url
   })
 
+  // Resolve a doc's relative image reference to a loadable koda-preview:// URL so local images render
+  // in the WYSIWYG doc surface (the file on disk keeps its plain `assets/pic.png` markdown). Only bare
+  // relative refs reach here; absolute URLs / data: URIs are handled in the renderer. Contained to the
+  // project root — an escaping or missing ref returns null and the renderer leaves the src untouched.
+  ipcMain.handle(IpcChannels.docAssetUrl, (event, rawArgs: unknown) => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    if (!win) return null
+    if (
+      typeof rawArgs !== 'object' ||
+      rawArgs === null ||
+      typeof (rawArgs as { docPath?: unknown }).docPath !== 'string' ||
+      typeof (rawArgs as { ref?: unknown }).ref !== 'string'
+    )
+      return null
+    const { docPath, ref } = rawArgs as { docPath: string; ref: string }
+    const root = rootForSender(event.sender)
+    // Resolve the ref against the doc's own folder (markdown image paths are doc-relative), then map to
+    // a project-relative key and containment-check it exactly as the protocol handler will.
+    const abs = resolve(dirname(docPath), ref)
+    const rel = relative(root, abs)
+    if (!rel || rel.startsWith('..') || isAbsolute(rel)) return null
+    try {
+      containedReal(root, rel) // realpath: throws on escape OR missing file
+    } catch {
+      return null
+    }
+    return previewAssetUrl(win.id, rel) ?? null
+  })
+
   // Re-run a session's last preview (the "Restart preview" button). Window-direct like previewStaticUrl,
   // NOT the agent's gated capability: the user is replaying a command the agent already ran in front of
   // them, on their own window's project. Resolves with the served URL (main also pushes preview:show so
@@ -594,6 +628,33 @@ export function registerIpcHandlers(): void {
       return MemoryWeightSchema.parse({ present: false, chars: 0, heavy: false })
     }
     return MemoryWeightSchema.parse(projectMemoryWeight(root))
+  })
+
+  // Encrypted cloud backup (Settings → Backup; dogfood-flagged in main/backup). Status/now are
+  // project-scoped; a no-project window reads as a disabled surface rather than an error.
+  ipcMain.handle(IpcChannels.backupStatus, async (event) => {
+    try {
+      return BackupStatusSchema.parse(await getBackupStatus(rootForSender(event.sender)))
+    } catch {
+      return BackupStatusSchema.parse({
+        enabled: false,
+        signedIn: false,
+        state: 'idle',
+        lastBackupAt: null,
+        sizeBytes: null,
+      })
+    }
+  })
+  ipcMain.handle(IpcChannels.backupNow, async (event) => {
+    return BackupStatusSchema.parse(await backupNow(rootForSender(event.sender)))
+  })
+  ipcMain.handle(IpcChannels.backupRecoveryCode, () => revealRecoveryCode())
+  ipcMain.handle(IpcChannels.backupList, async () => {
+    return z.array(BackupManifestSchema).parse(await listCloudBackups())
+  })
+  ipcMain.handle(IpcChannels.backupRestore, async (_event, rawArgs: unknown) => {
+    const args = BackupRestoreRequestSchema.parse(rawArgs)
+    return BackupRestoreResultSchema.parse(await restoreCloudBackup(args))
   })
 
   // The behavior layer (Settings → Guardrails): the curated Koda pack + this project's own
@@ -972,10 +1033,10 @@ export function registerIpcHandlers(): void {
     return WriteFileResultSchema.parse({ path: await writeProjectFile(root, path, content) })
   })
 
-  // Create a new empty document at the project root and return its path (the renderer opens it).
+  // Create a new empty document in Documents/ or a selected contained folder, then return its path.
   ipcMain.handle(IpcChannels.fsCreateFile, async (event, rawArgs: unknown) => {
-    const { name } = CreateFileRequestSchema.parse(rawArgs)
-    return CreateFileResultSchema.parse({ path: await createProjectFile(rootForSender(event.sender), name) })
+    const { name, parent } = CreateFileRequestSchema.parse(rawArgs)
+    return CreateFileResultSchema.parse({ path: await createProjectFile(rootForSender(event.sender), name, parent) })
   })
 
   // Rename/move a file/folder. Checkpoint the pre-move tree FIRST (so it's recoverable like an engine

@@ -43,7 +43,7 @@ export function RemoteMenu() {
     // event doesn't carry (url/code/devices); the next full refresh fills them in.
     const offRemote = window.koda.onRemoteActivity((a) =>
       setRemote((prev) => ({
-        ...(prev ?? { url: null, code: null, devices: [] }),
+        ...(prev ?? { url: null, hosts: [], code: null, devices: [] }),
         running: a.running,
         connectedClients: a.connectedClients,
       })),

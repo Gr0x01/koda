@@ -183,6 +183,13 @@ function FilesSection() {
   const newFolder = useWorkspace((s) => s.newFolder)
   const openSearch = useWorkspace((s) => s.setSearchOpen)
   const docs = filesView === 'docs'
+  const [docsFolder, setDocsFolder] = useState<string | null>(null)
+  useEffect(() => {
+    const onSelected = (e: Event): void => setDocsFolder((e as CustomEvent<string | null>).detail)
+    window.addEventListener('koda:docs-folder-selected', onSelected)
+    return () => window.removeEventListener('koda:docs-folder-selected', onSelected)
+  }, [])
+  useEffect(() => setDocsFolder(null), [filesView])
   return (
     <div className="flex min-h-0 flex-1 flex-col border-t border-border">
       <PanelHeader title={<DocsFilesToggle docs={docs} onChange={setFilesView} />}>
@@ -192,15 +199,17 @@ function FilesSection() {
             <circle cx="11" cy="11" r="7" />
             <path d="m20 20-3.5-3.5" />
           </HeaderIconButton>
-          <HeaderIconButton onClick={() => void newDocument()} title="New document" aria-label="New document">
+          <HeaderIconButton onClick={() => void newDocument(docs ? docsFolder ?? undefined : undefined)} title={docsFolder && docs ? `New document in ${docsFolder.split('/').pop()}` : 'New document'} aria-label="New document">
             <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
             <path d="M14 2v4a2 2 0 0 0 2 2h4M9 15h6M12 18v-6" />
           </HeaderIconButton>
           {/* New folder lands at the project root in the tree, and in the user's Documents/ from the
               doc-first view (where their writing lives, so it appears where they expect). */}
           <HeaderIconButton
-            onClick={() => void newFolder(undefined, docs)}
-            title="New folder"
+            onClick={() => void newFolder(docs ? docsFolder ?? undefined : undefined, docs && !docsFolder).then((path) => {
+              if (docs && path) window.dispatchEvent(new CustomEvent('koda:rename-doc-folder', { detail: path }))
+            })}
+            title={docsFolder && docs ? `New folder in ${docsFolder.split('/').pop()}` : 'New folder'}
             aria-label="New folder"
           >
             <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
@@ -306,4 +315,3 @@ function HeaderIconButton({
     </button>
   )
 }
-

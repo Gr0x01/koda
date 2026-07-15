@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import type { WebContents } from 'electron'
 import { IpcChannels } from '@shared/channels'
 import { DOCS_HOME, invalidateDocsCache } from './fs-browse'
+import { uploadReplicaNow } from './backup'
 
 /**
  * Per-window watcher on the project's `Documents/` folder so the doc-first sidebar reflects docs the
@@ -77,5 +78,8 @@ function onEvent(wc: WebContents, entry: Entry): void {
     if (wc.isDestroyed()) return
     invalidateDocsCache(entry.root) // else the renderer's re-fetch hits the stale 10s cache
     wc.send(IpcChannels.fsDocsChanged)
+    // Documents are the replica's source of truth. Upload this coalesced filesystem burst directly so
+    // a hand edit or external write reaches the phone without waiting for another agent turn boundary.
+    void uploadReplicaNow(entry.root)
   }, 120)
 }

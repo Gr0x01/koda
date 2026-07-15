@@ -220,6 +220,21 @@ export function loadCloudRelayEnabled(): boolean {
   return process.env.KODA_CLOUD_RELAY === '1' || readSettings().cloudRelay === true
 }
 
+/** Encrypted cloud backup (dogfood flag, same posture as cloudRelay: no Settings toggle yet — flip
+ *  with `"backupEnabled": true` in koda-settings.json or `KODA_BACKUP=1` in dev). Gates the debounced
+ *  uploader and the Settings → Backup surface. "Any signed-in account" is the dogfood gate; the paid
+ *  entitlement replaces it when IAP ships (ship-checklist-backup-sync.md). */
+export function loadBackupEnabled(): boolean {
+  return process.env.KODA_BACKUP === '1' || readSettings().backupEnabled === true
+}
+
+/** Docs replica upload (the paid tier's launch feature; full-project backup stays behind
+ *  loadBackupEnabled separately). Same dogfood posture: `"replicaEnabled": true` in
+ *  koda-settings.json or `KODA_REPLICA=1`; the paid entitlement replaces it when IAP ships. */
+export function loadReplicaEnabled(): boolean {
+  return process.env.KODA_REPLICA === '1' || readSettings().replicaEnabled === true
+}
+
 /**
  * Provisioned-runtime record — NOT a user preference (so it's out of the Settings surface below): it's
  * internal state recording which on-demand runtime (Node / Python) Koda installed and where. Read at

@@ -69,7 +69,9 @@ function applyContentSecurityPolicy(): void {
         ...details.responseHeaders,
         'Content-Security-Policy': [
           "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
-            "img-src 'self' data:; font-src 'self'; connect-src 'self'; " +
+            // koda-preview: lets the WYSIWYG doc surface show a doc's local images (served from the
+            // contained project file server); the protocol handler realpath-contains every request.
+            "img-src 'self' data: koda-preview:; font-src 'self'; connect-src 'self'; " +
             // The preview surface embeds the user's own web output in a sandboxed iframe: its static
             // origin (koda-preview:) and a managed dev server (localhost). Those origins are isolated
             // from Koda's renderer; this only permits FRAMING them, nothing more.

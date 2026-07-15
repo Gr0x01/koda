@@ -60,6 +60,23 @@
 }
 
 /*
+ * Crepe uses its outline token for toolbar glyphs. In Koda that token is deliberately the faint
+ * hairline-border colour, which made every available formatting action look disabled. Toolbar
+ * controls are actions, so give their resting state normal foreground contrast; active marks still
+ * use Crepe's primary/accent rule from toolbar.css.
+ */
+.milkdown .milkdown-toolbar .toolbar-item:not(.active) svg {
+  color: var(--koda-text);
+  fill: var(--koda-text);
+}
+
+/* The selection popover has two modes. Choosing its Koda action swaps the native formatting row for
+ * the agent-edit row at the same anchor, so there is only ever one piece of floating chrome. */
+.koda-ai-toolbar-open .milkdown .milkdown-toolbar {
+  display: none;
+}
+
+/*
  * The editable area: a comfortable reading column with generous gutters (a document, not a textarea).
  * The horizontal padding must stay ≥ the block handle's width (~46px): the `+`/drag handle is absolutely
  * positioned just left of the text block, so when the pane narrows a too-small gutter pushes it to a
