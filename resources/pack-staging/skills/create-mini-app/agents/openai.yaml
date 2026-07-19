@@ -1,0 +1,4 @@
+interface:
+  display_name: "Create Mini App"
+  short_description: "Turn a Koda project into a durable mini app"
+  default_prompt: "Create a view-first mini app in this project using Koda’s managed app contract."

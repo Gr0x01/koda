@@ -1,9 +1,10 @@
 import { create } from 'zustand'
-import { clampLayout, DEFAULT_LAYOUT } from '@shared/ipc'
+import { attachedFilesNote, clampLayout, DEFAULT_LAYOUT } from '@shared/ipc'
 import type {
   ApprovalMode,
   ApprovalRequest,
-  ArchivedSession,
+  ArchivedPreviewTurn,
+  ArchivedSessionMeta,
   AsideEvent,
   BillingMode,
   MemoryWeight,
@@ -11,8 +12,10 @@ import type {
   EngineEvent,
   EngineId,
   GitStatusFile,
+  MiniAppInfo,
   ModelSpend,
   PreviewRestart,
+  ProviderKind,
   ProviderStatusEvent,
   RateLimitInfo,
   WorkspaceLayoutSizes,
@@ -27,8 +30,10 @@ import type {
 } from '../transcript/Transcript'
 import type { TaskRow } from '../transcript/TaskList'
 
-/** An image staged for the next turn (base64). Transient draft state — never persisted. */
-export type ImageDraft = { mediaType: string; dataBase64: string }
+/** An attachment staged for the next turn (base64). Transient draft state — never persisted.
+ *  Images go inline to the engine; document files (non-`image/*` mediaType, csv/pdf) carry their
+ *  original `name` and reach the engine as a saved `.koda/scratch/` path instead (see send()). */
+export type ImageDraft = { mediaType: string; dataBase64: string; name?: string }
 /** The workflow turn-item, narrowed from Entry — the journal watcher patches its agents/status. */
 type WorkflowEntry = Extract<Entry, { kind: 'workflow' }>
 
@@ -283,9 +288,6 @@ export interface PersistedBlob {
     lastPreview?: PreviewRestart
     items: Entry[]
   }[]
-  /** Archived sessions — present only when HYDRATING (useEngineBridge merges them in from the cold
-   *  archive file). persistBlob never writes them: the cold file is saved separately, only on change. */
-  archived?: ArchivedSession[]
   /** Last-known account-level rate-limit windows (5-hour / weekly), so the footer survives a restart
    *  instead of going blank until the next turn re-emits them. `resetsAt` is absolute, so a restored
    *  value stays meaningful; the next turn refreshes it. */
@@ -347,6 +349,17 @@ const reattaching = new Set<string>()
 // LIVE turn (native "finished" notifications, the working-tree git refresh) are suppressed, so
 // replaying old TurnCompletes doesn't ping the user or thrash git for history they're just catching up on.
 const replayingSessions = new Set<string>()
+// Sessions that just dispatched a "write a handoff" turn for the Keep-going-in-a-fresh-chat flow. When
+// that turn completes, the summary it produced is carried into a brand-new session (see finishHandoff).
+// Module-level like the sets above so it survives re-renders without living on SessionState.
+const handoffPending = new Set<string>()
+// The turn Koda sends the current agent to produce a handoff before opening a fresh chat. Engine-agnostic
+// (Claude or Codex) — it only asks for text back; the continuity happens by seeding the new session with it.
+const HANDOFF_PROMPT =
+  'This conversation is getting long and we are about to continue in a fresh chat that starts with an empty ' +
+  'context. Write a concise handoff — under ~200 words, plain prose — so a new session can pick up exactly ' +
+  'where we are: what we are working on, the decisions already made, the current state, and the immediate ' +
+  'next step. Write it addressed to that next session. Output only the handoff, no preamble.'
 // Engine events that mean "a turn is actively running right now". Receiving any of these re-arms `busy`
 // so the sidebar/status FOLLOWS the real engine turn — not just the optimistic flag set in dispatchTurn.
 // A turn driven from the phone / relay goes straight through backend.sendTurn (bypassing dispatchTurn),
@@ -450,18 +463,20 @@ interface WorkspaceStore {
   sessions: Record<string, SessionState>
   order: string[] // stable display order (replaces the old array order)
   activeId: string | null
-  /** Archived (closed-but-kept) sessions, newest first. Persisted in the per-project blob; surfaced
-   *  in Settings → Archived sessions for restore. */
-  archived: ArchivedSession[]
+  /** Archived (closed-but-kept) session metadata, newest first — the light half (no transcript body,
+   *  which is fetched on restore). Persisted to the cold archive index; surfaced in Settings → Archived
+   *  sessions for restore. */
+  archived: ArchivedSessionMeta[]
   pending: ApprovalRequest[]
   /** Account-level subscription rate-limit windows, keyed by ENGINE then window type
    *  (`claude`/`codex` → `five_hour`/`weekly`). Each engine is a separate subscription with its own
    *  caps, so they never share a map. Not per-session — within one engine the windows are an account
    *  fact (newest update wins). Persisted so the footer survives a restart; refreshed on the next turn. */
   rateLimits: Record<string, Record<string, RateLimitInfo>>
-  /** Engines mid provider-outage (feed-confirmed, main-watched), keyed by engine → the status-bar
-   *  pill. Pushed over `providerStatus` + seeded on boot; not persisted (main re-seeds on reopen). */
-  providerDown: Record<string, { note?: string }>
+  /** Engines mid provider-incident (feed-confirmed, main-watched), keyed by engine → the engine chip's
+   *  health state (note + severity kind). Pushed over `providerStatus` + seeded on boot; not persisted
+   *  (main re-seeds on reopen). */
+  providerDown: Record<string, { note?: string; kind?: ProviderKind }>
   applyProviderStatus: (e: ProviderStatusEvent) => void
   /** Billing mode, mirrored from main's settings (seeded on boot + onSettingsChanged). Drives the
    *  status-bar chip + the 'auto' fallback trigger in the RateLimitUpdate handler. */
@@ -485,6 +500,18 @@ interface WorkspaceStore {
    *  folder opened with no CLAUDE.md/AGENTS.md). The user describes the project → the agent authors its
    *  guidelines. In-memory + one-shot: cleared on skip (remembered per-project) / once intake starts. */
   intakePending: boolean
+  /** Registered mini apps (ALL projects) + supervisor state, refreshed on workspace mount. [] when the
+   *  mini-apps flag is off — the list IS the renderer's feature gate (no rail, no App/Workshop toggle).
+   *  See mini-apps-plan.md "Desktop FACE model". */
+  miniApps: MiniAppInfo[]
+  /** The app fronting this window (its absolute dir); null = plain workspace, no face. */
+  faceDir: string | null
+  /** Figure-ground: 'app' = the face full-bleed over the chassis; 'workshop' = the normal workspace
+   *  (the face keeps running behind it — same process the Preview surface shows). */
+  faceView: 'app' | 'workshop'
+  /** Set by ProjectHome's app rail right before swapping this window to the app's project: which face
+   *  to land on. Consumed + cleared by the Chassis on mount (same one-shot pattern as intakePending). */
+  pendingFaceDir: string | null
   layout: WorkspaceLayout
   /** Open file/preview surfaces, keyed by session — the dock shows the active session's editor. See
    *  EditorState; read via the `activeEditor(state)` selector, never indexed directly at call sites. */
@@ -619,8 +646,9 @@ interface WorkspaceStore {
   /** End a session's live agent and move it to the archive (keeps the whole conversation; restorable
    *  from Settings). Replaces the old hard close — nothing is deleted. */
   archiveSession: (id: string) => Promise<void>
-  /** Reopen an archived session as a live tab (reattaches via --resume on its next turn). */
-  restoreArchived: (id: string) => void
+  /** Reopen an archived session as a live tab (reattaches via --resume on its next turn). Async: the
+   *  transcript body is fetched from its cold file on demand. */
+  restoreArchived: (id: string) => Promise<void>
   /** Permanently drop an archived session (the one genuinely destructive session action). */
   deleteArchived: (id: string) => void
   send: () => Promise<void>
@@ -648,6 +676,10 @@ interface WorkspaceStore {
   /** "Tidy memory" from Settings → Memory: composes a turn telling the agent to distill the
    *  always-injected pair per the memory skill's tidy recipe. Returns false if no session / busy. */
   sendMemoryTidy: () => Promise<boolean>
+  /** "Keep going in a fresh chat" — shown when the active session's context is nearly full. Asks the
+   *  current agent for a handoff summary, then (on that turn's completion) opens a new session with the
+   *  summary staged in its composer so the user reviews and continues. Engine-agnostic. No-op if busy. */
+  continueInFreshChat: () => void
   selectSession: (id: string) => void
   /** Ask a side question ("btw" / aside) on a session — answered from its context without entering the
    *  conversation. Clears the draft and opens the ephemeral answer overlay. */
@@ -692,6 +724,18 @@ interface WorkspaceStore {
   /** Flag this window's project to show the intake empty-state. Set by ProjectHome right after
    *  createProject (immediate, no flash); the open-time `maybeOfferIntake` covers existing folders. */
   setIntakePending: (pending: boolean) => void
+  // Mini apps (the face)
+  setPendingFaceDir: (dir: string | null) => void
+  /** Re-read the registered-apps list from main (workspace mount / rail refresh). Fails soft. */
+  refreshMiniApps: () => Promise<void>
+  /** Front an app's face (figure-ground flip to 'app'). */
+  openFace: (dir: string) => void
+  /** Flip between the face and the workshop without dropping which app is fronted. */
+  setFaceView: (view: 'app' | 'workshop') => void
+  /** The face's summon: a quick data/build turn to this project's agent without leaving the app.
+   *  Grounds the turn in which app the user is looking at; starts a session if none is live. Returns
+   *  false if nothing was dispatched (blank text / busy session / no fronted app). */
+  sendFaceTurn: (args: { text: string }) => Promise<boolean>
   /** Offer intake when a project is opened with no guidelines yet — the common case (existing folders,
    *  not just New project). Skips if it has sessions, was skipped before (per-project), or already has a
    *  CLAUDE.md/AGENTS.md (never re-author existing guidelines). Called once on project mount. */
@@ -794,7 +838,9 @@ interface WorkspaceStore {
   toggleDock: () => void
 
   // persistence
-  hydrate: (blob: PersistedBlob) => void
+  /** Boot restore. `archived` is the cold-store metadata (bodies fetched on restore), merged in by
+   *  useEngineBridge — kept off PersistedBlob because persistBlob → saveSessions must never carry it. */
+  hydrate: (blob: PersistedBlob & { archived?: ArchivedSessionMeta[] }) => void
   persistBlob: () => PersistedBlob
   noteRestored: (label: string) => void
 }
@@ -1099,7 +1145,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     applyProviderStatus: (e) =>
       set((state) => {
         const next = { ...state.providerDown }
-        if (e.down) next[e.engine] = { note: e.note }
+        if (e.down) next[e.engine] = { note: e.note, kind: e.kind }
         else delete next[e.engine]
         return { providerDown: next }
       }),
@@ -1110,6 +1156,10 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     defaultApprovalMode: 'auto',
     projectPath: null,
     intakePending: false,
+    miniApps: [],
+    faceDir: null,
+    faceView: 'workshop',
+    pendingFaceDir: null,
     layout: { mode: 'focus' },
     editors: {},
     openDirs: [],
@@ -1380,12 +1430,46 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           // updates the shared picture). Fire-and-forget. Skipped while replaying an adopted session's
           // history — one refresh after the replay settles covers it (see adoptHeadless).
           if (!replayingSessions.has(sid)) void get().refreshGitStatus()
+          // Keep-going-in-a-fresh-chat: this session requested a handoff summary — now that the turn is
+          // done, carry it into a new session. A stopped or empty turn yields no usable summary → say so
+          // and stay put rather than opening a blank chat.
+          if (handoffPending.delete(sid)) {
+            const items = get().sessions[sid]?.items ?? []
+            const summary = [...items]
+              .reverse()
+              .flatMap((it) => (it.kind === 'assistant' && it.markdown?.trim() ? [it.markdown.trim()] : []))[0]
+            if (stopped || !summary) {
+              pushItem(sid, {
+                kind: 'notice',
+                text: "Couldn't prepare a handoff. When you're ready, start a fresh chat from the + button.",
+              })
+            } else {
+              // The fresh chat should continue on the SAME engine/model as the one being handed off
+              // (matters when it's Codex, not the global last-used). startSession reads these, so seed
+              // them from the old session first.
+              const prev = get().sessions[sid]
+              if (prev) {
+                writeLastEngine(prev.engineId)
+                writeLastModel(prev.model)
+              }
+              void (async () => {
+                await get().startSession() // creates + activates the fresh session
+                const newId = get().activeId
+                if (!newId) return
+                const note = `Continuing from a previous chat that was getting long. Here's the handoff:\n\n${summary}`
+                // Stage as a real reply (replyStaged) so the composer shows it for review — the user reads
+                // what carried over, optionally adds their next instruction, and sends. Nothing silent.
+                patchSession(newId, (s) => ({ ...s, draft: note, replyStaged: true }))
+              })()
+            }
+          }
           break
         }
         case 'RateLimitUpdate': {
           // Account-level window — attribute it to the EMITTING session's engine (each engine is its own
-          // subscription), then store by type (five_hour/weekly), newest wins within that engine.
-          const rlEngine = get().sessions[sid]?.engineId ?? 'claude'
+          // subscription), then store by type (five_hour/weekly), newest wins within that engine. The
+          // driver's own stamp wins over the session lookup (authoritative at the source).
+          const rlEngine = e.engine ?? get().sessions[sid]?.engineId ?? 'claude'
           set((state) => ({
             rateLimits: {
               ...state.rateLimits,
@@ -1546,7 +1630,11 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       // first turn (after that the conversation is bound to its engine).
       const engineId = readLastEngine()
       const model = readLastModel() // pin the last model so the pill names it before the first turn
-      const { sessionId, cwd } = await window.koda.startSession({ engineId })
+      // Spawn the warm-up engine ON that model. Omitting it booted the engine on its own default while the
+      // pill named `model`, so a first turn sent without re-picking silently ran the wrong model (the pill
+      // was display-only). Main also reconciles intent-vs-actual before every turn now, but that backstop
+      // only works if main is TOLD the intended model here — the renderer is its source of truth.
+      const { sessionId, cwd } = await window.koda.startSession({ engineId, model })
       const label = 'New session' // placeholder until the first turn names it (titleFromPrompt → assistTitle)
       const approvalMode = get().defaultApprovalMode
       set((state) => ({
@@ -1677,27 +1765,41 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
 
     archiveSession: async (id) => {
       window.koda.disposeSession({ sessionId: id }).catch(console.error)
+      const s = get().sessions[id]
+      if (!s) return
+      // The transcript body goes to its own cold file; the metadata index (persisted by the archived
+      // subscription) stays light. Baked preview + maxItemId let the list render and boot advance the id
+      // counter WITHOUT re-loading bodies.
+      const items = s.items
+      // Await so the body is durably written before the session leaves the store (also orders it ahead of
+      // any later loadArchivedBody, which rides a different channel). Fail-soft: on error the archive is
+      // still recorded (visible in the list) — only its restore would come back empty.
+      try {
+        await window.koda.writeArchivedBody?.(id, items)
+      } catch (err) {
+        console.error(err)
+      }
+      // Snapshot the durable metadata (same fields the persist blob keeps, minus `items`) + an archive
+      // stamp, so it restores byte-identical and reattaches via --resume like a boot-restored session.
+      const meta: ArchivedSessionMeta = {
+        id: s.id,
+        label: s.label,
+        cwd: s.cwd,
+        userNamed: s.userNamed,
+        approvalMode: s.approvalMode,
+        model: s.model,
+        effort: s.effort,
+        engineId: s.engineId,
+        engineNativeId: s.engineNativeId,
+        context: s.context,
+        spendUsd: s.spendUsd,
+        byModel: s.byModel,
+        archivedAt: Date.now(),
+        preview: buildArchivePreview(items),
+        maxItemId: maxArchivedItemId(items),
+      }
       set((state) => {
-        const s = state.sessions[id]
-        if (!s) return {}
-        // Snapshot the durable payload (same fields the persist blob keeps) + an archive stamp, so it
-        // restores byte-identical and reattaches via --resume just like a boot-restored session.
-        const entry: ArchivedSession = {
-          id: s.id,
-          label: s.label,
-          cwd: s.cwd,
-          userNamed: s.userNamed,
-          approvalMode: s.approvalMode,
-          model: s.model,
-          effort: s.effort,
-          engineId: s.engineId,
-          engineNativeId: s.engineNativeId,
-          context: s.context,
-          spendUsd: s.spendUsd,
-          byModel: s.byModel,
-          items: s.items,
-          archivedAt: Date.now(),
-        }
+        if (!state.sessions[id]) return {}
         const rest = { ...state.sessions }
         delete rest[id]
         const order = state.order.filter((sid) => sid !== id)
@@ -1712,19 +1814,30 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           activeId,
           editors,
           pending: state.pending.filter((r) => r.sessionId !== id),
-          archived: [entry, ...state.archived],
+          archived: [meta, ...state.archived],
         }
       })
     },
 
-    restoreArchived: (id) => {
+    restoreArchived: async (id) => {
+      const a = get().archived.find((x) => x.id === id)
+      if (!a) return
+      // Already open (shouldn't happen) — just focus it, drop the stale archive entry, and let its now
+      // unused body file go.
+      if (get().sessions[id]) {
+        set((state) => ({ activeId: id, archived: state.archived.filter((x) => x.id !== id) }))
+        window.koda.deleteArchivedBody?.(id).catch(console.error)
+        return
+      }
+      // The transcript body lives in its own cold file — fetch it, then rehydrate. `null` = the read
+      // FAILED (vs a genuinely empty transcript): keep the archive intact and bail rather than restore an
+      // empty session and delete the body we couldn't read.
+      const raw = await window.koda.loadArchivedBody?.(id)
+      if (raw == null) return
+      const items = (raw as Entry[]).map(settleRestoredItem)
       set((state) => {
-        const a = state.archived.find((x) => x.id === id)
-        if (!a) return {}
-        // Already open (shouldn't happen) — just focus it and drop the stale archive entry.
-        if (state.sessions[id])
-          return { activeId: id, archived: state.archived.filter((x) => x.id !== id) }
-        const items = (a.items as Entry[]).map(settleRestoredItem)
+        // Re-check under the setter: a second restore/delete may have raced us since the await.
+        if (!state.archived.some((x) => x.id === id) || state.sessions[id]) return {}
         // Bump the entry counter past the restored items so new entries can't collide with them (the
         // boot hydrate only counted live sessions; an archive can hold higher ids than the current max).
         for (const it of items) {
@@ -1761,18 +1874,25 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           archived: state.archived.filter((x) => x.id !== id),
         }
       })
+      // Body consumed back into the live session — its cold file is no longer needed.
+      window.koda.deleteArchivedBody?.(id).catch(console.error)
     },
 
-    deleteArchived: (id) =>
-      set((state) => ({ archived: state.archived.filter((x) => x.id !== id) })),
+    deleteArchived: (id) => {
+      set((state) => ({ archived: state.archived.filter((x) => x.id !== id) }))
+      window.koda.deleteArchivedBody?.(id).catch(console.error)
+    },
 
     send: async () => {
       const { activeId, sessions } = get()
       const active = activeId ? sessions[activeId] : null
       if (!active || active.busy) return
       const text = active.draft
-      const images = active.attachments
-      if (!text.trim() && images.length === 0) return // nothing to send
+      // Images travel inline as engine content blocks; document files (csv/pdf) travel as a saved
+      // `.koda/scratch/` path only — the engine reads files natively, and a path survives the turn.
+      const images = active.attachments.filter((a) => a.mediaType.startsWith('image/'))
+      const files = active.attachments.filter((a) => !a.mediaType.startsWith('image/'))
+      if (!text.trim() && active.attachments.length === 0) return // nothing to send
       const id = active.id
       // Same synchronous double-send guard dispatchTurn applies, re-checked here so we don't consume
       // (clear) the composer for a dispatch that would early-return on a racing reattach.
@@ -1818,10 +1938,36 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         // Durable copies just landed — nudge the Recent images strip to refetch the folder.
         set((s) => ({ scratchTick: s.scratchTick + 1 }))
       }
+      // Document attachments: the scratch path IS the delivery (no inline copy), so unlike images a
+      // failed save is surfaced to the agent by omission from the list below. Staged in scratch, the
+      // agent is told to promote anything load-bearing out of it (scratch prunes by age).
+      if (files.length) {
+        const saved = await Promise.all(
+          files.map(async (f) => {
+            try {
+              const { path } = await window.koda.saveScratchImage({
+                mediaType: f.mediaType,
+                dataBase64: f.dataBase64,
+                fileName: f.name,
+              })
+              return path
+            } catch {
+              return null
+            }
+          }),
+        )
+        const paths = saved.filter((p): p is string => p !== null)
+        if (paths.length) sentText = `${sentText}\n\n${attachedFilesNote(paths)}`
+      }
       await dispatchTurn(id, {
         sentText,
         images,
-        displayItem: { kind: 'user', text, images: images.length ? images : undefined },
+        displayItem: {
+          kind: 'user',
+          text,
+          images: images.length ? images : undefined,
+          files: files.length ? files.map((f) => f.name ?? 'file') : undefined,
+        },
         nameFromText: text,
       })
     },
@@ -1844,6 +1990,36 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         sentText,
         displayItem: { kind: 'canvas', docTitle: basename(path), instruction: instr },
       })
+    },
+
+    sendFaceTurn: async ({ text }) => {
+      const msg = text.trim()
+      if (!msg) return false
+      const { faceDir, miniApps } = get()
+      const app = faceDir ? miniApps.find((a) => a.dir === faceDir) : undefined
+      if (!app) return false
+      // The summon must always have somewhere to land — a faced project normally has sessions (it was
+      // built through them), but cover the archived-everything case by starting one.
+      if (!get().activeId) await get().startSession()
+      const { activeId, sessions } = get()
+      const id = activeId
+      if (!id || !sessions[id] || sessions[id].busy) return false
+      const rel =
+        app.dir.startsWith(app.projectPath + '/') ? app.dir.slice(app.projectPath.length + 1) : app.dir
+      // Grounding per mini-apps-plan.md: the turn says WHICH app the user is inside, where it lives,
+      // and the two intents (data vs build) — so "5x5 at 225" and "this chart is wrong" both resolve
+      // without the user explaining context. The transcript shows a compact ✦-prefixed line.
+      const sentText =
+        `I'm using the running "${app.name}" mini app (its code and data live in \`${rel}\`): ${msg}\n\n` +
+        `(Sent from the app's ask-or-fix line while looking at the app itself. If this is data to record, ` +
+        `write it through the app's own data contract — see its DATA.md and schema, never a side note. ` +
+        `If it reports a problem or asks for a change to the app, edit the app's code in \`${rel}\`. ` +
+        `My app view reloads automatically when your turn finishes.)`
+      await dispatchTurn(id, {
+        sentText,
+        displayItem: { kind: 'user', text: `✦ ${app.name} — ${msg}` },
+      })
+      return true
     },
 
     sendGuardrailAuthoring: async ({ kind, description }) => {
@@ -1956,6 +2132,19 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         nameFromText: "Tidy this project's memory",
       })
       return true
+    },
+
+    continueInFreshChat: () => {
+      const id = get().activeId
+      const active = id ? get().sessions[id] : undefined
+      if (!id || !active || active.busy) return
+      // Mark this session so its next TurnComplete carries the handoff into a fresh chat, then ask the
+      // agent for the summary. A subtle notice (not a user bubble) shows what's happening in the old chat.
+      handoffPending.add(id)
+      void dispatchTurn(id, {
+        sentText: HANDOFF_PROMPT,
+        displayItem: { kind: 'notice', text: 'Preparing a handoff to a fresh chat…' },
+      })
     },
 
     // Select a session AND clear its attention (the user has now seen it). Guard against a session
@@ -2153,6 +2342,20 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     setProjectPath: (projectPath) => set({ projectPath }),
 
     setIntakePending: (intakePending) => set({ intakePending }),
+
+    setPendingFaceDir: (pendingFaceDir) => set({ pendingFaceDir }),
+
+    refreshMiniApps: async () => {
+      try {
+        set({ miniApps: await window.koda.miniAppsList() })
+      } catch {
+        // the list is a convenience — a failed fetch just means no rail/toggle this round
+      }
+    },
+
+    openFace: (faceDir) => set({ faceDir, faceView: 'app' }),
+
+    setFaceView: (faceView) => set({ faceView }),
 
     maybeOfferIntake: async ({ hasSessions }) => {
       const path = get().projectPath
@@ -2583,8 +2786,8 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
 
     hydrate: (blob) => {
       const archived = blob.archived ?? []
-      // Advance the id/label counters past BOTH live AND archived sessions, so a later restore (or a
-      // new session) can never reissue an entry id or "Session N" label an archived session still holds.
+      // Advance the entry-id counter past BOTH live AND archived sessions, so a later restore (or a new
+      // entry) can never reissue an entry id that a not-yet-restored archive still holds.
       let maxEntryId = 0
       const scanItems = (items: Entry[]): void => {
         for (const it of items) {
@@ -2594,7 +2797,9 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         }
       }
       for (const s of blob.sessions) scanItems(s.items)
-      for (const a of archived) scanItems(a.items as Entry[])
+      // Archived metadata carries only its baked maxItemId (bodies aren't loaded on boot) — advance past
+      // it so a new entry can't reuse an id a not-yet-restored archive still holds.
+      for (const a of archived) if ((a.maxItemId ?? 0) > maxEntryId) maxEntryId = a.maxItemId ?? 0
       entryId = maxEntryId
       if (!blob.sessions.length) {
         set({ archived, hydrated: true, rateLimits: blob.rateLimits ?? {} })
@@ -2763,6 +2968,30 @@ function settleRestoredItem(it: Entry): Entry {
   if (it.kind === 'thinking' && it.active) return { ...it, active: false }
   if (it.kind === 'workflow' && it.status === 'running') return { ...it, status: 'completed' }
   return it
+}
+
+/** The last few readable turns, baked into archive metadata at archive time so Settings can preview the
+ *  chat without loading its (cold-stored) transcript body. Mirrors the main-side builder. */
+function buildArchivePreview(items: Entry[]): ArchivedPreviewTurn[] {
+  const turns: ArchivedPreviewTurn[] = []
+  for (const it of items) {
+    if (it.kind === 'user' && it.text?.trim()) turns.push({ kind: 'user', text: clipArchivePreview(it.text.trim()) })
+    else if (it.kind === 'assistant' && it.markdown?.trim())
+      turns.push({ kind: 'assistant', text: clipArchivePreview(it.markdown.trim()) })
+  }
+  return turns.slice(-6)
+}
+const clipArchivePreview = (s: string): string => (s.length > 500 ? s.slice(0, 500) : s)
+
+/** Highest entry (and subagent-child) id in a transcript — baked into metadata so boot can advance the
+ *  id counter past a not-yet-restored archive without loading its body. */
+function maxArchivedItemId(items: Entry[]): number {
+  let max = 0
+  for (const it of items) {
+    if (it.id > max) max = it.id
+    if (it.kind === 'subagent') for (const c of it.children) if (c.id > max) max = c.id
+  }
+  return max
 }
 
 /** Derived per-session status (one source per signal). */

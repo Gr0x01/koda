@@ -594,22 +594,43 @@ class CodexSession implements EngineSession {
   }
 
   /** Codex rate-limit snapshot → the status-bar windows. Maps the rolling primary/secondary windows
-   *  onto Koda's five_hour/weekly slots (the renderer keys on those). Codex reports an exact
-   *  `usedPercent` (the OpenAI account's real window fill) — pass it through as a measured fact and
-   *  derive the coarse band from it for the dot color. (Claude gives no percent, so its windows stay
-   *  band-only; the renderer shows a real bar only where `usedPercent` is present.) */
+   *  onto Koda's five_hour/weekly slots (the renderer keys on those). Codex's primary/secondary order
+   *  is NOT guaranteed short-then-long, so key each window onto its slot by its real duration (a day
+   *  cleanly splits the ~5h window from the weekly one); positional order is only the fallback when
+   *  the duration is absent. Codex reports an exact `usedPercent` (the OpenAI account's real window
+   *  fill) — pass it through as a measured fact and derive the coarse band from it for the dot color.
+   *  (Claude gives no percent, so its windows stay band-only; the renderer shows a real bar only where
+   *  `usedPercent` is present.) */
   private emitRateLimits(snap: CodexRateLimitSnapshot | undefined): void {
     if (!snap) return
+    // Ground-truth breadcrumb: a window once surfaced as "five hour" while resetting 5+ days out, and
+    // the mapped store can't show whether Codex sent a duration or the fallback guessed. One line per
+    // snapshot (they only arrive per turn) so the next mislabel is diagnosable from the log.
+    log.info('codex', 'rate-limit snapshot', snap)
     const band = (pct: number): string => (pct >= 100 ? 'rejected' : pct >= 80 ? 'warning' : 'allowed')
     const windows: Array<[string, CodexRateLimitWindow | null | undefined]> = [
       ['five_hour', snap.primary],
       ['weekly', snap.secondary],
     ]
-    for (const [type, w] of windows) {
+    for (const [fallbackType, w] of windows) {
       if (!w || w.resetsAt == null) continue
+      // Duration-keyed when Codex reports one. Without a duration, the positional guess is only trusted
+      // when the reset could plausibly belong to a 5-hour window — a window resetting >6h out cannot be
+      // one, so it files as 'weekly' (if both windows land there, newest-wins keeps the real weekly one:
+      // one truthful row beats two with a fabricated label).
+      const horizonMs = w.resetsAt * 1000 - Date.now()
+      const type =
+        w.windowDurationMins != null
+          ? w.windowDurationMins > 1440
+            ? 'weekly'
+            : 'five_hour'
+          : horizonMs > 6 * 3_600_000
+            ? 'weekly'
+            : fallbackType
       this.emit({
         type: 'RateLimitUpdate',
         sessionId: this.id,
+        engine: 'codex',
         info: { rateLimitType: type, resetsAt: w.resetsAt, status: band(w.usedPercent), usedPercent: w.usedPercent },
       })
     }
@@ -640,6 +661,7 @@ interface CodexUserInputQuestion {
 }
 interface CodexRateLimitWindow {
   usedPercent: number
+  windowDurationMins: number | null
   resetsAt: number | null
 }
 interface CodexRateLimitSnapshot {

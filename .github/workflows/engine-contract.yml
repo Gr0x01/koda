@@ -123,7 +123,8 @@ jobs:
           if [ -n "$(gh pr list --head "$BRANCH" --state open --json number -q '.[0].number')" ]; then
             echo "::notice::PR for $BRANCH already open — pushed the updated branch."
           else
-            gh pr create --base main --head "$BRANCH" \
+            # Assigned so the PR actually reaches a human — unassigned bot PRs sat unnoticed for days.
+            gh pr create --base main --head "$BRANCH" --assignee Gr0x01 \
               --title "chore(engine): bump bundled Claude CLI to $TARGET" \
               --body "Automated: the engine-contract smoke test passed against \`$TARGET\` (stable, linux-x64). This bumps the pinned version; \`npm run dist\` fetches + verifies the new binary. Re-bundle for the next release."
           fi
@@ -134,7 +135,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TARGET: ${{ steps.v.outputs.target }}
         run: |
-          gh issue create \
+          gh issue create --assignee Gr0x01 \
             --title "Engine contract FAILED on Claude CLI $TARGET" \
             --body "The stream-json contract smoke test failed for \`$TARGET\` (stable) — do NOT bump the bundled engine until it's resolved. Logs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             || true
@@ -164,8 +165,11 @@ jobs:
           # Pin policy: latest GitHub-releases `stable` (newest non-prerelease `rust-v*` tag), NOT prereleases.
           # The workflow_dispatch `version` input is Claude-only (different version scheme) — Codex always
           # resolves its own stable so a Claude version can't be mis-fed here.
+          # --paginate + --jq emits one result PER PAGE (multi-line broke the $GITHUB_OUTPUT write and
+          # failed this job daily) — filter the empty pages and take the newest across all of them.
           TAG=$(gh api repos/openai/codex/releases --paginate \
-            --jq 'map(select(.prerelease==false and (.tag_name|startswith("rust-v")))) | first | .tag_name')
+            --jq 'map(select(.prerelease==false and (.tag_name|startswith("rust-v")))) | first | select(. != null) | .tag_name' \
+            | head -n1)
           TARGET="${TAG#rust-v}"
           echo "pinned=$PINNED" >> "$GITHUB_OUTPUT"
           echo "target=$TARGET" >> "$GITHUB_OUTPUT"
@@ -209,7 +213,7 @@ jobs:
           if [ -n "$(gh pr list --head "$BRANCH" --state open --json number -q '.[0].number')" ]; then
             echo "::notice::PR for $BRANCH already open — pushed the updated branch."
           else
-            gh pr create --base main --head "$BRANCH" \
+            gh pr create --base main --head "$BRANCH" --assignee Gr0x01 \
               --title "chore(engine): bump bundled Codex CLI to $TARGET" \
               --body "Automated: the codex app-server contract smoke test passed against \`$TARGET\` (stable, linux-musl). This bumps the pinned version + the darwin-arm64 tarball SHA; \`npm run fetch-engine\` fetches + verifies the new binary. Re-bundle for the next release."
           fi
@@ -220,7 +224,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TARGET: ${{ steps.v.outputs.target }}
         run: |
-          gh issue create \
+          gh issue create --assignee Gr0x01 \
             --title "Engine contract FAILED on Codex CLI $TARGET" \
             --body "The codex app-server contract smoke test failed for \`$TARGET\` (stable) — do NOT bump the bundled Codex engine until it's resolved. Logs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             || true

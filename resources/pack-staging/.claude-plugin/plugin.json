@@ -1,0 +1,7 @@
+{
+  "name": "koda-staging",
+  "description": "Koda behavior-layer skills that are built but not yet shipped — gated behind a dogfood flag (see loadMiniAppsEnabled) and wired as a second --plugin-dir only when that flag is on. Graduates into the main `koda` pack when the feature ships.",
+  "version": "0.0.1",
+  "author": { "name": "Koda" },
+  "license": "MIT"
+}

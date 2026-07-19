@@ -49,6 +49,8 @@ describe('docs snapshot', () => {
     try {
       const snap = await buildDocsSnapshot(dir)
       expect(snap).not.toBeNull()
+      // The live project path rides inside the sealed snapshot so the phone can open a doc for live editing.
+      expect(snap!.projectPath).toBe(dir)
       const rels = snap!.files.map((f) => f.rel).sort()
       expect(rels).toEqual(['.koda/memory/MEMORY.md', 'Documents/notes.md', 'Documents/plans/roadmap.md'])
       expect(snap!.skipped).toEqual([])

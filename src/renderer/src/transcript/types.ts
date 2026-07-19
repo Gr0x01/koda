@@ -9,7 +9,15 @@ import type { WorkflowItemData } from './WorkflowCard'
  * component re-exports these for back-compat with existing `from './Transcript'` import sites.
  */
 export type TurnItem =
-  | { kind: 'user'; text: string; images?: { mediaType: string; dataBase64: string }[] }
+  | {
+      kind: 'user'
+      text: string
+      /** Staged attachments. On the phone, document files (csv/pdf) ride here too, marked by a
+       *  non-`image/*` mediaType + their original `name` (the desktop uses `files` instead). */
+      images?: { mediaType: string; dataBase64: string; name?: string }[]
+      /** Names of attached document files (csv/pdf) — bytes live in `.koda/scratch/`, not the transcript. */
+      files?: string[]
+    }
   | { kind: 'assistant'; markdown: string }
   | { kind: 'tool'; toolUseId: string; name: string; input: unknown; result?: string; isError?: boolean }
   | { kind: 'notice'; text: string }

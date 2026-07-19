@@ -192,6 +192,27 @@ html[data-text-size='comfortable'] {
   50% { opacity: 1; }
 }
 .koda-pixel-twinkle { animation: koda-pixel-twinkle 1.6s ease-in-out infinite backwards; }
+/* Loader (diamond pulse): the diamond's cells share ONE keyframe on delays set by their ring distance
+   from center (see PixelGlyph.pulseDelay), so brightness radiates out from the core in concentric
+   diamond rings and holds the lit peak a beat before releasing — a "thinking" heartbeat, not a
+   scattered shimmer. `backwards` holds the dim 0% frame through each ring's start delay. */
+@keyframes koda-pixel-pulse {
+  0% { opacity: 0.1; }
+  16% { opacity: 1; }
+  34% { opacity: 1; }
+  70% { opacity: 0.1; }
+  100% { opacity: 0.1; }
+}
+.koda-pixel-pulse { animation: koda-pixel-pulse 1.7s ease-in-out infinite backwards; }
+/* Loader (snake): perimeter cells share one keyframe on staggered negative delays (spread around the
+   ring in PixelGlyph), so at any instant a short band is lit — a bright head fading to a tail — that
+   marches around the border. The generic "loading" motion, distinct from the twinkle's in-place think. */
+@keyframes koda-pixel-snake {
+  0% { opacity: 1; }
+  30% { opacity: 0; }
+  100% { opacity: 0; }
+}
+.koda-pixel-snake { animation: koda-pixel-snake 1.6s linear infinite backwards; }
 
 /* Hide the scrollbar but keep the element scrollable (wheel/trackpad/drag). For the dock tab strip,
    where a chunky horizontal bar is noisy and the edge fade already signals "more, scroll this way". */

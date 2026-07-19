@@ -24,6 +24,11 @@ extraResources:
   # Lands at <App>.app/Contents/Resources/pack; resolved by src/main/engine/pack.ts.
   - from: resources/pack
     to: pack
+  # Built-but-unshipped skills (create-mini-app): a separate plugin wired only when the mini-apps
+  # dogfood flag is on (loadMiniAppsEnabled). Ships in Resources but stays dark in normal releases;
+  # resolved by resolveStagingPack in pack.ts. Graduates into `pack` above when the feature ships.
+  - from: resources/pack-staging
+    to: pack-staging
   # Codex-only skills — supplements the pack skills for the Codex engine (e.g. code-review, which on
   # Claude is a subagent, not a skill). Materialized into the isolated Codex home by codex-home.ts.
   - from: resources/codex-skills

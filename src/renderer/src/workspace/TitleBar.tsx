@@ -1,6 +1,5 @@
-import { AnimatePresence, motion, spring, duration, ease } from '../motion'
-import { useTheme } from '../theme'
 import { RemoteMenu } from './RemoteMenu'
+import { Segmented } from '../ui'
 import { useWorkspace } from './store'
 
 // ── Title bar ────────────────────────────────────────────────────────────────────
@@ -30,83 +29,47 @@ export function TitleBar() {
       </div>
       <div className="flex-1" />
       {/* Pinned absolute (not in the flex flow) so the title stays truly centered regardless of the
-          switch width. inset-y-0 + flex centers it over the full bar height — no half-pixel translate
-          rounding. app-no-drag so the button is clickable inside the draggable strip. */}
+          cluster width. inset-y-0 + flex centers it over the full bar height — no half-pixel translate
+          rounding. app-no-drag so the controls are clickable inside the draggable strip. Kept to two
+          tenants (the face flip + Remote) — the theme quick-toggle moved to the status bar so this
+          strip stays calm. */}
       <div className="app-no-drag absolute inset-y-0 right-3 flex items-center gap-2.5">
+        <FaceToggle />
         <RemoteMenu />
-        <ThemeSwitch />
       </div>
     </div>
   )
 }
 
-// ── Theme switch ───────────────────────────────────────────────────────────────────
-// Twin-icon track (sun + moon sit faded in the rail) with a sliding ink disc that "selects" the active
-// mode; the disc carries the active icon, which rotates in as it crosses. Slide uses the snappy spring so
-// a click-mid-animation reverses smoothly; icon swap is a quick rotate-fade. Reduced-motion is honored
-// globally (MotionConfig at the app root) — the spring collapses to instant there.
-function ThemeSwitch() {
-  const { theme, toggle } = useTheme()
-  const isDark = theme === 'dark'
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={isDark}
-      aria-label="Toggle light or dark theme"
-      title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
-      onClick={toggle}
-      className="relative h-[23px] w-[43px] rounded-full bg-border transition-colors"
-    >
-      <span className="pointer-events-none absolute inset-y-0 left-[5px] flex items-center text-text-muted/70">
-        <SunIcon />
-      </span>
-      <span className="pointer-events-none absolute inset-y-0 right-[5px] flex items-center text-text-muted/70">
-        <MoonIcon />
-      </span>
-      <motion.span
-        animate={{ x: isDark ? 20 : 0 }}
-        transition={spring.snappy}
-        className="absolute left-[1.5px] top-[1.5px] z-[1] flex h-5 w-5 items-center justify-center rounded-full bg-surface text-accent shadow-sm"
-      >
-        <AnimatePresence mode="wait" initial={false}>
-          <motion.span
-            key={isDark ? 'moon' : 'sun'}
-            initial={{ rotate: -90, opacity: 0, scale: 0.4 }}
-            animate={{ rotate: 0, opacity: 1, scale: 1 }}
-            exit={{ rotate: 90, opacity: 0, scale: 0.4 }}
-            transition={{ duration: duration.fast, ease: ease.out }}
-            className="flex items-center justify-center"
-          >
-            {isDark ? <MoonIcon /> : <SunIcon />}
-          </motion.span>
-        </AnimatePresence>
-      </motion.span>
-    </button>
+// ── App | Workshop ───────────────────────────────────────────────────────────────
+// The figure-ground flip for a faced project (mini-apps-plan.md "Desktop FACE model"): App = the
+// running mini app full-bleed; Workshop = the normal Koda chassis behind it. Only rendered when this
+// window's project has a registered app — for everyone else the title bar is unchanged (and the
+// mini-apps flag being off means the list is always empty, so this never shows).
+function FaceToggle() {
+  const hasApp = useWorkspace((s) => s.miniApps.some((a) => a.projectPath === s.projectPath))
+  const firstAppDir = useWorkspace(
+    (s) => s.miniApps.find((a) => a.projectPath === s.projectPath)?.dir,
   )
-}
-
-function SunIcon() {
+  const faceView = useWorkspace((s) => s.faceView)
+  const faceDir = useWorkspace((s) => s.faceDir)
+  const openFace = useWorkspace((s) => s.openFace)
+  const setFaceView = useWorkspace((s) => s.setFaceView)
+  if (!hasApp) return null
+  const onApp = faceView === 'app' && !!faceDir
   return (
-    <svg
-      width="10"
-      height="10"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={2.2}
-      strokeLinecap="round"
-    >
-      <circle cx="12" cy="12" r="4.2" />
-      <path d="M12 2.5v2.2M12 19.3v2.2M4.6 4.6l1.6 1.6M17.8 17.8l1.6 1.6M2.5 12h2.2M19.3 12h2.2M4.6 19.4l1.6-1.6M17.8 6.2l1.6-1.6" />
-    </svg>
-  )
-}
-
-function MoonIcon() {
-  return (
-    <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
-      <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" />
-    </svg>
+    <Segmented
+      aria-label="App or workshop"
+      options={[
+        { value: 'app', label: 'App', title: 'The running app (⌘\\)' },
+        { value: 'workshop', label: 'Workshop', title: 'The full workspace behind it (⌘\\)' },
+      ]}
+      value={onApp ? 'app' : 'workshop'}
+      onChange={(v) => {
+        if (v === 'workshop') setFaceView('workshop')
+        else if (faceDir) setFaceView('app')
+        else if (firstAppDir) openFace(firstAppDir)
+      }}
+    />
   )
 }

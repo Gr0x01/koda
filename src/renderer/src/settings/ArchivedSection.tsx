@@ -1,11 +1,20 @@
-import { useMemo, useState } from 'react'
-import type { ArchivedSession } from '@shared/ipc'
-import type { Entry } from '../transcript/types'
+import { useEffect, useState } from 'react'
+import type { ArchivedSessionMeta } from '@shared/ipc'
 import { useWorkspace } from '../workspace/store'
 import { Button } from '../ui'
-import { SettingsSection } from './controls'
+import { SegmentedControl, SettingsRow, SettingsSection } from './controls'
 import { IconTrash } from './icons'
 import { Caret } from '../Caret'
+
+// How long an archived chat is kept before it's auto-deleted. Default 'Forever' (value 0): archives live
+// outside the undo history, so a purge can't be undone — the safe default never deletes, and short
+// windows are opt-in for people who don't want old chats piling up.
+const RETENTION_OPTIONS: { value: string; label: string; title: string }[] = [
+  { value: '0', label: 'Forever', title: "Never auto-deleted. You'll manage them yourself." },
+  { value: '7', label: '7 days', title: 'Delete archived chats after a week' },
+  { value: '30', label: '30 days', title: 'Delete archived chats after a month' },
+  { value: '90', label: '90 days', title: 'Delete archived chats after three months' },
+]
 
 // The retrieval surface for sessions archived from the kebab. Archiving is non-destructive (the whole
 // conversation is kept), so this is where it comes back from — restore reopens it as a live tab
@@ -13,15 +22,38 @@ import { Caret } from '../Caret'
 //
 // A row expands to preview the tail of the conversation (the last few turns) — just enough to recognize
 // which chat this was before restoring it. That's all an archived chat needs; "what files it changed" is
-// Recovery's job, not this. The transcript is already stored in the archive blob, so the preview is free.
+// Recovery's job, not this. The preview is baked into the archive metadata, so the list never loads the
+// (cold-stored) transcript body — only Restore does.
 export function ArchivedSection() {
   const archived = useWorkspace((s) => s.archived)
   const restoreArchived = useWorkspace((s) => s.restoreArchived)
   const deleteArchived = useWorkspace((s) => s.deleteArchived)
   const setSettingsOpen = useWorkspace((s) => s.setSettingsOpen)
 
+  const [retentionDays, setRetentionDays] = useState<number | null>(null)
+  useEffect(() => {
+    window.koda.getSettings().then((s) => setRetentionDays(s.archiveRetentionDays)).catch(console.error)
+  }, [])
+  const changeRetention = (next: string): void => {
+    const days = Number(next)
+    setRetentionDays(days)
+    window.koda.updateSettings({ archiveRetentionDays: days }).catch(console.error) // applied on next load
+  }
+
   return (
     <SettingsSection title="Archived sessions">
+      <SettingsRow
+        label="Delete old archived chats"
+        description="Archived chats are kept forever by default. Set a limit and Koda deletes ones older than that. Archived chats are not in the undo history, so deleting them is permanent."
+        control={
+          <SegmentedControl
+            ariaLabel="Delete old archived chats"
+            value={String(retentionDays ?? 0)}
+            options={RETENTION_OPTIONS}
+            onChange={changeRetention}
+          />
+        }
+      />
       {archived.length === 0 ? (
         <div className="px-4 py-4 text-[12.5px] leading-snug text-text-muted">
           Sessions you archive land here. Nothing is deleted. Restore one any time to pick up where you
@@ -33,7 +65,7 @@ export function ArchivedSection() {
             key={a.id}
             session={a}
             onRestore={() => {
-              restoreArchived(a.id)
+              void restoreArchived(a.id)
               setSettingsOpen(false) // jump back to the now-open session
             }}
             onDelete={() => deleteArchived(a.id)}
@@ -49,13 +81,13 @@ function ArchivedRow({
   onRestore,
   onDelete,
 }: {
-  session: ArchivedSession
+  session: ArchivedSessionMeta
   onRestore: () => void
   onDelete: () => void
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [open, setOpen] = useState(false)
-  const preview = useMemo(() => previewTurns(session.items), [session.items])
+  const preview = session.preview ?? []
 
   return (
     <div className="px-4 py-3">
@@ -129,19 +161,6 @@ function ArchivedRow({
       )}
     </div>
   )
-}
-
-/** The last few readable turns (user prompts + assistant replies) from a stored transcript — enough to
- *  recognize the chat. Tool/thinking/workflow plumbing is skipped; `items` is opaque to main so it's
- *  cast to the renderer's Entry model here. */
-function previewTurns(items: unknown[]): { kind: 'user' | 'assistant'; text: string }[] {
-  const turns: { kind: 'user' | 'assistant'; text: string }[] = []
-  for (const it of items as Entry[]) {
-    if (it?.kind === 'user' && it.text?.trim()) turns.push({ kind: 'user', text: it.text.trim() })
-    else if (it?.kind === 'assistant' && it.markdown?.trim())
-      turns.push({ kind: 'assistant', text: it.markdown.trim() })
-  }
-  return turns.slice(-6) // just the tail
 }
 
 /** Last path segment of the project dir, for a compact "where this ran" line. */

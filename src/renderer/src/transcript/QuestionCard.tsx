@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useWorkspace } from '../workspace/store'
+import { AnsweredQuestions, parseAnsweredResult, parseQuestions, type Answered } from './AnsweredQuestions'
 
 /**
  * The engine's AskUserQuestion tool, rendered Cursor-style: numbered options, one question at a time
@@ -7,30 +8,20 @@ import { useWorkspace } from '../workspace/store'
  * its pending approval is resolved with the user's picks as the tool's `answers` input (question text
  * → chosen label, multi-select joined), which the engine reads to produce the result. Skip is
  * PER-QUESTION — a skipped question is omitted from `answers`, so the engine records it as "(no option
- * selected)" and uses its judgment. Once submitted, the card locks to the result.
+ * selected)" and uses its judgment. Once answered, the card locks to the read-only AnsweredQuestions
+ * summary — driven off the persisted result too, so it survives a re-render/reload, not just local state.
  */
-type Option = { label: string; description?: string }
-type Question = { question: string; header?: string; options: Option[]; multiSelect?: boolean }
-
-function parseQuestions(input: unknown): Question[] {
-  const qs = (input as { questions?: unknown } | null)?.questions
-  if (!Array.isArray(qs)) return []
-  return qs
-    .map((q): Question | null => {
-      if (!q || typeof q.question !== 'string' || !Array.isArray(q.options)) return null
-      const options = q.options
-        .map((o: unknown) =>
-          o && typeof (o as Option).label === 'string'
-            ? { label: (o as Option).label, description: (o as Option).description }
-            : null,
-        )
-        .filter((o: Option | null): o is Option => o !== null)
-      return { question: q.question, header: q.header, options, multiSelect: q.multiSelect === true }
-    })
-    .filter((q): q is Question => q !== null && q.options.length > 0)
-}
-
-export function QuestionCard({ toolUseId, input }: { toolUseId: string; input: unknown }) {
+export function QuestionCard({
+  toolUseId,
+  input,
+  result,
+  isError,
+}: {
+  toolUseId: string
+  input: unknown
+  result?: string
+  isError?: boolean
+}) {
   const answerQuestion = useWorkspace((s) => s.answerQuestion)
   const dismissQuestion = useWorkspace((s) => s.dismissQuestion)
   const questions = parseQuestions(input)
@@ -41,12 +32,18 @@ export function QuestionCard({ toolUseId, input }: { toolUseId: string; input: u
   const [replied, setReplied] = useState(false)
   const cardRef = useRef<HTMLDivElement>(null)
 
+  // Answered state persisted in the tool result survives a re-render/reload where local state is gone;
+  // local `submitted`/`replied` cover the gap between the click and the result arriving from the engine.
+  const persisted = parseAnsweredResult(questions, result, isError)
+  const isReplied = replied || persisted?.replied === true
+  const isAnswered = submitted || !!persisted
+
   // Take focus when the card appears so keyboard picks work without a click first. preventScroll: the
   // default focus() scrolls the card into view, which on a session switch overrides the tail-snap and
   // strands the reader on the question instead of the newest message.
   useEffect(() => {
-    if (!submitted) cardRef.current?.focus({ preventScroll: true })
-  }, [submitted])
+    if (!isAnswered) cardRef.current?.focus({ preventScroll: true })
+  }, [isAnswered])
 
   if (questions.length === 0) return null
 
@@ -124,26 +121,21 @@ export function QuestionCard({ toolUseId, input }: { toolUseId: string; input: u
     }
   }
 
-  if (replied) {
-    return (
-      <div className="my-1 rounded-2xl border border-border bg-surface px-5 py-3 text-sm text-text-muted">
-        Replying in your own words below.
-      </div>
-    )
-  }
+  if (isReplied) return <AnsweredQuestions questions={questions} answered={{ replied: true }} />
 
-  if (submitted) {
-    return (
-      <div className="my-1 rounded-2xl border border-border bg-surface px-5 py-3 text-sm">
-        <div className="mb-1 text-[11px] uppercase tracking-wider text-text-muted">Your answer</div>
-        {questions.map((qq, i) => (
-          <div key={i} className="text-text">
-            <span className="text-text-muted">{qq.question} </span>
-            <span className="font-medium">{sel[i].length > 0 ? sel[i].join(', ') : 'Skipped'}</span>
-          </div>
-        ))}
-      </div>
-    )
+  if (isAnswered) {
+    // Prefer the live local picks (accurate the instant you submit, before the result echoes back);
+    // fall back to the answers parsed from the persisted result on a fresh render/reload. (isReplied
+    // returned above, so persisted here is never a reply.)
+    const answered: Answered = submitted
+      ? {
+          replied: false,
+          answers: Object.fromEntries(
+            questions.flatMap((qq, i) => (sel[i].length > 0 ? [[qq.question, sel[i].join(', ')]] : [])),
+          ),
+        }
+      : (persisted ?? { replied: false, answers: {} })
+    return <AnsweredQuestions questions={questions} answered={answered} />
   }
 
   const multiQ = questions.length > 1

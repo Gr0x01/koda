@@ -1,0 +1,4 @@
+interface:
+  display_name: "App Data Layer"
+  short_description: "Design a mini app's SQLite schema, migrations, and data contract"
+  default_prompt: "Design or evolve this app's data layer following the app-data contract."

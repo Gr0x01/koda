@@ -120,7 +120,7 @@ export function ModelControl({
       >
         {/* ── Claude ── */}
         <Divider label="Claude" />
-        <Row label="Default" hint="engine picks" active={engineId === 'claude' && !model} disabled={claudeLocked} onClick={() => chooseClaude(undefined)} />
+        <Row label="Default" hint={engineId === 'claude' && !model && activeModel ? `engine picks · now ${prettyModel(activeModel)}` : 'engine picks'} active={engineId === 'claude' && !model} disabled={claudeLocked} onClick={() => chooseClaude(undefined)} />
         {QUICK_ALIASES.map((a) => (
           <Row key={a.id} label={a.label} active={engineId === 'claude' && model === a.id} disabled={claudeLocked} onClick={() => chooseClaude(a.id)} />
         ))}
@@ -169,7 +169,7 @@ export function ModelControl({
           </div>
         ) : (
           <>
-            <Row label="Default" hint="engine picks" active={engineId === 'codex' && !model} disabled={codexLocked} onClick={() => chooseCodex(undefined)} />
+            <Row label="Default" hint={engineId === 'codex' && !model && activeModel ? `engine picks · now ${prettyModel(activeModel)}` : 'engine picks'} active={engineId === 'codex' && !model} disabled={codexLocked} onClick={() => chooseCodex(undefined)} />
             {codexModels.map((m) => (
               <Row key={m.id} label={m.label} active={engineId === 'codex' && model === m.id} disabled={codexLocked} onClick={() => chooseCodex(m.id)} />
             ))}

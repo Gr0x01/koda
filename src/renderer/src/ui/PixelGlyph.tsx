@@ -45,9 +45,48 @@ const GLYPHS = {
 export type GlyphName = keyof typeof GLYPHS
 
 /**
+ * The loader has three motions, each carrying a distinct meaning across the SAME grid:
+ *   - `twinkle` — the original full-grid shimmer (generic, kept as the default).
+ *   - `diamond` — "the agent is reasoning": a block the whole grid rotates 45° into (so it reads as a
+ *     sharp-tipped diamond) whose cells pulse from the center outward in concentric diamond rings — a
+ *     thinking heartbeat. When the turn resolves the grid spins back upright (0°) while the cells
+ *     cross-fade into the settled glyph — a spin-and-morph, not a cut.
+ *   - `snake`   — a short lit segment chases the perimeter with a fading tail: generic "loading".
+ * (A radar-pulse variant — rings breathing outward — is still kept in our pocket for later.)
+ */
+export type LoaderVariant = 'twinkle' | 'diamond' | 'snake'
+
+// The diamond is drawn UPRIGHT as a centred square block, then the whole grid is rotated 45° (see the
+// container transform) so it becomes a diamond with sharp single-cell tips an even grid can't draw
+// axis-aligned. A 4×4 block keeps it inset so the rotated diamond stays within the icon's footprint.
+const DIAMOND_BLOCK = ['......', '.####.', '.####.', '.####.', '.####.', '......']
+function inDiamond(r: number, c: number): boolean {
+  return DIAMOND_BLOCK[r][c] === '#'
+}
+
+// Pulse animation-delay (s) for a diamond cell: proportional to its Manhattan distance from the grid
+// center (2.5, 2.5). Once the grid is rotated 45°, equal-distance cells form concentric diamond rings
+// — center 4 (dist 1.0), edge cells (2.0), corner tips (3.0) — so brightness radiates out ring by ring.
+function pulseDelay(r: number, c: number): number {
+  const dist = Math.abs(r - 2.5) + Math.abs(c - 2.5)
+  return (dist - 1.0) * 0.13
+}
+
+// Clockwise perimeter path — the ordered ring of border cells the snake's lit band marches along.
+const SNAKE_PATH: Array<[number, number]> = []
+for (let c = 0; c < N; c++) SNAKE_PATH.push([0, c])
+for (let r = 1; r < N; r++) SNAKE_PATH.push([r, N - 1])
+for (let c = N - 2; c >= 0; c--) SNAKE_PATH.push([N - 1, c])
+for (let r = N - 2; r >= 1; r--) SNAKE_PATH.push([r, 0])
+const SNAKE_LEN = SNAKE_PATH.length
+// Perimeter index of a cell, or -1 for the (dark) interior.
+function snakePos(r: number, c: number): number {
+  return SNAKE_PATH.findIndex(([pr, pc]) => pr === r && pc === c)
+}
+
+/**
  * Twinkle loader: cells across the full grid softly flicker on fixed, scattered phases — an organic
  * "thinking" shimmer rather than a marching ring. Some cells stay dark so it reads sparse, not solid.
- * (A radar-pulse variant — rings breathing outward — is kept in our pocket for later.)
  */
 // phases are animation-delays in seconds; the 1.6s cycle itself lives in the CSS keyframe.
 const TWINKLE_DARK = 1.1 // a phase above this leaves the cell unlit, for sparseness
@@ -70,12 +109,15 @@ function twinkleDelay(r: number, c: number): number | null {
 export function PixelGlyph({
   glyph = 'check',
   loader = false,
+  variant = 'twinkle',
   size = 13,
   label,
   className = '',
 }: {
   glyph?: GlyphName
   loader?: boolean
+  /** Which loading motion to draw (only meaningful while `loader`). See {@link LoaderVariant}. */
+  variant?: LoaderVariant
   /** Rendered box in px (square). Drawn a little smaller than its slot on purpose. */
   size?: number
   label?: string
@@ -89,6 +131,10 @@ export function PixelGlyph({
   const gap = Math.max(1, Math.round(Math.max(0.5, size * 0.045) * dpr)) / dpr
   const cell = Math.max(1, Math.round(((size - gap * (N - 1)) / N) * dpr)) / dpr
   const box = cell * N + gap * (N - 1)
+  // Diamond mode rotates the whole grid: 45° while the shimmer runs, spinning back upright as it
+  // settles into the glyph. The transition lives only on this mode so other glyphs never animate transform.
+  const isDiamond = variant === 'diamond'
+  const rotate = loader && isDiamond
   return (
     <div
       role={label ? 'img' : undefined}
@@ -101,15 +147,45 @@ export function PixelGlyph({
         gridTemplateColumns: `repeat(${N}, ${cell}px)`,
         gridAutoRows: `${cell}px`,
         gap,
+        transform: isDiamond ? `rotate(${rotate ? 45 : 0}deg)` : undefined,
+        transition: isDiamond ? 'transform 460ms cubic-bezier(0.2, 0.75, 0.2, 1)' : undefined,
       }}
     >
       {Array.from({ length: N * N }, (_, idx) => {
         const r = Math.floor(idx / N)
         const c = idx % N
         // Every cell is always a `bg-current` square whose BASE opacity is its glyph target (lit 1 /
-        // dark 0). While loading it sits at 0 with a twinkle overlay on top; removing the overlay lets
-        // each cell transition (koda-pixel-cell) to its target — the twinkle *settles into* the glyph
+        // dark 0). While loading it sits at 0 with a motion overlay on top; removing the overlay lets
+        // each cell transition (koda-pixel-cell) to its target — the loader *settles into* the glyph
         // (forming cells lock to solid, the rest fade out) rather than cutting.
+        if (loader && variant === 'snake') {
+          // Perimeter cells march a lit band; interior stays dark. A negative per-cell delay spread
+          // around the ring makes the band chase (see .koda-pixel-snake).
+          const pos = snakePos(r, c)
+          if (pos === -1) return <span key={idx} className="koda-pixel-cell bg-current" style={{ opacity: 0 }} />
+          return (
+            <span
+              key={idx}
+              className="koda-pixel-cell koda-pixel-snake bg-current"
+              style={{ opacity: 0, animationDelay: `${-(pos / SNAKE_LEN) * 1.6}s` }}
+            />
+          )
+        }
+        // Diamond (agent thinking): a pulse that radiates out from the center. Every diamond cell shares
+        // ONE keyframe on a delay set by its ring distance (pulseDelay), so brightness blooms from the
+        // core outward in concentric diamond rings and holds a beat — a thinking heartbeat. The rest stay
+        // dark; culling cells would break the silhouette into a lopsided blob.
+        if (loader && variant === 'diamond') {
+          if (!inDiamond(r, c)) return <span key={idx} className="koda-pixel-cell bg-current" style={{ opacity: 0 }} />
+          return (
+            <span
+              key={idx}
+              className="koda-pixel-cell koda-pixel-pulse bg-current"
+              style={{ opacity: 0, animationDelay: `${pulseDelay(r, c)}s` }}
+            />
+          )
+        }
+        // full-grid twinkle: scattered cells shimmer, the rest stay dark for organic sparseness.
         const twinkle = loader ? twinkleDelay(r, c) : null
         if (twinkle !== null) {
           return (
@@ -121,7 +197,15 @@ export function PixelGlyph({
           )
         }
         const opacity = loader ? 0 : rows[r][c] === '#' ? 1 : 0
-        return <span key={idx} className="koda-pixel-cell bg-current" style={{ opacity }} />
+        // Diagonal stagger so a settled glyph wipes in top-left → bottom-right rather than all at once.
+        // Only visible when opacity actually changes (the settle); a static idle render mounts at target.
+        return (
+          <span
+            key={idx}
+            className="koda-pixel-cell bg-current"
+            style={{ opacity, transitionDelay: loader ? undefined : `${(r + c) * 22}ms` }}
+          />
+        )
       })}
     </div>
   )
@@ -135,16 +219,19 @@ export function PixelGlyph({
 export function BusyText({
   children,
   size = 12,
+  variant = 'snake',
   className = '',
 }: {
   children: ReactNode
   /** Glyph box in px. 12 suits 13px UI text; 11 is the floor for smaller inline text. */
   size?: number
+  /** Inline busy states are generic "loading", so the snake is the default; pass `diamond` for agent thinking. */
+  variant?: LoaderVariant
   className?: string
 }) {
   return (
     <span className={`inline-flex items-center gap-1.5 ${className}`}>
-      <PixelGlyph loader size={size} />
+      <PixelGlyph loader variant={variant} size={size} />
       {children}
     </span>
   )

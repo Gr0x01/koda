@@ -33,6 +33,11 @@ export const IpcChannels = {
   // boot; save = send, fired only when the archived list actually changes (archive/restore/delete).
   archivedLoad: 'sessions:archivedLoad',
   archivedSave: 'sessions:archivedSave',
+  // Transcript bodies live one-file-per-archive (split out of the metadata index above), fetched only
+  // on restore so the list never loads bodies it isn't showing. body = invoke (load/write/delete).
+  archivedLoadBody: 'sessions:archivedLoadBody',
+  archivedWriteBody: 'sessions:archivedWriteBody',
+  archivedDeleteBody: 'sessions:archivedDeleteBody',
   // Desktop adoption of phone-started sessions — a session the phone launched runs windowless on the
   // Mac (invisible to the desktop otherwise). adoptHeadless = invoke (this window claims its project's
   // live headless sessions + gets their replayable history); headlessAppeared = main→renderer push (a
@@ -148,6 +153,20 @@ export const IpcChannels = {
   projectHasGuidelines: 'project:hasGuidelines',
   projectOpen: 'project:open',
   projectGetRecents: 'project:getRecents',
+  // Native File menu → focused project renderer. File creation/import already lives in the
+  // renderer store, so the menu asks that one source of truth to perform the action.
+  uiFileCommand: 'ui:fileCommand',
+  // Delete a project from the home screen: stops + deregisters its mini apps, moves the folder to
+  // the Trash (recoverable, never rm), and drops it from recents. Main validates the path came from
+  // the recents/apps lists and refuses while the project is open in a window.
+  projectDelete: 'project:delete',
+  // Mini apps (the face — seam ③): the launcher rail lists registered apps; the face view starts one
+  // and embeds its served URL. Both flag-gated in main (loadMiniAppsEnabled). See mini-apps.ts.
+  miniAppsList: 'miniApps:list',
+  miniAppsStart: 'miniApps:start',
+  // main→renderer push (no payload): the registry or an app's run state changed — the agent installed,
+  // started, or stopped one mid-session. Windows re-fetch the list so the rail/toggle/face appear live.
+  miniAppsChanged: 'miniApps:changed',
   // Approval gate — the permission broker's "Ask me" round-trip. A request pushes
   // main→renderer; the user's decision + the mode setting flow renderer→main.
   approvalRequest: 'approval:request',
@@ -207,6 +226,9 @@ export const IpcChannels = {
   previewCaptureResponse: 'preview:captureResponse',
   // Persist a pasted/dropped image to the project's scratch folder; returns its relative path. See scratch.ts.
   scratchSave: 'scratch:save',
+  // Composer attach menu: pick files to attach (native dialog, bytes returned) or a path to reference in-place.
+  composerPickFiles: 'composer:pickFiles',
+  composerPickPath: 'composer:pickPath',
   // List the project's recent scratch images (newest first) for the Recent images strip. See scratch.ts.
   scratchList: 'scratch:list',
   // Read/write a doc's presentation sidecar (table column widths, …) under `.koda/docmeta/`. The doc
@@ -315,11 +337,13 @@ export const IpcChannels = {
   // Cloud-relay feature flag (LAN-only first release) — invoke, returns whether the from-anywhere
   // tier is enabled on this Mac; the renderer hides every cloud surface when it's off. See settings.ts.
   remoteCloudEnabled: 'remote:cloudEnabled',
-  // Provider-outage watch — providerStatus = main→renderer push (an engine's provider entered/left a
-  // feed-confirmed outage → the status-bar pill); providerStatusGet = invoke (seed a window that opens
-  // mid-outage). See engine/status-watch.ts.
+  // Provider-health watch — providerStatus = main→renderer push (an engine's provider entered/left a
+  // feed-confirmed incident → the engine chip's health dot); providerStatusGet = invoke (seed a window
+  // that opens mid-incident); providerStatusRefresh = invoke (on-arrival check when a window gains focus,
+  // so the chip is truthful the moment you sit down). See engine/status-watch.ts.
   providerStatus: 'status:provider',
   providerStatusGet: 'status:providerGet',
+  providerStatusRefresh: 'status:providerRefresh',
   // App self-update (releases-and-updates.md) — getState = invoke (seed a window with the current
   // update status); checkNow = invoke (manual "Check for updates"); quitAndInstall = invoke (restart
   // into a downloaded update). status = main→renderer push (checking/downloading/ready/up-to-date/

@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
-import type { AppInfo, EngineProbe, RateLimitInfo } from '@shared/ipc'
-import { Menu } from '../motion'
+import type { AppInfo, EngineProbe, ProviderKind, RateLimitInfo } from '@shared/ipc'
+import { AnimatePresence, Menu, motion, spring, duration, ease } from '../motion'
+import { useTheme } from '../theme'
 import { SegmentBar } from './ContextMeter'
-import { engineShort, engineOrder, engineAccent } from './models'
+import { engineShort, engineOrder } from './models'
 import { useWorkspace } from './store'
 import { Button } from '../ui'
 
@@ -53,16 +54,34 @@ export function StatusBar() {
     return () => clearInterval(t)
   }, [refreshMemoryWeight])
 
+  // Truthful-on-arrival provider health: one status check when the footer mounts and whenever the window
+  // regains focus (you sitting back down) — NOT a background monitor. Lives here (always mounted) so it
+  // runs in API-billing mode too, where the usage chips that carry health aren't shown. Selecting the
+  // key sets as joined strings keeps the effect dep a primitive (no render loop).
+  const activeEngine = useWorkspace((s) => (s.activeId ? s.sessions[s.activeId]?.engineId : undefined) ?? 'claude')
+  const rlKeys = useWorkspace((s) => Object.keys(s.rateLimits).join(','))
+  const pdKeys = useWorkspace((s) => Object.keys(s.providerDown).join(','))
+  const engineKey = Array.from(
+    new Set([activeEngine, ...rlKeys.split(',').filter(Boolean), ...pdKeys.split(',').filter(Boolean)]),
+  ).join(',')
+  useEffect(() => {
+    const check = (): void => void window.koda.refreshProviderStatus?.(engineKey.split(','))
+    check()
+    window.addEventListener('focus', check)
+    return () => window.removeEventListener('focus', check)
+  }, [engineKey])
+
   return (
     <footer className="relative flex items-center border-t border-border bg-bg px-2 py-1 text-[11px] text-text-muted">
       {/* Actions on the left — Versions + Settings, moved out of the old sidebar footer so they're
           always reachable regardless of the sidebar's collapse/resize state. */}
       <FooterActions />
 
-      {/* Billing stays dead-center (the limits gauge). Absolute so the left/right widths never shift it. */}
+      {/* Billing stays dead-center (the limits gauge). Absolute so the left/right widths never shift it.
+          Provider health rides the per-engine chips inside RateLimitStatus; the standalone pill only
+          appears in API-billing mode, where there are no usage chips to fold it into. */}
       <div className="absolute left-1/2 flex -translate-x-1/2 items-center gap-4 font-mono">
         <BillingStatus />
-        <ProviderOutagePill />
       </div>
 
       {/* Passive build status parked in the right corner (VS Code convention). */}
@@ -109,8 +128,79 @@ function FooterActions() {
           <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
         </svg>
       </FooterButton>
+      <ThemeSwitch />
       <MemoryTidyPill />
     </div>
+  )
+}
+
+// ── Theme switch ──────────────────────────────────────────────────────────────────
+// The light/dark quick-flip, moved out of the title bar (which stays calm: the face flip + Remote)
+// to sit with the bar's other controls. Twin-icon track with a sliding ink disc carrying the active
+// icon; scaled to the status bar's height. Full appearance control lives in Settings → Appearance.
+function ThemeSwitch() {
+  const { theme, toggle } = useTheme()
+  const isDark = theme === 'dark'
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={isDark}
+      aria-label="Toggle light or dark theme"
+      title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+      onClick={toggle}
+      className="relative ml-1 h-[19px] w-[37px] rounded-full bg-border transition-colors"
+    >
+      <span className="pointer-events-none absolute inset-y-0 left-[4px] flex items-center text-text-muted/70">
+        <SunIcon />
+      </span>
+      <span className="pointer-events-none absolute inset-y-0 right-[4px] flex items-center text-text-muted/70">
+        <MoonIcon />
+      </span>
+      <motion.span
+        animate={{ x: isDark ? 18 : 0 }}
+        transition={spring.snappy}
+        className="absolute left-[1.5px] top-[1.5px] z-[1] flex h-4 w-4 items-center justify-center rounded-full bg-surface text-accent shadow-sm"
+      >
+        <AnimatePresence mode="wait" initial={false}>
+          <motion.span
+            key={isDark ? 'moon' : 'sun'}
+            initial={{ rotate: -90, opacity: 0, scale: 0.4 }}
+            animate={{ rotate: 0, opacity: 1, scale: 1 }}
+            exit={{ rotate: 90, opacity: 0, scale: 0.4 }}
+            transition={{ duration: duration.fast, ease: ease.out }}
+            className="flex items-center justify-center"
+          >
+            {isDark ? <MoonIcon /> : <SunIcon />}
+          </motion.span>
+        </AnimatePresence>
+      </motion.span>
+    </button>
+  )
+}
+
+function SunIcon() {
+  return (
+    <svg
+      width="9"
+      height="9"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2.2}
+      strokeLinecap="round"
+    >
+      <circle cx="12" cy="12" r="4.2" />
+      <path d="M12 2.5v2.2M12 19.3v2.2M4.6 4.6l1.6 1.6M17.8 17.8l1.6 1.6M2.5 12h2.2M19.3 12h2.2M4.6 19.4l1.6-1.6M17.8 6.2l1.6-1.6" />
+    </svg>
+  )
+}
+
+function MoonIcon() {
+  return (
+    <svg width="9" height="9" viewBox="0 0 24 24" fill="currentColor">
+      <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" />
+    </svg>
   )
 }
 
@@ -128,10 +218,10 @@ function FooterButton({ label, onClick, children }: { label: string; onClick: ()
   )
 }
 
-// ── Provider outage pill ──────────────────────────────────────────────────────────
-// Quiet by default: renders only while a feed-CONFIRMED provider incident is being watched (a turn
-// failed AND the provider's status page agrees). Main polls for recovery and pings when it's over;
-// the pill just says "we know, it's them" so a dead turn doesn't read as a broken Koda.
+// ── Provider health pill (API-billing mode only) ───────────────────────────────────
+// The subscription case folds provider health into the per-engine usage chips (EngineWindows). API mode
+// has no such chips, so health gets this compact fallback. Quiet by default: renders only while a
+// feed-CONFIRMED incident is watched; the word matches the reported severity (never "outage" for a slowdown).
 function ProviderOutagePill() {
   const providerDown = useWorkspace((s) => s.providerDown)
   const engines = Object.keys(providerDown)
@@ -142,18 +232,36 @@ function ProviderOutagePill() {
         <span
           key={id}
           className="flex cursor-default select-none items-center gap-1.5 text-amber-500"
-          title={`${providerDown[id]?.note ?? 'The provider is reporting an incident'}. Your work is fine. You'll get a notification the moment it's back.`}
+          title={healthTooltip(providerDown[id])}
         >
           <span className="h-1.5 w-1.5 rounded-full bg-amber-500" aria-hidden />
-          {providerLabel(id)} outage · watching
+          {engineShort(id)} · {kindWord(providerDown[id]?.kind)}
         </span>
       ))}
     </>
   )
 }
 
-function providerLabel(engineId: string): string {
-  return engineId === 'codex' ? 'OpenAI' : 'Anthropic'
+/** Plain word for a reported severity — kept honest so the chip never overstates. A missing/unknown kind
+ *  falls back to the neutral "incident", never "outage" (that would be the exact overstatement to avoid). */
+function kindWord(kind?: ProviderKind): string {
+  switch (kind) {
+    case 'outage':
+      return 'outage'
+    case 'partial':
+      return 'partial outage'
+    case 'degraded':
+      return 'degraded'
+    case 'maintenance':
+      return 'maintenance'
+    default:
+      return 'incident'
+  }
+}
+
+function healthTooltip(health?: { note?: string; kind?: ProviderKind }): string {
+  const head = `${kindWord(health?.kind)}${health?.note ? ` — ${health.note}` : ''}`
+  return `${head}. Your work is fine; you'll get a ping when it's back.`
 }
 
 // ── Memory tidy pill ──────────────────────────────────────────────────────────────
@@ -194,11 +302,15 @@ function BillingStatus() {
   if (!apiActive) return <RateLimitStatus />
   const total = Object.values(sessions).reduce((sum, s) => sum + (s.spendUsd ?? 0), 0)
   return (
-    <span
-      className="cursor-default select-none"
-      title="Billing to your API account: real per-token spend. Details under Settings → Usage."
-    >
-      API · ~${total.toFixed(2)}
+    <span className="flex items-center gap-4">
+      <span
+        className="cursor-default select-none"
+        title="Billing to your API account: real per-token spend. Details under Settings → Usage."
+      >
+        API · ~${total.toFixed(2)}
+      </span>
+      {/* No usage chips in API mode, so provider health rides its own compact chip here instead. */}
+      <ProviderOutagePill />
     </span>
   )
 }
@@ -217,6 +329,7 @@ function RateLimitStatus() {
   // active session's engine is always shown (anchored even when empty, like the context meter — a missing
   // gauge reads as broken); other engines join once they've reported a window.
   const rateLimits = useWorkspace((s) => s.rateLimits)
+  const providerDown = useWorkspace((s) => s.providerDown)
   const activeEngine = useWorkspace((s) => (s.activeId ? s.sessions[s.activeId]?.engineId : undefined) ?? 'claude')
   // Re-evaluate every 30s so a window that reaches its reset time drops off on its own — the store isn't
   // touched between turns, so nothing else would trigger the re-render that expires it.
@@ -225,8 +338,9 @@ function RateLimitStatus() {
     const t = setInterval(() => setNowSec(Math.floor(Date.now() / 1000)), 30_000)
     return () => clearInterval(t)
   }, [])
-  const engineIds = Array.from(new Set([activeEngine, ...Object.keys(rateLimits)]))
-    .filter((id) => id === activeEngine || hasWindowData(liveWindows(rateLimits[id], nowSec)))
+  // An engine in an incident always earns a chip (even before it has window data) so its health shows.
+  const engineIds = Array.from(new Set([activeEngine, ...Object.keys(rateLimits), ...Object.keys(providerDown)]))
+    .filter((id) => id === activeEngine || providerDown[id] || hasWindowData(liveWindows(rateLimits[id], nowSec)))
     .sort((a, b) => engineOrder(a) - engineOrder(b))
   const labelEngines = engineIds.length > 1
   return (
@@ -284,6 +398,10 @@ function EngineWindows({
       document.removeEventListener('keydown', onKey)
     }
   }, [open])
+  // Provider health folds onto this chip: the dot is the always-present, subtle signal (brand/ muted when
+  // fine, amber the moment the provider reports trouble) and the honest severity word appears inline.
+  const health = useWorkspace((s) => s.providerDown[engineId])
+  const trouble = !!health
   const five = windows['five_hour']
   const pct = five?.usedPercent != null ? `${Math.round(five.usedPercent)}%` : null
   // Inline value: precise % when the engine reports one (Codex), else nothing (Claude's band is carried
@@ -293,18 +411,20 @@ function EngineWindows({
     <div ref={ref} className="relative">
       <button
         onClick={() => setOpen((v) => !v)}
-        className={`flex select-none items-center gap-1.5 transition-colors hover:text-text ${five ? '' : 'opacity-60'}`}
-        title="Plan usage, click for details"
+        className={`flex select-none items-center gap-1.5 transition-colors hover:text-text ${five || trouble ? '' : 'opacity-60'}`}
+        title={trouble ? healthTooltip(health) : 'Plan usage, click for details'}
         aria-label={`${engineShort(engineId)} plan usage`}
       >
-        {showLabel ? (
-          <span className="flex items-center gap-1.5">
-            <span className={`h-1.5 w-1.5 rounded-full ${engineAccent(engineId)}`} aria-hidden />
-            {engineShort(engineId)}
-          </span>
-        ) : (
-          <span>5-hour</span>
-        )}
+        <span className={`flex items-center gap-1.5 ${trouble ? 'text-amber-500' : ''}`}>
+          {/* Dot is a health light, same meaning for every engine: green when the provider is fine, amber
+              when it's not. The name label carries identity; the inline word carries the honest severity. */}
+          <span
+            className={`h-1.5 w-1.5 rounded-full ${trouble ? 'bg-amber-500' : 'bg-emerald-500'}`}
+            aria-hidden
+          />
+          {showLabel || trouble ? engineShort(engineId) : '5-hour'}
+          {trouble && <span>· {kindWord(health?.kind)}</span>}
+        </span>
         {/* Same 3-state band language as the context meter (allowed/warning/rejected → green/amber/red). */}
         <SegmentBar filled={five ? fillOf(five.status) : 0} segments={3} />
         {value && <span>{value}</span>}
@@ -317,7 +437,17 @@ function EngineWindows({
           origin="origin-bottom"
           className="w-max whitespace-nowrap rounded-xl border border-border bg-surface px-3 py-2 text-left font-mono text-[11px] text-text-muted shadow-pop"
         >
-          <div className="mb-1 text-text">{engineShort(engineId)}</div>
+          {/* Same label-left / value-right row as the window rows below, for consistency: engine name on
+              the left, provider health right-aligned, the incident note dropping right-aligned beneath. */}
+          <div className="mb-1 flex justify-between gap-6">
+            <span className="text-text">{engineShort(engineId)}</span>
+            <span className={health ? 'text-amber-500' : 'text-emerald-500'}>
+              {health ? kindWord(health.kind) : 'operational'}
+              {health?.note ? (
+                <span className="block text-right text-text-muted">{health.note}</span>
+              ) : null}
+            </span>
+          </div>
           <WindowRow type="five_hour" info={five} />
           <WindowRow type="weekly" info={windows['weekly']} />
         </Menu>

@@ -250,7 +250,7 @@ function RelayPairingSection({ lanActive }: { lanActive: boolean }) {
             label={relay?.paired ? 'A device is paired' : 'Connect a device'}
             description={
               relay?.paired
-                ? 'Your phone is paired with an end-to-end encrypted key. The relay only ever sees ciphertext.'
+                ? 'This trusted phone can control Koda with your Mac permissions. Traffic is end-to-end encrypted; the relay only sees ciphertext.'
                 : lanActive
                   ? 'Paused while Same Wi-Fi is on. Turn that off to pair a device from anywhere.'
                   : 'Scan the code below in the Koda app on your phone, signed into this account. It refreshes on its own.'
@@ -269,9 +269,9 @@ function RelayPairingSection({ lanActive }: { lanActive: boolean }) {
               <div className="flex items-center gap-5">
                 <QrCode value={pairBlob ?? ''} size={200} />
                 <div className="min-w-0 flex-1">
-                  <div className="text-[14px] font-semibold text-text">Scan to pair</div>
+                  <div className="text-[14px] font-semibold text-text">Scan to trust this phone</div>
                   <div className="mt-1 text-[12.5px] leading-snug text-text-muted">
-                    Open Koda on your phone, sign into this account, then scan.
+                    Pairing gives this phone control of Koda, including editing projects and running commands on this Mac.
                   </div>
                   <div className="mt-2 text-[12px] text-text-muted">Expires in 5 minutes, one-time use.</div>
                 </div>
@@ -482,23 +482,23 @@ export function RemoteSection() {
         </Collapse>
       </SettingsSection>
 
-      {running && state && state.devices.length > 0 && (
+      {state && state.devices.length > 0 && (
         <SettingsSection title="Paired devices">
           {state.devices.map((d) => (
             <SettingsRow
               key={d.id}
               label={d.label}
               description={`Paired ${new Date(d.pairedAt).toLocaleString()}`}
-              control={<Button variant="danger" onClick={() => revoke(d.id)}>Remove</Button>}
+              control={<Button variant="danger" onClick={() => revoke(d.id)}>Disconnect</Button>}
             />
           ))}
         </SettingsSection>
       )}
 
       <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 px-4 py-3 text-[12.5px] leading-snug text-text-muted">
-        <span className="font-medium text-text">Use this only on a network you trust.</span> While it's on, anyone on
-        the same Wi-Fi who has the code can drive the agent on this Mac, which can edit files and run commands. This
-        is an early preview; leave it off when you're not actively using it.
+        <span className="font-medium text-text">Pair only a phone you own and keep locked.</span> A paired phone is a
+        trusted controller: it can send instructions, approve actions, edit projects, and run commands with the same
+        permissions you use on this Mac. Disconnect it above at any time.
       </div>
     </>
   )

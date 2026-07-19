@@ -25,6 +25,7 @@ import type {
   TerminalExit,
   TerminalShow,
   PreviewRestart,
+  FileMenuCommand,
 } from '@shared/ipc'
 
 const api: KodaApi = {
@@ -49,6 +50,9 @@ const api: KodaApi = {
   saveSessions: (data) => ipcRenderer.send(IpcChannels.sessionsSave, data),
   loadArchived: () => ipcRenderer.invoke(IpcChannels.archivedLoad),
   saveArchived: (archived) => ipcRenderer.send(IpcChannels.archivedSave, archived),
+  loadArchivedBody: (id) => ipcRenderer.invoke(IpcChannels.archivedLoadBody, id),
+  writeArchivedBody: (id, items) => ipcRenderer.invoke(IpcChannels.archivedWriteBody, { id, items }),
+  deleteArchivedBody: (id) => ipcRenderer.invoke(IpcChannels.archivedDeleteBody, id),
   adoptHeadlessSessions: () => ipcRenderer.invoke(IpcChannels.sessionsAdoptHeadless),
   onHeadlessAppeared: (listener) => {
     const handler = (_e: IpcRendererEvent, payload: HeadlessAppeared) => listener(payload)
@@ -146,6 +150,19 @@ const api: KodaApi = {
   createProject: (args) => ipcRenderer.invoke(IpcChannels.projectCreate, args),
   hasGuidelines: () => ipcRenderer.invoke(IpcChannels.projectHasGuidelines),
   getRecentProjects: () => ipcRenderer.invoke(IpcChannels.projectGetRecents),
+  onFileMenuCommand: (listener) => {
+    const handler = (_e: IpcRendererEvent, command: FileMenuCommand): void => listener(command)
+    ipcRenderer.on(IpcChannels.uiFileCommand, handler)
+    return () => ipcRenderer.removeListener(IpcChannels.uiFileCommand, handler)
+  },
+  deleteProject: (args) => ipcRenderer.invoke(IpcChannels.projectDelete, args),
+  miniAppsList: () => ipcRenderer.invoke(IpcChannels.miniAppsList),
+  miniAppsStart: (args) => ipcRenderer.invoke(IpcChannels.miniAppsStart, args),
+  onMiniAppsChanged: (listener) => {
+    const handler = (): void => listener()
+    ipcRenderer.on(IpcChannels.miniAppsChanged, handler)
+    return () => ipcRenderer.removeListener(IpcChannels.miniAppsChanged, handler)
+  },
   onApprovalRequest: (listener) => {
     const handler = (_e: IpcRendererEvent, req: ApprovalRequest) => listener(req)
     ipcRenderer.on(IpcChannels.approvalRequest, handler)
@@ -222,6 +239,8 @@ const api: KodaApi = {
   respondPreviewCapture: (correlationId, rect, dpr) =>
     ipcRenderer.send(IpcChannels.previewCaptureResponse, { correlationId, rect, dpr }),
   saveScratchImage: (args) => ipcRenderer.invoke(IpcChannels.scratchSave, args),
+  pickComposerFiles: () => ipcRenderer.invoke(IpcChannels.composerPickFiles),
+  pickComposerPath: () => ipcRenderer.invoke(IpcChannels.composerPickPath),
   listScratchImages: (args) => ipcRenderer.invoke(IpcChannels.scratchList, args),
   getDocMeta: (args) => ipcRenderer.invoke(IpcChannels.docmetaGet, args),
   setDocMeta: (args) => ipcRenderer.invoke(IpcChannels.docmetaSet, args),
@@ -291,6 +310,8 @@ const api: KodaApi = {
     return () => ipcRenderer.removeListener(IpcChannels.providerStatus, handler)
   },
   getProviderStatus: () => ipcRenderer.invoke(IpcChannels.providerStatusGet),
+  refreshProviderStatus: (engines: string[]) =>
+    ipcRenderer.invoke(IpcChannels.providerStatusRefresh, engines),
   getRemoteAuth: () => ipcRenderer.invoke(IpcChannels.remoteAuthState),
   requestRemoteOtp: (args) => ipcRenderer.invoke(IpcChannels.remoteRequestOtp, args),
   verifyRemoteOtp: (args) => ipcRenderer.invoke(IpcChannels.remoteVerifyOtp, args),

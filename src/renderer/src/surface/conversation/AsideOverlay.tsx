@@ -44,7 +44,7 @@ export function AsideOverlay({
       ) : emptyDone ? (
         <div className="text-[13px] text-text-muted">No answer came back — try asking in the main chat.</div>
       ) : waiting ? (
-        <BusyText size={12} className="text-[12.5px] text-text-muted [&_.grid]:text-aside">
+        <BusyText variant="diamond" size={12} className="text-[12.5px] text-text-muted [&_.grid]:text-aside">
           Thinking…
         </BusyText>
       ) : (

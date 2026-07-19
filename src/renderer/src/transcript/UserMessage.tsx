@@ -1,22 +1,33 @@
 import { useWorkspace } from '../workspace/store'
+import { FileChip } from './FileChip'
 
 /** The user's turn — the instruction that opens a turn. Rendered inside the pinned card (see
- *  PinnedUserMessage), so this is just the content: image thumbnails above the text.
+ *  PinnedUserMessage), so this is just the content: attachment chips/thumbnails above the text.
  *
  *  Photos render as the same 56px upload tiles as the composer's attachment row (not a large,
  *  height-cropped preview) — so a photo-only turn reads as a labeled anchor, and expanding a turn
- *  just shows the tiles at the size they were attached. Click a tile to view it full-size. */
+ *  just shows the tiles at the size they were attached. Click a tile to view it full-size.
+ *  Document files (csv/pdf) show as name chips — the bytes live in `.koda/scratch/`, not here. */
 export function UserMessage({
   text,
   images,
+  files,
 }: {
   text: string
   images?: { mediaType: string; dataBase64: string }[]
+  files?: string[]
 }) {
   const setLightbox = useWorkspace((s) => s.setLightbox)
   const hasImages = images && images.length > 0
   return (
     <div className="flex flex-col items-start gap-1.5">
+      {files && files.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          {files.map((name, i) => (
+            <FileChip key={i} name={name} />
+          ))}
+        </div>
+      )}
       {hasImages && (
         <div className="flex flex-wrap items-center gap-2">
           {images.map((img, i) => (

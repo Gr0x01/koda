@@ -449,6 +449,7 @@ class ClaudeSession implements EngineSession {
           this.onEvent({
             type: 'RateLimitUpdate',
             sessionId: this.id,
+            engine: 'claude',
             info: {
               rateLimitType: info.rateLimitType,
               resetsAt: info.resetsAt,

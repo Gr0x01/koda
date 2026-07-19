@@ -280,13 +280,20 @@ export const EngineErrorSchema = z.object({
   category: z.enum(['apiError']).optional(),
 })
 
-/** Provider-outage pill state (main→renderer push over `providerStatus`, seeded by `providerStatusGet`).
- *  Emitted only for feed-CONFIRMED outages that interrupted a turn; `down: false` clears the pill. */
+/** The severity the provider's status page is reporting, so the chip's word stays honest — a slowdown is
+ *  never called an "outage". Ranked worst-first in the watcher; the renderer maps each to a plain word. */
+export const ProviderKindSchema = z.enum(['outage', 'partial', 'degraded', 'maintenance'])
+export type ProviderKind = z.infer<typeof ProviderKindSchema>
+
+/** Provider-health state (main→renderer push over `providerStatus`, seeded by `providerStatusGet`).
+ *  Emitted only for feed-CONFIRMED incidents; `down: false` clears it. */
 export const ProviderStatusEventSchema = z.object({
   engine: z.string(),
   down: z.boolean(),
   /** Human-readable incident line for the tooltip (e.g. the status page's incident name). */
   note: z.string().optional(),
+  /** Reported severity — drives the chip word (outage / degraded / …). Absent when `down: false`. */
+  kind: ProviderKindSchema.optional(),
 })
 export type ProviderStatusEvent = z.infer<typeof ProviderStatusEventSchema>
 
@@ -413,8 +420,9 @@ export type RemoteUsageSnapshot = {
   spendUsd: number
   byModel: Record<string, ModelSpend>
   context?: ContextUsage
-  /** Keyed by rateLimitType ('five_hour'/'weekly'), newest wins — account-level, same as the desktop. */
-  rateLimits: Record<string, RateLimitInfo>
+  /** Account-level windows for EVERY engine (engine → rateLimitType → info, newest wins) — the plan
+   *  panel labels each engine's windows, so it carries both plans regardless of the session's engine. */
+  rateLimits: Record<string, Record<string, RateLimitInfo>>
 }
 
 /** A rate-limit window update (account-level, not per-session) — surfaced in the status bar.
@@ -423,6 +431,9 @@ export type RemoteUsageSnapshot = {
 export const RateLimitUpdateSchema = z.object({
   type: z.literal('RateLimitUpdate'),
   sessionId: z.string(),
+  /** Stamped by the emitting driver — the authoritative attribution. A receiver inferring the engine
+   *  from its own session state can misfile a window when that state is cold (the phone's cold-open). */
+  engine: EngineIdSchema.optional(),
   info: RateLimitInfoSchema,
 })
 
@@ -903,6 +914,10 @@ export const KodaSettingsSchema = z.object({
   /** How many days a saved scratch image (the on-disk copy of a pasted/dropped image, in
    *  `.koda/scratch/`) is kept before it's pruned. `0` means keep forever. Default 7. */
   scratchRetentionDays: z.number(),
+  /** How many days an archived session is kept before it's auto-deleted. `0` (the default) means keep
+   *  forever — the safe posture, since archives live outside the safety-git undo net (a purge is
+   *  permanent). Opt-in: set >0 from the Archived settings section to auto-tidy old chats. */
+  archiveRetentionDays: z.number(),
   /** Optional Playwright browser-testing capability — lets the agent drive a real browser to confirm
    *  web work *works* (not just renders). Default-OFF: turning it on downloads ~150 MB of Chromium
    *  into a shared dir (once, reused by every project). The agent only gets browser tools when this is
@@ -1111,6 +1126,30 @@ export const ArchivedSessionSchema = PersistedSessionSchema.extend({
   archivedAt: z.number(),
 })
 export type ArchivedSession = z.infer<typeof ArchivedSessionSchema>
+
+/** One readable turn baked into the archive metadata so the retrieval list can preview a chat WITHOUT
+ *  loading its (potentially large) transcript body. Snapshotted at archive time — an archived chat is
+ *  immutable, so the tail never changes. */
+export const ArchivedPreviewTurnSchema = z.object({
+  kind: z.enum(['user', 'assistant']),
+  text: z.string(),
+})
+export type ArchivedPreviewTurn = z.infer<typeof ArchivedPreviewTurnSchema>
+
+/** The LIGHT half of an archived session — everything except the transcript `items`, which live in a
+ *  per-session body file (session-store.ts). This is what boot reads and the Settings list renders, so
+ *  it must stay small: a heavy project can hold 100+ archives, and loading every full transcript just to
+ *  draw a list is the exact O(n)-blob cost the split removes. Restore fetches the body on demand. */
+export const ArchivedSessionMetaSchema = ArchivedSessionSchema.omit({ items: true }).extend({
+  /** The last few turns' text, for the list's expandable preview. Optional/back-compat: a meta migrated
+   *  from a pre-split blob always has it; absence just shows "no preview". */
+  preview: z.array(ArchivedPreviewTurnSchema).optional(),
+  /** Highest entry (and subagent-child) id in the transcript, so boot can advance the id counter past a
+   *  not-yet-restored archive WITHOUT loading its body (else a new entry could reuse a held id → collide
+   *  on restore). Optional/back-compat; absent ⇒ treated as 0. */
+  maxItemId: z.number().optional(),
+})
+export type ArchivedSessionMeta = z.infer<typeof ArchivedSessionMetaSchema>
 
 // version 2: per-project persistence (one project per window). The payload shape is unchanged from
 // v1 (activeId + sessions) — the split is in main (a file per project, keyed by the window's root);
@@ -1413,14 +1452,47 @@ export const SkillSetActiveRequestSchema = z.object({
 })
 export type SkillSetActiveRequest = z.infer<typeof SkillSetActiveRequestSchema>
 
-/** scratch:save — persist a pasted/dropped image (already compressed by the composer) to the project's
- *  `.koda/scratch/` folder so it outlives the conversation and the agent can re-read it by path. Returns
- *  the project-relative path. Best-effort on the renderer side: a failure just means no durable copy. */
-export const ScratchSaveRequestSchema = z.object({ mediaType: z.string(), dataBase64: z.string() })
+/** scratch:save — persist a pasted/dropped attachment to the project's `.koda/scratch/` folder so it
+ *  outlives the conversation and the agent can re-read it by path. Images arrive already compressed by
+ *  the composer; document files (csv/pdf) arrive raw and carry `fileName` so the saved copy keeps a
+ *  recognizable name. Returns the project-relative path. Best-effort on the renderer side: a failure
+ *  just means no durable copy. */
+export const ScratchSaveRequestSchema = z.object({
+  mediaType: z.string(),
+  dataBase64: z.string(),
+  fileName: z.string().optional(),
+})
 export type ScratchSaveRequest = z.infer<typeof ScratchSaveRequestSchema>
 
 export const ScratchSaveResultSchema = z.object({ path: z.string() })
 export type ScratchSaveResult = z.infer<typeof ScratchSaveResultSchema>
+
+/** The engine-facing note appended to a turn when document files (csv/pdf) ride along as saved
+ *  `.koda/scratch/` paths. ONE builder for both attach heads — the desktop composer (store.send) and
+ *  a phone turn landing in main (sessions.sendTurn) — so the promote-out-of-scratch instruction can't
+ *  drift between them. */
+export function attachedFilesNote(paths: string[]): string {
+  const one = paths.length === 1
+  const list = paths.map((p) => `\`${p}\``).join(', ')
+  return `(The user attached ${one ? 'a file, saved at' : 'files, saved at'} ${list} — read ${one ? 'it' : 'them'} from ${one ? 'that path' : 'those paths'}. ${one ? "It's" : "They're"} staged in \`.koda/scratch/\`, which prunes by age: if ${one ? 'this file' : 'a file'} is data the project should keep — something you'll import or reference again — move it into the project properly and say so.)`
+}
+
+/** composer:pickFiles — native open dialog for the composer's attach menu. Main reads the picked files
+ *  and returns their bytes; the renderer stages them exactly like a drop (images get compressed there). */
+export const PickedFileSchema = z.object({
+  name: z.string(),
+  mediaType: z.string(),
+  dataBase64: z.string(),
+})
+export type PickedFile = z.infer<typeof PickedFileSchema>
+
+export const PickFilesResultSchema = z.object({ files: z.array(PickedFileSchema) })
+export type PickFilesResult = z.infer<typeof PickFilesResultSchema>
+
+/** composer:pickPath — "point at a file or folder": a native dialog that returns the chosen absolute
+ *  path (or null on cancel). Nothing is copied — the path is referenced in the message as-is. */
+export const PickPathResultSchema = z.object({ path: z.string().nullable() })
+export type PickPathResult = z.infer<typeof PickPathResultSchema>
 
 // ── Terminal surface (a real interactive shell in the window's project) ────────
 /** Terminal viewport in character cells — the pty is sized to match xterm's fit. */
@@ -2042,6 +2114,10 @@ export type WorktreeOpenRequest = z.infer<typeof WorktreeOpenRequestSchema>
 export const ProjectContextSchema = z.object({
   /** Absolute project root, or '' for a ProjectHome window awaiting a folder. */
   projectPath: z.string(),
+  /** One-shot: this ProjectHome window was opened by "New Project…" (File menu), so it should land
+   *  with the create-a-project modal already open. Cleared on first read — a renderer reload/HMR
+   *  after the window resolves must not re-pop the modal. */
+  newProjectIntent: z.boolean().default(false),
 })
 export type ProjectContext = z.infer<typeof ProjectContextSchema>
 
@@ -2082,7 +2158,36 @@ export type ProjectOpenResult = z.infer<typeof ProjectOpenResultSchema>
 
 export const RecentProjectsSchema = z.array(z.string())
 
+/** project:delete — move a project's folder to the Trash after stopping + deregistering its mini
+ *  apps. The renderer can only name paths it learned from project:getRecents / miniApps:list. */
+export const ProjectDeleteRequestSchema = z.object({ path: z.string().min(1) })
+export type ProjectDeleteRequest = z.infer<typeof ProjectDeleteRequestSchema>
+export const ProjectDeleteResultSchema = z.object({})
+export type ProjectDeleteResult = z.infer<typeof ProjectDeleteResultSchema>
+
+/** miniApps:list — every registered mini app (all projects) + live supervisor state, for the launcher
+ *  rail and the face view. Doubles as the renderer's feature gate: flag off ⇒ always [] ⇒ no rail,
+ *  no App/Workshop toggle. `dir` is the app's identity (what miniApps:start takes back). */
+export const MiniAppInfoSchema = z.object({
+  dir: z.string(),
+  projectPath: z.string(),
+  name: z.string(),
+  state: z.enum(['starting', 'running', 'stopped', 'crashed']),
+  url: z.string().optional(),
+})
+export type MiniAppInfo = z.infer<typeof MiniAppInfoSchema>
+export const MiniAppListSchema = z.array(MiniAppInfoSchema)
+
+/** miniApps:start — start (or join) a REGISTERED app under the supervisor; resolves once it serves.
+ *  Main validates `dir` against the registry — the renderer can only start apps the agent installed. */
+export const MiniAppStartRequestSchema = z.object({ dir: z.string().min(1) })
+export type MiniAppStartRequest = z.infer<typeof MiniAppStartRequestSchema>
+export const MiniAppStartResultSchema = z.object({ url: z.string() })
+export type MiniAppStartResult = z.infer<typeof MiniAppStartResultSchema>
+
 /** The shape exposed on `window.koda` — implemented in preload, consumed in the renderer. */
+export type FileMenuCommand = 'newDocument' | 'newFolder' | 'filesImported'
+
 export interface KodaApi {
   getAppInfo: () => Promise<AppInfo>
   echo: (args: EchoRequest) => Promise<EchoResponse>
@@ -2105,10 +2210,20 @@ export interface KodaApi {
   loadSessions: () => Promise<PersistedSessions | null>
   /** Fire-and-forget: persist the open sessions + transcripts (debounced in the renderer). */
   saveSessions: (data: PersistedSessions) => void
-  /** Archived sessions ride a separate COLD file (never the hot blob above — the 53MB-freeze bug).
-   *  load on boot; save fires only when the archived list changes (archive / restore / delete). */
-  loadArchived: () => Promise<ArchivedSession[]>
-  saveArchived: (archived: ArchivedSession[]) => void
+  /** Archived sessions ride a separate COLD store (never the hot blob above — the 53MB-freeze bug).
+   *  Split further: this loads/saves only the LIGHT metadata index (transcript bodies live in per-session
+   *  files, fetched on restore) so boot and every archive/delete stay small regardless of history size.
+   *  `loadArchived` also runs the opt-in retention purge. Save fires only when the list changes. */
+  loadArchived: () => Promise<ArchivedSessionMeta[]>
+  saveArchived: (archived: ArchivedSessionMeta[]) => void
+  /** Fetch one archived session's full transcript body (its `items`) — only needed to restore it. `null`
+   *  means the read failed (so restore keeps the archive instead of destroying it); `[]` is a clean but
+   *  genuinely empty transcript. */
+  loadArchivedBody: (id: string) => Promise<unknown[] | null>
+  /** Persist one archived session's transcript body to its own file (called when archiving). */
+  writeArchivedBody: (id: string, items: unknown[]) => Promise<void>
+  /** Delete one archived session's body file (called when the archive is restored or deleted). */
+  deleteArchivedBody: (id: string) => Promise<void>
   /** Claim this window's project's live headless (phone-started) sessions + get their replayable
    *  history, so the desktop can show sessions launched from the phone. Empty when there are none. */
   adoptHeadlessSessions: () => Promise<AdoptedHeadlessSession[]>
@@ -2236,6 +2351,17 @@ export interface KodaApi {
   hasGuidelines: () => Promise<ProjectHasGuidelinesResult>
   /** Recent project paths, most-recent-first (for the ProjectHome screen). */
   getRecentProjects: () => Promise<string[]>
+  /** A native File-menu action for this project window. */
+  onFileMenuCommand: (listener: (command: FileMenuCommand) => void) => () => void
+  /** Delete a project (ProjectHome only): stop its apps, move the folder to the Trash, drop recents. */
+  deleteProject: (args: ProjectDeleteRequest) => Promise<ProjectDeleteResult>
+  // Mini apps (the face — seam ③, flag-gated in main).
+  /** Registered mini apps + live state; [] when the mini-apps flag is off. */
+  miniAppsList: () => Promise<MiniAppInfo[]>
+  /** Start (or join) a registered mini app under the supervisor; resolves once it's serving. */
+  miniAppsStart: (args: MiniAppStartRequest) => Promise<MiniAppStartResult>
+  /** Subscribe to registry/run-state changes (re-fetch the list on fire); returns an unsubscribe fn. */
+  onMiniAppsChanged: (listener: () => void) => () => void
   // Approval gate ("Ask me" mode).
   /** Subscribe to tool-approval requests; returns an unsubscribe fn. */
   onApprovalRequest: (listener: (req: ApprovalRequest) => void) => () => void
@@ -2308,8 +2434,12 @@ export interface KodaApi {
   /** Answer a capture request with the preview iframe's on-screen rect (null = nothing to capture) and
    *  the window's devicePixelRatio (so main caps the capture by PHYSICAL pixels — the real token lever). */
   respondPreviewCapture: (correlationId: string, rect: PreviewRect | null, dpr: number) => void
-  /** Persist a pasted/dropped image to the project's `.koda/scratch/` folder; returns its relative path. */
+  /** Persist a pasted/dropped attachment to the project's `.koda/scratch/` folder; returns its relative path. */
   saveScratchImage: (args: ScratchSaveRequest) => Promise<ScratchSaveResult>
+  /** Composer attach menu: native file dialog → picked files' bytes (staged like a drop). */
+  pickComposerFiles: () => Promise<PickFilesResult>
+  /** Composer attach menu: "point at a file or folder" → the chosen absolute path (null = canceled). */
+  pickComposerPath: () => Promise<PickPathResult>
   /** Page through this project's recent scratch images (newest first) for the Recent images strip. */
   listScratchImages: (args: ScratchListRequest) => Promise<ScratchListResult>
   /** Read a doc's presentation sidecar (table column widths, …). Empty `{}` when none/unreadable. */
@@ -2409,6 +2539,8 @@ export interface KodaApi {
   onProviderStatus: (listener: (e: ProviderStatusEvent) => void) => () => void
   /** Current down-state (engines mid-outage), for seeding a window that opens during one. */
   getProviderStatus: () => Promise<ProviderStatusEvent[]>
+  /** On-arrival re-check (window focus / launch): surface a confirmed incident the user hasn't hit yet. */
+  refreshProviderStatus: (engines: string[]) => Promise<void>
   // Cloud relay account (Phase 1b) — email-OTP sign-in shared by Mac + phone.
   /** Read whether the Mac is signed into the cloud relay account. */
   getRemoteAuth: () => Promise<RemoteAuthState>

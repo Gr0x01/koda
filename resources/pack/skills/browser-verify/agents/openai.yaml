@@ -1,0 +1,4 @@
+interface:
+  display_name: "Browser Verify"
+  short_description: "Drive the page in a real browser to prove it works"
+  default_prompt: "Verify this page works by clicking through it in a real browser."

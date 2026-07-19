@@ -35,6 +35,30 @@ export interface PackLocation {
   dir: string
 }
 
+/** Skills from the shared Claude pack that Koda also installs into its isolated Codex plugin. Keep
+ * this list explicit: browser-verify remains capability-gated and Codex-only supplements live apart.
+ * Every skill shipped to Codex also carries `agents/openai.yaml` interface metadata (display name,
+ * short description, default prompt) — OpenAI's own curated skills do 20/20; match that convention
+ * when adding a skill here. Claude ignores the `agents/` folder. */
+export const CODEX_PACK_SKILLS = ['memory', 'documents', 'verify', 'frontend-design'] as const
+
+/**
+ * Built-but-not-shipped skills — they live in the separate `pack-staging` plugin (resolveStagingPack),
+ * NOT the main pack, and reach an engine only when the mini-apps dogfood flag is on (loadMiniAppsEnabled):
+ * Claude via a second `--plugin-dir` at the staging pack, Codex by copying these from staging into its
+ * plugin. Keeping them physically out of the main pack is what makes normal releases ship clean without
+ * per-file flag checks. When the mini-apps project ships, graduate the skill back into the main pack +
+ * CODEX_PACK_SKILLS and drop it here. See mini-apps-plan.md.
+ */
+export const GATED_PACK_SKILLS = ['create-mini-app', 'app-data'] as const
+
+/** Bump when same-app-version dogfood must rematerialize the Codex plugin after pack wiring changes. */
+export const CODEX_PACK_REVISION = 8
+
+export function codexPackMarker(appVersion: string, playwrightWired: boolean, miniAppsWired: boolean): string {
+  return `${appVersion}:pack${CODEX_PACK_REVISION}:pw${playwrightWired ? 1 : 0}:ma${miniAppsWired ? 1 : 0}`
+}
+
 export interface PackRule {
   id: string
   kind: 'preference' | 'safety'
@@ -94,6 +118,22 @@ export function resolvePack(opts: { resourcesPath?: string } = {}): PackLocation
     if (existsSync(join(dir, '.claude-plugin', 'plugin.json'))) {
       return { dir }
     }
+  }
+  return null
+}
+
+/**
+ * Resolve the staging pack (GATED_PACK_SKILLS) the same way as resolvePack — packaged Resources first,
+ * then the in-repo copy. Its skills only reach an engine when the caller has decided the mini-apps flag
+ * is on (loadMiniAppsEnabled); this just locates the dir. Returns null when absent (stripped build /
+ * once the pieces have graduated into the main pack and staging is empty).
+ */
+export function resolveStagingPack(opts: { resourcesPath?: string } = {}): PackLocation | null {
+  const candidates: string[] = []
+  if (opts.resourcesPath) candidates.push(join(opts.resourcesPath, 'pack-staging'))
+  candidates.push(join(process.cwd(), 'resources', 'pack-staging'))
+  for (const dir of candidates) {
+    if (existsSync(join(dir, '.claude-plugin', 'plugin.json'))) return { dir }
   }
   return null
 }

@@ -1,0 +1,6 @@
+SKILL.md is an unmodified copy of Anthropic's open-source `frontend-design`
+Agent Skill, sourced from https://github.com/anthropics/skills and licensed
+under the Apache License, Version 2.0 (see LICENSE.txt).
+
+`agents/openai.yaml` is Koda-added interface metadata for the Codex engine
+(the convention for every skill Koda ships to Codex); Claude ignores it.

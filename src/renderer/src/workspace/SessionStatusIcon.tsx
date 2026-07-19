@@ -44,6 +44,7 @@ export function StatusIcon({
     <PixelGlyph
       glyph={glyph}
       loader={loading}
+      variant="diamond"
       size={ICON_SIZE}
       label={label}
       className={`${tone} ${pulse} ${className}`}

@@ -11,7 +11,7 @@ import type { ToolDecision } from '@shared/ipc'
  * ship an approval that vanishes after ~5 minutes on the next engine bump.
  */
 
-// The broker constructor takes nine collaborators; none are exercised by these transport-level tests.
+// The broker constructor takes ten collaborators; none are exercised by these transport-level tests.
 const noop = (async () => {}) as never
 function makeBroker(): PermissionBroker {
   return new PermissionBroker(
@@ -24,6 +24,7 @@ function makeBroker(): PermissionBroker {
     noop, // previewFile
     noop, // ensureTool
     noop, // openTerminal
+    { install: noop, start: noop, stop: noop, status: noop }, // miniApps
   )
 }
 

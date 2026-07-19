@@ -6,7 +6,7 @@ import { TranscriptFind } from './TranscriptFind'
 import { AnimatePresence, cardVariants, motion } from '../motion'
 import { useWorkspace, activeEditor } from '../workspace/store'
 import { busyActivity } from '../workspace/activity'
-import { ContextReadout } from '../workspace/ContextMeter'
+import { ContextReadout, ContinueFreshButton } from '../workspace/ContextMeter'
 import { ApprovalModeControl, nextApprovalMode } from '../workspace/ApprovalModeControl'
 import { ModelControl } from '../workspace/ModelControl'
 import { EffortControl } from '../workspace/EffortControl'
@@ -14,9 +14,11 @@ import { Button } from '../ui'
 import { SessionHeader } from './conversation/SessionHeader'
 import { AsideOverlay } from './conversation/AsideOverlay'
 import { ComposerError } from './conversation/ComposerError'
-import { VoiceInputButton } from './conversation/VoiceInputButton'
+import { ComposerPrimaryButton } from './conversation/ComposerPrimaryButton'
+import { AttachMenu } from './conversation/AttachMenu'
 import { useMentionPicker, inkTokens } from './conversation/useMentionPicker'
-import { stagingFromFiles, baseName } from './conversation/imageAttach'
+import { stagingFromFiles, baseName, docMediaType } from './conversation/attach'
+import { FileChip } from '../transcript/FileChip'
 
 /**
  * The conversation surface (ui-workspace.md §3) — the always-present, premium center of the
@@ -39,6 +41,7 @@ export function ConversationSurface() {
   const askAside = useWorkspace((s) => s.askAside)
   const dismissAside = useWorkspace((s) => s.dismissAside)
   const promoteAside = useWorkspace((s) => s.promoteAside)
+  const continueInFreshChat = useWorkspace((s) => s.continueInFreshChat)
   const retryLastTurn = useWorkspace((s) => s.retryLastTurn)
   const startSession = useWorkspace((s) => s.startSession)
   const intakePending = useWorkspace((s) => s.intakePending)
@@ -262,7 +265,7 @@ export function ConversationSurface() {
               <circle cx="9" cy="9" r="2" />
               <path d="m21 15-3.5-3.5a2 2 0 0 0-2.8 0L5 21" />
             </svg>
-            <span className="text-sm font-medium text-accent">Drop image to attach</span>
+            <span className="text-sm font-medium text-accent">Drop to attach</span>
           </motion.div>
         )}
       </AnimatePresence>
@@ -412,18 +415,22 @@ export function ConversationSurface() {
             <div className="mb-2 flex flex-wrap gap-2">
               {session.attachments.map((img, i) => (
                 <div key={i} className="group relative">
-                  <button
-                    type="button"
-                    onClick={() => setLightbox(img)}
-                    title="Click to view"
-                    className="block h-14 w-14 overflow-hidden rounded-lg border border-border bg-bg"
-                  >
-                    <img
-                      src={`data:${img.mediaType};base64,${img.dataBase64}`}
-                      alt="attachment"
-                      className="h-full w-full object-contain"
-                    />
-                  </button>
+                  {img.mediaType.startsWith('image/') ? (
+                    <button
+                      type="button"
+                      onClick={() => setLightbox(img)}
+                      title="Click to view"
+                      className="block h-14 w-14 overflow-hidden rounded-lg border border-border bg-bg"
+                    >
+                      <img
+                        src={`data:${img.mediaType};base64,${img.dataBase64}`}
+                        alt="attachment"
+                        className="h-full w-full object-contain"
+                      />
+                    </button>
+                  ) : (
+                    <FileChip name={img.name ?? 'file'} />
+                  )}
                   <button
                     onClick={(e) => {
                       e.stopPropagation()
@@ -438,7 +445,9 @@ export function ConversationSurface() {
               ))}
             </div>
           )}
-          {/* The prompt row: the text field with dictate + send kept inside the input box. Buttons
+          {/* The prompt row: the text field, then + (attach) and the ONE primary button — mic when
+              empty, morphs to Send once anything is staged (see ComposerPrimaryButton) — clustered
+              on the right so the controls read as one group even when the draft grows tall. Buttons
               bottom-align (items-end) so they stay anchored as the textarea grows. */}
           <div className="flex items-end gap-2">
             <div className="relative min-w-0 flex-1">
@@ -477,9 +486,9 @@ export function ConversationSurface() {
               }}
               onPaste={(e) => {
                 const files = [...e.clipboardData.items]
-                  .filter((it) => it.kind === 'file' && it.type.startsWith('image/'))
+                  .filter((it) => it.kind === 'file')
                   .map((it) => it.getAsFile())
-                  .filter((f): f is File => f !== null)
+                  .filter((f): f is File => f !== null && (f.type.startsWith('image/') || docMediaType(f) !== null))
                 if (activeId && files.length) {
                   e.preventDefault() // don't also paste the filename text
                   attachFiles(activeId, files)
@@ -498,14 +507,20 @@ export function ConversationSurface() {
               {inkTokens(session.draft)}
             </div>
             </div>
-            <VoiceInputButton
-              disabled={session.busy}
-              draft={session.draft}
-              setText={(t) => activeId && setDraft(activeId, t)}
+            <AttachMenu
+              onAttach={(staged) => {
+                if (activeId) addAttachments(activeId, staged)
+              }}
+              onInsertPath={(path) => {
+                if (!activeId) return
+                const d = session.draft
+                setDraft(activeId, d && !d.endsWith(' ') ? `${d} \`${path}\` ` : `${d}\`${path}\` `)
+                composerRef.current?.focus()
+              }}
             />
             {/* Mid-turn, Stop is ALWAYS reachable (graceful interrupt) — so anyone who didn't mean to ask a
                 side question can still just stop the agent. When they're typing an aside, the muted
-                aside-send appears beside it. Idle → the normal ink Send.
+                aside-send appears beside it. Idle → the one morphing mic/Send button.
                 These stay as plain rounded-full buttons — <Button> is rounded-lg and would change the shape. */}
             {session.busy ? (
               <>
@@ -533,17 +548,12 @@ export function ConversationSurface() {
                 )}
               </>
             ) : (
-              <button
-                onClick={submitComposer}
-                disabled={!session.draft.trim() && session.attachments.length === 0}
-                title="Send"
-                aria-label="Send"
-                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-accent text-white transition-colors hover:opacity-90 disabled:bg-text/10 disabled:text-text-muted"
-              >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                  <path d="M12 19V5M5 12l7-7 7 7" />
-                </svg>
-              </button>
+              <ComposerPrimaryButton
+                hasContent={!!session.draft.trim() || session.attachments.length > 0}
+                draft={session.draft}
+                setText={(t) => activeId && setDraft(activeId, t)}
+                onSend={submitComposer}
+              />
             )}
           </div>
           {/* Per-session controls ride inside the card under a hairline divider: defaults on the
@@ -563,7 +573,14 @@ export function ConversationSurface() {
               />
               <EffortControl sessionId={session.id} effort={session.effort} busy={session.busy} />
             </div>
-            <ContextReadout context={session.context} openUpward />
+            <div className="flex shrink-0 items-center gap-2">
+              <ContinueFreshButton
+                context={session.context}
+                busy={session.busy}
+                onClick={continueInFreshChat}
+              />
+              <ContextReadout context={session.context} openUpward />
+            </div>
           </div>
         </div>
       </div>

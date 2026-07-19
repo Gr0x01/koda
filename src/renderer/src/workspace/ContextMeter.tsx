@@ -20,6 +20,38 @@ function ratioOf(c: ContextUsage): number | null {
   return Math.min(1, c.contextTokens / c.contextWindow)
 }
 
+/** The conversation is nearly full (red zone) — the point where continuing in the same session starts
+ *  to cost speed and quality, so the "keep going in a fresh chat" handoff is worth offering. */
+export function contextFull(c?: ContextUsage): boolean {
+  if (!c) return false
+  const r = ratioOf(c)
+  return r !== null && r >= AMBER
+}
+
+/** The one-button handoff CTA, shown in the composer footer only once context is nearly full. Asks the
+ *  agent for a summary and carries it into a fresh session (see store.continueInFreshChat). */
+export function ContinueFreshButton({
+  context,
+  busy,
+  onClick,
+}: {
+  context?: ContextUsage
+  busy?: boolean
+  onClick: () => void
+}) {
+  if (!contextFull(context)) return null
+  return (
+    <button
+      onClick={onClick}
+      disabled={busy}
+      title="This chat is getting long. Carry a summary into a fresh chat to keep going fast."
+      className="flex shrink-0 items-center gap-1 rounded-lg bg-amber-500/10 px-2 py-1 text-[11px] font-medium text-amber-600 transition-colors hover:bg-amber-500/20 disabled:opacity-40 dark:text-amber-400"
+    >
+      Keep going in a fresh chat
+    </button>
+  )
+}
+
 function fillClass(ratio: number): string {
   if (ratio < GREEN) return 'bg-emerald-500'
   if (ratio < AMBER) return 'bg-amber-500'

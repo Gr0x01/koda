@@ -23,12 +23,30 @@ export interface WindowContext {
    *  the integer window id so a previewed app can't enumerate other windows' tokens to read their
    *  projects' files across the preview protocol. */
   previewToken: string
+  /** One-shot intent for a ProjectHome window opened by "New Project…": the renderer should land with
+   *  the create-a-project modal open. `takeNewProjectIntent` reads-and-clears it (see getContext). */
+  newProjectIntent: boolean
 }
 
 const registry = new Map<number, WindowContext>()
 
-export function registerWindow(win: BrowserWindow, projectPath: string): void {
-  registry.set(win.id, { win, projectPath, sessionIds: new Set(), previewToken: randomUUID() })
+export function registerWindow(win: BrowserWindow, projectPath: string, newProjectIntent = false): void {
+  registry.set(win.id, {
+    win,
+    projectPath,
+    sessionIds: new Set(),
+    previewToken: randomUUID(),
+    newProjectIntent,
+  })
+}
+
+/** Read-and-clear the "opened for a new project" intent — one-shot so a renderer reload won't re-pop
+ *  the create modal once the user has moved on. */
+export function takeNewProjectIntent(winId: number): boolean {
+  const ctx = registry.get(winId)
+  if (!ctx || !ctx.newProjectIntent) return false
+  ctx.newProjectIntent = false
+  return true
 }
 
 /** Drop a window's context on close; returns the snapshot so the caller can tear down its sessions. */

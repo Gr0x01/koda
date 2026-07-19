@@ -10,13 +10,111 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
 
 ## [Unreleased]
 
+_The iPhone app and its Mac connection ship as one launch entry when the phone
+tier goes live. Fixes and features for that unshipped tier are not logged here as
+they land — they are development on a feature no user can reach yet. The launch
+gets one fresh marquee entry written as a capability, not a stack of dev-time
+bullets. History for it lives in git and the project memory._
+
+## [0.1.6] - 2026-07-19
+
 ### Added
 
-- Edit your documents from your phone, not just read them. Open a document in the
-  phone app and tap the edit button to write in it like a normal page — headings,
-  lists, checklists, tables, and callouts all work, the same as on your Mac. Your
-  changes save back to your Mac on their own when you tap Done, and every save can
-  be undone.
+- You can now hand Koda files, not just pictures. Drag a CSV or PDF into the
+  chat (or paste it), and Koda keeps a copy and reads it. This is great for
+  importing data or working from a document. A new + button in the message box
+  also lets you pick files, or point Koda at any file or folder on your Mac
+  without copying anything.
+- Pages and screens Koda builds for you now go through a real design pass. It
+  picks a look made for your project, with its own colors and type, instead of
+  falling back on the same generic template every time.
+- When a conversation gets long, a "Keep going in a fresh chat" button now
+  appears next to the fullness meter. Tap it and Koda writes a short handoff of
+  where you left off, then opens a fresh chat carrying it over, so you can keep
+  going at full speed without losing the thread. The old chat stays put.
+- The Mac File menu now has the project basics where you expect them. Make a
+  document or folder, open a recent project, import files, reveal the project
+  in Finder, copy its path, or close its window. Koda still saves continuously,
+  so there is no Save command to remember.
+- You can now delete a project from the home screen. Hover over it in the
+  recent list (or right-click it), type the project's name to confirm, and
+  Koda stops anything the project is running and moves its folder to the Trash.
+  You can always put it back if you change your mind.
+- Each engine's status now shows in the bottom bar. The small dot next to Claude
+  or Codex is a health light. It stays calm when all is well and turns amber the
+  moment that provider has trouble, with the honest word for it (outage,
+  degraded, or maintenance). So when something feels off, you can tell at a
+  glance whether it is you or them. It refreshes the moment you come back to the
+  window.
+- The send button now does double duty, like you may know from other chat apps.
+  When the message box is empty it is a microphone, so you can tap to dictate. As
+  soon as you type or attach something, it smoothly turns into the send arrow.
+
+### Changed
+
+- The AI settings now give each provider its own tab. Pick Claude or Codex at
+  the top and you see just that account and its usage, instead of one long stack
+  of everything at once. Each provider's sign-in status shows right in its
+  header, and the option to use your own API key is tucked behind an advanced
+  toggle so the everyday view stays simple.
+- The light and dark switch moved from the strip at the very top of the window
+  down to the bottom status bar, next to Settings. The top of the window stays
+  calm, and day or night mode is still one click away.
+- When Koda asks you a multiple-choice question and you type your own reply
+  instead of picking an option, the conversation now keeps showing the question
+  you were asked, not just a note that you answered in your own words.
+- If you have Koda tell you when Claude is back after an outage, a single failed
+  message is now enough to start watching. You no longer have to retry to make it
+  notice. Anthropic's status page often lags behind what you are already seeing,
+  so Koda watches quietly in the background from your first failed message and
+  still catches the recovery once the page catches up.
+- Updated the bundled Claude engine to 2.1.205.
+
+### Fixed
+
+- The model you pick now actually runs. If you started a new chat and sent a
+  message without re-opening the model selector, Koda could quietly run a
+  different model than the one shown. You would pick Sonnet and get Opus. Your
+  choice is now honored from the very first message.
+- Deleting a project now clears its chat history for good. Before, an old
+  project's conversations could reappear if you later made a new project with
+  the same name in the same place. Fresh start now means fresh.
+- If you delete a project's folder from your Mac, it no longer lingers as a
+  dead tile in your recent projects. And if you bring the folder back, the
+  project shows up again on its own.
+
+## [0.1.5] - 2026-07-17
+
+### Added
+
+- Choose how long archived chats are kept. They stay forever by default. If you
+  prefer to keep things tidy, you can now have Koda automatically delete archived
+  chats older than a week, a month, or three months. The setting lives in Settings
+  under Archived sessions.
+
+### Changed
+
+- Koda opens faster when you have a lot of archived chats. Archived conversations
+  are now stored so that having hundreds of them no longer slows down startup.
+- The little status icons now tell you what is happening at a glance. When the
+  assistant is thinking, its icon becomes a softly shimmering diamond that spins
+  into a checkmark once it is done. When Koda is loading something, a small dot
+  traces around the icon instead. Same quiet pixel style, easier to read.
+- The "memory needs a tidy" reminder now shows up far less often. Koda's assistant
+  keeps its own notes about your project tidy as it works, clearing out finished
+  items on its own instead of letting them pile up, so you are nudged to tidy only
+  when it is really needed.
+
+### Fixed
+
+- When Claude asks you a multiple-choice question, your answer now stays on screen
+  after you pick it. It used to show the choices again as if you never answered, so
+  you couldn't tell what you'd picked. The card now keeps showing your selection.
+- The Codex usage details now label the 5-hour and weekly limits correctly. They
+  could show up swapped, so the 5-hour limit appeared to reset days away. The
+  reset times now line up with the right window, and when Codex does not say how
+  long a window lasts, Koda no longer guesses "5-hour" for one that resets days
+  from now.
 
 ## [0.1.4] - 2026-07-15
 
@@ -130,7 +228,9 @@ _First versioned build — the baseline the auto-updater ships from._
 - Settings now shows the Koda version, the bundled Claude engine version, and a
   "Check for updates" button.
 
-[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/Gr0x01/koda/releases/tag/v0.1.6
+[0.1.5]: https://github.com/Gr0x01/koda/releases/tag/v0.1.5
 [0.1.4]: https://github.com/Gr0x01/koda/releases/tag/v0.1.4
 [0.1.3]: https://github.com/Gr0x01/koda/releases/tag/v0.1.3
 [0.1.2]: https://github.com/Gr0x01/koda/releases/tag/v0.1.2

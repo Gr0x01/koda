@@ -1,8 +1,17 @@
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { assembleGuardrailText, MEMORY_HEAVY_CHARS, projectMemoryWeight, toCodexToolNames } from './pack'
+import {
+  assembleGuardrailText,
+  CODEX_PACK_SKILLS,
+  codexPackMarker,
+  GATED_PACK_SKILLS,
+  MEMORY_HEAVY_CHARS,
+  projectMemoryWeight,
+  resolveStagingPack,
+  toCodexToolNames,
+} from './pack'
 
 // A project dir with no `.koda/guardrails.json` ⇒ nothing disabled, so we read the shipped pack as-is.
 // assembleGuardrailText resolves the in-repo resources/pack via process.cwd() (dev path).
@@ -77,5 +86,26 @@ describe('assembleGuardrailText (shared by both engine drivers)', () => {
     )
     // A non-Koda mcp__ reference (hypothetical) is left alone — scoped, not a blanket strip.
     expect(toCodexToolNames('mcp__other__thing')).toBe('mcp__other__thing')
+  })
+})
+
+describe('gated mini-app recipe', () => {
+  // create-mini-app is built but not shipped: it lives in the staging pack and reaches an engine only
+  // when the mini-apps dogfood flag is on. These assertions guard that it stays OUT of the always-on
+  // path so a normal release ships clean; flip them when the feature graduates into the main pack.
+  it('keeps the create-mini-app skill in staging, not the main pack or the always-on Codex list', () => {
+    const staging = resolveStagingPack()
+    expect(staging).not.toBeNull()
+    const skill = readFileSync(join(staging!.dir, 'skills', 'create-mini-app', 'SKILL.md'), 'utf8')
+    expect(skill).toContain('name: create-mini-app')
+    expect(skill).toContain('Install, start, stop, and inspect the app only through Koda')
+    expect(GATED_PACK_SKILLS).toContain('create-mini-app')
+    expect(CODEX_PACK_SKILLS).not.toContain('create-mini-app')
+  })
+
+  it('invalidates same-version Codex plugin caches when pack wiring or the mini-apps flag changes', () => {
+    expect(codexPackMarker('0.1.4', false, false)).toMatch(/^0\.1\.4:pack\d+:pw0:ma0$/)
+    expect(codexPackMarker('0.1.4', true, false)).toMatch(/^0\.1\.4:pack\d+:pw1:ma0$/)
+    expect(codexPackMarker('0.1.4', false, true)).toMatch(/^0\.1\.4:pack\d+:pw0:ma1$/)
   })
 })

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Code Review"
+  short_description: "Review a change for real bugs and security holes"
+  default_prompt: "Review the latest change for real bugs, security holes, and obvious cleanups."

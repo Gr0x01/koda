@@ -19,11 +19,18 @@ export default function App() {
   const projectPath = useWorkspace((s) => s.projectPath)
   const setProjectPath = useWorkspace((s) => s.setProjectPath)
   const [onboarded, setOnboarded] = useState<boolean | null>(null)
+  // A ProjectHome window opened by "New Project…" lands with the create modal already open.
+  const [newProjectIntent, setNewProjectIntent] = useState(false)
 
   useEffect(() => {
     window.koda
       .getProjectContext()
-      .then(({ projectPath }) => setProjectPath(projectPath))
+      .then(({ projectPath, newProjectIntent }) => {
+        setProjectPath(projectPath)
+        // Latch: StrictMode double-invokes this effect in dev, and main clears the intent on first
+        // read — so the second call returns false. OR it in so the modal still opens.
+        setNewProjectIntent((prev) => prev || newProjectIntent)
+      })
       .catch(() => setProjectPath('')) // fail safe to ProjectHome rather than a stuck splash
     window.koda
       .getSettings()
@@ -41,7 +48,7 @@ export default function App() {
   if (!onboarded) return <OnboardingWizard onDone={() => setOnboarded(true)} />
   return (
     <>
-      {projectPath === '' ? <ProjectHome /> : <Workspace />}
+      {projectPath === '' ? <ProjectHome openCreate={newProjectIntent} /> : <Workspace />}
       {/* App self-update banner + one-time "What's New" popup — every resolved window, never onboarding. */}
       <UpdateSurface />
     </>

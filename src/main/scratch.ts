@@ -13,7 +13,9 @@ import { mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promi
 import { join } from 'node:path'
 import { log } from './logger'
 
-// MIME → file extension. Mirrors the renderer's compressible set (+ svg, which is passed through).
+// MIME → file extension. Mirrors the renderer's compressible set (+ svg, which is passed through),
+// plus the document types the composer can attach. Docs are saved here but NOT listed by
+// listScratchImages (the MIME map below stays image-only), so they never reach the Recent images strip.
 const EXT: Record<string, string> = {
   'image/webp': 'webp',
   'image/png': 'png',
@@ -21,6 +23,8 @@ const EXT: Record<string, string> = {
   'image/gif': 'gif',
   'image/bmp': 'bmp',
   'image/svg+xml': 'svg',
+  'text/csv': 'csv',
+  'application/pdf': 'pdf',
 }
 
 // Extension → MIME, for re-inlining a saved file. Only known image extensions are listed in (others are
@@ -49,15 +53,21 @@ export async function saveScratchImage(
   mediaType: string,
   dataBase64: string,
   retentionDays: number,
+  fileName?: string,
 ): Promise<string> {
   const dir = scratchDir(projectDir)
   await mkdir(dir, { recursive: true })
   await pruneScratch(projectDir, retentionDays)
-  const ext = EXT[mediaType] ?? 'img'
+  // Document attachments keep their original name (the agent and the user both recognize
+  // `sales-2025` better than a bare timestamp); images stay on the `image-` scheme.
+  const origExt = fileName?.includes('.') ? fileName.slice(fileName.lastIndexOf('.') + 1).toLowerCase() : ''
+  const ext = (origExt || EXT[mediaType]) ?? 'img'
+  const stemRaw = fileName ? fileName.slice(0, fileName.length - (origExt ? origExt.length + 1 : 0)) : 'image'
+  const stem = stemRaw.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[.-]+/, '').slice(0, 40) || 'file'
   // Timestamp (human-sortable) + a UUID segment: collision-free even when a multi-image paste saves in
   // the same second, so the parallel writes never clobber each other. No need to read the dir first.
   const stamp = new Date().toISOString().replace('T', '_').replace(/[:.]/g, '-').slice(0, 19)
-  const name = `image-${stamp}-${randomUUID().slice(0, 8)}.${ext}`
+  const name = `${stem}-${stamp}-${randomUUID().slice(0, 8)}.${ext}`
   await writeFile(join(dir, name), Buffer.from(dataBase64, 'base64'))
   return `.koda/scratch/${name}`
 }

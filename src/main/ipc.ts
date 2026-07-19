@@ -1,6 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, shell, type WebContents } from 'electron'
 import { existsSync, realpathSync } from 'node:fs'
-import { mkdir } from 'node:fs/promises'
+import { mkdir, readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { track, trackFirstTurn } from './telemetry'
 import { checkForUpdatesNow, getUpdateStatus, getWhatsNew, quitAndInstallUpdate } from './updater'
@@ -27,7 +27,7 @@ import {
   SafetyFileDiffRequestSchema,
   SafetyFileDiffResultSchema,
   PersistedSessionsSchema,
-  ArchivedSessionSchema,
+  ArchivedSessionMetaSchema,
   AdoptedHeadlessListSchema,
   RendererLogSchema,
   AttentionCountSchema,
@@ -48,6 +48,8 @@ import {
   WriteFileResultSchema,
   CreateFileRequestSchema,
   CreateFileResultSchema,
+  PickFilesResultSchema,
+  PickPathResultSchema,
   ScratchSaveRequestSchema,
   ScratchSaveResultSchema,
   DocMetaGetRequestSchema,
@@ -101,7 +103,12 @@ import {
   ProjectHasGuidelinesResultSchema,
   ProjectOpenRequestSchema,
   ProjectOpenResultSchema,
+  ProjectDeleteRequestSchema,
+  ProjectDeleteResultSchema,
   RecentProjectsSchema,
+  MiniAppListSchema,
+  MiniAppStartRequestSchema,
+  MiniAppStartResultSchema,
   AddRecentModelSchema,
   KodaSettingsSchema,
   KodaSettingsPatchSchema,
@@ -139,7 +146,7 @@ import { backupNow, getBackupStatus, listCloudBackups, restoreCloudBackup, revea
 import { probeEngine } from './engine/probe'
 import { EngineSessionManager } from './engine/sessions'
 import { loadUsageHistory } from './engine/usage-history'
-import { currentProviderStatus, setStatusWatchHooks } from './engine/status-watch'
+import { currentProviderStatus, refreshProviderStatus, setStatusWatchHooks } from './engine/status-watch'
 import { assistTitle } from './assist'
 import {
   browseDir,
@@ -186,9 +193,20 @@ import {
   projectPathForWindow,
   removeSessionFromWindow,
   setProjectPath,
+  takeNewProjectIntent,
   windowForProject,
 } from './window-registry'
-import { loadAppState, loadArchivedSessions, noteProjectOpened, saveArchivedSessions } from './session-store'
+import {
+  deleteArchivedBody,
+  loadAppState,
+  loadArchivedBody,
+  loadArchivedMeta,
+  noteProjectDeleted,
+  purgeProjectSessions,
+  noteProjectOpened,
+  saveArchivedMeta,
+  writeArchivedBody,
+} from './session-store'
 import {
   loadRecentModels,
   addRecentModel,
@@ -196,7 +214,9 @@ import {
   updateSettings,
   resetSettings,
   loadScratchRetentionDays,
+  loadMiniAppsEnabled,
 } from './settings'
+import { deleteProjectApps, listMiniApps, startRegisteredMiniApp, setMiniAppsChangedListener } from './mini-apps'
 import {
   initRemoteControl,
   registerRemoteIpcHandlers,
@@ -269,8 +289,8 @@ export function registerIpcHandlers(): void {
   // The phone-control tier (LAN server + cloud relay + pairing) — one seam, see remote-control.ts.
   initRemoteControl(engineSessions)
 
-  // Provider-outage watch: pill broadcasts to every window; the remote legs (server-side watch, phone
-  // push) come from the seam and are inert when phone control is absent or the cloud flag is off.
+  // Provider-health watch: health broadcasts to every window (the engine chips); the remote legs
+  // (server-side watch, phone push) come from the seam and are inert when phone control is absent or off.
   setStatusWatchHooks({
     broadcast: (e) => {
       for (const win of BrowserWindow.getAllWindows()) win.webContents.send(IpcChannels.providerStatus, e)
@@ -278,6 +298,9 @@ export function registerIpcHandlers(): void {
     ...remoteStatusWatchHooks(),
   })
   ipcMain.handle(IpcChannels.providerStatusGet, () => currentProviderStatus())
+  ipcMain.handle(IpcChannels.providerStatusRefresh, (_e, engines: string[]) =>
+    refreshProviderStatus(Array.isArray(engines) ? engines : []),
+  )
 
   ipcMain.handle(IpcChannels.getAppInfo, () =>
     AppInfoSchema.parse({
@@ -380,21 +403,52 @@ export function registerIpcHandlers(): void {
     }
   })
 
-  // Archived sessions: the cold per-project file (see session-store.ts) — read on boot, written only
-  // when the archived list changes. Same fail-soft posture as the hot save above.
+  // Archived sessions: the cold per-project store (see session-store.ts). The metadata index is read on
+  // boot and written when the list changes; transcript bodies live in per-session files, fetched only on
+  // restore. Same fail-soft posture as the hot save above.
   ipcMain.handle(IpcChannels.archivedLoad, (event) => {
     try {
-      return loadArchivedSessions(rootForSender(event.sender))
+      return loadArchivedMeta(rootForSender(event.sender))
     } catch {
       return []
     }
   })
 
   ipcMain.on(IpcChannels.archivedSave, (event, rawArgs: unknown) => {
-    const parsed = z.array(ArchivedSessionSchema).safeParse(rawArgs)
+    const parsed = z.array(ArchivedSessionMetaSchema).safeParse(rawArgs)
     if (!parsed.success) return
     try {
-      saveArchivedSessions(rootForSender(event.sender), parsed.data)
+      saveArchivedMeta(rootForSender(event.sender), parsed.data)
+    } catch {
+      /* no project for this window yet */
+    }
+  })
+
+  ipcMain.handle(IpcChannels.archivedLoadBody, (event, rawArgs: unknown) => {
+    const id = z.string().safeParse(rawArgs)
+    if (!id.success) return null
+    try {
+      return loadArchivedBody(rootForSender(event.sender), id.data)
+    } catch {
+      return null // read failure → caller (restore) keeps the archive rather than destroying it
+    }
+  })
+
+  ipcMain.handle(IpcChannels.archivedWriteBody, (event, rawArgs: unknown) => {
+    const parsed = z.object({ id: z.string(), items: z.array(z.unknown()) }).safeParse(rawArgs)
+    if (!parsed.success) return
+    try {
+      writeArchivedBody(rootForSender(event.sender), parsed.data.id, parsed.data.items)
+    } catch {
+      /* no project for this window yet */
+    }
+  })
+
+  ipcMain.handle(IpcChannels.archivedDeleteBody, (event, rawArgs: unknown) => {
+    const id = z.string().safeParse(rawArgs)
+    if (!id.success) return
+    try {
+      deleteArchivedBody(rootForSender(event.sender), id.data)
     } catch {
       /* no project for this window yet */
     }
@@ -567,14 +621,54 @@ export function registerIpcHandlers(): void {
   // Persist a pasted/dropped image to the window project's `.koda/scratch/` folder. Root is resolved in
   // main (renderer never names a cwd); retention is read live so a settings change applies next save.
   ipcMain.handle(IpcChannels.scratchSave, async (event, rawArgs: unknown) => {
-    const { mediaType, dataBase64 } = ScratchSaveRequestSchema.parse(rawArgs)
+    const { mediaType, dataBase64, fileName } = ScratchSaveRequestSchema.parse(rawArgs)
     const path = await saveScratchImage(
       rootForSender(event.sender),
       mediaType,
       dataBase64,
       loadScratchRetentionDays(),
+      fileName,
     )
     return ScratchSaveResultSchema.parse({ path })
+  })
+
+  // Composer attach menu: native open dialog → the picked files' bytes. Main does the read (the
+  // renderer has no fs); the renderer stages the result exactly like a drop, compressing images there.
+  ipcMain.handle(IpcChannels.composerPickFiles, async (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    const opts = {
+      properties: ['openFile', 'multiSelections'] as ('openFile' | 'multiSelections')[],
+      filters: [
+        { name: 'Attachable files', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'csv', 'pdf'] },
+      ],
+    }
+    const res = win ? await dialog.showOpenDialog(win, opts) : await dialog.showOpenDialog(opts)
+    if (res.canceled) return PickFilesResultSchema.parse({ files: [] })
+    const byExt: Record<string, string> = {
+      png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
+      bmp: 'image/bmp', svg: 'image/svg+xml', csv: 'text/csv', pdf: 'application/pdf',
+    }
+    const files = await Promise.all(
+      res.filePaths.map(async (p) => {
+        const name = basename(p)
+        const mediaType = byExt[name.slice(name.lastIndexOf('.') + 1).toLowerCase()]
+        if (!mediaType) return null
+        try {
+          return { name, mediaType, dataBase64: (await readFile(p)).toString('base64') }
+        } catch {
+          return null // unreadable (vanished, permissions) — skip, never block the pick
+        }
+      }),
+    )
+    return PickFilesResultSchema.parse({ files: files.filter((f) => f !== null) })
+  })
+
+  // "Point at a file or folder" — returns the chosen absolute path; nothing is copied.
+  ipcMain.handle(IpcChannels.composerPickPath, async (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    const opts = { properties: ['openFile', 'openDirectory'] as ('openFile' | 'openDirectory')[] }
+    const res = win ? await dialog.showOpenDialog(win, opts) : await dialog.showOpenDialog(opts)
+    return PickPathResultSchema.parse({ path: res.canceled ? null : (res.filePaths[0] ?? null) })
   })
 
   // Page through the window project's recent scratch images (newest first) for the Recent images strip.
@@ -1299,7 +1393,11 @@ export function registerIpcHandlers(): void {
   // Which project is this window? '' ⇒ ProjectHome (renderer shows the folder picker).
   ipcMain.handle(IpcChannels.projectGetContext, (event) => {
     const win = BrowserWindow.fromWebContents(event.sender)
-    return ProjectContextSchema.parse({ projectPath: (win && projectPathForWindow(win.id)) || '' })
+    return ProjectContextSchema.parse({
+      projectPath: (win && projectPathForWindow(win.id)) || '',
+      // Read-and-clear: a ProjectHome window opened by "New Project…" lands on the create modal once.
+      newProjectIntent: win ? takeNewProjectIntent(win.id) : false,
+    })
   })
 
   // Native open-directory dialog, parented to the calling window.
@@ -1313,7 +1411,7 @@ export function registerIpcHandlers(): void {
 
   // Open a folder as THIS window's project, in place. If another window already shows it, focus that
   // one and leave this window unchanged (block-and-focus, VSCode-style — one window per project).
-  ipcMain.handle(IpcChannels.projectOpen, (event, rawArgs: unknown) => {
+  ipcMain.handle(IpcChannels.projectOpen, async (event, rawArgs: unknown) => {
     const { path } = ProjectOpenRequestSchema.parse(rawArgs)
     const projectPath = realpathSync(path) // resolve once so the registry + store key consistently
     const existing = windowForProject(projectPath)
@@ -1327,6 +1425,8 @@ export function registerIpcHandlers(): void {
       win.setTitle(basename(projectPath) || 'Koda') // distinguish windows in the switcher
     }
     noteProjectOpened(projectPath) // openProjects (restore-on-boot) + recents
+    const { buildAppMenu } = await import('./index')
+    buildAppMenu()
     return ProjectOpenResultSchema.parse({ projectPath, alreadyOpen: false })
   })
 
@@ -1359,6 +1459,8 @@ export function registerIpcHandlers(): void {
       win.setTitle(basename(projectPath) || 'Koda')
     }
     noteProjectOpened(projectPath) // openProjects (restore-on-boot) + recents
+    const { buildAppMenu } = await import('./index')
+    buildAppMenu()
     track('project_created', {})
     return ProjectOpenResultSchema.parse({ projectPath, alreadyOpen: false })
   })
@@ -1372,9 +1474,62 @@ export function registerIpcHandlers(): void {
     return ProjectHasGuidelinesResultSchema.parse({ hasGuidelines })
   })
 
+  // Serve-time existence filter: a project folder deleted outside Koda (Finder, the agent) must not
+  // linger as a dead launcher tile. The state file keeps the path — it ages out via the recents cap —
+  // so a folder restored from the Trash reappears without ceremony.
   ipcMain.handle(IpcChannels.projectGetRecents, () =>
-    RecentProjectsSchema.parse(loadAppState().recentProjects),
+    RecentProjectsSchema.parse(loadAppState().recentProjects.filter((p) => existsSync(p))),
   )
+
+  // Delete a project: stop + deregister its mini apps, then move the folder (and its orphaned agent
+  // worktrees, if any) to the Trash — recoverable, never rm. The path must come from the recents/apps
+  // lists (same posture as miniApps:start: a compromised renderer can't trash arbitrary folders), and
+  // the project can't be open in a window — closing it stays the user's explicit step, never something
+  // main does out from under a live session.
+  ipcMain.handle(IpcChannels.projectDelete, async (_event, rawArgs: unknown) => {
+    const { path } = ProjectDeleteRequestSchema.parse(rawArgs)
+    const known =
+      loadAppState().recentProjects.includes(path) ||
+      (await listMiniApps()).some((a) => a.projectPath === path)
+    if (!known) throw new Error('that folder is not a Koda project')
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (projectPathForWindow(win.id) === path) {
+        throw new Error('this project is open in a window — close that window first')
+      }
+    }
+    await deleteProjectApps(path)
+    // Purge the project's session stores BEFORE trashing the folder — the engine's store slug depends on
+    // the path's realpath, which stops resolving once the folder is gone. Otherwise a same-name project
+    // recreated at this path re-adopts the old sessions.
+    purgeProjectSessions(path)
+    if (existsSync(path)) await shell.trashItem(path)
+    const worktrees = join(dirname(path), '.worktrees', basename(path))
+    if (existsSync(worktrees)) await shell.trashItem(worktrees)
+    noteProjectDeleted(path)
+    return ProjectDeleteResultSchema.parse({})
+  })
+
+  // Mini apps (the face — seam ③). List doubles as the renderer's feature gate: flag off ⇒ [] ⇒ no
+  // launcher rail, no App/Workshop toggle — one flag, read live, same posture as the broker verbs.
+  ipcMain.handle(IpcChannels.miniAppsList, async () =>
+    MiniAppListSchema.parse(loadMiniAppsEnabled() ? await listMiniApps() : []),
+  )
+
+  // Registry/run-state changes push to every window (a project window opened BEFORE the agent built
+  // its app must still learn the face exists — the graduation moment happens mid-session). Flag off ⇒
+  // never fires (nothing can register), and the re-fetch would return [] anyway.
+  setMiniAppsChangedListener(() => {
+    for (const win of BrowserWindow.getAllWindows()) win.webContents.send(IpcChannels.miniAppsChanged)
+  })
+
+  // Start is registry-validated in mini-apps.ts — the renderer can only start apps the agent installed,
+  // never run an arbitrary folder's entry command.
+  ipcMain.handle(IpcChannels.miniAppsStart, async (_event, rawArgs: unknown) => {
+    if (!loadMiniAppsEnabled()) throw new Error('mini apps are not enabled')
+    const { dir } = MiniAppStartRequestSchema.parse(rawArgs)
+    const { url } = await startRegisteredMiniApp(dir)
+    return MiniAppStartResultSchema.parse({ url })
+  })
 
   // Renderer log forwarding is fire-and-forget (send/on, no reply). safeParse so a
   // bad shape is dropped, never thrown — logging must not become a crash vector.

@@ -463,6 +463,7 @@ function CapabilityRow({
           <PixelGlyph
             glyph={ready || installing ? 'check' : 'dotRound'}
             loader={installing}
+            variant="snake"
             size={14}
             className={ready || installing ? 'text-accent' : 'text-text-muted/50'}
           />

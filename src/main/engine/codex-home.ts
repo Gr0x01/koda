@@ -17,7 +17,15 @@ import { promisify } from 'node:util'
 import { app } from 'electron'
 import { resolveEnginePath } from './binary'
 import { buildEngineEnv } from './env'
-import { resolvePack, toCodexToolNames } from './pack'
+import {
+  CODEX_PACK_SKILLS,
+  GATED_PACK_SKILLS,
+  codexPackMarker,
+  resolvePack,
+  resolveStagingPack,
+  toCodexToolNames,
+} from './pack'
+import { loadMiniAppsEnabled } from '../settings'
 import { log } from '../logger'
 
 const execFileP = promisify(execFile)
@@ -138,10 +146,6 @@ export async function reconcileCodexAuth(opts: { resourcesPath?: string; apiKey?
   }
 }
 
-/** Shared skills taken from the Claude pack (one source of truth). The always-on subset — browser-verify
- *  is added only when the Playwright capability is wired (its tools attach via the driver), so its
- *  guidance never dangles for tools that aren't there. */
-const PACK_SKILLS = ['memory', 'documents', 'verify'] as const
 /** The pack skill that teaches browser verification — materialized for Codex only when Playwright is wired. */
 const BROWSER_VERIFY_SKILL = 'browser-verify'
 
@@ -234,7 +238,8 @@ async function setup(opts: {
   ensureCodexAuthSeed() // home dir + login (shared with the pre-session probes)
 
   // Version-keyed install, plus the wired-state of optional skills, so a capability toggle re-installs.
-  const markerValue = `${opts.appVersion}:pw${opts.playwrightWired ? 1 : 0}`
+  const miniApps = loadMiniAppsEnabled()
+  const markerValue = codexPackMarker(opts.appVersion, opts.playwrightWired === true, miniApps)
   const markerPath = join(home, MARKER)
   if (existsSync(markerPath) && readFileSync(markerPath, 'utf8').trim() === markerValue) return
 
@@ -251,10 +256,20 @@ async function setup(opts: {
   mkdirSync(join(pluginDir, 'skills'), { recursive: true })
   writeFileSync(join(srcRoot, '.agents', 'plugins', 'marketplace.json'), marketplaceJson())
   writeFileSync(join(pluginDir, '.codex-plugin', 'plugin.json'), pluginJson(opts.appVersion))
-  const packSkills = opts.playwrightWired ? [...PACK_SKILLS, BROWSER_VERIFY_SKILL] : [...PACK_SKILLS]
+  const packSkills = opts.playwrightWired ? [...CODEX_PACK_SKILLS, BROWSER_VERIFY_SKILL] : [...CODEX_PACK_SKILLS]
   for (const name of packSkills) {
     const from = join(pack.dir, 'skills', name)
     if (existsSync(from)) cpSync(from, join(pluginDir, 'skills', name), { recursive: true })
+  }
+  // Built-but-unshipped skills live in the staging pack, not the main one — copy them only when the
+  // mini-apps dogfood flag is on (mirrors the Claude side's staging --plugin-dir; folded into the marker
+  // above so toggling re-installs). Absent staging (graduated/stripped build) ⇒ nothing to copy.
+  const staging = miniApps ? resolveStagingPack({ resourcesPath: opts.resourcesPath }) : null
+  if (staging) {
+    for (const name of GATED_PACK_SKILLS) {
+      const from = join(staging.dir, 'skills', name)
+      if (existsSync(from)) cpSync(from, join(pluginDir, 'skills', name), { recursive: true })
+    }
   }
   // Codex-only supplements (each a dir with a SKILL.md).
   const codexOnly = codexOnlySkillsDir(opts.resourcesPath)

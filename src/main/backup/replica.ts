@@ -48,6 +48,10 @@ export interface ReplicaFile {
 export interface ReplicaSnapshot {
   schemaVersion: 1
   createdAt: number
+  /** The project's live path on the Mac — carried INSIDE the sealed blob (never the plaintext manifest, so
+   *  the path stays private). Lets the phone, when connected, open a replica doc in the live editable editor
+   *  (write-back needs the path `remoteWriteFile` validates against known projects). Read-only without it. */
+  projectPath: string
   files: ReplicaFile[]
   /** What the per-file cap left out — sealed with everything else, so the phone can say so. */
   skipped: { rel: string; bytes: number }[]
@@ -173,7 +177,7 @@ async function collectDocImages(projectDir: string, snap: ReplicaSnapshot): Prom
 
 /** Null = nothing to replicate (no Documents/ and no memory — a brand-new or non-doc project). */
 export async function buildDocsSnapshot(projectDir: string): Promise<ReplicaSnapshot | null> {
-  const snap: ReplicaSnapshot = { schemaVersion: 1, createdAt: Date.now(), files: [], skipped: [] }
+  const snap: ReplicaSnapshot = { schemaVersion: 1, createdAt: Date.now(), projectPath: projectDir, files: [], skipped: [] }
   let total = 0
   for (const root of REPLICA_ROOTS) total += await collectRoot(projectDir, root, snap)
   if (snap.files.length === 0 && snap.skipped.length === 0) return null
@@ -208,7 +212,7 @@ export async function replicaNow(projectDir: string): Promise<ReplicaStatus> {
         s.state = 'idle'
         return s
       }
-      snap = { schemaVersion: 1, createdAt: Date.now(), files: [], skipped: [] }
+      snap = { schemaVersion: 1, createdAt: Date.now(), projectPath: projectDir, files: [], skipped: [] }
     }
     const sealed = encryptBlob(gzipSync(Buffer.from(JSON.stringify(snap))), replicaAad(hash), key)
     const manifest = await uploadReplica(userId, hash, projectDir, sealed, snap.files.length)

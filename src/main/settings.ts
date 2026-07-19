@@ -152,6 +152,14 @@ export function loadScratchRetentionDays(): number {
   return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 7
 }
 
+/** Archived-session retention in days — archives older than this are auto-deleted on load. `0` (the
+ *  default) keeps them forever: archives live outside the safety-git undo net, so a purge is permanent,
+ *  and the safe default never deletes. Opt-in from the Archived settings section. */
+export function loadArchiveRetentionDays(): number {
+  const v = readSettings().archiveRetentionDays
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0
+}
+
 /** Optional Playwright browser-testing toggle — default-OFF (it costs a ~150 MB download). Read live at
  *  session spawn (playwright/index.ts) so the agent gains/loses browser tools on the next session. */
 export function loadPlaywrightEnabled(): boolean {
@@ -235,6 +243,17 @@ export function loadReplicaEnabled(): boolean {
   return process.env.KODA_REPLICA === '1' || readSettings().replicaEnabled === true
 }
 
+/** Mini-apps make-and-run (the in-progress apps platform; mini-apps-plan.md). ONE gate for the whole
+ *  half-built project so normal releases stay shippable while it lands over a couple weeks: it's read
+ *  at every *activation seam* — the create-mini-app skill (a staging --plugin-dir wired only when on),
+ *  the lifecycle capability's broker tools, and the "turn this into an app" UI entry. The guts (verbs,
+ *  component kit, bridge) land freely on main because they're inert until a seam surfaces them. Same
+ *  dogfood posture as backup/replica: `"miniAppsEnabled": true` in koda-settings.json or
+ *  `KODA_MINI_APPS=1` in dev. Default OFF; flip it (or graduate the pieces) when the project ships. */
+export function loadMiniAppsEnabled(): boolean {
+  return process.env.KODA_MINI_APPS === '1' || readSettings().miniAppsEnabled === true
+}
+
 /**
  * Provisioned-runtime record — NOT a user preference (so it's out of the Settings surface below): it's
  * internal state recording which on-demand runtime (Node / Python) Koda installed and where. Read at
@@ -306,6 +325,7 @@ export function loadSettings(): KodaSettings {
     previewAutoStart: loadPreviewAutoStart(),
     imageDetail: loadImageDetail(),
     scratchRetentionDays: loadScratchRetentionDays(),
+    archiveRetentionDays: loadArchiveRetentionDays(),
     playwrightEnabled: loadPlaywrightEnabled(),
     hasOnboarded: loadHasOnboarded(),
     billingMode: loadBillingMode(),
@@ -343,6 +363,8 @@ export function updateSettings(patch: Partial<KodaSettings>): KodaSettings {
   if (patch.imageDetail !== undefined) next.imageDetail = patch.imageDetail
   if (patch.scratchRetentionDays !== undefined)
     next.scratchRetentionDays = Math.max(0, Math.floor(patch.scratchRetentionDays))
+  if (patch.archiveRetentionDays !== undefined)
+    next.archiveRetentionDays = Math.max(0, Math.floor(patch.archiveRetentionDays))
   if (patch.playwrightEnabled !== undefined) next.playwrightEnabled = patch.playwrightEnabled
   if (patch.hasOnboarded !== undefined) next.hasOnboarded = patch.hasOnboarded
   if (patch.billingMode !== undefined) next.billingMode = patch.billingMode

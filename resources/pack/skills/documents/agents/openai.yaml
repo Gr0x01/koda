@@ -1,0 +1,4 @@
+interface:
+  display_name: "Koda Documents"
+  short_description: "Rich formatting for documents in Koda"
+  default_prompt: "Format this document so it reads as a polished page in Koda."

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useId, useMemo, useState, type ReactNode } from 'react'
 import type {
   BillingMode,
   BillingState,
@@ -9,30 +9,33 @@ import type {
   RateLimitInfo,
   UsageHistoryDay,
 } from '@shared/ipc'
-import { Collapse } from '../motion'
+import { Collapse, motion, spring } from '../motion'
+import { Caret } from '../Caret'
 import { useWorkspace } from '../workspace/store'
 import { engineLabel, engineOrder, engineAccent } from '../workspace/models'
 import { SegmentedControl, SettingsRow, SettingsSection } from './controls'
-import { BusyText, Button } from '../ui'
+import { BusyText, Button, Card, PixelGlyph, cx } from '../ui'
 
-// ── AI providers (engine billing, grouped by provider) ──────────────────────────────
-// How the LLM that powers each session is authenticated and paid for, organized as one self-contained
-// block per provider (each is a separate account and bill, so they never share auth or usage): Anthropic
-// (Claude plan, optional BYO API key, usage) and OpenAI (ChatGPT plan → the Codex engine, usage). Each
-// block mirrors the same shape — sign-in/status, then usage — so the two read as peers, not one bolted
-// under the other. Switching is user-visible here, never silent; a stored key is encrypted in main and
-// never echoed back (the UI only learns whether one exists). Cross-engine daily history sits at the end.
+// ── AI providers (engine billing, one tab per provider) ─────────────────────────────
+// How the LLM that powers each session is authenticated and paid for. Each provider (Anthropic → Claude,
+// OpenAI → Codex) is a separate account and bill, so they never share auth or usage. They read as PEERS
+// on a tab strip — pick one and see just its account + usage — rather than one long stack where the
+// advanced key path and the read-only usage compete with the primary sign-in for attention. Adding a
+// provider later (Google, open models) is one entry in `providers` once its backend exists; we don't
+// ship a tab that leads nowhere. Switching billing is user-visible here, never silent; a stored key is
+// encrypted in main and never echoed back (the UI only learns whether one exists). Cross-engine daily
+// history spans both providers, so it sits below the tabs.
 export function ProvidersSection() {
   const [billing, setBilling] = useState<BillingState | null>(null)
   const [history, setHistory] = useState<UsageHistoryDay[]>([])
   const [codexAuth, setCodexAuth] = useState<CodexAuthStatus | null>(null)
-  const sessions = useWorkspace((s) => s.sessions)
+  const [active, setActive] = useState<ProviderId>('anthropic')
   const rateLimits = useWorkspace((s) => s.rateLimits)
 
   const refresh = (): void => {
     window.koda.getBillingState().then(setBilling).catch(console.error)
   }
-  // Stable identity so OpenAiPanel's progress-listener effect doesn't re-subscribe on every render (this
+  // Stable identity so OpenAiSignIn's progress-listener effect doesn't re-subscribe on every render (this
   // parent re-renders on session/rateLimit churn). When login completes it already carries fresh status,
   // so seed from that and skip a second probe; otherwise (initial mount) fetch it.
   const refreshCodex = useCallback((status?: CodexAuthStatus): void => {
@@ -56,15 +59,19 @@ export function ProvidersSection() {
   const apiAlways = billing?.mode === 'api'
   const apiActive = billing?.apiActive ?? false
 
-  // Per-engine spend + by-model aggregates from open/restored sessions: each engine is a separate
-  // subscription, so these never mix across Anthropic and OpenAI.
-  const perEngine = useMemo(() => {
+  // Per-engine spend + by-model breakdown from the PERSISTED history, not just the sessions open right
+  // now — so Usage shows every model you've used lately (e.g. one from a session you've since closed),
+  // which the old open-sessions-only aggregate silently dropped. Model → engine by id (Claude reports
+  // `claude-*` ids or a Claude alias; everything else is Codex) — the same two-brand split the history
+  // bars use, extended when a third engine lands. Snapshotted at mount, which is fine for a settings pane.
+  const byEngine = useMemo(() => {
     const agg: Record<string, { spend: number; byModel: Record<string, ModelSpend> }> = {}
-    for (const s of Object.values(sessions)) {
-      const eid = s.engineId ?? 'claude'
-      const e = (agg[eid] ??= { spend: 0, byModel: {} })
-      e.spend += s.spendUsd ?? 0
-      for (const [model, m] of Object.entries(s.byModel ?? {})) {
+    for (const day of history) {
+      for (const [eid, cost] of Object.entries(day.byEngine ?? {})) {
+        ;(agg[eid] ??= { spend: 0, byModel: {} }).spend += cost
+      }
+      for (const [model, m] of Object.entries(day.byModel ?? {})) {
+        const e = (agg[engineOfModel(model)] ??= { spend: 0, byModel: {} })
         const a = e.byModel[model]
         e.byModel[model] = {
           costUsd: (a?.costUsd ?? 0) + m.costUsd,
@@ -76,14 +83,12 @@ export function ProvidersSection() {
       }
     }
     return agg
-  }, [sessions])
+  }, [history])
 
-  // Multi-engine = any engine other than the always-present Claude has spend or a reported window —
-  // drives whether OpenAI shows a usage card and whether the history bars segment by engine.
+  // OpenAI's usage card + the history-bar engine split appear once there's any Codex usage on record.
   const codexHasUsage =
-    (perEngine.codex?.spend ?? 0) > 0 || Object.keys(rateLimits.codex ?? {}).length > 0
-  const multi =
-    new Set(['claude', ...Object.keys(perEngine), ...Object.keys(rateLimits)]).size > 1
+    (byEngine.codex?.spend ?? 0) > 0 || Object.keys(rateLimits.codex ?? {}).length > 0
+  const multi = new Set(['claude', ...Object.keys(byEngine), ...Object.keys(rateLimits)]).size > 1
 
   // Hide a provider's advanced (API key) + usage rows until it's actually signed in — a logged-out pane
   // should read as one clean "sign in" card, not a wall of empty usage. Claude is ready on a subscription
@@ -94,180 +99,261 @@ export function ProvidersSection() {
   const codexReady = (codexAuth?.signedIn ?? false) || (billing?.hasCodexKey ?? false)
   const anyReady = claudeReady || codexReady
 
+  const claudeStatus = claudeStatusOf(billing)
+  const codexStatus = codexStatusOf(codexAuth, billing)
+  const tabs: ProviderTab[] = [
+    { id: 'anthropic', brand: 'Anthropic', sub: 'Claude', status: claudeStatus },
+    { id: 'openai', brand: 'OpenAI', sub: 'Codex', status: codexStatus },
+  ]
+
   return (
-    <>
-      <ProviderGroup brand="Anthropic" sub="Claude">
-        <ClaudePanel billing={billing} onChanged={refresh} />
-        {claudeReady && (
-          <>
-            <ApiKeyPanel billing={billing} onChanged={refresh} />
-            <EngineUsage
-              title="Usage"
-              engineId="claude"
-              windows={rateLimits.claude ?? {}}
-              spend={perEngine.claude?.spend ?? 0}
-              byModel={perEngine.claude?.byModel ?? {}}
-              // Plan windows are meaningless under always-API billing; hide just that block.
-              showPlanLimits={!apiAlways}
+    <div className="space-y-5">
+      <ProviderTabs tabs={tabs} activeId={active} onSelect={setActive} />
+
+      {/* Both panels stay MOUNTED (only the active one is shown) so a sign-in listener isn't torn down
+          mid-login when you switch tabs — the in-flight paste UI and the completion refresh survive the
+          switch. Only one is ever visible, so a plain hidden toggle is enough. */}
+      <div>
+        <div className={active === 'anthropic' ? undefined : 'hidden'}>
+          <ProviderPanel brand="Anthropic" sub="Claude" status={claudeStatus}>
+            <ClaudeAccountCard
+              billing={billing}
+              onChanged={refresh}
+              showKey={claudeReady}
               apiActive={apiActive}
             />
-          </>
-        )}
-      </ProviderGroup>
+            {claudeReady && (
+              <EngineUsage
+                title="Usage"
+                engineId="claude"
+                windows={rateLimits.claude ?? {}}
+                spend={byEngine.claude?.spend ?? 0}
+                byModel={byEngine.claude?.byModel ?? {}}
+                // Plan windows are meaningless under always-API billing; hide just that block.
+                showPlanLimits={!apiAlways}
+                apiActive={apiActive}
+              />
+            )}
+          </ProviderPanel>
+        </div>
 
-      <ProviderGroup brand="OpenAI" sub="ChatGPT · Codex">
-        <OpenAiPanel auth={codexAuth} onChanged={refreshCodex} />
-        <OpenAiApiKeyPanel
-          billing={billing}
-          onChanged={() => {
-            refresh()
-            refreshCodex() // auth.json flips between apikey/chatgpt after reconcile — re-read sign-in status
-          }}
-        />
-        {codexReady && codexHasUsage && (
-          <EngineUsage
-            title="Usage"
-            engineId="codex"
-            windows={rateLimits.codex ?? {}}
-            spend={perEngine.codex?.spend ?? 0}
-            byModel={perEngine.codex?.byModel ?? {}}
-            // Plan windows are meaningless when Codex bills the API key; hide just that block.
-            showPlanLimits={!(billing?.codexApiActive ?? false)}
-            apiActive={billing?.codexApiActive ?? false}
-          />
-        )}
-      </ProviderGroup>
+        <div className={active === 'openai' ? undefined : 'hidden'}>
+          <ProviderPanel brand="OpenAI" sub="Codex" status={codexStatus}>
+            <OpenAiAccountCard
+              auth={codexAuth}
+              billing={billing}
+              onChangedAuth={refreshCodex}
+              onChangedBilling={() => {
+                refresh()
+                refreshCodex() // auth.json flips between apikey/chatgpt after reconcile — re-read sign-in status
+              }}
+            />
+            {codexReady && codexHasUsage && (
+              <EngineUsage
+                title="Usage"
+                engineId="codex"
+                windows={rateLimits.codex ?? {}}
+                spend={byEngine.codex?.spend ?? 0}
+                byModel={byEngine.codex?.byModel ?? {}}
+                // Plan windows are meaningless when Codex bills the API key; hide just that block.
+                showPlanLimits={!(billing?.codexApiActive ?? false)}
+                apiActive={billing?.codexApiActive ?? false}
+              />
+            )}
+          </ProviderPanel>
+        </div>
+      </div>
 
       {anyReady && history.length > 0 && (
         <HistorySection history={history} multi={multi} apiActive={apiActive} />
       )}
-    </>
+    </div>
   )
 }
 
-/** One provider's whole story — a prominent brand header (company first, the framing the user thinks
- *  in: "Anthropic vs OpenAI") over its stack of cards (sign-in/status, key, usage). The header is a
- *  level above the cards' own uppercase titles, so each block reads as a self-contained unit. */
-function ProviderGroup({ brand, sub, children }: { brand: string; sub: string; children: ReactNode }) {
+// ── Provider tabs ────────────────────────────────────────────────────────────────────
+type ProviderId = 'anthropic' | 'openai'
+type ProviderStatus = { dot: boolean; short: string; full: string }
+type ProviderTab = { id: ProviderId; brand: string; sub: string; status: ProviderStatus }
+
+/** The provider switcher: a segmented strip (same white chip that SLIDES between options as the rest of
+ *  Settings) where each tab is a whole provider — brand over "engine · at-a-glance status", with a status
+ *  dot so signed-in vs not reads without opening it. Only the picked provider's account + usage render
+ *  below, so the pane stays one provider tall no matter how many we add. */
+function ProviderTabs({
+  tabs,
+  activeId,
+  onSelect,
+}: {
+  tabs: ProviderTab[]
+  activeId: ProviderId
+  onSelect: (id: ProviderId) => void
+}) {
+  const layoutId = useId()
+  return (
+    <div role="tablist" aria-label="AI provider" className="inline-flex gap-px rounded-lg bg-text/5 p-0.5">
+      {tabs.map((t) => {
+        const active = t.id === activeId
+        return (
+          <button
+            key={t.id}
+            role="tab"
+            aria-selected={active}
+            onClick={() => onSelect(t.id)}
+            className={cx(
+              'relative rounded-md px-3.5 py-2 text-left transition-colors',
+              !active && 'hover:bg-surface/40',
+            )}
+          >
+            {active && (
+              <motion.span
+                layoutId={layoutId}
+                className="absolute inset-0 rounded-md bg-surface shadow-soft"
+                transition={spring.snappy}
+              />
+            )}
+            <span className="relative z-10 block">
+              <span className="flex items-center gap-1.5">
+                <PixelGlyph
+                  glyph="dot"
+                  size={9}
+                  className={t.status.dot ? 'text-emerald-500' : 'text-text-muted/40'}
+                />
+                <span className="truncate font-display text-[13.5px] font-semibold text-text">
+                  {t.brand}
+                </span>
+              </span>
+              <span className="mt-0.5 block truncate text-[11.5px] text-text-muted">
+                {t.sub} · {t.status.short}
+              </span>
+            </span>
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+/** The active provider's story: a brand header (company first — "Anthropic vs OpenAI", the framing the
+ *  user thinks in) with the full account status as a pill on the right, over its stack of cards. Status
+ *  lives in the header, not a repeated row inside every card. */
+function ProviderPanel({
+  brand,
+  sub,
+  status,
+  children,
+}: {
+  brand: string
+  sub: string
+  status: ProviderStatus
+  children: ReactNode
+}) {
   return (
     <div className="space-y-4">
-      <div className="flex items-baseline gap-2 px-1">
-        <h2 className="font-display text-[15px] font-semibold text-text">{brand}</h2>
-        <span className="text-[12.5px] text-text-muted">{sub}</span>
+      <div className="flex items-center justify-between gap-3 px-1">
+        <div className="flex items-baseline gap-2">
+          <h2 className="font-display text-[15px] font-semibold text-text">{brand}</h2>
+          <span className="text-[12.5px] text-text-muted">{sub}</span>
+        </div>
+        <StatusBadge status={status} />
       </div>
       {children}
     </div>
   )
 }
 
-/** OpenAI sign-in: a ChatGPT-plan OAuth login that drives `codex login` in main. Unlike Claude's
- *  paste-code flow, Codex uses a loopback callback, so there's no code to paste — the browser opens,
- *  the user approves, and it completes on its own. Koda never stores the OpenAI credential (the engine
- *  owns it). Signed in → OpenAI models become selectable in the model menu. */
-function OpenAiPanel({
-  auth,
-  onChanged,
-}: {
-  auth: CodexAuthStatus | null
-  onChanged: (status?: CodexAuthStatus) => void
-}) {
-  const [phase, setPhase] = useState<'idle' | 'awaiting-browser' | 'verifying' | 'failed'>('idle')
-  const [url, setUrl] = useState('')
-  const [msg, setMsg] = useState('')
-
-  useEffect(() => {
-    return window.koda.onCodexLoginProgress((e) => {
-      if (e.state === 'awaiting-browser') {
-        setPhase('awaiting-browser')
-        setUrl(e.url)
-      } else if (e.state === 'verifying') setPhase('verifying')
-      else if (e.state === 'completed') {
-        setPhase('idle')
-        onChanged(e.status) // completed already carries fresh status — no second probe
-      } else if (e.state === 'failed') {
-        setPhase('failed')
-        setMsg(e.message)
-      } else setPhase('idle') // cancelled / timeout
-    })
-  }, [onChanged])
-
-  const start = (): void => {
-    setMsg('')
-    setPhase('verifying') // optimistic until the URL or a failure lands
-    window.koda
-      .startCodexLogin()
-      .then((r) => {
-        if (!r.ok) {
-          setPhase('failed')
-          setMsg(r.reason ?? 'Could not start sign-in.')
-        }
-      })
-      .catch(() => setPhase('failed'))
-  }
-
-  const signedIn = auth?.signedIn ?? false
-  const method = auth?.authMethod === 'chatgpt' ? 'ChatGPT' : auth?.authMethod ?? null
-  const status = !auth ? '…' : signedIn ? `Signed in${method ? ` · ${method}` : ''}` : 'Not signed in'
-  // Both pre-URL ('verifying') and post-URL ('awaiting-browser') are in-flight: a real child is running,
-  // so Cancel must be reachable in either (otherwise a URL that never parses strands "Working…" until the
-  // 5-min timeout with no escape).
-  const inFlight = phase === 'verifying' || phase === 'awaiting-browser'
-
+/** The account's at-a-glance state — a dot + one line ("Signed in · max · you@…" / "Not signed in"),
+ *  tinted green when a credential is live. The sign-in button lives in the card below; this is the
+ *  read-out. */
+function StatusBadge({ status }: { status: ProviderStatus }) {
   return (
-    <SettingsSection title="Subscription">
-      <SettingsRow
-        label="ChatGPT plan"
-        description="Bills OpenAI's Codex engine against your ChatGPT plan. Pick an OpenAI model from the model menu to use it."
-        control={
-          phase === 'awaiting-browser' ? (
-            <BusyText className="text-[13px] text-text-muted">Waiting for the browser…</BusyText>
-          ) : phase === 'verifying' ? (
-            <BusyText className="text-[13px] text-text-muted">Working…</BusyText>
-          ) : (
-            <Button variant="secondary" onClick={start}>{signedIn ? 'Re-authenticate' : 'Sign in'}</Button>
-          )
-        }
+    <span
+      className={cx(
+        'inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 py-1 text-[12px]',
+        status.dot ? 'bg-emerald-500/10 text-text' : 'bg-text/5 text-text-muted',
+      )}
+    >
+      <PixelGlyph
+        glyph="dot"
+        size={9}
+        className={status.dot ? 'text-emerald-500' : 'text-text-muted/50'}
       />
-      {inFlight && (
-        <div className="space-y-2.5 px-4 pb-4">
-          <p className="text-[12.5px] leading-snug text-text-muted">
-            {phase === 'awaiting-browser' ? (
-              <>
-                A browser opened to sign in to ChatGPT. Approve there and this finishes on its own —
-                nothing to paste back.{' '}
-                <a href={url} target="_blank" rel="noreferrer" className="text-accent hover:underline">
-                  Reopen the page
-                </a>
-              </>
-            ) : (
-              'Starting sign-in… a browser will open shortly.'
-            )}
-          </p>
-          <button
-            onClick={() => window.koda.cancelCodexLogin().catch(console.error)}
-            className="text-[12.5px] text-text-muted transition-colors hover:text-text"
-          >
-            Cancel
-          </button>
-        </div>
-      )}
-      {!inFlight && (
-        <SettingsRow label="Status" control={<span className="text-[13px] text-text-muted">{status}</span>} />
-      )}
-      {phase === 'idle' && auth && !signedIn && (
-        <div className="px-4 pb-3.5 pt-0.5 text-[12.5px] leading-snug text-text-muted">
-          Sign in with your ChatGPT plan to use OpenAI models. Koda reads the login — it never stores your
-          OpenAI credentials.
-        </div>
-      )}
-      {phase === 'failed' && msg && <div className="px-4 pb-3 text-[12px] text-red-500">{msg}</div>}
-    </SettingsSection>
+      {status.full}
+    </span>
   )
 }
 
-/** The Claude provider: sign in with a Pro/Max plan (reuses the onboarding `auth:*` flow — button →
- *  open the browser → paste the code back). The API-key path is the sibling panel below. */
-function ClaudePanel({ billing, onChanged }: { billing: BillingState | null; onChanged: () => void }) {
+/** The disclosure that tucks the advanced BYO-key path under one collapsed row, so it never competes with
+ *  the primary sign-in. Chevron rides the shared <Caret> (right when closed, down when open); the body
+ *  height-animates open. */
+function ApiKeyDisclosure({
+  open,
+  onToggle,
+  children,
+}: {
+  open: boolean
+  onToggle: () => void
+  children: ReactNode
+}) {
+  return (
+    <div>
+      <button
+        onClick={onToggle}
+        aria-expanded={open}
+        className="group flex w-full items-center justify-between gap-4 px-4 py-3.5 text-left"
+      >
+        <span className="text-[13.5px] font-medium text-text-muted transition-colors group-hover:text-text">
+          Use your own API key
+        </span>
+        <Caret
+          dir={open ? 'down' : 'right'}
+          className="text-text-muted transition-colors group-hover:text-text"
+        />
+      </button>
+      <Collapse open={open}>
+        <div className="divide-y divide-border">{children}</div>
+      </Collapse>
+    </div>
+  )
+}
+
+// ── Anthropic (Claude) ────────────────────────────────────────────────────────────────
+/** The Claude account card: subscription sign-in on top, the BYO-key path folded into a disclosure below.
+ *  One card so the advanced path reads as a sub-option of the same account, not a rival section. */
+function ClaudeAccountCard({
+  billing,
+  onChanged,
+  showKey,
+  apiActive,
+}: {
+  billing: BillingState | null
+  onChanged: () => void
+  showKey: boolean
+  apiActive: boolean
+}) {
+  // Open the key disclosure on its own when the key is the live biller (mode 'api'), so a user who runs
+  // on their key sees it active rather than hidden — but leave it toggleable after.
+  const [keyOpen, setKeyOpen] = useState(false)
+  useEffect(() => {
+    if (apiActive) setKeyOpen(true)
+  }, [apiActive])
+
+  return (
+    <Card divide>
+      <ClaudeSignIn billing={billing} onChanged={onChanged} />
+      {showKey && (
+        <ApiKeyDisclosure open={keyOpen} onToggle={() => setKeyOpen((v) => !v)}>
+          <ApiKeyBody billing={billing} onChanged={onChanged} />
+        </ApiKeyDisclosure>
+      )}
+    </Card>
+  )
+}
+
+/** Claude sign-in: a Pro/Max plan OAuth login (reuses the onboarding `auth:*` flow — button → open the
+ *  browser → paste the code back). Renders the sign-in row + its in-flight/failed UI; the account status
+ *  itself shows in the provider header badge, so there's no separate status row here. */
+function ClaudeSignIn({ billing, onChanged }: { billing: BillingState | null; onChanged: () => void }) {
   const [phase, setPhase] = useState<'idle' | 'awaiting-code' | 'verifying' | 'failed'>('idle')
   const [url, setUrl] = useState('')
   const [code, setCode] = useState('')
@@ -293,12 +379,15 @@ function ClaudePanel({ billing, onChanged }: { billing: BillingState | null; onC
   const start = (): void => {
     setMsg('')
     setPhase('verifying') // optimistic until the URL or a failure lands
-    window.koda.startLogin().then((r) => {
-      if (!r.ok) {
-        setPhase('failed')
-        setMsg(r.reason ?? 'Could not start sign-in.')
-      }
-    }).catch(() => setPhase('failed'))
+    window.koda
+      .startLogin()
+      .then((r) => {
+        if (!r.ok) {
+          setPhase('failed')
+          setMsg(r.reason ?? 'Could not start sign-in.')
+        }
+      })
+      .catch(() => setPhase('failed'))
   }
 
   const submit = (): void => {
@@ -306,19 +395,11 @@ function ClaudePanel({ billing, onChanged }: { billing: BillingState | null; onC
     window.koda.submitAuthCode(code.trim()).catch(console.error)
   }
 
-  const v = billing?.verdict
-  const signedInSub = v?.mode === 'subscription'
-  const status = !v
-    ? '…'
-    : signedInSub
-      ? `Signed in${v.plan ? ` · ${v.plan}` : ''}${v.email ? ` · ${v.email}` : ''}`
-      : billing?.mode === 'api'
-        ? 'Using an API key (below)'
-        : 'Not signed in'
+  const signedInSub = billing?.verdict?.mode === 'subscription'
 
   return (
-    <SettingsSection title="Subscription">
-      {v?.apiKeyTrap && (
+    <>
+      {billing?.verdict?.apiKeyTrap && (
         <div className="mx-4 mt-3 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[12px] text-text-muted">
           An API key in your environment is shadowing your subscription, so turns are billing at API rates.
           Remove it from your shell, or choose API billing below to make it deliberate.
@@ -333,7 +414,9 @@ function ClaudePanel({ billing, onChanged }: { billing: BillingState | null; onC
           ) : phase === 'verifying' ? (
             <BusyText className="text-[13px] text-text-muted">Working…</BusyText>
           ) : (
-            <Button variant="secondary" onClick={start}>{signedInSub ? 'Re-authenticate' : 'Sign in'}</Button>
+            <Button variant="secondary" onClick={start}>
+              {signedInSub ? 'Re-authenticate' : 'Sign in'}
+            </Button>
           )
         }
       />
@@ -363,11 +446,8 @@ function ClaudePanel({ billing, onChanged }: { billing: BillingState | null; onC
           </div>
         </div>
       )}
-      {phase !== 'awaiting-code' && (
-        <SettingsRow label="Status" control={<span className="text-[13px] text-text-muted">{status}</span>} />
-      )}
       {phase === 'failed' && msg && <div className="px-4 pb-3 text-[12px] text-red-500">{msg}</div>}
-    </SettingsSection>
+    </>
   )
 }
 
@@ -389,8 +469,9 @@ const MODE_BLURB: Record<BillingMode, string> = {
 /** Paste / replace / remove the BYO API key, and — once a key is stored — choose WHEN it's used
  *  (subscription only / after the limit / always). Picking a mode here is just a preference: nothing
  *  spends until the next turn, so it switches immediately and the per-mode blurb carries the warning.
- *  The actual consent-to-spend moment is the mid-session auto-fallback banner (Chassis), not this. */
-function ApiKeyPanel({ billing, onChanged }: { billing: BillingState | null; onChanged: () => void }) {
+ *  The actual consent-to-spend moment is the mid-session auto-fallback banner (Chassis), not this.
+ *  Rendered inside the account card's key disclosure — no card of its own. */
+function ApiKeyBody({ billing, onChanged }: { billing: BillingState | null; onChanged: () => void }) {
   const [key, setKey] = useState('')
   const [saving, setSaving] = useState(false)
   const [err, setErr] = useState('')
@@ -436,11 +517,11 @@ function ApiKeyPanel({ billing, onChanged }: { billing: BillingState | null; onC
   }
 
   return (
-    <SettingsSection title="API key (advanced)">
+    <>
       {hasKey ? (
         <>
-          {/* Row + its warning live in one band so the card's divider sits below the pair, not crashing
-              into the inset amber box. */}
+          {/* Row + its warning live in one band so the divider sits below the pair, not crashing into
+              the inset amber box. */}
           <div>
             <SettingsRow
               label="When to use your API key"
@@ -474,7 +555,7 @@ function ApiKeyPanel({ billing, onChanged }: { billing: BillingState | null; onC
           />
         </>
       ) : (
-        <div className="px-4 pt-3 text-[12.5px] leading-snug text-text-muted">
+        <div className="px-4 pt-3.5 text-[12.5px] leading-snug text-text-muted">
           Spend your own Anthropic API credits instead of your subscription. Pay per token, with no 5-hour
           or weekly plan limit. Create a key at console.anthropic.com. After saving, choose whether to use it
           only past your plan limit or always.
@@ -506,7 +587,139 @@ function ApiKeyPanel({ billing, onChanged }: { billing: BillingState | null; onC
           {err && <div className="text-[12px] text-red-500">{err}</div>}
         </div>
       </Collapse>
-    </SettingsSection>
+    </>
+  )
+}
+
+// ── OpenAI (Codex) ────────────────────────────────────────────────────────────────────
+/** The OpenAI account card: ChatGPT-plan sign-in on top, the BYO-key path folded into a disclosure below.
+ *  Mirrors the Claude card; the key path is always available (either credential can drive Codex). */
+function OpenAiAccountCard({
+  auth,
+  billing,
+  onChangedAuth,
+  onChangedBilling,
+}: {
+  auth: CodexAuthStatus | null
+  billing: BillingState | null
+  onChangedAuth: (status?: CodexAuthStatus) => void
+  onChangedBilling: () => void
+}) {
+  const codexApiActive = billing?.codexApiActive ?? false
+  const [keyOpen, setKeyOpen] = useState(false)
+  useEffect(() => {
+    if (codexApiActive) setKeyOpen(true)
+  }, [codexApiActive])
+
+  return (
+    <Card divide>
+      <OpenAiSignIn auth={auth} onChanged={onChangedAuth} />
+      <ApiKeyDisclosure open={keyOpen} onToggle={() => setKeyOpen((v) => !v)}>
+        <OpenAiApiKeyBody billing={billing} onChanged={onChangedBilling} />
+      </ApiKeyDisclosure>
+    </Card>
+  )
+}
+
+/** OpenAI sign-in: a ChatGPT-plan OAuth login that drives `codex login` in main. Unlike Claude's
+ *  paste-code flow, Codex uses a loopback callback, so there's no code to paste — the browser opens,
+ *  the user approves, and it completes on its own. Koda never stores the OpenAI credential (the engine
+ *  owns it). Signed in → OpenAI models become selectable in the model menu. */
+function OpenAiSignIn({
+  auth,
+  onChanged,
+}: {
+  auth: CodexAuthStatus | null
+  onChanged: (status?: CodexAuthStatus) => void
+}) {
+  const [phase, setPhase] = useState<'idle' | 'awaiting-browser' | 'verifying' | 'failed'>('idle')
+  const [url, setUrl] = useState('')
+  const [msg, setMsg] = useState('')
+
+  useEffect(() => {
+    return window.koda.onCodexLoginProgress((e) => {
+      if (e.state === 'awaiting-browser') {
+        setPhase('awaiting-browser')
+        setUrl(e.url)
+      } else if (e.state === 'verifying') setPhase('verifying')
+      else if (e.state === 'completed') {
+        setPhase('idle')
+        onChanged(e.status) // completed already carries fresh status — no second probe
+      } else if (e.state === 'failed') {
+        setPhase('failed')
+        setMsg(e.message)
+      } else setPhase('idle') // cancelled / timeout
+    })
+  }, [onChanged])
+
+  const start = (): void => {
+    setMsg('')
+    setPhase('verifying') // optimistic until the URL or a failure lands
+    window.koda
+      .startCodexLogin()
+      .then((r) => {
+        if (!r.ok) {
+          setPhase('failed')
+          setMsg(r.reason ?? 'Could not start sign-in.')
+        }
+      })
+      .catch(() => setPhase('failed'))
+  }
+
+  const signedIn = auth?.signedIn ?? false
+  // Both pre-URL ('verifying') and post-URL ('awaiting-browser') are in-flight: a real child is running,
+  // so Cancel must be reachable in either (otherwise a URL that never parses strands "Working…" until the
+  // 5-min timeout with no escape).
+  const inFlight = phase === 'verifying' || phase === 'awaiting-browser'
+
+  return (
+    <>
+      <SettingsRow
+        label="ChatGPT plan"
+        description="Bills OpenAI's Codex engine against your ChatGPT plan. Pick an OpenAI model from the model menu to use it."
+        control={
+          phase === 'awaiting-browser' ? (
+            <BusyText className="text-[13px] text-text-muted">Waiting for the browser…</BusyText>
+          ) : phase === 'verifying' ? (
+            <BusyText className="text-[13px] text-text-muted">Working…</BusyText>
+          ) : (
+            <Button variant="secondary" onClick={start}>
+              {signedIn ? 'Re-authenticate' : 'Sign in'}
+            </Button>
+          )
+        }
+      />
+      {inFlight && (
+        <div className="space-y-2.5 px-4 pb-4">
+          <p className="text-[12.5px] leading-snug text-text-muted">
+            {phase === 'awaiting-browser' ? (
+              <>
+                A browser opened to sign in to ChatGPT. Approve there and this finishes on its own —
+                nothing to paste back.{' '}
+                <a href={url} target="_blank" rel="noreferrer" className="text-accent hover:underline">
+                  Reopen the page
+                </a>
+              </>
+            ) : (
+              'Starting sign-in… a browser will open shortly.'
+            )}
+          </p>
+          <button
+            onClick={() => window.koda.cancelCodexLogin().catch(console.error)}
+            className="text-[12.5px] text-text-muted transition-colors hover:text-text"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
+      {phase === 'idle' && auth && !signedIn && (
+        <div className="px-4 pb-3.5 pt-0.5 text-[12.5px] leading-snug text-text-muted">
+          Sign in with your ChatGPT plan to use OpenAI models. Koda reads the login — it never stores your
+          OpenAI credentials.
+        </div>
+      )}
+      {phase === 'failed' && msg && <div className="px-4 pb-3 text-[12px] text-red-500">{msg}</div>}
+    </>
   )
 }
 
@@ -518,10 +731,10 @@ const CODEX_MODE_OPTIONS: { value: CodexBillingMode; label: string; title: strin
 ]
 
 /** Paste / replace / remove the BYO OpenAI key for Codex, and choose whether Codex bills the ChatGPT plan
- *  or the key. Mirrors the Anthropic ApiKeyPanel, minus the 'auto' fallback (Codex has no plan-limit
+ *  or the key. Mirrors the Anthropic ApiKeyBody, minus the 'auto' fallback (Codex has no plan-limit
  *  hand-off in v1). The key is stored encrypted in main and written into Codex's isolated login on save;
- *  it never echoes back to the renderer. */
-function OpenAiApiKeyPanel({ billing, onChanged }: { billing: BillingState | null; onChanged: () => void }) {
+ *  it never echoes back to the renderer. Rendered inside the account card's key disclosure. */
+function OpenAiApiKeyBody({ billing, onChanged }: { billing: BillingState | null; onChanged: () => void }) {
   const [key, setKey] = useState('')
   const [saving, setSaving] = useState(false)
   const [err, setErr] = useState('')
@@ -565,7 +778,7 @@ function OpenAiApiKeyPanel({ billing, onChanged }: { billing: BillingState | nul
   }
 
   return (
-    <SettingsSection title="API key (advanced)">
+    <>
       {hasKey ? (
         <>
           <div>
@@ -605,7 +818,7 @@ function OpenAiApiKeyPanel({ billing, onChanged }: { billing: BillingState | nul
           />
         </>
       ) : (
-        <div className="px-4 pt-3 text-[12.5px] leading-snug text-text-muted">
+        <div className="px-4 pt-3.5 text-[12.5px] leading-snug text-text-muted">
           Spend your own OpenAI API credits instead of a ChatGPT plan. Pay per token, with no plan limit.
           Create a key at platform.openai.com. Saving switches Codex to bill your API key.
         </div>
@@ -636,8 +849,47 @@ function OpenAiApiKeyPanel({ billing, onChanged }: { billing: BillingState | nul
           {err && <div className="text-[12px] text-red-500">{err}</div>}
         </div>
       </Collapse>
-    </SettingsSection>
+    </>
   )
+}
+
+// ── Status derivation ─────────────────────────────────────────────────────────────────
+/** Claude account state → tab dot + short (tab subtitle) + full (header badge). Mirrors the old in-card
+ *  Status row: signed in on a subscription, running on a stored API key, or logged out. */
+function claudeStatusOf(billing: BillingState | null): ProviderStatus {
+  const v = billing?.verdict
+  if (!billing || !v) return { dot: false, short: '…', full: '…' }
+  if (v.mode === 'subscription') {
+    const full = `Signed in${v.plan ? ` · ${v.plan}` : ''}${v.email ? ` · ${v.email}` : ''}`
+    return { dot: true, short: 'signed in', full }
+  }
+  if (billing.mode === 'api' || billing.apiActive) {
+    return { dot: true, short: 'API key', full: 'Using an API key' }
+  }
+  if (billing.hasKey) return { dot: true, short: 'key stored', full: 'API key stored' }
+  return { dot: false, short: 'not signed in', full: 'Not signed in' }
+}
+
+/** OpenAI account state → tab dot + short + full. Signed in on a ChatGPT plan, running on a stored OpenAI
+ *  key, or not set up. */
+function codexStatusOf(auth: CodexAuthStatus | null, billing: BillingState | null): ProviderStatus {
+  if (!auth) return { dot: false, short: '…', full: '…' }
+  if (auth.signedIn) {
+    const method = auth.authMethod === 'chatgpt' ? 'ChatGPT' : auth.authMethod === 'apikey' ? 'API key' : auth.authMethod
+    return { dot: true, short: 'signed in', full: `Signed in${method ? ` · ${method}` : ''}` }
+  }
+  if (billing?.codexApiActive) return { dot: true, short: 'API key', full: 'Using an API key' }
+  if (billing?.hasCodexKey) return { dot: true, short: 'key stored', full: 'API key stored' }
+  return { dot: false, short: 'not set up', full: 'Not set up' }
+}
+
+// Attribute a recorded model id to its provider so the persisted history (a flat model→spend map) can be
+// split per tab. Claude reports `claude-*` ids or, rarely, a bare Claude alias; every other id is Codex.
+// A two-brand heuristic, NOT a model-version assertion — extend the Claude set when a third engine lands.
+const CLAUDE_ALIASES = new Set(['opus', 'sonnet', 'haiku', 'fable', 'opusplan', 'default', 'best'])
+function engineOfModel(id: string): 'claude' | 'codex' {
+  const low = id.toLowerCase()
+  return low.startsWith('claude-') || CLAUDE_ALIASES.has(low) ? 'claude' : 'codex'
 }
 
 // ── Usage history (cross-engine daily rollup) ─────────────────────────────────────────
@@ -704,8 +956,8 @@ function EngineUsage({
           label="Estimated spend"
           description={
             apiActive
-              ? 'Billed to your API account, across open and restored sessions.'
-              : 'What these turns would cost on the API — your plan covers it.'
+              ? 'Billed to your API account across your recent usage.'
+              : 'What your recent turns would cost on the API. Your plan covers it.'
           }
           control={<span className="font-mono text-[13px] text-text">{fmtUsd(spend)}</span>}
         />
@@ -715,7 +967,7 @@ function EngineUsage({
       ))}
       <div className="px-4 pb-3 pt-1 text-[12px] leading-snug text-text-muted">
         {showPlanLimits
-          ? 'Your subscription usage windows as the engine reports them — approximate; the exact limit is enforced on the provider’s side.'
+          ? 'These are your subscription usage windows as the engine reports them, so they are approximate. The exact limit is enforced on the provider’s side.'
           : 'Per-token spend from the engine. Your real invoice lives in the provider’s console.'}
       </div>
     </SettingsSection>

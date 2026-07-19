@@ -1,13 +1,14 @@
-import { join } from 'node:path'
-import { realpathSync } from 'node:fs'
-import { app, BrowserWindow, dialog, ipcMain, Menu, screen, session, shell } from 'electron'
+import { basename, dirname, join } from 'node:path'
+import { existsSync, realpathSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, screen, session, shell } from 'electron'
 import { IpcChannels } from '@shared/channels'
 import { disposeEngineSessions, getEngineSessions, registerIpcHandlers } from './ipc'
 import { probeEngine } from './engine/probe'
 import { initUpdater } from './updater'
 import { activateProvisionedRuntimes, activateToolsBinDir } from './runtime/provision'
 import { ensureGlobalSkillsSeeded } from './engine/skills-catalog'
-import { registerWindow, unregisterWindow, windowForProject } from './window-registry'
+import { projectPathForWindow, registerWindow, unregisterWindow, windowForProject } from './window-registry'
 import {
   loadAppState,
   migrateV1IfPresent,
@@ -25,10 +26,12 @@ import {
   killDevServer,
 } from './preview'
 import { stopAllLanForwards } from './lan-forward'
+import { bootStartMiniApps, disposeMiniApps } from './mini-apps'
 import { voiceController } from './voice'
 import { resumePlaywrightIfEnabled } from './playwright'
 import { killTerminal, registerTerminalIpc } from './terminal'
 import { track } from './telemetry'
+import { importFilesIntoProject } from './fs-browse'
 
 // Pin the app name before any getPath() call (unpackaged Electron would otherwise name it
 // "Electron"). In dev we deliberately use a DISTINCT name so a `npm run dev` instance and the
@@ -131,7 +134,7 @@ function restoreWindowBounds():
  * window (the renderer shows a folder picker); a real path opens straight into that project's
  * workspace. The renderer asks which it is via `project:getContext`.
  */
-function createWindow(projectPath: string): void {
+function createWindow(projectPath: string, newProjectIntent = false): void {
   const win = new BrowserWindow({
     ...restoreWindowBounds(),
     minWidth: MIN_SIZE.width,
@@ -152,7 +155,7 @@ function createWindow(projectPath: string): void {
     },
   })
 
-  registerWindow(win, projectPath)
+  registerWindow(win, projectPath, newProjectIntent)
   // Title the window by project so multiple windows are distinguishable in the macOS window switcher.
   if (projectPath) win.setTitle(projectPath.split('/').filter(Boolean).pop() || 'Koda')
 
@@ -221,9 +224,10 @@ function createWindow(projectPath: string): void {
   }
 }
 
-/** A new window with no project yet — the renderer shows the folder picker. */
-function createProjectHomeWindow(): void {
-  createWindow('')
+/** A new window with no project yet — the renderer shows the folder picker. When `newProject` is set
+ *  (the "New Project…" menu entry), it lands with the create-a-project modal already open. */
+function createProjectHomeWindow(newProject = false): void {
+  createWindow('', newProject)
 }
 
 /** Menu "Open…" (⌘O): pick a folder, then open it in its OWN window (focus it if already open). */
@@ -235,6 +239,7 @@ async function openFolderInNewWindow(): Promise<void> {
   if (existing) return existing.focus() // one window per project
   noteProjectOpened(projectPath)
   createWindow(projectPath)
+  buildAppMenu()
 }
 
 /** Open a known folder (e.g. a worktree surfaced in Versions) in its OWN window — focus it if already
@@ -258,15 +263,47 @@ function openSettingsInFocusedWindow(): void {
   BrowserWindow.getFocusedWindow()?.webContents.send(IpcChannels.uiOpenSettings)
 }
 
+function focusedProject(): { win: BrowserWindow; path: string } | undefined {
+  const win = BrowserWindow.getFocusedWindow()
+  const path = win && projectPathForWindow(win.id)
+  return win && path ? { win, path } : undefined
+}
+
+function sendFileCommand(command: 'newDocument' | 'newFolder' | 'filesImported'): void {
+  focusedProject()?.win.webContents.send(IpcChannels.uiFileCommand, command)
+}
+
+function openRecentProject(path: string): void {
+  if (!existsSync(path)) return
+  const opened = openProjectInNewWindow(path)
+  if (opened.alreadyOpen) noteProjectOpened(opened.projectPath)
+  buildAppMenu() // bumping a project to the front should immediately reorder Open Recent
+}
+
+async function importFilesFromMenu(): Promise<void> {
+  const project = focusedProject()
+  if (!project) return
+  const res = await dialog.showOpenDialog(project.win, { properties: ['openFile', 'multiSelections'] })
+  if (res.canceled || !res.filePaths.length) return
+  const files = await Promise.all(
+    res.filePaths.map(async (path) => ({ name: basename(path), data: new Uint8Array(await readFile(path)) })),
+  )
+  await getEngineSessions().checkpointProjectEdit(project.path, `import ${files.length} file(s)`)
+  await importFilesIntoProject(project.path, undefined, files)
+  project.win.webContents.send(IpcChannels.uiFileCommand, 'filesImported')
+}
+
 /** App menu. On macOS the app submenu is built by hand (rather than `role: 'appMenu'`) so the
  *  conventional "Settings…" item (⌘,) sits in its standard place; the rest mirrors the default roles. */
-function buildAppMenu(): void {
+export function buildAppMenu(): void {
   const isMac = process.platform === 'darwin'
+  const hasProject = !!focusedProject()
+  const recents = loadAppState().recentProjects.filter(existsSync).slice(0, 12)
   const template: Electron.MenuItemConstructorOptions[] = [
     ...(isMac
       ? [
           {
-            label: app.name,
+            label: isDev ? 'Koda Dev' : 'Koda',
             submenu: [
               { role: 'about' as const },
               { type: 'separator' as const },
@@ -286,10 +323,57 @@ function buildAppMenu(): void {
     {
       label: 'File',
       submenu: [
-        { label: 'New Window', accelerator: 'CmdOrCtrl+Shift+N', click: () => createProjectHomeWindow() },
-        { label: 'Open…', accelerator: 'CmdOrCtrl+O', click: () => void openFolderInNewWindow() },
-        // ⌘W is intentionally left unbound here so the renderer can use it to close the active session
-        // (browser-tab convention); the window still closes via the red button or ⌘Q.
+        // Opens a ProjectHome window landing on the create-a-project modal (the start-a-new-project
+        // flow). Always available — from a project window this is the only way back to it; the
+        // project-scoped items below aren't.
+        { label: 'New Project…', click: () => createProjectHomeWindow(true) },
+        { type: 'separator' },
+        { label: 'New Document', accelerator: 'CmdOrCtrl+N', enabled: hasProject, click: () => sendFileCommand('newDocument') },
+        { label: 'New Folder', accelerator: 'CmdOrCtrl+Shift+N', enabled: hasProject, click: () => sendFileCommand('newFolder') },
+        { type: 'separator' },
+        { label: 'Open Project…', accelerator: 'CmdOrCtrl+O', click: () => void openFolderInNewWindow() },
+        {
+          label: 'Open Recent',
+          submenu: recents.length
+            ? recents.map((path) => ({
+                label: basename(path),
+                sublabel: dirname(path),
+                click: () => openRecentProject(path),
+              }))
+            : [{ label: 'No Recent Projects', enabled: false }],
+        },
+        {
+          label: 'Import Files…',
+          enabled: hasProject,
+          click: () =>
+            void importFilesFromMenu().catch((err) =>
+              log.error('files', 'menu import failed', err instanceof Error ? err.message : err),
+            ),
+        },
+        { type: 'separator' },
+        {
+          label: 'Reveal Project in Finder',
+          enabled: hasProject,
+          click: () => {
+            const project = focusedProject()
+            if (project) shell.showItemInFolder(project.path)
+          },
+        },
+        {
+          label: 'Copy Project Path',
+          enabled: hasProject,
+          click: () => {
+            const project = focusedProject()
+            if (project) clipboard.writeText(project.path)
+          },
+        },
+        { type: 'separator' },
+        {
+          label: 'Close Window',
+          accelerator: 'CmdOrCtrl+Shift+W',
+          click: () => BrowserWindow.getFocusedWindow()?.close(),
+        },
+        // ⌘W stays renderer-owned for closing the active session.
         ...(isMac ? [] : [{ type: 'separator' as const }, { role: 'quit' as const }]),
       ],
     },
@@ -318,6 +402,7 @@ app.whenReady().then(async () => {
     log.error('skills', 'seed failed', err instanceof Error ? err.message : err)
   }
   buildAppMenu()
+  app.on('browser-window-focus', buildAppMenu)
   initUpdater() // app self-update: check-on-launch + interval, background download (packaged-only)
   track('app_opened', {}) // no-op unless the user opted in (telemetry.ts)
 
@@ -339,6 +424,10 @@ app.whenReady().then(async () => {
   // Finish a Chromium download the user enabled but didn't see complete (quit mid-install). No-op
   // when the capability is off or already installed. Fail-soft (never throws).
   resumePlaywrightIfEnabled()
+
+  // Restart the mini apps that were running at last quit ("restart when Koda relaunches"). No-op with
+  // the mini-apps flag off; fire-and-forget per app — a failure just leaves it stopped (app_status).
+  bootStartMiniApps()
 
   // Boot-time engine check — fail soft (surface it, don't crash the shell).
   // resourcesPath only means our bundled engine when packaged; in dev it's Electron's own.
@@ -397,8 +486,10 @@ app.on('before-quit', (event) => {
     voiceController.killForWindow(win.id)
   }
   stopAllLanForwards()
-  // Flush the renderers' pending saves in parallel with engine teardown — both are bounded.
-  Promise.allSettled([flushRendererState(), disposeEngineSessions()]).then(() => {
+  // Flush the renderers' pending saves in parallel with engine + mini-app teardown — all bounded.
+  // Mini apps get SIGTERM → short-grace SIGKILL (a port held by a half-dead child would break the
+  // next launch's boot-restart); their desired-running state survives, so they come back next launch.
+  Promise.allSettled([flushRendererState(), disposeEngineSessions(), disposeMiniApps()]).then(() => {
     clearTimeout(backstop)
     app.exit(0)
   })

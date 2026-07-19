@@ -71,7 +71,7 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, { phase: P
             animate={{ opacity: 0.6 }}
             transition={{ delay: 0.3, duration: duration.base, ease: ease.out }}
           >
-            <PixelGlyph loader size={16} className="text-text-muted" />
+            <PixelGlyph loader variant="snake" size={16} className="text-text-muted" />
           </motion.div>
         </div>
       )

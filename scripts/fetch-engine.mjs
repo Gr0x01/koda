@@ -32,7 +32,7 @@ const execFileP = promisify(execFile)
 // (2.1.198) and the permission-default→Manual flip (2.1.200), both of which touch seams Koda renders.
 // Bump deliberately (the engine-contract workflow opens the PR). NOTE: check-engine-floor.mjs + the
 // workflow read `PINNED_VERSION` by regex — keep the name.
-const PINNED_VERSION = '2.1.197'
+const PINNED_VERSION = '2.1.205'
 const CLAUDE_BASE = 'https://downloads.claude.ai/claude-code-releases'
 
 // ── Codex ──────────────────────────────────────────────────────────────────────────────────────────

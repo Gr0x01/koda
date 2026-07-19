@@ -196,8 +196,9 @@ export function useEngineBridge(): void {
             lastPreview: s.lastPreview,
             items: s.items as Entry[],
           })),
-          // Cold-file archived, plus any still inline in an old blob (pre-split, not yet migrated).
-          archived: [...archived, ...(data?.archived ?? [])],
+          // Archived-session metadata from the cold index. Any archives still inline in an old hot blob
+          // are migrated out (split to body + metadata) by main's loadProjectSessions before we get here.
+          archived,
           rateLimits: data?.rateLimits, // restore the 5-hour/weekly footer (refreshed next turn)
         })
         // A project opened with no sessions + no guidelines yet → offer the one-time intake (common

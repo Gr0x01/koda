@@ -56,6 +56,17 @@ export type EnsureToolFn = (sessionId: string, toolId: string) => Promise<Ensure
  *  `command` is staged at the prompt for the user to run — never executed. */
 export type OpenTerminalFn = (sessionId: string, command?: string) => Promise<void>
 
+/** Mini-app lifecycle capability (mini-apps-plan.md): install/start/stop/status for the project's mini
+ *  apps. The broker drives; the manager resolves session → project → app dir (containment) and the
+ *  supervisor (mini-apps.ts) owns the processes. The verbs are advertised only when register() is told
+ *  the mini-apps flag is on — that's this feature's activation seam. Results are JSON-stringified. */
+export interface MiniAppsFns {
+  install: (sessionId: string, path: string) => Promise<unknown>
+  start: (sessionId: string, path: string) => Promise<unknown>
+  stop: (sessionId: string, path: string) => Promise<unknown>
+  status: (sessionId: string) => Promise<unknown>
+}
+
 /** The MCP server name — MUST match the `mcp__koda_broker__approve` tool reference on the engine.
  *  Exported so the Codex driver attaches the same server under the same `mcp_servers.<name>` key. */
 export const SERVER_NAME = 'koda_broker'
@@ -68,6 +79,12 @@ const TOOL_PREVIEW_FILE = 'preview_file'
 const TOOL_VIEW_PREVIEW = 'view_preview'
 const TOOL_ENSURE_TOOL = 'ensure_tool'
 const TOOL_OPEN_TERMINAL = 'open_terminal'
+const TOOL_APP_INSTALL = 'app_install'
+const TOOL_APP_START = 'app_start'
+const TOOL_APP_STOP = 'app_stop'
+const TOOL_APP_STATUS = 'app_status'
+/** The mini-app lifecycle verbs — advertised only when the mini-apps flag is on (register() opts). */
+const MINI_APP_TOOLS = new Set([TOOL_APP_INSTALL, TOOL_APP_START, TOOL_APP_STOP, TOOL_APP_STATUS])
 /** The env var the engine expands for the bearer token (kept out of argv). */
 export const BROKER_TOKEN_ENV = 'KODA_BROKER_TOKEN'
 
@@ -112,6 +129,8 @@ export class PermissionBroker {
     private readonly ensureTool: EnsureToolFn,
     /** Pop the terminal shelf for the user, optionally staging (never running) a command at the prompt. */
     private readonly openTerminal: OpenTerminalFn,
+    /** Mini-app lifecycle verbs (install/start/stop/status) — surfaced only when register() opts in. */
+    private readonly miniApps: MiniAppsFns,
   ) {}
 
   /**
@@ -152,12 +171,15 @@ export class PermissionBroker {
    * Create a per-session MCP server/transport. Call after ensureListening, before spawn.
    * `includeApprove` exposes the `approve` permission-prompt tool — true for Claude (its tool-gating
    * transport), false for Codex (native approvals; it only consumes the capability tools below).
+   * `includeMiniApps` surfaces the mini-app lifecycle verbs — the caller reads the dogfood flag
+   * (loadMiniAppsEnabled) at session start; a normal release keeps them invisible.
    */
-  async register(sessionId: string, opts: { includeApprove?: boolean } = {}): Promise<void> {
+  async register(sessionId: string, opts: { includeApprove?: boolean; includeMiniApps?: boolean } = {}): Promise<void> {
     // Defensive: the manager always disposes a live session before re-registering, but if that invariant
     // ever slipped a bare re-register would orphan the prior entry's keepalive interval + MCP server.
     if (this.sessions.has(sessionId)) await this.unregister(sessionId)
     const includeApprove = opts.includeApprove ?? true
+    const includeMiniApps = opts.includeMiniApps ?? false
     const token = randomUUID()
     const server = new Server({ name: SERVER_NAME, version: '1.0.0' }, { capabilities: { tools: {} } })
 
@@ -253,7 +275,54 @@ export class PermissionBroker {
             additionalProperties: false,
           },
         },
-      ].filter((t) => includeApprove || t.name !== TOOL_APPROVE),
+        {
+          name: TOOL_APP_INSTALL,
+          description:
+            'Register a mini app with Koda\'s lifecycle supervisor: validates its koda-app.json manifest (name, entry, icon, data paths) and records it. Pass the project-relative path to the app folder (e.g. "apps/fitness"). This does NOT install npm dependencies — do that yourself with Bash in the app folder. Idempotent.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              path: { type: 'string', description: 'Project-relative path to the app folder, e.g. "apps/fitness".' },
+            },
+            required: ['path'],
+            additionalProperties: false,
+          },
+        },
+        {
+          name: TOOL_APP_START,
+          description:
+            "Start a mini app under Koda's supervisor — the ONLY way to run an app server (never start one with Bash; a Bash-started server dies with the session and nobody owns its port). Koda assigns the port (the app must read the PORT env var and bind 127.0.0.1), waits until it's actually serving, restarts it on crashes with backoff, and keeps it running across Koda relaunches until app_stop. Auto-registers a valid manifest, so a prior app_install isn't required. Returns { url, port }.",
+          inputSchema: {
+            type: 'object',
+            properties: {
+              path: { type: 'string', description: 'Project-relative path to the app folder, e.g. "apps/fitness".' },
+            },
+            required: ['path'],
+            additionalProperties: false,
+          },
+        },
+        {
+          name: TOOL_APP_STOP,
+          description:
+            'Stop a running mini app and stop keeping it alive (it will no longer restart on crash or when Koda relaunches). Idempotent.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              path: { type: 'string', description: 'Project-relative path to the app folder, e.g. "apps/fitness".' },
+            },
+            required: ['path'],
+            additionalProperties: false,
+          },
+        },
+        {
+          name: TOOL_APP_STATUS,
+          description:
+            "List this project's mini apps with their live state (starting / running / stopped / crashed), URL, pid, restart count, and whether they start when Koda launches. 'crashed' means it exited repeatedly and the supervisor gave up — fix the app, then app_start again.",
+          inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+        },
+      ].filter(
+        (t) => (includeApprove || t.name !== TOOL_APPROVE) && (includeMiniApps || !MINI_APP_TOOLS.has(t.name)),
+      ),
     }))
 
     server.setRequestHandler(CallToolRequestSchema, async (req, extra) =>
@@ -335,6 +404,26 @@ export class PermissionBroker {
         try {
           await this.openTerminal(sessionId, command)
           return { content: [{ type: 'text', text: JSON.stringify({ opened: true, staged: !!command }) }] }
+        } catch (err) {
+          return toolError(err)
+        }
+      }
+      if (MINI_APP_TOOLS.has(req.params.name)) {
+        // Defense in depth: an unadvertised verb must also be uncallable (a session registered with the
+        // flag off never reaches the supervisor, even if the agent guesses the tool name).
+        if (!includeMiniApps) return toolError(new Error('mini apps are not enabled'))
+        const path = String(args.path ?? '').trim()
+        try {
+          switch (req.params.name) {
+            case TOOL_APP_INSTALL:
+              return { content: [{ type: 'text', text: JSON.stringify(await this.miniApps.install(sessionId, path)) }] }
+            case TOOL_APP_START:
+              return { content: [{ type: 'text', text: JSON.stringify(await this.miniApps.start(sessionId, path)) }] }
+            case TOOL_APP_STOP:
+              return { content: [{ type: 'text', text: JSON.stringify(await this.miniApps.stop(sessionId, path)) }] }
+            default:
+              return { content: [{ type: 'text', text: JSON.stringify(await this.miniApps.status(sessionId)) }] }
+          }
         } catch (err) {
           return toolError(err)
         }

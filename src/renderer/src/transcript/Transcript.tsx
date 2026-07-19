@@ -175,7 +175,7 @@ export const Transcript = memo(function Transcript({
 function WorkingIndicator({ label }: { label: string }) {
   return (
     <div className="flex items-center gap-2 py-0.5 pl-0.5 text-[11px] text-text-muted" aria-live="polite">
-      <PixelGlyph loader size={12} className="text-accent" />
+      <PixelGlyph loader variant="diamond" size={12} className="text-accent" />
       <span className="italic">{label}</span>
     </div>
   )
@@ -208,7 +208,7 @@ function PinnedUserMessage({ item }: { item: UserEntry }) {
     const ro = new ResizeObserver(check)
     ro.observe(el)
     return () => ro.disconnect()
-  }, [item.text, item.images, expanded])
+  }, [item.text, item.images, item.files, expanded])
   // Animate maxHeight in px (not between rem/vh, which don't interpolate). Collapsed caps at 5rem;
   // expanded grows to the content height, itself capped at 60vh so a huge turn scrolls instead of
   // swallowing the viewport.
@@ -223,7 +223,7 @@ function PinnedUserMessage({ item }: { item: UserEntry }) {
         style={{ overflowY: expanded && natural > cap ? 'auto' : 'hidden' }}
         className="px-3 py-2"
       >
-        <UserMessage text={item.text} images={item.images} />
+        <UserMessage text={item.text} images={item.images} files={item.files} />
       </motion.div>
       {overflowed && !expanded && (
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-7 bg-gradient-to-t from-surface to-transparent" />
@@ -273,14 +273,21 @@ function PinnedUserMessage({ item }: { item: UserEntry }) {
 function TurnItemView({ item }: { item: Entry }) {
   switch (item.kind) {
     case 'user':
-      return <UserMessage text={item.text} images={item.images} />
+      return <UserMessage text={item.text} images={item.images} files={item.files} />
     case 'assistant':
       return <AssistantMarkdown markdown={item.markdown} />
     case 'tool':
       // AskUserQuestion isn't a tool to "run" — it's a question. Render its options (answered through
       // the permission gate as the tool's `answers` input), not a generic tool row.
       if (item.name === 'AskUserQuestion')
-        return <QuestionCard toolUseId={item.toolUseId} input={item.input} />
+        return (
+          <QuestionCard
+            toolUseId={item.toolUseId}
+            input={item.input}
+            result={item.result}
+            isError={item.isError}
+          />
+        )
       return <ToolCard name={item.name} input={item.input} result={item.result} isError={item.isError} />
     case 'subagent':
       return <SubagentCard item={item} />

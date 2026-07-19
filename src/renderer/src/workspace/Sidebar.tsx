@@ -1,6 +1,7 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { SIDEBAR_MIN_WIDTH } from '@shared/ipc'
-import { AnimatePresence, motion, spring } from '../motion'
+import { AnimatePresence } from '../motion'
+import { Segmented } from '../ui'
 import { computeSessionChanges, statusOf, useWorkspace } from './store'
 import { SessionRow } from './SessionRow'
 import { FilesBrowser } from './FilesBrowser'
@@ -223,71 +224,23 @@ function FilesSection() {
 }
 
 /**
- * The Documents ⇄ Files view switch — a segmented control: a `bg-text/5` trough with a ring-edged
- * surface chip that SLIDES to the active cell, active label in full-strength ink. A mode-switch *looks*
- * like a mode-switch — distinct from the action icons (Find, New) beside it, which open/create.
- *
- * The chip slides via a single indicator measured from each button's offset WITHIN the trough (x/size),
- * NOT a shared `layoutId`. A layout-animated chip re-measures against the whole tree and springs
- * vertically every frame the Files section is resized (the Sessions⇆Files drag shifts this header's
- * position) — the jitter bug. Button offsets inside the trough don't change on that resize, so the
- * indicator stays put; it only animates when the active cell actually changes.
+ * The Documents ⇄ Files view switch — the shared `<Segmented>` mode-switch (ui/Segmented.tsx), which
+ * carries this control's original trough/sliding-chip design and its jitter-proof offset measurement
+ * (see the primitive for the layoutId story). A mode-switch *looks* like a mode-switch — distinct
+ * from the action icons (Find, New) beside it, which open/create.
  */
 function DocsFilesToggle({ docs, onChange }: { docs: boolean; onChange: (v: 'docs' | 'tree') => void }) {
-  const opts = [
-    { v: 'docs', label: 'Docs', on: docs },
-    { v: 'tree', label: 'Files', on: !docs },
-  ] as const
-  const activeV = docs ? 'docs' : 'tree'
-  const btnRefs = useRef<Record<string, HTMLButtonElement | null>>({})
-  const troughRef = useRef<HTMLDivElement>(null)
-  const [chip, setChip] = useState<{ x: number; y: number; w: number; h: number } | null>(null)
-
-  // Re-measure only when the active cell changes or the trough's own box does (font swap, not the
-  // sidebar's vertical resize — the trough is content-sized inside a fixed-height header).
-  useLayoutEffect(() => {
-    const measure = () => {
-      const btn = btnRefs.current[activeV]
-      if (btn) setChip({ x: btn.offsetLeft, y: btn.offsetTop, w: btn.offsetWidth, h: btn.offsetHeight })
-    }
-    measure()
-    const el = troughRef.current
-    if (!el) return
-    const ro = new ResizeObserver(measure)
-    ro.observe(el)
-    return () => ro.disconnect()
-  }, [activeV])
-
   return (
-    <div ref={troughRef} className="-ml-0.5 relative flex items-center gap-px rounded-lg bg-text/5 p-0.5">
-      {/* Ring edge (lighter than both trough and fill) so the active half reads as a filled segment on
-          dark too — plain bg-surface sits darker than the light-overlay trough there and recedes (the
-          old "button mashup" look). The ring alone does it; no drop shadow needed. */}
-      {chip && (
-        <motion.span
-          aria-hidden
-          initial={false}
-          animate={{ x: chip.x, y: chip.y, width: chip.w, height: chip.h }}
-          transition={spring.snappy}
-          className="pointer-events-none absolute left-0 top-0 rounded-md bg-surface ring-1 ring-border"
-        />
-      )}
-      {opts.map(({ v, label, on }) => (
-        <button
-          key={v}
-          ref={(el) => {
-            btnRefs.current[v] = el
-          }}
-          onClick={() => onChange(v)}
-          aria-pressed={on}
-          className={`relative z-10 rounded-md px-2.5 py-0.5 font-display text-[11px] font-medium transition-colors ${
-            on ? 'text-text' : 'text-text-muted hover:text-text'
-          }`}
-        >
-          {label}
-        </button>
-      ))}
-    </div>
+    <Segmented
+      className="-ml-0.5"
+      aria-label="Documents or file tree"
+      options={[
+        { value: 'docs', label: 'Docs' },
+        { value: 'tree', label: 'Files' },
+      ]}
+      value={docs ? 'docs' : 'tree'}
+      onChange={onChange}
+    />
   )
 }
 

@@ -34,11 +34,12 @@ import {
   type RateLimitInfo,
   type RemoteUsageSnapshot,
   IMAGE_DETAIL_CAPS,
+  attachedFilesNote,
 } from '@shared/ipc'
 import { startClaudeSession, type EngineSession, type SessionOpts, type TurnImage } from './adapter'
 import { startCodexSession } from './codex-driver'
 import { ensureCodexHome, reconcileCodexAuth } from './codex-home'
-import { assembleGuardrailText } from './pack'
+import { assembleGuardrailText, resolveStagingPack } from './pack'
 import { getCodexAuthStatus, listCodexModels } from './codex-auth'
 import { askCodexSideQuestion, askSideQuestion, type SideQuestionHandle } from './side-question'
 import { WorkflowWatcher } from './workflow-watch'
@@ -54,7 +55,8 @@ import {
   restoreVersion,
   UserGitError,
 } from '../user-git'
-import { browseDir, docExcerpt, listProjectDocs, readProjectFile, readProjectImage, writeProjectFile } from '../fs-browse'
+import { browseDir, containedReal, docExcerpt, listProjectDocs, readProjectFile, readProjectImage, writeProjectFile } from '../fs-browse'
+import { installApp, startApp, stopApp, appStatus } from '../mini-apps'
 import { encodeWebp } from '../backup/webp'
 import { noteRateLimit } from './usage-reset-notifier'
 import { noteProviderError, noteTurnOk } from './status-watch'
@@ -79,7 +81,10 @@ import {
   loadRecentModels,
   loadLastPosture,
   saveLastPosture,
+  loadMiniAppsEnabled,
+  loadScratchRetentionDays,
 } from '../settings'
+import { saveScratchImage } from '../scratch'
 import { getApiKey } from '../api-key'
 import {
   applyPlaywrightToMcpConfig,
@@ -93,10 +98,10 @@ import { stopLanForward, stopAllLanForwards } from '../lan-forward'
 import {
   claudeConversationExists,
   claudeConversationMtime,
-  loadArchivedSessions,
+  ingestFullArchives,
+  readClaudeConversationReplay,
   loadProjectSessions,
   readPersistedSession,
-  saveArchivedSessions,
   saveProjectSessions,
   loadAppState,
 } from '../session-store'
@@ -162,6 +167,9 @@ export class EngineSessionManager {
    *  storing it main-side lets session-adjacent features such as aside fork the live Codex thread
    *  without asking the renderer to echo private routing state back over IPC. */
   private readonly engineNativeIds = new Map<string, string>()
+  /** A posture/engine pick made before the first turn needs a FRESH same-id respawn, never --resume:
+   *  there is no conversation yet on either engine to resume. */
+  private readonly freshPostureStale = new Set<string>()
   /** sessionId → tools the engine advertised at session start (system/init). An aside fork denies exactly
    *  this set (by bare name) so it inherits no tool it could attempt or execute — version-proof, unlike a
    *  hand-maintained denylist that rots on an engine bump. */
@@ -208,16 +216,25 @@ export class EngineSessionManager {
   /** Headless (phone-started) sessions we've already run first-turn auto-titling for, so a session is
    *  titled once and later turns don't reconsider it. Cleared on dispose. See `titleRemoteSession`. */
   private readonly remoteTitled = new Set<string>()
-  /** The model/effort each live session was last spawned with. The renderer is authoritative for a
-   *  windowed session, but a headless remote head has no live renderer — so the manager remembers the
-   *  pair to (a) show it on the phone and (b) re-apply BOTH on a remote model-OR-effort change (the
-   *  engine can't switch either live, so a change is a --resume respawn; passing only one would reset
-   *  the other to engine-default). Set in start(), cleared in dispose(). */
+  /** A session's INTENDED model/effort — the pair the next turn should run on. The renderer is
+   *  authoritative for a windowed session; a headless remote head has no live renderer, so the manager
+   *  remembers the pair to (a) show it on the phone and (b) re-apply BOTH on a remote model-OR-effort
+   *  change (the engine can't switch either live, so a change is a --resume respawn; passing only one
+   *  would reset the other to engine-default). Set in start() (a spawn = the intent at that moment) and
+   *  in setSessionModelEffort() (a later pick, WITHOUT respawning). Diverges from `spawnedWith` exactly
+   *  when a pick has landed but no respawn has happened yet — sendTurn reconciles the two. */
   private readonly sessionModelEffort = new Map<string, { model?: string; effort?: string }>()
-  /** Sessions whose live child predates a model/effort pick (the desktop reattaches lazily, so a pick
-   *  leaves the old child running). sendTurn respawns these on the intent pair first — otherwise a
-   *  phone-driven turn would silently run the OLD model while every surface names the new one. */
-  private readonly modelEffortStale = new Set<string>()
+  /** A session's ACTUAL live child — the exact (model, effort, engine) triple it was spawned with. Set
+   *  only where the child is really launched (start()), so it can't drift from the process. Compared
+   *  against the intent (sessionModelEffort + sessionEngines) in sendTurn: any mismatch means the live
+   *  engine is on the wrong model, so respawn before the turn goes out. This is "verify, don't trust" —
+   *  it replaces a hand-set stale flag, so no spawn path can forget to mark a change (or a wrong first
+   *  spawn) as needing reconciliation. Cleared in dispose(). */
+  private readonly spawnedWith = new Map<string, { model?: string; effort?: string; engineId: EngineId }>()
+  /** The model each session's engine REPORTED running (SessionStarted) — ground truth for showing what
+   *  a "Default" pick resolved to. Cleared on engine switch (the old engine's model isn't the new
+   *  engine's default); the desktop store keeps its own copy (activeModel), this one feeds the phone. */
+  private readonly resolvedModels = new Map<string, string>()
   /** sessionId → epoch ms of the last human interaction (spawn or a user turn), so the phone's launcher
    *  can float the session you most recently touched to the top of "Active now" instead of freezing in
    *  start order. In-memory only (running sessions); past sessions order by their conversation mtime. */
@@ -267,6 +284,25 @@ export class EngineSessionManager {
       // Pop the terminal shelf for the user (open_terminal) — the "advanced: the human can" escape hatch
       // for the rare command the agent can't run itself (sudo, an interactive login). Staged, never run.
       (sessionId, command) => this.openTerminal(sessionId, command),
+      // Mini-app lifecycle verbs (mini-apps-plan.md): session → project → contained app dir here; the
+      // supervisor (mini-apps.ts) is session-unaware and owns the processes. Only advertised when the
+      // mini-apps dogfood flag is on (register() below reads it).
+      {
+        install: async (sessionId, path) => {
+          const { dir, projectPath } = this.appTarget(sessionId, path)
+          return installApp(dir, projectPath)
+        },
+        start: async (sessionId, path) => {
+          const { dir, projectPath } = this.appTarget(sessionId, path)
+          return { started: true, ...(await startApp(dir, projectPath)) }
+        },
+        stop: async (sessionId, path) => {
+          const { dir } = this.appTarget(sessionId, path)
+          await stopApp(dir)
+          return { stopped: true }
+        },
+        status: async (sessionId) => appStatus(this.projectPathFor(sessionId)),
+      },
     )
     // Seed the DEFAULT posture new sessions start at (per-session overrides come from the renderer).
     this.gate.setDefaultMode(loadApprovalMode())
@@ -323,14 +359,20 @@ export class EngineSessionManager {
     // Remember what this session runs with, so a later remote model/effort change can re-apply both
     // (dispose above cleared any prior entry; set the current intent now).
     this.sessionModelEffort.set(sessionId, { model: opts.model, effort: opts.effort })
-    this.modelEffortStale.delete(sessionId) // this spawn runs the intent — no longer stale
     this.sessionEngines.set(sessionId, engineId)
+    // Ground truth for reconciliation: this is exactly what the child is about to launch with, so a later
+    // turn can tell whether the live engine still matches the (possibly since-changed) intent above.
+    this.spawnedWith.set(sessionId, { model: opts.model, effort: opts.effort, engineId })
     // A resumed session (restart-reattach or the phone's resume-old) is never on its first turn — its
     // title, if any, belongs to the original conversation. Mark it so headless first-turn titling never
     // recomputes a label from a mid-conversation follow-up. (Fresh sessions title on their first turn.)
     if (opts.resumeSessionId) this.remoteTitled.add(sessionId)
-    // Codex omits the `approve` tool (native approvals); both get the capability tools.
-    await this.broker.register(sessionId, { includeApprove: engineId === 'claude' })
+    // Codex omits the `approve` tool (native approvals); both get the capability tools. The mini-app
+    // lifecycle verbs ride the dogfood flag (read per session start — seam ② of the release gate).
+    await this.broker.register(sessionId, {
+      includeApprove: engineId === 'claude',
+      includeMiniApps: loadMiniAppsEnabled(),
+    })
     // Register window ownership BEFORE spawn so the very first event (system/init → SessionStarted,
     // or a fatal spawn 'error') routes to the owning window instead of falling into a gap and being
     // dropped (adapter emits these as soon as the child starts).
@@ -422,10 +464,13 @@ export class EngineSessionManager {
         mcpConfigJson: applyPlaywrightToMcpConfig(this.broker.mcpConfig(sessionId)),
         // Deny the browser-verify skill unless Playwright is wired (no guidance for absent tools).
         extraDisallowedTools: playwrightDisallowedTools(),
-        // Koda-managed global skills the user turned on in the gallery (null when none active).
-        extraPluginDirs: [resolveGlobalSkillsPlugin(app.getPath('userData'))].filter(
-          (d): d is string => d !== null,
-        ),
+        // Koda-managed global skills the user turned on in the gallery (null when none active), plus
+        // the staging pack (built-but-unshipped skills like create-mini-app) only when the mini-apps
+        // dogfood flag is on — that's how a normal release ships without the half-built skill.
+        extraPluginDirs: [
+          resolveGlobalSkillsPlugin(app.getPath('userData')),
+          loadMiniAppsEnabled() ? resolveStagingPack({ resourcesPath: this.resourcesPath })?.dir ?? null : null,
+        ].filter((d): d is string => d !== null),
         planMode: opts.planMode,
         model: opts.model,
         effort: opts.effort,
@@ -489,34 +534,45 @@ export class EngineSessionManager {
   async sendTurn(
     sessionId: string,
     text: string,
-    images?: TurnImage[],
+    // Phone attachments ride in here too: image entries go inline to the engine; document entries
+    // (non-`image/*` mediaType, csv/pdf — carrying their original `name`) are written to the
+    // project's scratch folder and reach the engine as a path, same contract as the desktop
+    // composer (store.send).
+    images?: (TurnImage & { name?: string })[],
     // Where the turn came from. A 'remote' turn (the phone) never ran through the owner window's
     // dispatchTurn, so its user bubble has to be echoed into that window (below); a 'local' turn already
     // pushed its own optimistic bubble there, so echoing it would duplicate the message.
     origin: 'local' | 'remote' = 'local',
   ): Promise<void> {
-    // A model/effort pick landed after this child spawned (the desktop reattaches lazily, so its own
-    // next turn re-spawns — but a PHONE turn arrives here directly and would silently run the old
-    // pair). Respawn on the intent first. Only idle sessions can be stale (both pickers block
-    // mid-turn changes), so the --resume can't drop an in-flight turn.
-    if (this.modelEffortStale.has(sessionId) && this.sessions.has(sessionId)) {
-      // Clear the flag BEFORE the await: a second turn arriving during the respawn must not start a
-      // concurrent start() for the same id (dispose/spawn interleave = two children, one broker route).
-      this.modelEffortStale.delete(sessionId)
-      const dir = this.projectDirs.get(sessionId)
-      if (dir) {
-        const { model, effort } = this.sessionModelEffort.get(sessionId) ?? {}
-        await this.start({
-          resumeSessionId: sessionId,
-          cwd: dir,
-          model,
-          effort,
-          planMode: this.gate.getSessionMode(sessionId) === 'plan',
-        })
-      }
+    // Invariant enforced here, at the one point every turn (local AND remote) funnels through: the live
+    // engine must be running the session's INTENDED model/effort/engine before the turn goes out. The
+    // engine can't switch these on a live -p process, so if what we actually spawned with has drifted from
+    // the intent — a pick that landed after spawn (the desktop reattaches lazily; a phone turn arrives here
+    // directly), or a first spawn that never carried the pick — respawn on the intent first. Comparison,
+    // not a remembered flag: `spawnedWith` is set only where the child truly launches, so no spawn path can
+    // forget to mark a change. A turn can't start mid-turn (both surfaces block send while busy) and this
+    // runs before `working` is set, so the --resume can't drop an in-flight turn or strand an approval.
+    const cwd = this.projectDirs.get(sessionId)
+    if (cwd && this.sessions.has(sessionId) && this.spawnDrifted(sessionId)) {
+      const { model, effort } = this.sessionModelEffort.get(sessionId) ?? {}
+      const engineId = this.sessionEngines.get(sessionId) ?? 'claude'
+      // Realign the actuals to the intent up front so a second turn racing in during the respawn sees no
+      // drift and can't kick off a concurrent start() for the same id (dispose/spawn interleave = two
+      // children, one broker route). start() overwrites spawnedWith with the real launch triple anyway.
+      this.spawnedWith.set(sessionId, { model, effort, engineId })
+      // Before the first turn there is no conversation to --resume, so a posture pick respawns FRESH under
+      // the same id (freshPostureStale); once a conversation exists, reattach with --resume.
+      const fresh = this.freshPostureStale.delete(sessionId)
+      await this.start({
+        ...(fresh ? { sessionId } : { resumeSessionId: sessionId }),
+        cwd,
+        model,
+        effort,
+        engineId,
+        planMode: this.gate.getSessionMode(sessionId) === 'plan',
+      })
     }
     const session = this.require(sessionId)
-    const cwd = this.projectDirs.get(sessionId)
     this.lastActivityAt.set(sessionId, Date.now()) // float this session to the top of the launcher
     this.working.add(sessionId) // live "working" glyph the instant the turn is sent, before the first delta
     // Capture the human's turn into the replay log (engine events never echo the user's own prompt, so
@@ -558,11 +614,29 @@ export class EngineSessionManager {
       const sha = await headSha(cwd).catch(() => null)
       if (sha) this.diffBaselines.set(sessionId, sha)
     }
+    // Split document attachments out of a phone turn: save each to `.koda/scratch/` and hand the
+    // engine the path (attachedFilesNote — the same note the desktop composer appends), leaving only
+    // real images to go inline. Best-effort like the desktop: a failed save just drops off the list.
+    const docs = images?.filter((i) => !i.mediaType.startsWith('image/')) ?? []
+    const inline = docs.length ? images?.filter((i) => i.mediaType.startsWith('image/')) : images
+    let engineText = text
+    if (docs.length && cwd) {
+      const saved = await Promise.all(
+        docs.map((d) =>
+          saveScratchImage(cwd, d.mediaType, d.dataBase64, loadScratchRetentionDays(), d.name).catch(() => null),
+        ),
+      )
+      const paths = saved.filter((p): p is string => p !== null)
+      if (paths.length) engineText = `${engineText}\n\n${attachedFilesNote(paths)}`
+    }
     // Ride any finished background-workflow results in ahead of the human's words, framed as context so
     // the agent picks up where it left off. Only what the ENGINE sees is augmented — the user's visible
     // bubble, replay entry, checkpoint label and titling above all use the untouched `text`.
     const pending = this.drainWorkflowResults(sessionId)
-    session.sendTurn(pending ? (text ? `${pending}\n\n${text}` : pending) : text, images)
+    session.sendTurn(
+      pending ? (engineText ? `${pending}\n\n${engineText}` : pending) : engineText,
+      inline?.length ? inline : undefined,
+    )
   }
 
   /** A finished workflow's result, stashed until this session's next human turn delivers it inline. */
@@ -723,8 +797,24 @@ export class EngineSessionManager {
   }
 
   /** The model/effort a session currently runs with (for the remote head's pickers). */
-  getSessionModelEffort(sessionId: string): { model?: string; effort?: string } {
-    return this.sessionModelEffort.get(sessionId) ?? {}
+  getSessionModelEffort(sessionId: string): { model?: string; effort?: string; activeModel?: string } {
+    return { ...this.sessionModelEffort.get(sessionId), activeModel: this.resolvedModels.get(sessionId) }
+  }
+
+  /** True when the live child's actual spawn triple no longer matches the session's intended one — i.e.
+   *  a turn sent now would run on the wrong model/effort/engine. `undefined` spawnedWith (never spawned
+   *  by us) can't drift. Normalises '' / undefined to one "engine default" so a Default pick doesn't read
+   *  as a change, and defaults the engine to 'claude' on both sides. */
+  private spawnDrifted(sessionId: string): boolean {
+    const actual = this.spawnedWith.get(sessionId)
+    if (!actual) return false
+    const intent = this.sessionModelEffort.get(sessionId) ?? {}
+    const intendedEngine = this.sessionEngines.get(sessionId) ?? 'claude'
+    return (
+      (actual.model || undefined) !== (intent.model || undefined) ||
+      (actual.effort || undefined) !== (intent.effort || undefined) ||
+      (actual.engineId || 'claude') !== intendedEngine
+    )
   }
 
   /** Sessions blocked on a human answer right now — the phone launcher's "Needs you" triage. */
@@ -757,12 +847,15 @@ export class EngineSessionManager {
     const engineId = opts.engineId ?? prevEngine
     this.sessionModelEffort.set(sessionId, { model, effort })
     if (opts.engineId) this.sessionEngines.set(sessionId, opts.engineId)
+    // Crossing engines invalidates the reported model — the new engine's default is unknown until it
+    // spawns and reports its own (mirrors the desktop store dropping activeModel on an engine switch).
+    if (opts.engineId && prevEngine && opts.engineId !== prevEngine) this.resolvedModels.delete(sessionId)
     // Remember this pick as the app-wide last-used posture so the next NEW session (notably the phone's
     // headless start, which has no renderer copy) opens on it instead of the engine default.
     saveLastPosture({ model, effort, engineId: engineId ?? 'claude' })
     if (prev.model === model && prev.effort === effort && (prevEngine ?? 'claude') === (engineId ?? 'claude')) return
-    // A live child now predates this pick — sendTurn respawns it before the next turn (see the field).
-    if (this.sessions.has(sessionId)) this.modelEffortStale.add(sessionId)
+    // Intent now diverges from the live child's `spawnedWith`; sendTurn reconciles it before the next turn
+    // (no flag to set — the comparison sees the difference on its own).
     // A WINDOWLESS session has no renderer to persist the new pair, so a Mac restart would resurrect
     // the old one — upsert it into the project store here (same reason + same window guard + same
     // resumed-id resolution as persistRemoteTitle; a windowed session's renderer owns the blob, and
@@ -821,19 +914,30 @@ export class EngineSessionManager {
     // for remote heads too, since main is the authority. Conversation-started = a Codex thread id
     // exists, or Claude has the conversation on disk.
     const prevEngine = this.sessionEngines.get(sessionId) ?? 'claude'
-    // Conversation-started = a Codex thread id exists, or Claude has the conversation on disk. Before the
-    // first turn neither is true — there's nothing to --resume yet.
-    const conversationStarted = this.engineNativeIds.has(sessionId) || claudeConversationExists(cwd, sessionId)
+    // A Codex thread id is NOT proof of a conversation: Codex creates the thread during fresh-session
+    // initialization, before the first user turn. Treating that id as content locked every phone-started
+    // Codex session to Codex before the user typed anything. Real content is a sent turn, a replayed phone
+    // turn, persisted renderer items, or Claude's on-disk conversation.
+    const storeId = this.resumedFrom.get(sessionId) ?? sessionId
+    const stored = loadProjectSessions(cwd)?.sessions.find((s) => s.id === storeId)
+    const conversationStarted =
+      this.working.has(sessionId) ||
+      this.remoteEventLog.get(sessionId)?.some((e) => e.type === 'RemoteUserTurn') === true ||
+      Boolean(stored?.items?.length) ||
+      (prevEngine === 'claude' && claudeConversationExists(cwd, storeId))
     if (engineId !== prevEngine && conversationStarted)
       throw new Error('the engine is locked once a conversation has started — start a new chat to switch')
     // Record + broadcast FIRST so the desktop's pill/persisted pick follows the phone's change (else its
-    // next reattach would silently revert this respawn to the old pair). This also flags the live child
-    // stale, so the first turn respawns on the new pair.
+    // next reattach would silently revert this respawn to the old pair). This updates the intent, so the
+    // live child's spawnedWith now diverges — sendTurn reconciles it on the next turn.
     this.setSessionModelEffort(sessionId, { ...opts, engineId })
     // A brand-new session (picking a model before sending) has no conversation to reattach to — an eager
     // `--resume` would race the fresh child's init and fatal with "No conversation found", killing the
-    // session. The stale flag set above makes the first turn spawn on this pair, so just record and return.
-    if (!conversationStarted) return
+    // session. The intent update above makes the first turn spawn FRESH on this pair, so just record and return.
+    if (!conversationStarted) {
+      this.freshPostureStale.add(sessionId)
+      return
+    }
     await this.start({ resumeSessionId: sessionId, cwd, model: opts.model || undefined, effort: opts.effort || undefined, engineId })
   }
   /** The default posture new sessions start at (the renderer seeds its per-session default from this). */
@@ -1018,6 +1122,14 @@ export class EngineSessionManager {
     })
     this.attachRemote(id)
     if (id !== sessionId) this.resumedFrom.set(id, sessionId) // so the phone can load the prior transcript
+    // Seed the replay buffer with the prior history when the store holds no transcript (a headless
+    // session's items are never persisted). Without this, the first turn after a resume makes the
+    // buffer non-empty, so remoteTranscript's file fallback stops firing and a reopen would show ONLY
+    // the new turn. Seeding happens before the resumed engine emits anything, so nothing can double.
+    if (!stored?.items?.length && (stored?.engineId ?? 'claude') === 'claude') {
+      const seed = readClaudeConversationReplay(stored?.cwd || projectPath, sessionId, id)
+      if (seed.length) this.remoteEventLog.set(id, seed)
+    }
     this.notifyDesktopOfHeadless(projectPath) // if this project is open on the Mac, let it adopt this live
     return { sessionId: id }
   }
@@ -1054,7 +1166,7 @@ export class EngineSessionManager {
         activeId: store.activeId === storedId ? null : store.activeId,
         sessions: store.sessions.filter((s) => s.id !== storedId),
       })
-      saveArchivedSessions(cwd, [{ ...session, archivedAt: Date.now() }, ...loadArchivedSessions(cwd)])
+      ingestFullArchives(cwd, [{ ...session, archivedAt: Date.now() }])
       return
     }
     if (!this.remoteHistory().some((h) => h.id === sessionId && h.projectPath === projectPath))
@@ -1072,8 +1184,9 @@ export class EngineSessionManager {
       activeId: store.activeId === sessionId ? null : store.activeId,
       sessions: store.sessions.filter((s) => s.id !== sessionId),
     })
-    // Archives live in their own cold file now — never in the hot store above.
-    saveArchivedSessions(projectPath, [{ ...session, archivedAt: Date.now() }, ...loadArchivedSessions(projectPath)])
+    // Archives live in their own cold store now (metadata index + split-out body) — never in the hot
+    // store above.
+    ingestFullArchives(projectPath, [{ ...session, archivedAt: Date.now() }])
   }
 
   /** Rename a live session from the phone — the desktop right-click's same move. Two write paths (the
@@ -1176,14 +1289,23 @@ export class EngineSessionManager {
     // renderer, so its `items` are empty even though it has a full history. Fall back to the live replay
     // buffer — the same per-session event log the Mac desktop adopts through — which the phone reduces
     // into a transcript exactly like the live stream. Keyed by the LIVE id (the log is never remapped).
-    const events = items.length ? undefined : this.remoteEventLog.get(sessionId)
+    let events = items.length ? undefined : this.remoteEventLog.get(sessionId)
+    // The replay buffer is in-memory, so a Mac relaunch wipes it — a phone-driven session then opened
+    // to a blank "Ready" screen with its whole history sitting in the engine's own conversation file.
+    // Last resort: rebuild the events from that file (claude only; Codex keeps its own store).
+    if (!items.length && !events?.length && engine === 'claude') {
+      const fileCwd = this.projectDirs.get(sessionId) ?? found?.cwd ?? cwd
+      if (fileCwd) events = readClaudeConversationReplay(fileCwd, storeId, sessionId)
+    }
     return {
       items,
       usage: {
         spendUsd: found?.spendUsd ?? 0,
         byModel: found?.byModel ?? {},
         context: found?.context,
-        rateLimits: this.lastRateLimits.get(engine) ?? {},
+        // All engines' windows, not just this session's — the plan panel labels them per engine, and
+        // binding to the session's engine tag misattributed windows when that tag was stale/wrong.
+        rateLimits: this.remoteRateLimits(),
       },
       ...(events?.length ? { events: [...events] } : {}),
     }
@@ -1440,6 +1562,36 @@ export class EngineSessionManager {
     return showStaticPreview(ctx.win.id, ctx.projectPath, relPath, sessionId)
   }
 
+  /** The session's project root for the mini-app verbs. Unlike preview, no window is required — a
+   *  phone-started (windowless) session can run lifecycle verbs too; projectDirs has every session.
+   *  Realpath'd: containedReal returns realpath'd app dirs, and status computes project-relative ids
+   *  from this — a symlinked root (macOS loves these) would otherwise yield `../..`-shaped ids the
+   *  other verbs reject. */
+  private projectPathFor(sessionId: string): string {
+    const path = contextForSession(sessionId)?.projectPath ?? this.projectDirs.get(sessionId)
+    if (!path) throw new Error('no project for this session')
+    try {
+      return realpathSync(path)
+    } catch {
+      return path
+    }
+  }
+
+  /** Resolve + contain a project-relative app folder for the mini-app verbs (mini-apps.ts stays
+   *  session-unaware; this is the session → project → dir seam, like startPreview's window dance). */
+  private appTarget(sessionId: string, relPath: string): { dir: string; projectPath: string } {
+    const projectPath = this.projectPathFor(sessionId)
+    const rel = relPath.replace(/^\/+/, '').trim()
+    if (!rel) throw new Error('path is required — the project-relative app folder, e.g. "apps/fitness"')
+    let dir: string
+    try {
+      dir = containedReal(projectPath, rel) // realpath: throws on escape OR missing — never leaks which
+    } catch {
+      throw new Error(`"${relPath}" is outside the project or doesn't exist`)
+    }
+    return { dir, projectPath }
+  }
+
   /**
    * Pop the terminal shelf open in the session's window (the agent's open_terminal tool), optionally
    * staging a command at the prompt for the user to run. The raw shell is the "advanced: the human can"
@@ -1601,7 +1753,9 @@ export class EngineSessionManager {
     this.remoteEventLog.delete(sessionId)
     this.diffBaselines.delete(sessionId)
     this.sessionModelEffort.delete(sessionId)
-    this.modelEffortStale.delete(sessionId)
+    this.spawnedWith.delete(sessionId)
+    this.resolvedModels.delete(sessionId)
+    this.freshPostureStale.delete(sessionId)
     this.sessionEngines.delete(sessionId)
     this.engineNativeIds.delete(sessionId)
     this.advertisedTools.delete(sessionId)
@@ -1812,6 +1966,8 @@ export class EngineSessionManager {
       if (event.engineNativeId) this.engineNativeIds.set(event.sessionId, event.engineNativeId)
       else this.engineNativeIds.delete(event.sessionId)
       if (event.tools.length) this.advertisedTools.set(event.sessionId, event.tools)
+      // The model the engine actually resolved to — what a "Default" pick means, shown on the phone.
+      if (event.model) this.resolvedModels.set(event.sessionId, event.model)
       // A fresh session from a broker reconnect: auto-send the continuation nudge now that the engine is
       // initialized, so the turn the drop interrupted resumes without the user resending anything.
       if (this.resumeAfterReconnect.delete(event.sessionId)) {
