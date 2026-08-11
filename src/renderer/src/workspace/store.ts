@@ -1,11 +1,25 @@
 import { create } from 'zustand'
-import { attachedFilesNote, clampLayout, DEFAULT_LAYOUT } from '@shared/ipc'
+import { attachedFilesNote, clampLayout, DEFAULT_LAYOUT, faceTurnText, undoPointRefusal } from '@shared/ipc'
+import {
+  appendLiveToolOutput,
+  hasRunningSubagent,
+  isTopLevelTurnActivity,
+  settleRestoredTranscriptItem,
+  settleRestoredTranscriptItems,
+} from '@shared/delegation'
+import {
+  appSummonThread,
+  faceDayKey,
+  faceDayLabel,
+  rememberAppSummonThread,
+} from '@shared/face-thread'
 import type {
   ApprovalMode,
   ApprovalRequest,
   ArchivedPreviewTurn,
   ArchivedSessionMeta,
   AsideEvent,
+  BackupKept,
   BillingMode,
   MemoryWeight,
   ContextUsage,
@@ -20,6 +34,7 @@ import type {
   RateLimitInfo,
   WorkspaceLayoutSizes,
 } from '@shared/ipc'
+import { expandDocMentionLabels } from '../doc-mentions'
 import { isModelAlias, prettyModel } from './models'
 import type {
   Entry,
@@ -33,7 +48,7 @@ import type { TaskRow } from '../transcript/TaskList'
 /** An attachment staged for the next turn (base64). Transient draft state — never persisted.
  *  Images go inline to the engine; document files (non-`image/*` mediaType, csv/pdf) carry their
  *  original `name` and reach the engine as a saved `.koda/scratch/` path instead (see send()). */
-export type ImageDraft = { mediaType: string; dataBase64: string; name?: string }
+export type ImageDraft = { mediaType: string; dataBase64: string; name?: string; scratchPath?: string }
 /** The workflow turn-item, narrowed from Entry — the journal watcher patches its agents/status. */
 type WorkflowEntry = Extract<Entry, { kind: 'workflow' }>
 
@@ -54,6 +69,8 @@ export interface SessionState {
    *  place (resume is cwd-scoped; spike/resume). */
   cwd: string
   items: Entry[]
+  /** Highest durable remote/headless replay event applied to this rendered session. */
+  replaySeq?: number
   streaming: string
   busy: boolean
   errored: boolean
@@ -119,6 +136,11 @@ export interface SessionState {
    *  composer instead of raw text in the transcript. The UI classifies `message` into calm copy
    *  (shared/engine-error). Cleared on the next turn, on retry, or on dismiss. Not persisted. */
   error?: EngineErrorBanner
+  /** Copy for a file the composer could not attach (an unsupported format dropped, pasted or picked),
+   *  shown in the same fused row as `error`. A refused drop is transient, so it lives here and not as a
+   *  transcript item — a mis-drag shouldn't sit in the conversation forever. Cleared on dismiss, on the
+   *  next drop, and on the next turn. Not persisted. */
+  attachNotice?: string
 }
 
 /** The raw material for the composer error banner — the UI derives the friendly copy from it. */
@@ -286,6 +308,7 @@ export interface PersistedBlob {
     spendUsd?: number
     byModel?: Record<string, ModelSpend>
     lastPreview?: PreviewRestart
+    replaySeq?: number
     items: Entry[]
   }[]
   /** Last-known account-level rate-limit windows (5-hour / weekly), so the footer survives a restart
@@ -298,33 +321,51 @@ export interface PersistedBlob {
 // (a small global preference, like the dock state). New sessions start here; the user can switch
 // engine from the model dropdown before the first turn. Fails soft to 'claude'.
 const LAST_ENGINE_KEY = 'koda.lastEngine'
-function readLastEngine(): EngineId {
-  return localStorage.getItem(LAST_ENGINE_KEY) === 'codex' ? 'codex' : 'claude'
-}
-function writeLastEngine(engineId: EngineId): void {
+const LAST_MODEL_KEY = 'koda.lastModel'
+const NEW_SESSION_POSTURE_KEY = 'koda.newSessionPosture'
+
+type NewSessionPosture = { engineId: EngineId; model?: string }
+
+// Read/write the new-session engine + model as one posture. A SessionStarted event from an older
+// session must never update just the model half: that used to pair (for example) Claude + gpt-5.x,
+// so the next session silently fell back to whichever engine/model happened to accept the mismatch.
+function readNewSessionPosture(): NewSessionPosture {
   try {
-    localStorage.setItem(LAST_ENGINE_KEY, engineId)
+    const saved = JSON.parse(localStorage.getItem(NEW_SESSION_POSTURE_KEY) ?? 'null') as unknown
+    if (saved && typeof saved === 'object') {
+      const value = saved as { engineId?: unknown; model?: unknown }
+      if (value.engineId === 'claude' || value.engineId === 'codex')
+        return { engineId: value.engineId, model: typeof value.model === 'string' ? value.model : undefined }
+    }
   } catch {
-    /* private mode / quota — last-engine memory is a nicety, never fatal */
+    /* migrate the old split-key preference below */
+  }
+
+  const legacyEngine: EngineId = localStorage.getItem(LAST_ENGINE_KEY) === 'codex' ? 'codex' : 'claude'
+  const model = localStorage.getItem(LAST_MODEL_KEY) || undefined
+  // The old split keys could be crossed by two SessionStarted events. Claude aliases and concrete IDs
+  // identify their engine unambiguously; prefer that evidence over the stale engine half.
+  const engineId: EngineId = model && (isModelAlias(model) || model.startsWith('claude-')) ? 'claude' : legacyEngine
+  const migrated = { engineId, model }
+  writeNewSessionPosture(engineId, model)
+  return migrated
+}
+function writeNewSessionPosture(engineId: EngineId, model: string | undefined): void {
+  try {
+    // One JSON value makes the pair indivisible: no event can update only the model or engine half.
+    localStorage.setItem(NEW_SESSION_POSTURE_KEY, JSON.stringify({ engineId, model }))
+    localStorage.removeItem(LAST_ENGINE_KEY)
+    localStorage.removeItem(LAST_MODEL_KEY)
+  } catch {
+    /* private mode / quota — new-session memory is a nicety, never fatal */
   }
 }
 
-// The model a new session defaults to — the last one the user actually ran on, so the composer's model
-// pill names a real model up front instead of a blank "Model" before the first turn. Stores an explicit
-// pick (alias or full id, preserving alias auto-upgrade) or, for a "Default" session, the concrete model
-// the engine resolved to (see SessionStarted). Belongs to `lastEngine` — the two are always written
-// together on an engine switch, and each engine's SessionStarted overwrites it with that engine's model.
-const LAST_MODEL_KEY = 'koda.lastModel'
-function readLastModel(): string | undefined {
-  return localStorage.getItem(LAST_MODEL_KEY) || undefined
-}
-function writeLastModel(model: string | undefined): void {
-  try {
-    if (model) localStorage.setItem(LAST_MODEL_KEY, model)
-    else localStorage.removeItem(LAST_MODEL_KEY)
-  } catch {
-    /* private mode / quota — last-model memory is a nicety, never fatal */
-  }
+// Resolve an engine default only while that engine is still the selected new-session engine. Late
+// starts from background sessions cannot overwrite a newer pick made in another engine.
+function writeResolvedNewSessionModel(engineId: EngineId, model: string): void {
+  const current = readNewSessionPosture()
+  if (current.engineId === engineId && !current.model) writeNewSessionPosture(engineId, model)
 }
 
 // Monotonic counters + synchronous guards live module-level (as the old App.tsx refs did) — they
@@ -360,22 +401,6 @@ const HANDOFF_PROMPT =
   'context. Write a concise handoff — under ~200 words, plain prose — so a new session can pick up exactly ' +
   'where we are: what we are working on, the decisions already made, the current state, and the immediate ' +
   'next step. Write it addressed to that next session. Output only the handoff, no preamble.'
-// Engine events that mean "a turn is actively running right now". Receiving any of these re-arms `busy`
-// so the sidebar/status FOLLOWS the real engine turn — not just the optimistic flag set in dispatchTurn.
-// A turn driven from the phone / relay goes straight through backend.sendTurn (bypassing dispatchTurn),
-// so without this the desktop sidebar shows a session as idle (checkmark) while the agent is working.
-// ToolResult is excluded on purpose: it can arrive AFTER a user interrupt/TurnComplete and must not
-// re-arm a finished turn. Workflow events are excluded too — a workflow runs in the BACKGROUND and
-// outlives its turn's TurnComplete, so arming on it would re-lock the composer after the turn ended.
-// Subagents, by contrast, always complete inside the turn (their Task tool call blocks the result).
-const ENGINE_ACTIVITY = new Set<EngineEvent['type']>([
-  'ThinkingDelta',
-  'AssistantDelta',
-  'AssistantBlock',
-  'ToolRequested',
-  'SubagentStarted',
-  'SubagentProgress',
-])
 // Set by the bridge on mount once Notification permission is granted.
 let notifyOk = false
 export function setNotifyOk(v: boolean): void {
@@ -397,6 +422,9 @@ const EDIT_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit'])
 // 'auto' billing: rejected-window resetsAt values we've already prompted (or acted) on, so a repeated
 // 'rejected' event for the same window doesn't re-raise the banner. Module-level like the other guards.
 const fallbackPromptedFor = new Set<number>()
+// Sessions whose credential respawn was deferred because their parent turn, approval, or delegated
+// child still owned the current engine process. Cleared at the first genuinely safe lifecycle edge.
+const billingRespawnPending = new Set<string>()
 
 /** A short clock time from unix seconds — for the "resets at 4:31 PM" fallback notice. */
 function fmtClock(unixSeconds: number): string {
@@ -410,22 +438,14 @@ function fmtClock(unixSeconds: number): string {
  *  text actually contains an `@`, so the common no-mention turn skips the listDocs round-trip. */
 async function expandDocMentions(text: string): Promise<string> {
   if (!text.includes('@')) return text
-  // Bare-name tokens only: `@` at a word boundary, no slash (a slash means it's already a path).
-  const re = /(^|\s)@([^\s/]+)/g
+  // Labels are either one token or quoted; a slash means the user already supplied a path.
+  const re = /(^|\s)@(?:"(?:\\.|[^"\\])*"|[^\s/]+)/g
   if (!re.test(text)) return text
   const res = await window.koda.listDocs({}).catch(() => null)
   const docs = res?.docs ?? []
   if (!docs.length) return text
-  // displayName → rel; docs arrive most-recent-first, so on a name collision the freshest doc wins.
-  const byLabel = new Map<string, string>()
-  for (const d of docs) {
-    const label = d.name.replace(/\.[^.]+$/, '')
-    if (!byLabel.has(label)) byLabel.set(label, d.rel)
-  }
-  return text.replace(/(^|\s)@([^\s/]+)/g, (m, pre: string, name: string) => {
-    const rel = byLabel.get(name)
-    return rel ? `${pre}@${rel}` : m
-  })
+  // Docs arrive most-recent-first, so the shared resolver keeps the freshest name collision.
+  return expandDocMentionLabels(text, docs)
 }
 
 /** Plain-language footer for an ABNORMAL turn end (the engine `result.subtype`). A clean 'success'
@@ -459,6 +479,18 @@ function foldModelSpend(
   return next
 }
 
+/** What boot's two store reads found, in the terms the data-integrity banner speaks: which store could
+ *  not be read, whether a copy of it was actually kept, and how many rows a readable-but-drifted store
+ *  had to set aside. Fields documented on WorkspaceStore below. */
+export interface StoreIntegrity {
+  sessionsLoadFailed: boolean
+  archiveLoadFailed: boolean
+  sessionsBackupKept: BackupKept
+  archiveBackupKept: BackupKept
+  droppedSessions: number
+  droppedArchives: number
+}
+
 interface WorkspaceStore {
   sessions: Record<string, SessionState>
   order: string[] // stable display order (replaces the old array order)
@@ -471,13 +503,19 @@ interface WorkspaceStore {
   /** Account-level subscription rate-limit windows, keyed by ENGINE then window type
    *  (`claude`/`codex` → `five_hour`/`weekly`). Each engine is a separate subscription with its own
    *  caps, so they never share a map. Not per-session — within one engine the windows are an account
-   *  fact (newest update wins). Persisted so the footer survives a restart; refreshed on the next turn. */
+   *  fact. Main owns reconciliation and persistence; this is its live display mirror. */
   rateLimits: Record<string, Record<string, RateLimitInfo>>
   /** Engines mid provider-incident (feed-confirmed, main-watched), keyed by engine → the engine chip's
    *  health state (note + severity kind). Pushed over `providerStatus` + seeded on boot; not persisted
    *  (main re-seeds on reopen). */
   providerDown: Record<string, { note?: string; kind?: ProviderKind }>
   applyProviderStatus: (e: ProviderStatusEvent) => void
+  /** Engines with no working sign-in right now, keyed by engine id → true. Read from the same signals
+   *  Settings uses (Claude billing verdict + stored key; Codex auth status + stored key). Drives the
+   *  status-bar dot's "sign in" state. Only the ACTIVE session's engine is ever surfaced from this, so a
+   *  Codex-only user is never nagged to sign into Claude. Refreshed on mount + window focus, not polled. */
+  engineSignedOut: Record<string, boolean>
+  refreshEngineAuth: () => Promise<void>
   /** Billing mode, mirrored from main's settings (seeded on boot + onSettingsChanged). Drives the
    *  status-bar chip + the 'auto' fallback trigger in the RateLimitUpdate handler. */
   billingMode: BillingMode
@@ -585,8 +623,8 @@ interface WorkspaceStore {
   gitFiles: GitStatusFile[]
   /** True when the changed count exceeded the status cap and gitFiles is clipped. */
   gitChangesTruncated: boolean
-  /** True when ANOTHER worktree (not this window's) has uncommitted work — drives the Versions badge so
-   *  a past session's stranded work is visible without opening the surface. Refreshed with git status. */
+  /** True when ANOTHER worktree (not this window's) needs attention — loose work, an unreadable
+   *  status, or a missing folder. Drives the Versions badge without claiming unknown state is clean. */
   gitWorktreesDirty: boolean
   /** Re-read git repo state + working-tree status into gitRepo/gitFiles. Fire-and-forget; fails soft. */
   refreshGitStatus: () => Promise<void>
@@ -609,6 +647,39 @@ interface WorkspaceStore {
   recentImagesExpanded: boolean
   toggleRecentImagesExpanded: () => void
   hydrated: boolean
+  /** The hot sessions store exists but couldn't be read this run (schema drift, a torn write, an older
+   *  Koda build reading a newer file). Main already refused to report it as empty — this only drives the
+   *  visible warning; `hydrated` stays false so no chat in this window is saved over it. See
+   *  useEngineBridge's boot load. */
+  sessionsLoadFailed: boolean
+  /** Same shape as `sessionsLoadFailed`, but for the cold archive index — sessions can still hydrate
+   *  and save normally; only archiving (a two-writer op on this same index) is blocked while it's set,
+   *  so a broken index can't be silently rewritten with the session mid-archive missing from both the
+   *  hot list and the index (archiveSession's guard). */
+  archiveLoadFailed: boolean
+  /** Did main verifiably keep a `.corrupt-*.bak` copy of the file it couldn't read? The banner promises
+   *  that copy, and the promise is false whenever the copy itself failed (an EACCES store whose re-read
+   *  fails the same way, a `copyFileSync` that hit ENOSPC), so the banner branches on the real answer.
+   *  `null` = nobody got to say, and the banner then claims nothing either way. */
+  sessionsBackupKept: BackupKept
+  archiveBackupKept: BackupKept
+  /** Rows a load that otherwise SUCCEEDED had to set aside (one drifted chat costs only itself). Saving
+   *  stays on in that case, so the shortened list IS written back — the count is the user's only notice
+   *  that a chat left the list, which is why it's state and not just a log line. */
+  droppedSessions: number
+  droppedArchives: number
+  /** One patch for all of the above: boot resolves them together, from one pair of loads. */
+  setStoreIntegrity: (patch: Partial<StoreIntegrity>) => void
+  /** The archive index could be READ this run, but a write to it came back refused — so the move the
+   *  user just asked for (archive / reopen / delete) was declined rather than half-done. Not part of
+   *  StoreIntegrity: that's what boot's two reads found, this only becomes knowable when someone acts.
+   *  Cleared by the next write that does land, so a one-off failure stops nagging on its own. */
+  archiveWriteFailed: boolean
+  /** A reopen read the archived chat's transcript file and couldn't. Its own flag rather than a branch
+   *  of `archiveWriteFailed`: the index is fine here, one chat's body isn't, and the user is left
+   *  looking at a Settings panel that closed with nothing reopened. Cleared by the next reopen that
+   *  works. */
+  archiveRestoreFailed: boolean
 
   // engine + approvals
   applyEngineEvent: (e: EngineEvent) => void
@@ -629,6 +700,8 @@ interface WorkspaceStore {
   /** Stop the active turn mid-stream — a graceful interrupt that keeps the session alive so the user can
    *  type a correction and continue (vs the old session-killing stop). Clears `busy` optimistically. */
   interrupt: (sessionId: string) => void
+  /** Stop one background child without interrupting its parent conversation or sibling children. */
+  stopSubagent: (sessionId: string, taskId: string) => void
   /** Retry the failed turn behind the error banner: re-send the session's last user prompt as a fresh
    *  turn (what the user would do by hand). Clears the banner. No-op if there's no last prompt. */
   retryLastTurn: (sessionId: string) => void
@@ -639,18 +712,20 @@ interface WorkspaceStore {
    *  for each and replay its buffered history so the conversation shows up. Idempotent — skips sessions
    *  already open. Called after boot-hydrate and whenever a phone starts a session in this project. */
   adoptHeadless: () => Promise<void>
-  /** A phone turn arrived on a session THIS window already owns (adopted before it had any turn). The
-   *  engine stream never carries the human's prompt, so append it here — and, if the tab is still the
-   *  unnamed "From your phone" default, run the same first-turn titling adoptHeadless does. */
-  applyRemoteUserTurn: (sessionId: string, text: string) => void
+  /** Reconcile a human turn with durable replay: phone turns append their missing bubble; local turns
+   *  stamp the optimistic row with the replay identity main assigned. */
+  applyRemoteUserTurn: (sessionId: string, text: string, replaySeq?: number, append?: boolean) => void
+  /** Refetch the Recent images strip — a scratch image was saved outside the composer (a phone turn). */
+  bumpScratch: () => void
   /** End a session's live agent and move it to the archive (keeps the whole conversation; restorable
    *  from Settings). Replaces the old hard close — nothing is deleted. */
   archiveSession: (id: string) => Promise<void>
   /** Reopen an archived session as a live tab (reattaches via --resume on its next turn). Async: the
    *  transcript body is fetched from its cold file on demand. */
   restoreArchived: (id: string) => Promise<void>
-  /** Permanently drop an archived session (the one genuinely destructive session action). */
-  deleteArchived: (id: string) => void
+  /** Permanently drop an archived session (the one genuinely destructive session action). Async: the
+   *  index write is acknowledged before the transcript file is deleted. */
+  deleteArchived: (id: string) => Promise<void>
   send: () => Promise<void>
   /** Canvas edit: the user selected a passage in the doc surface and asked the active session's agent
    *  to change it. Composes a targeted-edit turn (the selection is the anchor) and dispatches it to the
@@ -692,6 +767,8 @@ interface WorkspaceStore {
   setDraft: (id: string, text: string) => void
   addAttachments: (id: string, imgs: ImageDraft[]) => void
   removeAttachment: (id: string, index: number) => void
+  /** Say why a dropped/pasted/picked file could not be attached (null clears the row). */
+  setAttachNotice: (id: string, message: string | null) => void
   /** Seed the default posture (boot, from main's persisted setting). */
   setDefaultApprovalMode: (mode: ApprovalMode) => void
   /** Mirror billing mode + whether the API key is currently effective (boot + onSettingsChanged). */
@@ -735,7 +812,10 @@ interface WorkspaceStore {
   /** The face's summon: a quick data/build turn to this project's agent without leaving the app.
    *  Grounds the turn in which app the user is looking at; starts a session if none is live. Returns
    *  false if nothing was dispatched (blank text / busy session / no fronted app). */
-  sendFaceTurn: (args: { text: string }) => Promise<boolean>
+  /** Dispatch an ask-or-fix turn into the app's summon thread. Resolves to the session id the turn
+   *  landed in (so the face can pin its busy/reply/question watchers to THAT session, never whatever
+   *  is active), or null when the thread is mid-turn / the app is gone. */
+  sendFaceTurn: (args: { text: string }) => Promise<string | null>
   /** Offer intake when a project is opened with no guidelines yet — the common case (existing folders,
    *  not just New project). Skips if it has sessions, was skipped before (per-project), or already has a
    *  CLAUDE.md/AGENTS.md (never re-author existing guidelines). Called once on project mount. */
@@ -860,6 +940,62 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     patchSession(id, (s) => ({ ...s, items: [...s.items, { ...item, id: eid }] }))
   }
 
+  function settleDeferredBillingRespawn(id: string): void {
+    if (!billingRespawnPending.has(id)) return
+    const state = get()
+    const session = state.sessions[id]
+    if (!session) {
+      billingRespawnPending.delete(id)
+      return
+    }
+    if (
+      session.busy ||
+      hasRunningSubagent(session.items) ||
+      state.pending.some((request) => request.sessionId === id)
+    )
+      return
+    billingRespawnPending.delete(id)
+    if (session.live) patchSession(id, (current) => ({ ...current, live: false }))
+  }
+
+  // ── First-turn session naming ────────────────────────────────────────────────
+  // Sibling names (live + archived) an auto-title must not collide with — an exact match gets a date
+  // suffix (engine-side), so repeat sessions on one feature never share a name.
+  function takenTitles(excludeId: string): string[] {
+    const st = get()
+    return [
+      ...st.order.filter((sid) => sid !== excludeId).map((sid) => st.sessions[sid]?.label),
+      ...st.archived.filter((a) => a.id !== excludeId).map((a) => a.label),
+    ]
+      .filter((l): l is string => !!l?.trim() && l !== 'New session' && l !== 'From your phone')
+      .slice(0, 12)
+  }
+
+  // Per-session titling epoch: each upgradeTitle call invalidates any still-in-flight predecessor, so
+  // a slow birth-title call (model cold-load) can never resolve late and revert the settled substance
+  // retitle. Entries are a number per session ever titled — no cleanup needed.
+  const titleGen = new Map<string, number>()
+
+  // Fire-and-forget on-device title upgrade; never blocks a turn, never rejects. A user rename
+  // (userNamed) always wins — including against an in-flight upgrade resolving late.
+  function upgradeTitle(id: string, text: string): void {
+    const gen = (titleGen.get(id) ?? 0) + 1
+    titleGen.set(id, gen)
+    void window.koda
+      .assistTitle({ text, avoid: takenTitles(id) })
+      .then(({ title }) => {
+        if (titleGen.get(id) !== gen) return // superseded by a newer titling for this session
+        if (title.trim()) patchSession(id, (s) => (s.userNamed ? s : { ...s, label: title }))
+      })
+      .catch(() => {})
+  }
+
+  // The substance digest: first prompt + the turn's final reply. Naming from what was DONE (not just
+  // what was asked) is what makes two sessions with the same opening prompt end up named apart.
+  function titleDigest(prompt: string, reply: string): string {
+    return `${prompt.slice(0, 1500)}\n\nWhat was done:\n${reply.slice(0, 2000)}`
+  }
+
   // Shared turn dispatch for every path that drives the engine (the composer + Canvas edits). Pushes an
   // optimistic transcript item, marks the session busy, lazily reattaches a restored session via
   // --resume, then sends. `sentText` is what the engine receives; `displayItem` is what the transcript
@@ -888,7 +1024,9 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       busy: true,
       errored: false,
       error: undefined, // a fresh turn clears any prior error banner
-      label: firstTurn && name ? titleFromPrompt(name) : s.label,
+      attachNotice: undefined, // …and any leftover "couldn't attach that" row
+      // userNamed guard: a session renamed BEFORE its first message keeps that name.
+      label: firstTurn && name && !s.userNamed ? titleFromPrompt(name) : s.label,
     }))
     // Interacting with a session (sending a turn) bumps it to the top — newest activity first. Merely
     // selecting a session to glance at it does NOT reorder (that would yank the list under the user).
@@ -897,15 +1035,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         ? {}
         : { order: [id, ...state.order.filter((sid) => sid !== id)] },
     )
-    if (firstTurn && name) {
-      // Fire-and-forget on-device title upgrade; never blocks the turn, never rejects.
-      void window.koda
-        .assistTitle({ text: name })
-        .then(({ title }) => {
-          if (title.trim()) patchSession(id, (s) => (s.userNamed ? s : { ...s, label: title }))
-        })
-        .catch(() => {})
-    }
+    if (firstTurn && name && !get().sessions[id]?.userNamed) upgradeTitle(id, name)
     if (needsReattach) {
       reattaching.add(id)
       suppressStartNotice.add(id)
@@ -919,6 +1049,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         const effort = active.effort
         const engineId = active.engineId
         const engineNativeId = active.engineNativeId
+        const replaySeq = active.replaySeq
         if (!firstTurn && engineId === 'codex' && !engineNativeId) {
           suppressStartNotice.delete(id)
           patchSession(id, (s) => ({ ...s, busy: false }))
@@ -932,8 +1063,17 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         }
         await window.koda.startSession(
           firstTurn
-            ? { cwd, sessionId: id, planMode, model, effort, engineId }
-            : { cwd, resumeSessionId: id, planMode, model, effort, engineId, engineNativeId },
+            ? { cwd, sessionId: id, planMode, model, effort, engineId, replaySeq }
+            : {
+                cwd,
+                resumeSessionId: id,
+                planMode,
+                model,
+                effort,
+                engineId,
+                engineNativeId,
+                replaySeq,
+              },
         )
         patchSession(id, (s) => ({ ...s, live: true }))
         // The gate's per-session posture map is empty after a restart — re-push this session's mode.
@@ -989,7 +1129,11 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         ...s,
         items: s.items.map((it) =>
           it.kind === 'subagent' && it.toolUseId === parentToolUseId
-            ? { ...it, children: [...it.children, { ...child, id: childId } as SubagentChild] }
+            ? {
+                ...it,
+                lastActivityAt: Date.now(),
+                children: [...it.children, { ...child, id: childId } as SubagentChild],
+              }
             : it,
         ),
       }
@@ -1009,6 +1153,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         if (it.kind !== 'subagent' || it.toolUseId !== parentToolUseId) return it
         return {
           ...it,
+          lastActivityAt: Date.now(),
           children: it.children.map((c) =>
             c.kind === 'tool' && c.toolUseId === toolUseId ? { ...c, result, isError } : c,
           ),
@@ -1132,6 +1277,54 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     }
   }
 
+  /** Write the archive index and WAIT for the answer. One file backs all three moves between the hot
+   *  session store and the archive (archive / reopen / delete), and the hot half of every one of them
+   *  lands on its own — so the caller must not commit its half until this returns true. A `false` that
+   *  gets ignored is exactly how a chat leaves the sidebar with nothing left recording where it went.
+   *
+   *  Refuses outright while the index couldn't be READ this run: writing then would replace a file we
+   *  never managed to parse. (Unreachable in practice — a failed read hydrates an empty archived list,
+   *  so there is nothing to reopen or delete and archiveSession bails earlier — kept because this is the
+   *  one function that touches the file.)
+   *
+   *  A preload predating the acknowledged channel resolves `undefined`, which reads as a refusal: the
+   *  move is declined rather than completed on an unverified write. That's the dev hot-reload window
+   *  only, and refusing is the safe side of it. */
+  const persistArchived = async (next: ArchivedSessionMeta[]): Promise<boolean> => {
+    if (get().archiveLoadFailed) return false
+    let ok = false
+    try {
+      ok = (await window.koda.saveArchived?.(next)) === true
+    } catch (err) {
+      console.error('archive index save failed', err)
+    }
+    // Cleared by the first write that lands, so a genuinely one-off failure stops warning on its own.
+    if (get().archiveWriteFailed !== !ok) set({ archiveWriteFailed: !ok })
+    return ok
+  }
+
+  /** Run one move between the hot store and the archive at a time.
+   *
+   *  Each of the three (archive / reopen / delete) is a read-modify-write of ONE list: read `archived`,
+   *  derive the next list, await the file, commit that list. Two of them in flight at once — the phone
+   *  forwarding an archive while ⌘W archives another session — both read the same base, so the second
+   *  write lands over the first and the second commit overwrites it in memory too. One chat then leaves
+   *  the sidebar without ever reaching the index, its transcript orphaned in `.bodies/`.
+   *
+   *  Zustand's setter composes updates for free, which is why the old fire-and-forget version survived
+   *  this; waiting on the write is what put a gap between the read and the commit. Serializing closes
+   *  the gap instead of choosing between the two properties: each move sees the previous one's
+   *  committed result, so the list it persists and the list it commits are still the same list.
+   *  (Re-deriving inside the setter would fix memory only — the loser's row would be live in the store
+   *  and absent from the file it was just told about, which needs another unacknowledged write to
+   *  reconcile.) */
+  let archiveMoves: Promise<unknown> = Promise.resolve()
+  const queueArchiveMove = <T,>(move: () => Promise<T>): Promise<T> => {
+    const run = archiveMoves.then(move, move)
+    archiveMoves = run.catch(() => {})
+    return run
+  }
+
   const initialDock = readDock() // seed dock open/tool from the last session (localStorage)
 
   return {
@@ -1149,6 +1342,22 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         else delete next[e.engine]
         return { providerDown: next }
       }),
+    engineSignedOut: {},
+    refreshEngineAuth: async () => {
+      // Read each engine's sign-in the same way Settings does, so the dot and the Providers panel never
+      // disagree. "Signed out" mirrors ProvidersSection's readiness: Claude is out when the subscription
+      // verdict is logged-out AND no API key is stored; Codex is out when it isn't signed in AND has no
+      // stored key. Fail-soft (treat an unreadable probe as signed-in) so a transient probe error never
+      // raises a false "sign in" nag.
+      const [billing, codex] = await Promise.all([
+        window.koda.getBillingState().catch(() => null),
+        window.koda.getCodexAuthStatus().catch(() => null),
+      ])
+      const next: Record<string, boolean> = {}
+      if (billing) next.claude = billing.verdict.mode === 'logged-out' && !billing.hasKey
+      if (codex && !codex.probeFailed) next.codex = !(codex.signedIn || (billing?.hasCodexKey ?? false))
+      set({ engineSignedOut: next })
+    },
     billingMode: 'subscription',
     apiActive: false,
     billingFallbackPrompt: null,
@@ -1190,6 +1399,14 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     recentImagesExpanded: false,
     recentFiles: [],
     hydrated: false,
+    sessionsLoadFailed: false,
+    archiveLoadFailed: false,
+    sessionsBackupKept: null,
+    archiveBackupKept: null,
+    droppedSessions: 0,
+    droppedArchives: 0,
+    archiveWriteFailed: false,
+    archiveRestoreFailed: false,
 
     applyAsideEvent: (e) => {
       patchSession(e.sessionId, (s) => {
@@ -1204,10 +1421,13 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
 
     applyEngineEvent: (e) => {
       const sid = e.sessionId
+      const replaySeq = e.replaySeq
+      if (replaySeq !== undefined)
+        patchSession(sid, (s) => ({ ...s, replaySeq: Math.max(s.replaySeq ?? 0, replaySeq) }))
       // Reconcile `busy` from the live stream so the sidebar follows the ACTUAL turn, including turns
       // started outside this renderer (phone/relay → backend.sendTurn, which never runs dispatchTurn).
       // Skip while a user interrupt is settling so a trailing event can't re-arm a turn just stopped.
-      if (ENGINE_ACTIVITY.has(e.type) && !userInterrupted.has(sid))
+      if (isTopLevelTurnActivity(e) && !userInterrupted.has(sid))
         patchSession(sid, (s) => (s.busy ? s : { ...s, busy: true }))
       switch (e.type) {
         case 'SessionStarted': {
@@ -1229,7 +1449,8 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           // Seed the next new session's pill. An explicit pick was already remembered at pick time (keep
           // its alias for auto-upgrade); a "Default" session had no name to show, so remember the concrete
           // model the engine just resolved to — after any first turn, new sessions name a real model.
-          if (!hadModel && e.model) writeLastModel(e.model)
+          if (!hadModel && e.model)
+            writeResolvedNewSessionModel(get().sessions[sid]?.engineId ?? 'claude', e.model)
           // A reattach (--resume) re-fires this; swallow its banner so restored history stays clean.
           if (suppressStartNotice.has(sid)) suppressStartNotice.delete(sid)
           // No banner in a fresh session — the composer's model pill owns model truth, and a spawn-time
@@ -1273,11 +1494,15 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           break
         case 'AssistantBlock':
           if (e.parentToolUseId)
-            addChild(sid, e.parentToolUseId, { kind: 'assistant', markdown: e.markdown })
+            addChild(sid, e.parentToolUseId, {
+              kind: 'assistant',
+              markdown: e.markdown,
+              replaySeq: e.replaySeq,
+            })
           else {
             finalizeThinking(sid)
             patchSession(sid, (s) => ({ ...s, streaming: '' }))
-            pushItem(sid, { kind: 'assistant', markdown: e.markdown })
+            pushItem(sid, { kind: 'assistant', markdown: e.markdown, replaySeq: e.replaySeq })
           }
           break
         case 'ToolRequested':
@@ -1288,6 +1513,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
               toolUseId: e.id,
               name: e.name,
               input: e.input,
+              replaySeq: e.replaySeq,
             })
             break
           }
@@ -1300,8 +1526,38 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
             const inp = e.input as { taskId?: string | number; status?: string } | null
             if (inp?.taskId != null) updateTaskStatus(sid, String(inp.taskId), String(inp.status ?? ''))
           } else {
-            pushItem(sid, { kind: 'tool', toolUseId: e.id, name: e.name, input: e.input })
+            pushItem(sid, {
+              kind: 'tool',
+              toolUseId: e.id,
+              name: e.name,
+              input: e.input,
+              replaySeq: e.replaySeq,
+            })
           }
+          break
+        case 'ToolProgress':
+          patchSession(sid, (s) => ({
+            ...s,
+            items: s.items.map((it) =>
+              it.kind === 'tool' && it.toolUseId === e.id
+                ? { ...it, liveOutput: appendLiveToolOutput(it.liveOutput, e.output) }
+                : it,
+            ),
+          }))
+          break
+        case 'PlanUpdate':
+          mutateTaskList(sid, () => e.steps)
+          break
+        case 'ContextCompacted':
+          patchSession(sid, (s) => ({ ...s, context: undefined }))
+          pushItem(sid, {
+            kind: 'notice',
+            text: 'Codex condensed the earlier conversation and continued with a summary.',
+            replaySeq: e.replaySeq,
+          })
+          break
+        case 'ContextUsageUpdate':
+          patchSession(sid, (s) => ({ ...s, context: e.context }))
           break
         case 'ToolResult': {
           // Fold the result into its requesting tool card by the engine's tool id — nested child or
@@ -1323,7 +1579,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
             ...s,
             items: s.items.map((it) =>
               it.kind === 'tool' && it.toolUseId === e.id
-                ? { ...it, result: e.output, isError: e.isError }
+                ? { ...it, liveOutput: undefined, result: e.output, isError: e.isError }
                 : it,
             ),
           }))
@@ -1353,16 +1609,26 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           pushItem(sid, {
             kind: 'subagent',
             toolUseId: e.toolUseId,
+            taskId: e.taskId,
             subagentType: e.subagentType,
             description: e.description,
             prompt: e.prompt,
             status: 'running',
+            lastActivityAt: Date.now(),
+            replaySeq: e.replaySeq,
             children: [],
           })
           break
         case 'WorkflowStarted':
           finalizeThinking(sid)
-          pushItem(sid, { kind: 'workflow', runId: e.runId, name: e.name, status: 'running', agents: [] })
+          pushItem(sid, {
+            kind: 'workflow',
+            runId: e.runId,
+            name: e.name,
+            status: 'running',
+            agents: [],
+            replaySeq: e.replaySeq,
+          })
           break
         case 'WorkflowAgent':
           mutateWorkflow(sid, e.runId, (w) => {
@@ -1378,8 +1644,12 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           raiseAttention(sid, 'done') // a backgrounded workflow finishing pings the user
           break
         case 'SubagentProgress': {
-          const patch: Partial<SubagentItem> = {}
-          if (e.status === 'completed') patch.status = 'completed'
+          const patch: Partial<SubagentItem> = { lastActivityAt: Date.now() }
+          if (e.status === 'completed') {
+            patch.status = 'completed'
+            patch.stopRequested = undefined
+          }
+          if (e.taskId) patch.taskId = e.taskId
           if (e.description) patch.liveStatus = e.description // live one-liner, not task identity
           if (e.lastToolName) patch.lastToolName = e.lastToolName
           if (e.usage) patch.usage = e.usage
@@ -1388,11 +1658,20 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         }
         case 'SubagentCompleted':
           updateSubagent(sid, e.toolUseId, {
-            status: 'completed',
+            status:
+              e.outcome === 'interrupted'
+                ? 'interrupted'
+                : e.outcome === 'unknown'
+                  ? 'unknown'
+                  : 'completed',
+            stopRequested: undefined,
+            lastActivityAt: Date.now(),
+            ...(e.taskId ? { taskId: e.taskId } : {}),
             isError: e.isError,
             ...(e.resultText ? { resultText: e.resultText } : {}),
             ...(e.usage ? { usage: e.usage } : {}),
           })
+          settleDeferredBillingRespawn(sid)
           break
         case 'TurnComplete': {
           finalizeThinking(sid) // covers a thinking-only turn that produced no text
@@ -1410,6 +1689,28 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           // approve timeout drops the `approve` call and the agent re-asks, stranding the old requestId
           // with no cancel event) — clear it, else statusOf latches the session on "Needs your approval".
           get().cancelPending(sid)
+          settleDeferredBillingRespawn(sid)
+          // One-shot substance retitle: the FIRST turn just finished cleanly, so rename from what was
+          // actually done (prompt + final reply) — two sessions that open with the same prompt diverge
+          // in the work, so this is where their names come apart. Fires only while the session has a
+          // single turn; after this the name never moves again unless the user renames it (userNamed).
+          if (!replayingSessions.has(sid) && e.stopReason === 'success') {
+            const sess = get().sessions[sid]
+            // Count only turns that could have named the session: canvas + text prompts. An image-only
+            // opener never named it, so the first TEXT turn's completion is this session's one shot.
+            const turns =
+              sess?.items.filter(
+                (it) => it.kind === 'canvas' || (it.kind === 'user' && it.text.trim() && it.text !== '(image)'),
+              ) ?? []
+            const opener = turns.length === 1 && turns[0].kind === 'user' ? turns[0].text : ''
+            if (sess && !sess.userNamed && opener) {
+              const reply = sess.items
+                .slice()
+                .reverse()
+                .find((it) => it.kind === 'assistant') as Extract<Entry, { kind: 'assistant' }> | undefined
+              if (reply) upgradeTitle(sid, titleDigest(opener, reply.markdown))
+            }
+          }
           // A clean turn (subtype 'success') needs no footer — the next composer marks the boundary.
           // Surface a notice ONLY when the turn ended abnormally, so a truncated answer isn't silent.
           // (No cost here — running spend lives in the Usage view; fatal errors get their own notice.)
@@ -1424,7 +1725,6 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           const lastItem = get().sessions[sid]?.items.at(-1)
           const dupe = lastItem?.kind === 'notice' && lastItem.text === abnormal
           if (abnormal && !dupe) pushItem(sid, { kind: 'notice', text: abnormal })
-          raiseAttention(sid, 'done')
           // A completed turn is the moment the working tree most likely changed — refresh the dirty
           // state that feeds the per-session chips + Changes surface (aggregate, so any session's turn
           // updates the shared picture). Fire-and-forget. Skipped while replaying an adopted session's
@@ -1449,8 +1749,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
               // them from the old session first.
               const prev = get().sessions[sid]
               if (prev) {
-                writeLastEngine(prev.engineId)
-                writeLastModel(prev.model)
+                writeNewSessionPosture(prev.engineId, prev.model)
               }
               void (async () => {
                 await get().startSession() // creates + activates the fresh session
@@ -1463,6 +1762,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
               })()
             }
           }
+          raiseAttention(sid, 'done')
           break
         }
         case 'RateLimitUpdate': {
@@ -1470,12 +1770,18 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           // subscription), then store by type (five_hour/weekly), newest wins within that engine. The
           // driver's own stamp wins over the session lookup (authoritative at the source).
           const rlEngine = e.engine ?? get().sessions[sid]?.engineId ?? 'claude'
-          set((state) => ({
-            rateLimits: {
-              ...state.rateLimits,
-              [rlEngine]: { ...(state.rateLimits[rlEngine] ?? {}), [e.info.rateLimitType]: e.info },
-            },
-          }))
+          set((state) => {
+            const windows = e.reconciledWindows ?? {
+              ...state.rateLimits[rlEngine],
+              [e.info.rateLimitType]: e.info,
+            }
+            return {
+              rateLimits: {
+                ...state.rateLimits,
+                [rlEngine]: windows,
+              },
+            }
+          })
           // 'auto' billing: a 'rejected' window means the plan limit is hit (the engine guide confirms it
           // lands at the END of the crossing turn, so the NEXT turn is blocked → switch forward). Raise
           // the one-time "continue on your API key?" banner. We re-fetch live billing state rather than
@@ -1527,7 +1833,11 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
             bannerErrored.add(sid)
             raiseAttention(sid, 'error')
           } else {
-            pushItem(sid, { kind: 'notice', text: `⚠ engine notice: ${e.message}` })
+            pushItem(sid, {
+              kind: 'notice',
+              text: `⚠ engine notice: ${e.message}`,
+              replaySeq: e.replaySeq,
+            })
           }
           break
         }
@@ -1535,8 +1845,13 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     },
 
     addPending: (req) => {
-      set((state) => ({ pending: [...state.pending, req] }))
-      raiseAttention(req.sessionId, 'waiting')
+      let inserted = false
+      set((state) => {
+        if (state.pending.some((r) => r.requestId === req.requestId)) return state
+        inserted = true
+        return { pending: [...state.pending, req] }
+      })
+      if (inserted) raiseAttention(req.sessionId, 'waiting')
     },
 
     cancelPending: (sessionId) =>
@@ -1607,6 +1922,17 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       patchSession(sessionId, (x) => ({ ...x, busy: false, error: undefined }))
     },
 
+    stopSubagent: (sessionId, taskId) => {
+      const s = get().sessions[sessionId]
+      const child = s?.items.find((it) => it.kind === 'subagent' && it.taskId === taskId)
+      if (!child || child.kind !== 'subagent' || child.status !== 'running' || child.stopRequested) return
+      updateSubagent(sessionId, child.toolUseId, { stopRequested: true, lastActivityAt: Date.now() })
+      window.koda.stopSubagent({ sessionId, taskId }).catch((err) => {
+        console.error(err)
+        updateSubagent(sessionId, child.toolUseId, { stopRequested: undefined, lastActivityAt: Date.now() })
+      })
+    },
+
     retryLastTurn: (sessionId) => {
       const s = get().sessions[sessionId]
       if (!s || s.busy) return
@@ -1628,8 +1954,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       // reattaches the session in plan mode on its next turn (see setSessionApprovalMode). The engine
       // defaults to the last one the user picked; they can switch it from the model dropdown until the
       // first turn (after that the conversation is bound to its engine).
-      const engineId = readLastEngine()
-      const model = readLastModel() // pin the last model so the pill names it before the first turn
+      const { engineId, model } = readNewSessionPosture()
       // Spawn the warm-up engine ON that model. Omitting it booted the engine on its own default while the
       // pill named `model`, so a first turn sent without re-picking silently ran the wrong model (the pill
       // was display-only). Main also reconciles intent-vs-actual before every turn now, but that backstop
@@ -1672,19 +1997,65 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       const adopted = await window.koda.adoptHeadlessSessions().catch(() => [])
       let any = false
       for (const s of adopted) {
-        if (get().sessions[s.id]) continue // already open in this window (idempotent re-call)
         any = true
+        const existing = get().sessions[s.id]
+        if (existing) {
+          // A reopened window hydrates this same id as a cold transcript before main transfers the
+          // still-running engine back to it. The persisted replay cursor lets the normal reducer apply
+          // only the exact headless tail—no text-based guessing when the user says "continue" twice.
+          patchSession(s.id, (current) => ({
+            ...current,
+            cwd: s.cwd,
+            streaming: '',
+            busy: s.working ?? current.busy,
+            errored: false,
+            error: undefined,
+            live: true,
+            approvalMode: s.approvalMode,
+            engineId: s.engineId,
+            model: s.model,
+            effort: s.effort,
+          }))
+          const tail = s.events.filter(
+            (entry) => entry.replaySeq === undefined || entry.replaySeq > (existing.replaySeq ?? 0),
+          )
+          replayingSessions.add(s.id)
+          suppressStartNotice.add(s.id)
+          try {
+            for (const entry of tail) {
+              if (entry.type === 'RemoteUserTurn')
+                pushItem(s.id, { kind: 'user', text: entry.text, replaySeq: entry.replaySeq })
+              else get().applyEngineEvent(entry)
+            }
+          } finally {
+            replayingSessions.delete(s.id)
+            suppressStartNotice.delete(s.id)
+          }
+          const activeChildren = new Set(s.activeSubagentToolUseIds ?? [])
+          patchSession(s.id, (current) => ({
+            ...current,
+            items: settleRestoredTranscriptItems(current.items, activeChildren) as Entry[],
+            busy: s.working ?? current.busy,
+            replaySeq: Math.max(
+              current.replaySeq ?? 0,
+              ...s.events.map((entry) => entry.replaySeq ?? 0),
+            ),
+          }))
+          continue
+        }
         // Create the tab first so the replay + subsequent live events have a session to land in. It's
         // `live: true` — the engine is already running on main; a Mac turn sends straight through (no
-        // reattach). approvalMode follows this window's default (the gate's per-session posture was set
-        // when the phone started it).
+        // reattach). approvalMode mirrors the gate's ACTUAL posture for this session (main reads it
+        // live, not a guessed window default) — a phone session's mode may have been changed before
+        // any window existed to display it, and showing a looser posture than the gate enforces would
+        // be the dangerous direction to get wrong.
         set((state) => ({
           sessions: {
             ...state.sessions,
             [s.id]: {
               id: s.id,
-              label: 'From your phone',
-              userNamed: false,
+              label: s.label || 'From your phone',
+              userNamed: s.userNamed ?? false,
               cwd: s.cwd,
               items: [],
               streaming: '',
@@ -1694,9 +2065,10 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
               attachments: [],
               live: true,
               attention: false,
-              approvalMode: state.defaultApprovalMode,
+              approvalMode: s.approvalMode,
               engineId: s.engineId,
               model: s.model,
+              effort: s.effort,
               spendUsd: 0,
               byModel: {},
               fromRemote: true,
@@ -1711,29 +2083,40 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         suppressStartNotice.add(s.id)
         try {
           for (const entry of s.events) {
-            if (entry.type === 'RemoteUserTurn') pushItem(s.id, { kind: 'user', text: entry.text })
+            if (entry.type === 'RemoteUserTurn')
+              pushItem(s.id, { kind: 'user', text: entry.text, replaySeq: entry.replaySeq })
             else get().applyEngineEvent(entry)
           }
         } finally {
           replayingSessions.delete(s.id)
           suppressStartNotice.delete(s.id)
         }
-        // Name the tab from its first user turn (mirrors first-turn naming), falling back to the marker.
-        // A phone-started session never ran through dispatchTurn locally, so it also never got the
-        // on-device AI title upgrade — mirror both stages here: the instant prompt-word title, then the
-        // fire-and-forget assistTitle refinement (skipped only if the user has since named it).
+        // Replaying describes the history; main's ownership snapshot is authoritative for what remains
+        // live at the handoff boundary (including a child whose Start event predates this window).
+        const activeChildren = new Set(s.activeSubagentToolUseIds ?? [])
+        patchSession(s.id, (current) => ({
+          ...current,
+          items: settleRestoredTranscriptItems(current.items, activeChildren) as Entry[],
+          busy: s.working ?? current.busy,
+          replaySeq: Math.max(
+            current.replaySeq ?? 0,
+            ...s.events.map((entry) => entry.replaySeq ?? 0),
+          ),
+        }))
+        // A session main already named keeps that name verbatim (s.label above) — a settled title must
+        // not change on open. Only a still-unnamed adoption derives one here (mirrors first-turn
+        // naming: instant prompt-word title, then the digest upgrade when the replay holds a reply).
+        // If its first turn is still running, the TurnComplete retitle in the reducer finishes the job.
         const first = get().sessions[s.id]?.items.find((it) => it.kind === 'user') as
           | { kind: 'user'; text: string }
           | undefined
-        if (first?.text.trim()) {
+        if (!s.label && first?.text.trim()) {
           patchSession(s.id, (ss) => ({ ...ss, label: titleFromPrompt(first.text) }))
-          void window.koda
-            .assistTitle({ text: first.text })
-            .then(({ title }) => {
-              if (title.trim())
-                patchSession(s.id, (ss) => (ss.userNamed ? ss : { ...ss, label: title }))
-            })
-            .catch(() => {})
+          const reply = get()
+            .sessions[s.id]?.items.slice()
+            .reverse()
+            .find((it) => it.kind === 'assistant') as Extract<Entry, { kind: 'assistant' }> | undefined
+          upgradeTitle(s.id, reply ? titleDigest(first.text, reply.markdown) : first.text)
         }
       }
       // One git refresh after replay settles (the per-turn refreshes were suppressed during replay).
@@ -1743,145 +2126,239 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       if (any && !get().activeId) set({ activeId: get().order[0] })
     },
 
-    applyRemoteUserTurn: (sessionId, text) => {
+    bumpScratch: () => set((s) => ({ scratchTick: s.scratchTick + 1 })),
+
+    applyRemoteUserTurn: (sessionId, text, replaySeq, append = true) => {
       const s = get().sessions[sessionId]
-      if (!s) return // not owned by this window — nothing to append to
+      if (!s) return // not owned by this window — nothing to append or stamp
+      if (!append) {
+        // The desktop already rendered this turn optimistically. Main assigns the replay identity before
+        // the engine receives it, so stamp the newest unstamped turn row rather than appending a copy.
+        patchSession(sessionId, (current) => {
+          const index = current.items.findLastIndex(
+            (item) => (item.kind === 'user' || item.kind === 'canvas') && item.replaySeq === undefined,
+          )
+          if (index === -1) return current
+          const items = current.items.slice()
+          items[index] = { ...items[index], replaySeq }
+          return {
+            ...current,
+            items,
+            replaySeq: replaySeq === undefined ? current.replaySeq : Math.max(current.replaySeq ?? 0, replaySeq),
+          }
+        })
+        return
+      }
       // This is the session's first real prompt if nothing before it was one (an image-only turn shows
       // as "(image)" and never names the tab). Decide BEFORE appending so the new turn isn't counted.
       const hadPrompt = s.items.some((it) => it.kind === 'user' && it.text.trim() && it.text !== '(image)')
-      pushItem(sessionId, { kind: 'user', text: text || '(image)' })
+      pushItem(sessionId, { kind: 'user', text: text || '(image)', replaySeq })
+      if (replaySeq !== undefined)
+        patchSession(sessionId, (current) => ({
+          ...current,
+          replaySeq: Math.max(current.replaySeq ?? 0, replaySeq),
+        }))
       // Mirror adoptHeadless's first-turn naming: the session was adopted empty (before any turn), so it
       // never got titled. Instant first-words label, then the fire-and-forget assistTitle upgrade.
       if (!s.userNamed && !hadPrompt && text.trim()) {
         patchSession(sessionId, (ss) => ({ ...ss, label: titleFromPrompt(text) }))
-        void window.koda
-          .assistTitle({ text })
-          .then(({ title }) => {
-            if (title.trim()) patchSession(sessionId, (ss) => (ss.userNamed ? ss : { ...ss, label: title }))
-          })
-          .catch(() => {})
+        upgradeTitle(sessionId, text)
       }
     },
 
-    archiveSession: async (id) => {
-      window.koda.disposeSession({ sessionId: id }).catch(console.error)
-      const s = get().sessions[id]
-      if (!s) return
-      // The transcript body goes to its own cold file; the metadata index (persisted by the archived
-      // subscription) stays light. Baked preview + maxItemId let the list render and boot advance the id
-      // counter WITHOUT re-loading bodies.
-      const items = s.items
-      // Await so the body is durably written before the session leaves the store (also orders it ahead of
-      // any later loadArchivedBody, which rides a different channel). Fail-soft: on error the archive is
-      // still recorded (visible in the list) — only its restore would come back empty.
-      try {
-        await window.koda.writeArchivedBody?.(id, items)
-      } catch (err) {
-        console.error(err)
-      }
-      // Snapshot the durable metadata (same fields the persist blob keeps, minus `items`) + an archive
-      // stamp, so it restores byte-identical and reattaches via --resume like a boot-restored session.
-      const meta: ArchivedSessionMeta = {
-        id: s.id,
-        label: s.label,
-        cwd: s.cwd,
-        userNamed: s.userNamed,
-        approvalMode: s.approvalMode,
-        model: s.model,
-        effort: s.effort,
-        engineId: s.engineId,
-        engineNativeId: s.engineNativeId,
-        context: s.context,
-        spendUsd: s.spendUsd,
-        byModel: s.byModel,
-        archivedAt: Date.now(),
-        preview: buildArchivePreview(items),
-        maxItemId: maxArchivedItemId(items),
-      }
-      set((state) => {
-        if (!state.sessions[id]) return {}
-        const rest = { ...state.sessions }
-        delete rest[id]
-        const order = state.order.filter((sid) => sid !== id)
-        const activeId =
-          state.activeId === id ? (order.length ? order[0] : null) : state.activeId
-        // Drop the session's editor workbench too — its tabs die with it.
-        const editors = { ...state.editors }
-        delete editors[id]
-        return {
-          sessions: rest,
-          order,
-          activeId,
-          editors,
-          pending: state.pending.filter((r) => r.sessionId !== id),
-          archived: [meta, ...state.archived],
+    archiveSession: (id) =>
+      queueArchiveMove(async () => {
+        const s = get().sessions[id]
+        if (!s) return
+        // The archive index couldn't be read this run (archiveLoadFailed) — archiving is a two-writer
+        // move (out of `sessions`, into `archived`) backed by ONE persisted index; writing half of that
+        // (the session leaves the hot list) while the other half (its new archived entry) can't be saved
+        // would drop the chat from both the hot store and the index, with its transcript body orphaned on
+        // disk. Refuse outright rather than half-complete it — the chat stays exactly where it is, visible.
+        if (get().archiveLoadFailed) {
+          console.error(
+            `archive blocked for session ${id} — this project's archive index failed to load this run; ` +
+              'archiving is disabled until the project is reopened',
+          )
+          return
         }
-      })
-    },
+        // The transcript body goes to its own cold file; the metadata index stays light. Baked preview +
+        // maxItemId let the list render and boot advance the id counter WITHOUT re-loading bodies.
+        const items = s.items
+        // Await so the body is durably written before the session leaves the store (also orders it ahead of
+        // any later loadArchivedBody, which rides a different channel). Fail-soft: on error the archive is
+        // still recorded (visible in the list) — only its restore would come back empty.
+        try {
+          await window.koda.writeArchivedBody?.(id, items)
+        } catch (err) {
+          console.error(err)
+        }
+        // Snapshot the durable metadata (same fields the persist blob keeps, minus `items`) + an archive
+        // stamp, so it restores byte-identical and reattaches via --resume like a boot-restored session.
+        const meta: ArchivedSessionMeta = {
+          id: s.id,
+          label: s.label,
+          cwd: s.cwd,
+          userNamed: s.userNamed,
+          approvalMode: s.approvalMode,
+          model: s.model,
+          effort: s.effort,
+          engineId: s.engineId,
+          engineNativeId: s.engineNativeId,
+          context: s.context,
+          spendUsd: s.spendUsd,
+          byModel: s.byModel,
+          replaySeq: s.replaySeq,
+          archivedAt: Date.now(),
+          preview: buildArchivePreview(items),
+          maxItemId: maxArchivedItemId(items),
+        }
+        // The move's other half, and the one that used to go out unacknowledged. The session leaves the
+        // hot store only once the index is on disk holding it — otherwise the hot save (which never fails
+        // the same way) would write the removal and the chat would be gone from both, its body orphaned.
+        // The committed list below is this exact array, so memory and disk can't disagree about the move.
+        // It still composes with a second move asked for at the same time: `queueArchiveMove` holds that
+        // one until this one has committed, so the base read here already carries whatever landed first.
+        const nextArchived = [meta, ...get().archived]
+        if (!(await persistArchived(nextArchived))) {
+          console.error(`archive aborted for session ${id} — the archive index refused the write`)
+          return
+        }
+        // Only now is the move real, so only now does the live agent go. A refused archive above leaves the
+        // session running, which is the whole point of asking first.
+        window.koda.disposeSession({ sessionId: id }).catch(console.error)
+        set((state) => {
+          // The session went away across the awaits (a phone close). The index on disk already holds
+          // `nextArchived`, so commit that half regardless — same rule restoreArchived's setter follows.
+          if (!state.sessions[id]) return { archived: nextArchived }
+          const rest = { ...state.sessions }
+          delete rest[id]
+          const order = state.order.filter((sid) => sid !== id)
+          const activeId =
+            state.activeId === id ? (order.length ? order[0] : null) : state.activeId
+          // Drop the session's editor workbench too — its tabs die with it.
+          const editors = { ...state.editors }
+          delete editors[id]
+          return {
+            sessions: rest,
+            order,
+            activeId,
+            editors,
+            pending: state.pending.filter((r) => r.sessionId !== id),
+            archived: nextArchived,
+          }
+        })
+      }),
 
-    restoreArchived: async (id) => {
-      const a = get().archived.find((x) => x.id === id)
-      if (!a) return
-      // Already open (shouldn't happen) — just focus it, drop the stale archive entry, and let its now
-      // unused body file go.
-      if (get().sessions[id]) {
-        set((state) => ({ activeId: id, archived: state.archived.filter((x) => x.id !== id) }))
+    // Reopening runs the same move as archiving, in the other direction: the row leaves the index and a
+    // session joins the hot store. Same rule, then — the index write is acknowledged first, and a refusal
+    // leaves the archived chat listed and its body on disk instead of half-reopening it. The chat itself
+    // is never at risk here (its transcript is in hand before anything is removed), but committing on an
+    // unacknowledged write would leave a row on disk whose body this function has already deleted, which
+    // reads to the user as an archived chat that reopens to nothing.
+    restoreArchived: (id) =>
+      queueArchiveMove(async () => {
+        const a = get().archived.find((x) => x.id === id)
+        if (!a) return
+        // Already open (shouldn't happen) — just focus it, drop the stale archive entry, and let its now
+        // unused body file go.
+        if (get().sessions[id]) {
+          const withoutRow = get().archived.filter((x) => x.id !== id)
+          if (!(await persistArchived(withoutRow))) {
+            set({ activeId: id }) // focusing it is still right and costs nothing
+            return
+          }
+          set({ activeId: id, archived: withoutRow })
+          window.koda.deleteArchivedBody?.(id).catch(console.error)
+          return
+        }
+        // The transcript body lives in its own cold file — fetch it, then rehydrate. `null` = the read
+        // FAILED (vs a genuinely empty transcript): keep the archive intact and bail rather than restore an
+        // empty session and delete the body we couldn't read. Bailing used to be the end of it, and the
+        // Settings panel closes on the click either way, so the user watched their chat not reopen with
+        // nothing anywhere saying why. Raise it to the banner instead.
+        const raw = await window.koda.loadArchivedBody?.(id)
+        if (raw == null) {
+          console.error(`reopen aborted for archived session ${id} — its saved conversation couldn't be read`)
+          if (!get().archiveRestoreFailed) set({ archiveRestoreFailed: true })
+          return
+        }
+        const items = (raw as Entry[]).map(settleRestoredTranscriptItem)
+        // Main may have folded a durable replay tail into the cold body after the archive metadata was
+        // snapshotted. Carry the strongest cursor visible in the restored transcript before deleting
+        // that sidecar, or the next attached event can reuse an existing identity and disappear.
+        const restoredReplaySeq = Math.max(a.replaySeq ?? 0, maxTranscriptReplaySeq(items)) || undefined
+        // Drop the row from the index BEFORE the session joins the hot store, and only if that lands. The
+        // body file is deleted at the end, so a refusal here has to stop everything: otherwise the row
+        // survives on disk pointing at a transcript that no longer exists.
+        const nextArchived = get().archived.filter((x) => x.id !== id)
+        if (!(await persistArchived(nextArchived))) {
+          console.error(`reopen aborted for archived session ${id} — the archive index refused the write`)
+          return
+        }
+        set((state) => {
+          // Re-check under the setter: a second restore may have raced us across the awaits. The index on
+          // disk already holds `nextArchived`, so every branch out of here commits that same list — bailing
+          // with `{}` would leave the row alive in memory and gone from the file, which is the disagreement
+          // this whole change exists to prevent.
+          if (state.sessions[id]) return { archived: nextArchived }
+          // Bump the entry counter past the restored items so new entries can't collide with them (the
+          // boot hydrate only counted live sessions; an archive can hold higher ids than the current max).
+          for (const it of items) {
+            if (it.id > entryId) entryId = it.id
+            if (it.kind === 'subagent')
+              for (const c of it.children) if (c.id > entryId) entryId = c.id
+          }
+          const session: SessionState = {
+            id: a.id,
+            label: a.label,
+            userNamed: a.userNamed ?? false,
+            cwd: a.cwd,
+            items,
+            context: a.context,
+            streaming: '',
+            busy: false,
+            errored: false,
+            draft: '',
+            attachments: [],
+            live: false, // engine not spawned — reattaches via --resume on its next turn
+            attention: false,
+            approvalMode: a.approvalMode ?? state.defaultApprovalMode,
+            model: a.model,
+            effort: a.effort,
+            engineId: a.engineId ?? 'claude',
+            engineNativeId: a.engineNativeId,
+            spendUsd: a.spendUsd ?? 0,
+            byModel: a.byModel ?? {},
+            replaySeq: restoredReplaySeq,
+          }
+          return {
+            sessions: { ...state.sessions, [id]: session },
+            order: [id, ...state.order],
+            activeId: id,
+            archived: nextArchived,
+          }
+        })
+        // Body consumed back into the live session — its cold file is no longer needed.
         window.koda.deleteArchivedBody?.(id).catch(console.error)
-        return
-      }
-      // The transcript body lives in its own cold file — fetch it, then rehydrate. `null` = the read
-      // FAILED (vs a genuinely empty transcript): keep the archive intact and bail rather than restore an
-      // empty session and delete the body we couldn't read.
-      const raw = await window.koda.loadArchivedBody?.(id)
-      if (raw == null) return
-      const items = (raw as Entry[]).map(settleRestoredItem)
-      set((state) => {
-        // Re-check under the setter: a second restore/delete may have raced us since the await.
-        if (!state.archived.some((x) => x.id === id) || state.sessions[id]) return {}
-        // Bump the entry counter past the restored items so new entries can't collide with them (the
-        // boot hydrate only counted live sessions; an archive can hold higher ids than the current max).
-        for (const it of items) {
-          if (it.id > entryId) entryId = it.id
-          if (it.kind === 'subagent')
-            for (const c of it.children) if (c.id > entryId) entryId = c.id
-        }
-        const session: SessionState = {
-          id: a.id,
-          label: a.label,
-          userNamed: a.userNamed ?? false,
-          cwd: a.cwd,
-          items,
-          context: a.context,
-          streaming: '',
-          busy: false,
-          errored: false,
-          draft: '',
-          attachments: [],
-          live: false, // engine not spawned — reattaches via --resume on its next turn
-          attention: false,
-          approvalMode: a.approvalMode ?? state.defaultApprovalMode,
-          model: a.model,
-          effort: a.effort,
-          engineId: a.engineId ?? 'claude',
-          engineNativeId: a.engineNativeId,
-          spendUsd: a.spendUsd ?? 0,
-          byModel: a.byModel ?? {},
-        }
-        return {
-          sessions: { ...state.sessions, [id]: session },
-          order: [id, ...state.order],
-          activeId: id,
-          archived: state.archived.filter((x) => x.id !== id),
-        }
-      })
-      // Body consumed back into the live session — its cold file is no longer needed.
-      window.koda.deleteArchivedBody?.(id).catch(console.error)
-    },
+        // A reopen that worked takes the notice down, the same way a write that lands clears the other.
+        if (get().archiveRestoreFailed) set({ archiveRestoreFailed: false })
+      }),
 
-    deleteArchived: (id) => {
-      set((state) => ({ archived: state.archived.filter((x) => x.id !== id) }))
-      window.koda.deleteArchivedBody?.(id).catch(console.error)
-    },
+    // The genuinely destructive one, so the order matters most here: the index has to record the removal
+    // before the transcript file is unlinked. Committing on an unacknowledged write would delete the only
+    // copy of the transcript and leave its row in the index, so the chat the user deleted would come back
+    // on the next launch and open to nothing.
+    deleteArchived: (id) =>
+      queueArchiveMove(async () => {
+        const nextArchived = get().archived.filter((x) => x.id !== id)
+        if (!(await persistArchived(nextArchived))) {
+          console.error(`delete aborted for archived session ${id} — the archive index refused the write`)
+          return
+        }
+        set({ archived: nextArchived })
+        window.koda.deleteArchivedBody?.(id).catch(console.error)
+      }),
 
     send: async () => {
       const { activeId, sessions } = get()
@@ -1922,6 +2399,9 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       if (images.length) {
         const saved = await Promise.all(
           images.map(async (img) => {
+            // A Recent images attachment already has a durable scratch copy. Reuse it instead of
+            // writing the same bytes under a new timestamped name on every re-send.
+            if (img.scratchPath) return img.scratchPath
             try {
               return (await window.koda.saveScratchImage({ mediaType: img.mediaType, dataBase64: img.dataBase64 })).path
             } catch {
@@ -1994,32 +2474,53 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
 
     sendFaceTurn: async ({ text }) => {
       const msg = text.trim()
-      if (!msg) return false
+      if (!msg) return null
       const { faceDir, miniApps } = get()
       const app = faceDir ? miniApps.find((a) => a.dir === faceDir) : undefined
-      if (!app) return false
-      // The summon must always have somewhere to land — a faced project normally has sessions (it was
-      // built through them), but cover the archived-everything case by starting one.
-      if (!get().activeId) await get().startSession()
-      const { activeId, sessions } = get()
-      const id = activeId
-      if (!id || !sessions[id] || sessions[id].busy) return false
+      if (!app) return null
+      // Every face turn lands in the APP'S OWN summon thread (mini-apps-plan's summon-thread model),
+      // remembered per app dir — never in whichever conversation happens to be active, which dropped an
+      // app question into the middle of an unrelated chat (dogfood 07-30). A thread whose session is
+      // gone just earns the app a fresh one: files are the durable memory, sessions are disposable.
+      // With day threads on (the default), that thread is scoped to the local day and named for it.
+      const daySessions = await window.koda
+        .getSettings()
+        .then((s) => s.appDaySessions)
+        .catch(() => true) // a failed read must not silently revert to forever-threads
+      const now = new Date()
+      const day = daySessions ? faceDayKey(now) : null
+      const dayLabel = daySessions ? faceDayLabel(app.name, now) : null
+      let id = appSummonThread(localStorage, app.dir, day)
+      if (id && !get().sessions[id]) id = null
+      // Cross-head adoption: the phone keeps its OWN thread map, so a day thread it opened this
+      // morning is invisible here except by its (deterministic) name. Join it instead of opening a
+      // second thread for the same day. A window only ever holds its own project's sessions, so the
+      // label is already project-scoped, and the app name inside it scopes it to this app.
+      if (!id && dayLabel) {
+        const { sessions, order } = get()
+        id = order.find((sid) => sessions[sid]?.label === dayLabel) ?? null
+      }
+      if (id && get().sessions[id].busy) return null // the app's thread is mid-turn — summon says try again
+      if (!id) {
+        await get().startSession() // creates + activates the fresh thread
+        id = get().activeId
+        if (!id) return null
+        // userNamed, so the first-prompt auto-titler can't rename the day to whatever got logged first.
+        if (dayLabel) get().renameSession(id, dayLabel)
+      } else {
+        get().selectSession(id) // front the thread so the workshop flip shows the turn in progress
+      }
+      rememberAppSummonThread(localStorage, app.dir, id, day)
       const rel =
         app.dir.startsWith(app.projectPath + '/') ? app.dir.slice(app.projectPath.length + 1) : app.dir
-      // Grounding per mini-apps-plan.md: the turn says WHICH app the user is inside, where it lives,
-      // and the two intents (data vs build) — so "5x5 at 225" and "this chart is wrong" both resolve
-      // without the user explaining context. The transcript shows a compact ✦-prefixed line.
-      const sentText =
-        `I'm using the running "${app.name}" mini app (its code and data live in \`${rel}\`): ${msg}\n\n` +
-        `(Sent from the app's ask-or-fix line while looking at the app itself. If this is data to record, ` +
-        `write it through the app's own data contract — see its DATA.md and schema, never a side note. ` +
-        `If it reports a problem or asks for a change to the app, edit the app's code in \`${rel}\`. ` +
-        `My app view reloads automatically when your turn finishes.)`
+      // Grounding + RUN-mode framing live in the shared faceTurnText (see its doc comment) — the
+      // turn says WHICH app the user is inside, that the app exists (operate, don't shape), and that
+      // the closing message renders inside the app. The transcript shows a compact ✦-prefixed line.
       await dispatchTurn(id, {
-        sentText,
+        sentText: faceTurnText(app.name, rel, msg),
         displayItem: { kind: 'user', text: `✦ ${app.name} — ${msg}` },
       })
-      return true
+      return id
     },
 
     sendGuardrailAuthoring: async ({ kind, description }) => {
@@ -2201,9 +2702,25 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     setDraft: (id, text) =>
       patchSession(id, (s) => ({ ...s, draft: text, replyStaged: text.trim() ? s.replyStaged : false })),
     addAttachments: (id, imgs) =>
-      patchSession(id, (s) => ({ ...s, attachments: [...s.attachments, ...imgs] })),
+      patchSession(id, (s) => {
+        const attachments = [...s.attachments]
+        for (const img of imgs) {
+          if (
+            attachments.some(
+              (existing) =>
+                (img.scratchPath && existing.scratchPath === img.scratchPath) ||
+                (existing.mediaType === img.mediaType && existing.dataBase64 === img.dataBase64),
+            )
+          ) {
+            continue
+          }
+          attachments.push(img)
+        }
+        return { ...s, attachments }
+      }),
     removeAttachment: (id, index) =>
       patchSession(id, (s) => ({ ...s, attachments: s.attachments.filter((_, i) => i !== index) })),
+    setAttachNotice: (id, message) => patchSession(id, (s) => ({ ...s, attachNotice: message ?? undefined })),
 
     setDefaultApprovalMode: (mode) => set({ defaultApprovalMode: mode }),
 
@@ -2230,7 +2747,10 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       const pendingIds = new Set(get().pending.map((p) => p.sessionId))
       for (const id of get().order) {
         const s = get().sessions[id]
-        if (s?.live && !s.busy && !pendingIds.has(id)) patchSession(id, (x) => ({ ...x, live: false }))
+        if (!s?.live) continue
+        if (!s.busy && !hasRunningSubagent(s.items) && !pendingIds.has(id))
+          patchSession(id, (x) => ({ ...x, live: false }))
+        else billingRespawnPending.add(id)
       }
       const active = get().activeId
       if (active)
@@ -2254,13 +2774,26 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       // live on a -p process. A respawn would kill an in-flight turn or strand a pending approval, so
       // the control blocks the cross while either is outstanding.
       const crossesPlan = (mode === 'plan') !== (s.approvalMode === 'plan')
-      if (crossesPlan && (s.busy || get().pending.some((r) => r.sessionId === id))) return
+      if (
+        crossesPlan &&
+        (s.busy || hasRunningSubagent(s.items) || get().pending.some((r) => r.sessionId === id))
+      )
+        return
       patchSession(id, (x) => ({ ...x, approvalMode: mode }))
       // Tell main in EVERY case (fire-and-forget). ask ↔ acceptEdits ↔ auto is the live gate switch
       // (no-op if the engine isn't live yet — re-pushed on reattach in send()). For a plan crossing the
       // gate value is moot until the respawn, but pushing now broadcasts ApprovalModeChanged so other
       // surfaces (the phone sheet) follow immediately instead of at the next turn's re-push.
-      window.koda.setApprovalMode({ sessionId: id, mode }).catch(console.error)
+      window.koda.setApprovalMode({ sessionId: id, mode }).catch((err) => {
+        console.error(err)
+        // Main owns the final race check. If a child started before this IPC arrived, restore the
+        // optimistic pill/process state unless the user has already made a newer choice.
+        patchSession(id, (current) =>
+          current.approvalMode === mode
+            ? { ...current, approvalMode: s.approvalMode, live: s.live }
+            : current,
+        )
+      })
 
       if (!crossesPlan) return
       // Cross the plan boundary: mark the session not-live so the next turn reattaches in the new
@@ -2275,16 +2808,26 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       if (!s || model === s.model) return
       // A respawn would kill an in-flight turn or strand a pending approval — block the switch while
       // either is outstanding (same guard as crossing the plan boundary; --model is also spawn-time).
-      if (s.busy || get().pending.some((r) => r.sessionId === id)) return
+      if (s.busy || hasRunningSubagent(s.items) || get().pending.some((r) => r.sessionId === id)) return
       patchSession(id, (x) => ({ ...x, model }))
-      writeLastModel(model) // seed the next new session (undefined "Default" clears it — SessionStarted refills concrete)
-      // Remember an explicit full id so it's a quick-pick next time (engine aliases are always offered,
-      // so they're not worth remembering). This is Koda's substitute for an enumerable model list.
-      // Claude only — Codex models come from the engine's own model/list, not the typed-id recents.
-      if (s.engineId === 'claude' && model && !isModelAlias(model)) window.koda.addRecentModel({ model }).catch(console.error)
       // Tell main at pick time (fire-and-forget, like setApprovalMode) so a real change broadcasts
       // ModelEffortChanged to the phone and main's map reads fresh — not stale until the next reattach.
-      window.koda.setModelEffort({ sessionId: id, model, effort: s.effort }).catch(console.error)
+      window.koda
+        .setModelEffort({ sessionId: id, model, effort: s.effort })
+        .then(() => {
+          const current = get().sessions[id]
+          if (!current || current.engineId !== s.engineId || current.model !== model) return
+          writeNewSessionPosture(s.engineId, model)
+          // Remember an explicit full id so it's a quick-pick next time (aliases are always offered).
+          if (s.engineId === 'claude' && model && !isModelAlias(model))
+            window.koda.addRecentModel({ model }).catch(console.error)
+        })
+        .catch((err) => {
+          console.error(err)
+          patchSession(id, (current) =>
+            current.model === model ? { ...current, model: s.model, live: s.live } : current,
+          )
+        })
       // Drop the live engine so the next turn reattaches with the new --model (send() reads `model`).
       // We don't dispose here — main's start() tears the old idle child down right before the respawn.
       if (s.live) patchSession(id, (x) => ({ ...x, live: false }))
@@ -2300,13 +2843,8 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       // auto "session started" notice, so `items.length > 0` would lock the switch prematurely and the
       // dropdown pick would silently no-op (same signal ModelControl uses for `conversationStarted`).
       if (s.items.some((it) => it.kind === 'user' || it.kind === 'canvas')) return
-      if (s.busy || get().pending.some((r) => r.sessionId === id)) return
+      if (s.busy || hasRunningSubagent(s.items) || get().pending.some((r) => r.sessionId === id)) return
       if (engineId === s.engineId && model === s.model) return
-      writeLastEngine(engineId) // remember as the new-session default
-      writeLastModel(model) // keep last-model aligned with last-engine (both seed the next new session)
-      // Recents are the Claude group's "recently typed" ids; Codex models come from the engine's own
-      // model/list, so don't pollute the Claude recents with a gpt-* id.
-      if (engineId === 'claude' && model && !isModelAlias(model)) window.koda.addRecentModel({ model }).catch(console.error)
       // Drop the old engine's ground-truth fields: `activeModel` (what the pill falls back to when no
       // model is picked) and `engineNativeId` (the Codex thread id) both describe the abandoned engine.
       // Leaving `activeModel` makes a "Default" pick on the new engine still show the old engine's model
@@ -2314,7 +2852,30 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       // new engine re-reports both on its next SessionStarted.
       patchSession(id, (x) => ({ ...x, engineId, model, activeModel: undefined, engineNativeId: undefined }))
       // Pick-time push (see setSessionModel) — carries engineId so the phone's sheet switches groups too.
-      window.koda.setModelEffort({ sessionId: id, model, effort: s.effort, engineId }).catch(console.error)
+      window.koda
+        .setModelEffort({ sessionId: id, model, effort: s.effort, engineId })
+        .then(() => {
+          const current = get().sessions[id]
+          if (!current || current.engineId !== engineId || current.model !== model) return
+          writeNewSessionPosture(engineId, model)
+          if (engineId === 'claude' && model && !isModelAlias(model))
+            window.koda.addRecentModel({ model }).catch(console.error)
+        })
+        .catch((err) => {
+          console.error(err)
+          patchSession(id, (current) =>
+            current.engineId === engineId && current.model === model
+              ? {
+                  ...current,
+                  engineId: s.engineId,
+                  model: s.model,
+                  activeModel: s.activeModel,
+                  engineNativeId: s.engineNativeId,
+                  live: s.live,
+                }
+              : current,
+          )
+        })
       // Drop the live engine so the next turn spawns the new engine fresh (send() reads engineId+model).
       // No prior transcript to resume (guarded above), so it's a clean --session-id respawn.
       if (s.live) patchSession(id, (x) => ({ ...x, live: false }))
@@ -2325,10 +2886,15 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       if (!s || effort === s.effort) return
       // Spawn-time like --model: a respawn would kill an in-flight turn or strand a pending approval,
       // so block the switch while either is outstanding.
-      if (s.busy || get().pending.some((r) => r.sessionId === id)) return
+      if (s.busy || hasRunningSubagent(s.items) || get().pending.some((r) => r.sessionId === id)) return
       patchSession(id, (x) => ({ ...x, effort }))
       // Pick-time push (see setSessionModel) — always the full pair so model doesn't reset to default.
-      window.koda.setModelEffort({ sessionId: id, model: s.model, effort }).catch(console.error)
+      window.koda.setModelEffort({ sessionId: id, model: s.model, effort }).catch((err) => {
+        console.error(err)
+        patchSession(id, (current) =>
+          current.effort === effort ? { ...current, effort: s.effort, live: s.live } : current,
+        )
+      })
       // Drop the live engine so the next turn reattaches with the new --effort (send() reads `effort`).
       if (s.live) patchSession(id, (x) => ({ ...x, live: false }))
     },
@@ -2449,6 +3015,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     setLightbox: (img) => set({ lightbox: img }),
     toggleRecentImagesExpanded: () =>
       set((s) => ({ recentImagesExpanded: !s.recentImagesExpanded })),
+    setStoreIntegrity: (patch) => set(patch),
 
     openFile: (path, gotoLine, opts) =>
       set((state) => {
@@ -2761,7 +3328,11 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       // catch any IPC rejection — either way it degrades to "no worktree info", never breaking above.
       try {
         const worktrees = (await window.koda.gitWorktrees?.()) ?? []
-        set({ gitWorktreesDirty: worktrees.some((w) => !w.isCurrent && w.dirtyCount > 0) })
+        set({
+          gitWorktreesDirty: worktrees.some(
+            (w) => !w.isCurrent && (!w.statusKnown || w.dirtyCount > 0 || w.prunable),
+          ),
+        })
       } catch (err) {
         console.error('refreshGitStatus: worktrees skipped', err)
       }
@@ -2814,7 +3385,8 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           cwd: s.cwd,
           // Settle live-only item states: no engine is attached yet, so a thinking burst or workflow
           // that was in flight when we last saved must not restore as a forever-spinning indicator.
-          items: s.items.map(settleRestoredItem),
+          items: s.items.map(settleRestoredTranscriptItem),
+          replaySeq: s.replaySeq,
           context: s.context, // restore the fuel gauge; refreshed on the next completed turn
           streaming: '',
           busy: false,
@@ -2847,7 +3419,6 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       return {
         version: 2,
         activeId,
-        rateLimits: get().rateLimits,
         sessions: order
           .map((id) => sessions[id])
           .filter(Boolean)
@@ -2865,10 +3436,12 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
             spendUsd: s.spendUsd,
             byModel: s.byModel,
             lastPreview: s.lastPreview,
+            replaySeq: s.replaySeq,
             items: s.items,
           })),
-        // `archived` deliberately absent: it lives in its own cold file (saved by useEngineBridge's
-        // archived subscription only when it changes), never in this constantly-rewritten hot blob.
+        // `archived` deliberately absent: it lives in its own cold file, written by the three actions
+        // that move a session in or out of it (archiveSession / restoreArchived / deleteArchived, via
+        // `persistArchived`), never in this constantly-rewritten hot blob.
       }
     },
 
@@ -2950,6 +3523,10 @@ function withinDir(filePath: string, dir: string | undefined): boolean {
 /** Turn a raw IPC rejection into a calm, non-engineer-readable line for the Files browser. */
 function humanFsError(e: unknown): string {
   const m = String(e)
+  // Main refused a destroying action it couldn't make undoable. That sentence is already written for
+  // the user and names what did NOT happen, so pass it through rather than flattening it.
+  const noUndo = undoPointRefusal(e)
+  if (noUndo) return noUndo
   if (/already exists/i.test(m)) return 'A file or folder with that name already exists.'
   if (/escapes the project root/i.test(m)) return 'That location is outside this project.'
   if (/cannot delete the project root/i.test(m)) return "The project folder itself can't be deleted."
@@ -2959,15 +3536,6 @@ function humanFsError(e: unknown): string {
 /** Markdown files default to the WYSIWYG document view. */
 function isMarkdown(path: string): boolean {
   return /\.(md|markdown)$/i.test(path)
-}
-
-/** Settle a restored transcript item's live-only state — a session loaded from disk has no engine
- *  behind it, so a `thinking` burst or `workflow` left mid-flight at save time would otherwise spin
- *  forever (its finalize/complete event can never arrive). Freeze them to a resting state. */
-function settleRestoredItem(it: Entry): Entry {
-  if (it.kind === 'thinking' && it.active) return { ...it, active: false }
-  if (it.kind === 'workflow' && it.status === 'running') return { ...it, status: 'completed' }
-  return it
 }
 
 /** The last few readable turns, baked into archive metadata at archive time so Settings can preview the
@@ -2994,6 +3562,18 @@ function maxArchivedItemId(items: Entry[]): number {
   return max
 }
 
+/** Highest durable replay identity present in a rendered transcript, including a subagent's nested
+ *  prose/tool rows. Archive-body loading can merge either level from the sidecar. */
+function maxTranscriptReplaySeq(items: Entry[]): number {
+  let max = 0
+  for (const item of items) {
+    max = Math.max(max, item.replaySeq ?? 0)
+    if (item.kind === 'subagent')
+      for (const child of item.children) max = Math.max(max, child.replaySeq ?? 0)
+  }
+  return max
+}
+
 /** Derived per-session status (one source per signal). */
 export function statusOf(s: SessionState, pending: ApprovalRequest[]): SessionStatus {
   if (pending.some((r) => r.sessionId === s.id)) return 'waiting'
@@ -3005,12 +3585,13 @@ export function statusOf(s: SessionState, pending: ApprovalRequest[]): SessionSt
 // ── Per-session change attribution ─────────────────────────────────────────────────
 // Git has ONE working tree per project (all sessions edit the same files), so `gitFiles` is aggregate.
 // But Koda records every file each session's agent edited (edit-tool cards carry `input.file_path`),
-// so we can slice that shared pile per session. A dirty file no session touched → the "Not from a
-// session" group (a manual edit, `npm install`, Bash codegen). Best-effort by design.
+// so we can slice that shared pile per session. A dirty file no recorded edit card touched falls into
+// "Loose changes" (manual edits, npm install, Bash codegen). That names the state without making the
+// false claim that no session caused it. Best-effort by design.
 
-/** A group of dirty files, all attributed to one session (or the no-session bucket). */
+/** A group of dirty files, all attributed to one session (or the loose/unattributed bucket). */
 export interface SessionChangeGroup {
-  /** The owning session, or null for "Not from a session". */
+  /** The owning session, or null when transcript evidence cannot identify one. */
   sessionId: string | null
   label: string
   files: GitStatusFile[]
@@ -3090,7 +3671,7 @@ export function computeSessionChanges(
     if (fs && fs.length) ordered.push({ sessionId: id, label: sessions[id]?.label ?? 'Session', files: fs })
   }
   const orphan = groups.get(null)
-  if (orphan && orphan.length) ordered.push({ sessionId: null, label: 'Not from a session', files: orphan })
+  if (orphan && orphan.length) ordered.push({ sessionId: null, label: 'Loose changes', files: orphan })
 
   return { groups: ordered, alsoBy, countBySession }
 }

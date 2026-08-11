@@ -51,12 +51,13 @@ export function buildEngineEnv(
   // (Claude: DISABLE_AUTOUPDATER=1; Codex: none — it never self-replaces.)
   Object.assign(env, profile.disableUpdaterEnv)
 
-  // Keep subagents running FOREGROUND (inline), not the engine's new background-by-default (≥2.1.197).
-  // Koda's UX is human-steered + everything-visible-in-turn: a backgrounded subagent lands its result
-  // out-of-band as a notification, so its card renders empty and the turn ends before the answer. This
-  // flag restores the inline stream Koda's adapter (and cleanSubagentResult's trailer format) expects.
-  // Claude-only; Codex has its own task model.
-  if ((opts.engineId ?? 'claude') === 'claude') env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = '1'
+  // Claude delegation stays deliberately flat and small. Per-Agent foreground enforcement rides the
+  // bundled pack's PreToolUse hook; the global DISABLE_BACKGROUND_TASKS flag cannot be used because it
+  // also disables Koda's explicit `background: true` scout/worker profiles.
+  if ((opts.engineId ?? 'claude') === 'claude') {
+    env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS = '3'
+    env.CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH = '1'
+  }
 
   // Give the agent's Bash tool the user's real login-shell PATH. A Finder-launched .app otherwise
   // inherits launchd's minimal PATH and can't find node/npm/python the user has installed.

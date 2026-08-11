@@ -13,7 +13,9 @@ import { IconWarning } from './icons'
 export function BackupSection() {
   const [status, setStatus] = useState<BackupStatus | null>(null)
   const [code, setCode] = useState<string | null>(null)
+  const [revealMsg, setRevealMsg] = useState<string | null>(null)
   const [backups, setBackups] = useState<BackupManifest[] | null>(null)
+  const [backupsError, setBackupsError] = useState(false)
   const [restoreMsg, setRestoreMsg] = useState<string | null>(null)
   const [typedCode, setTypedCode] = useState('')
   const [busy, setBusy] = useState(false)
@@ -43,11 +45,31 @@ export function BackupSection() {
       setCode(null)
       return
     }
-    setCode((await window.koda.getBackupRecoveryCode().catch(() => null)) ?? 'Could not create a key on this Mac.')
+    setRevealMsg(null)
+    // Reveal-specific wording only. The "new backups are paused" half of this state already reaches
+    // the user through status.error in the row above, so repeating it here would say it twice.
+    const result = await window.koda.getBackupRecoveryCode().catch(() => null)
+    if (!result) {
+      setRevealMsg('Koda couldn’t read the recovery code just now. Try again.')
+    } else if (result.code) {
+      setCode(result.code)
+    } else if (result.unreadable) {
+      setRevealMsg(
+        'This Mac can’t open its backup key, so there’s no code to show here. If you saved your recovery code, that copy still opens the backups already in the cloud.',
+      )
+    } else {
+      setRevealMsg('Koda couldn’t create a backup key on this Mac, so there’s no code to show yet.')
+    }
   }
 
   const loadBackups = async () => {
-    setBackups(await window.koda.listCloudBackups().catch(() => []))
+    setBackupsError(false)
+    try {
+      setBackups(await window.koda.listCloudBackups())
+    } catch {
+      setBackups(null)
+      setBackupsError(true)
+    }
   }
 
   const restoreOne = async (m: BackupManifest) => {
@@ -98,8 +120,11 @@ export function BackupSection() {
             ) : status.state === 'backing-up' ? (
               <span className="text-[12.5px] text-text-muted">backing up…</span>
             ) : status.state === 'error' ? (
-              <span className="flex items-center gap-1.5 text-[12.5px] text-amber-500">
-                <span className="[&_svg]:h-3.5 [&_svg]:w-3.5" aria-hidden>
+              // The control slot is shrink-0, so an error longer than a few words would push the row
+              // out instead of wrapping — and the one that matters most (the unreadable key) is three
+              // sentences.
+              <span className="flex max-w-[22rem] items-start gap-1.5 text-[12.5px] leading-snug text-amber-500">
+                <span className="mt-px shrink-0 [&_svg]:h-3.5 [&_svg]:w-3.5" aria-hidden>
                   <IconWarning />
                 </span>
                 {status.error ?? 'backup failed'}
@@ -141,6 +166,7 @@ export function BackupSection() {
             {code}
           </div>
         )}
+        {revealMsg && <div className="px-4 py-2.5 text-[12px] text-text-muted">{revealMsg}</div>}
       </SettingsSection>
       <SettingsSection title="Restore">
         <SettingsRow
@@ -168,7 +194,15 @@ export function BackupSection() {
             }
           />
         )}
-        {backups?.length === 0 && (
+        {backupsError && (
+          <div className="flex items-center justify-between gap-3 px-4 py-2.5 text-[12px] text-amber-500">
+            <span>Koda couldn’t load your backed-up projects. Your backups are still in the cloud.</span>
+            <Button variant="ghost" size="sm" onClick={() => void loadBackups()}>
+              Try again
+            </Button>
+          </div>
+        )}
+        {!backupsError && backups?.length === 0 && (
           <div className="px-4 py-2.5 text-[12px] text-text-muted">No backups on this account yet.</div>
         )}
         {backups?.map((m) => (

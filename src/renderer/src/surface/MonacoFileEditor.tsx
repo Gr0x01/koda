@@ -39,15 +39,23 @@ export function MonacoFileEditor({
   const [dirty, setDirty] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // The last save landed but main couldn't take a recovery point for it. Silence here would leave the
+  // user believing this edit is undoable when it isn't. Cleared by the next save that does get one.
+  const [noUndo, setNoUndo] = useState(false)
+  // The pane swaps a new file's content INTO this instance rather than remounting it (see the
+  // initialContent effect below), so a per-file flag follows the user to the next file unless it's
+  // cleared here.
+  useEffect(() => setNoUndo(false), [path])
 
   async function save(): Promise<void> {
     if (readOnly || saving || valueRef.current === baselineRef.current) return
     setSaving(true)
     setError(null)
     try {
-      await window.koda.writeFile({ path, content: valueRef.current })
+      const res = await window.koda.writeFile({ path, content: valueRef.current })
       baselineRef.current = valueRef.current
       setDirty(false)
+      setNoUndo(res.checkpointed === false)
     } catch (e) {
       setError(String(e))
     } finally {
@@ -128,20 +136,26 @@ export function MonacoFileEditor({
           }}
         />
       </div>
-      {(dirty || error) && !readOnly && (
+      {(dirty || error || noUndo) && !readOnly && (
         <div className="flex items-center justify-between gap-3 border-t border-border px-4 py-1.5">
           {error ? (
             <span className="truncate text-[11px] text-red-400">Couldn't save: {error}</span>
-          ) : (
+          ) : dirty ? (
             <span className="text-[11px] text-text-muted">Unsaved changes</span>
+          ) : (
+            <span role="status" className="truncate text-[11px] text-amber-600 dark:text-amber-400">
+              Saved, but Koda couldn't add this to the recovery timeline.
+            </span>
           )}
-          <button
-            onClick={() => void save()}
-            disabled={saving}
-            className="shrink-0 rounded-lg bg-accent px-3 py-1 text-[11px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
-          >
-            {saving ? 'Saving…' : 'Save'}
-          </button>
+          {(dirty || error) && (
+            <button
+              onClick={() => void save()}
+              disabled={saving}
+              className="shrink-0 rounded-lg bg-accent px-3 py-1 text-[11px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+            >
+              {saving ? 'Saving…' : 'Save'}
+            </button>
+          )}
         </div>
       )}
     </div>

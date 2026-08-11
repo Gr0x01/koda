@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { OnboardingWizard } from './onboarding/OnboardingWizard'
 import { Chassis } from './workspace/Chassis'
 import { ProjectHome } from './workspace/ProjectHome'
+import { StageLinkProvider } from './workspace/StageLinks'
 import { UpdateSurface } from './workspace/UpdateSurface'
 import { useEngineBridge } from './workspace/useEngineBridge'
 import { useWorkspace } from './workspace/store'
@@ -59,5 +60,9 @@ export default function App() {
  *  only once a project is known, so it loads exactly this project's sessions. */
 function Workspace() {
   useEngineBridge()
-  return <Chassis />
+  return (
+    <StageLinkProvider>
+      <Chassis />
+    </StageLinkProvider>
+  )
 }

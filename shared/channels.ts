@@ -4,13 +4,13 @@
  */
 export const IpcChannels = {
   getAppInfo: 'app:getInfo',
-  echo: 'app:echo',
   probeEngine: 'engine:probe',
   // Engine adapter — commands flow renderer→main (invoke); normalized events
   // flow main→renderer (push) over the single `engineEvent` channel.
   startSession: 'engine:startSession',
   sendTurn: 'engine:sendTurn',
   interruptSession: 'engine:interrupt',
+  stopSubagent: 'engine:stopSubagent',
   disposeSession: 'engine:dispose',
   engineEvent: 'engine:event',
   // Side questions ("btw" / aside) — a throwaway one-shot fork of the live session; the answer streams
@@ -53,10 +53,10 @@ export const IpcChannels = {
   // Same two-owner rule for a phone RENAME of a live session in a windowed project: main forwards,
   // the renderer renames (store.renameSession → its normal persist). main→renderer push.
   sessionRenameRequested: 'sessions:renameRequested',
-  // A phone turn landed on a session a window already OWNS (it adopted the session empty, before this
-  // turn). The engine stream never echoes the human's prompt, so main forwards it to that window only
-  // (not the remote sinks — the sending phone shows its own optimistic bubble) → the renderer appends
-  // the user turn and runs first-turn titling. main→renderer push.
+  // A turn appended to a session a window OWNS but didn't send itself: a phone turn (the engine
+  // stream never echoes the human's prompt) — main forwards it to that window only (not the remote
+  // sinks — the sending phone shows its own optimistic bubble) → the renderer appends it.
+  // main→renderer push.
   sessionRemoteUserTurn: 'sessions:remoteUserTurn',
   // Renderer warnings/errors forwarded into the main-process log file (send, not invoke).
   rendererLog: 'app:rendererLog',
@@ -102,6 +102,10 @@ export const IpcChannels = {
   // default app. Read-only shell actions, path-contained to the project root. invoke.
   fsRevealPath: 'fs:revealPath',
   fsOpenPath: 'fs:openPath',
+  // Drag a file/folder OUT of Koda as a native macOS drag (into Finder, Mail, a browser). The
+  // renderer preventDefaults its HTML5 dragstart and asks main to start the OS drag instead; the
+  // invoke resolves once the native drag is underway. Path-contained to the project root.
+  fsStartDrag: 'fs:startDrag',
   // Live-edits diff: a file's pre-edit state (safety-git HEAD) vs its current contents. Read-only.
   fsDiffFile: 'fs:diffFile',
   // Project-wide find (the Find overlay) — filename + content matches across the project root,
@@ -153,6 +157,11 @@ export const IpcChannels = {
   projectHasGuidelines: 'project:hasGuidelines',
   projectOpen: 'project:open',
   projectGetRecents: 'project:getRecents',
+  // App-global files main refused to trust this run: the project list (koda-app-state.json) and the
+  // settings file. Both fall back to defaults on a bad read, which is silent by construction — an empty
+  // ProjectHome looks exactly like a fresh install, and a lost API-key choice reads as a subscription.
+  // ProjectHome and the data-integrity banner ask this so the fallback is stated instead of assumed.
+  appDataIntegrity: 'app:dataIntegrity',
   // Native File menu → focused project renderer. File creation/import already lives in the
   // renderer store, so the menu asks that one source of truth to perform the action.
   uiFileCommand: 'ui:fileCommand',
@@ -167,6 +176,16 @@ export const IpcChannels = {
   // main→renderer push (no payload): the registry or an app's run state changed — the agent installed,
   // started, or stopped one mid-session. Windows re-fetch the list so the rail/toggle/face appear live.
   miniAppsChanged: 'miniApps:changed',
+  // Lane B bridge (app-bridge.ts): per-app "may use your API key" consent + recorded spend, for the
+  // Settings toggle. Same flag gate as the list (flag off ⇒ []).
+  miniAppsBridgeInfo: 'miniApps:bridgeInfo',
+  miniAppsSetBridgeConsent: 'miniApps:setBridgeConsent',
+  // Clicking an app tile whose project is already open in another window: main surfaces that window
+  // (restore if minimized, show, focus) and pushes uiFrontFace so it flips to the app's face — never
+  // a dead-end "already open" note. See ProjectHome.openApp / mini-apps-plan.md FACE model.
+  miniAppsFront: 'miniApps:front',
+  // main→renderer push: front this project window's app face for the given dir (payload { dir }).
+  uiFrontFace: 'ui:frontFace',
   // Approval gate — the permission broker's "Ask me" round-trip. A request pushes
   // main→renderer; the user's decision + the mode setting flow renderer→main.
   approvalRequest: 'approval:request',
@@ -174,6 +193,7 @@ export const IpcChannels = {
   // One specific request was answered (on ANY head) — clear just that prompt. Distinct from
   // approvalCancelled (whole-session void); needed so a second head's stale prompt doesn't latch.
   approvalResolved: 'approval:resolved',
+  approvalPending: 'approval:pending',
   approvalResolve: 'approval:resolve',
   approvalSetMode: 'approval:setMode',
   approvalGetMode: 'approval:getMode',
@@ -214,6 +234,9 @@ export const IpcChannels = {
   // Resolve a doc's relative image reference (e.g. `assets/pic.png`) to a loadable `koda-preview://`
   // URL so local images render in the WYSIWYG doc surface. See preview.ts / CrepeDocEditor.
   docAssetUrl: 'doc:assetUrl',
+  // Export the open document as a PDF: the renderer sends the doc's rendered HTML, main lays it out
+  // on a clean print page in a hidden window (printToPDF), saves where the user picks, then opens it.
+  docExportPdf: 'doc:exportPdf',
   previewShow: 'preview:show',
   // Re-run a session's last preview (dev command or static file) when it's gone — the user-facing
   // "Restart preview" button. A window-direct invoke (like previewStaticUrl), NOT the agent's gated
@@ -231,6 +254,9 @@ export const IpcChannels = {
   composerPickPath: 'composer:pickPath',
   // List the project's recent scratch images (newest first) for the Recent images strip. See scratch.ts.
   scratchList: 'scratch:list',
+  // A scratch image landed outside the composer (a phone turn saved one main-side) → the owning window
+  // refreshes its Recent images strip. main→renderer push.
+  scratchChanged: 'scratch:changed',
   // Read/write a doc's presentation sidecar (table column widths, …) under `.koda/docmeta/`. The doc
   // file stays canonical markdown; layout state lives beside it. invoke. See docmeta.ts.
   docmetaGet: 'docmeta:get',
@@ -322,6 +348,8 @@ export const IpcChannels = {
   // (owner-scoped rc:<uid>:* channels). authState = invoke (signed-in/email); requestOtp/verifyOtp =
   // invoke (the 6-digit code flow); signOut = invoke. See remote/auth-otp.ts.
   remoteAuthState: 'remote:authState',
+  // main→renderer push: cloud-account auth state changed (esp. dead-token → needs re-sign-in).
+  remoteAuthChanged: 'remote:authChanged',
   remoteRequestOtp: 'remote:requestOtp',
   remoteVerifyOtp: 'remote:verifyOtp',
   remoteSignOut: 'remote:signOut',

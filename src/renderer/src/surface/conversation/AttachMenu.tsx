@@ -1,20 +1,23 @@
 import { useEffect, useRef, useState } from 'react'
 import { Menu } from '../../motion'
-import { stagingFromFiles, type StagedAttachment } from './attach'
+import { refusedAttachmentMessage, stagingFromFiles, type StagedAttachment } from './attach'
 
 /* ── The composer's + menu ────────────────────────────────────────────────────────────────────
  * Two ways to hand the agent a file without dragging it in:
  *   Attach a file…            → native picker; bytes come back from main and are staged exactly
  *                               like a drop (images compressed, csv/pdf raw + named).
- *   Point at a file or folder… → nothing is copied — the chosen absolute path lands in the draft
- *                               as a reference the agent reads in place. For things that live
+ *   Point at files or folders… → nothing is copied — the chosen absolute paths land in the draft
+ *                               as references the agent reads in place. For things that live
  *                               where they are (a folder of data, a big export). */
 export function AttachMenu({
   onAttach,
-  onInsertPath,
+  onInsertPaths,
+  onRefused,
 }: {
   onAttach: (staged: StagedAttachment[]) => void
-  onInsertPath: (path: string) => void
+  onInsertPaths: (paths: string[]) => void
+  /** Copy for anything the pick couldn't attach (null when it was all fine) — the composer shows it. */
+  onRefused: (message: string | null) => void
 }) {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
@@ -40,14 +43,15 @@ export function AttachMenu({
           type: f.mediaType,
         }),
     )
+    onRefused(refusedAttachmentMessage(fileObjs))
     const staged = await stagingFromFiles(fileObjs)
     if (staged.length) onAttach(staged)
   }
 
   async function pickPath(): Promise<void> {
     setOpen(false)
-    const { path } = await window.koda.pickComposerPath()
-    if (path) onInsertPath(path)
+    const { paths } = await window.koda.pickComposerPath()
+    if (paths.length) onInsertPaths(paths)
   }
 
   return (
@@ -91,7 +95,7 @@ export function AttachMenu({
           }
         />
         <MenuRow
-          label="Point at a file or folder…"
+          label="Point at files or folders…"
           hint="Referenced in place, not copied"
           onClick={() => void pickPath()}
           icon={

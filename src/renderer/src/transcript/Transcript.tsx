@@ -94,6 +94,7 @@ export const Transcript = memo(function Transcript({
   items,
   streaming,
   working,
+  onStopSubagent,
 }: {
   items: Entry[]
   streaming: string
@@ -102,6 +103,7 @@ export const Transcript = memo(function Transcript({
    *  "is it working or stuck?" that the engine's reasoning stream can't be relied on to give (Codex
    *  barely streams reasoning deltas, so without this the surface goes blank between actions). */
   working?: string | null
+  onStopSubagent?: (taskId: string) => void
 }) {
   return (
     <div className="space-y-4">
@@ -135,12 +137,12 @@ export const Transcript = memo(function Transcript({
                   className="rounded-[10px] border border-border bg-black/[0.02] px-2 py-1 dark:bg-white/[0.025]"
                 >
                   {node.entries.map((entry) => (
-                    <TurnItemView key={entry.id} item={entry} />
+                    <TurnItemView key={entry.id} item={entry} onStopSubagent={onStopSubagent} />
                   ))}
                 </div>
               ) : (
                 <div key={node.entry.id}>
-                  <TurnItemView item={node.entry} />
+                  <TurnItemView item={node.entry} onStopSubagent={onStopSubagent} />
                 </div>
               )
             )}
@@ -270,7 +272,7 @@ function PinnedUserMessage({ item }: { item: UserEntry }) {
   )
 }
 
-function TurnItemView({ item }: { item: Entry }) {
+function TurnItemView({ item, onStopSubagent }: { item: Entry; onStopSubagent?: (taskId: string) => void }) {
   switch (item.kind) {
     case 'user':
       return <UserMessage text={item.text} images={item.images} files={item.files} />
@@ -288,9 +290,9 @@ function TurnItemView({ item }: { item: Entry }) {
             isError={item.isError}
           />
         )
-      return <ToolCard name={item.name} input={item.input} result={item.result} isError={item.isError} />
+      return <ToolCard name={item.name} input={item.input} liveOutput={item.liveOutput} result={item.result} isError={item.isError} />
     case 'subagent':
-      return <SubagentCard item={item} />
+      return <SubagentCard item={item} onStop={onStopSubagent} />
     case 'thinking':
       return <ThinkingIndicator estimatedTokens={item.estimatedTokens} active={item.active} />
     case 'tasklist':

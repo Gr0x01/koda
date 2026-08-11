@@ -1,3 +1,4 @@
+import { attachableMediaType, extensionOf } from '@shared/attachments'
 import { IMAGE_DETAIL_CAPS } from '@shared/ipc'
 
 /** A composer attachment, staged in memory until send. Images are compressed and go inline to the
@@ -10,29 +11,22 @@ export function isImageAttachment(a: { mediaType: string }): boolean {
   return a.mediaType.startsWith('image/')
 }
 
-// Document types the composer accepts alongside images. Detected by extension first — macOS browsers
-// report inconsistent MIMEs for csv (`application/vnd.ms-excel`, sometimes empty) — MIME as fallback.
-const DOC_EXT: Record<string, string> = { csv: 'text/csv', pdf: 'application/pdf' }
-const DOC_MIME = new Set(Object.values(DOC_EXT))
+// Raster types worth re-encoding — deliberately NOT the accept-list (@shared/attachments), a subset
+// of it. Animated GIF passes through untouched (canvas would keep only the first frame); everything
+// here decodes cleanly. This set is a token/payload optimization ONLY — never the thing that makes a
+// format sendable. Every failure path below falls back to the raw file, so a format that is only
+// valid after re-encoding would ship broken; the accept-list keeps that from being representable.
+const COMPRESSIBLE = new Set(['image/png', 'image/jpeg', 'image/webp'])
 
-/** The doc mediaType for a file the composer should accept as a document, or null. */
-export function docMediaType(file: { name: string; type: string }): string | null {
-  const ext = file.name.slice(file.name.lastIndexOf('.') + 1).toLowerCase()
-  return DOC_EXT[ext] ?? (DOC_MIME.has(file.type) ? file.type : null)
-}
-
-// Raster types worth re-encoding. Animated GIF (canvas keeps only the first frame) and SVG (canvas
-// rasterizes the vector) are passed through untouched; everything else here decodes cleanly.
-const COMPRESSIBLE = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/bmp'])
-
-/** Blob → bare base64 (strips the `data:…;base64,` prefix), preserving the blob's MIME as mediaType. */
-function blobToStaged(blob: Blob): Promise<StagedAttachment | null> {
+/** Blob → bare base64 (strips the `data:…;base64,` prefix), tagged with `mediaType` (the blob's own
+ *  MIME unless the caller resolved a better one from the extension). */
+function blobToStaged(blob: Blob, mediaType = blob.type): Promise<StagedAttachment | null> {
   return new Promise((resolve) => {
     const reader = new FileReader()
     reader.onload = () => {
       const url = String(reader.result)
       const comma = url.indexOf(',')
-      resolve(comma >= 0 ? { mediaType: blob.type, dataBase64: url.slice(comma + 1) } : null)
+      resolve(comma >= 0 ? { mediaType, dataBase64: url.slice(comma + 1) } : null)
     }
     reader.onerror = () => resolve(null)
     reader.readAsDataURL(blob)
@@ -46,8 +40,14 @@ function blobToStaged(blob: Blob): Promise<StagedAttachment | null> {
  * file on any failure — an unsupported type, a decode error, or a WebP that came out no smaller — so a
  * paste/drop is never silently dropped or degraded.
  */
-export async function compressImage(file: File, maxEdge: number): Promise<StagedAttachment | null> {
-  if (!COMPRESSIBLE.has(file.type)) return blobToStaged(file)
+export async function compressImage(
+  file: File,
+  maxEdge: number,
+  mediaType = file.type,
+): Promise<StagedAttachment | null> {
+  // Pass-through keeps the resolved mediaType, not the blob's — a drop can arrive with a blank type,
+  // and main names the scratch copy from whatever we send (a blank one lands as `.img`).
+  if (!COMPRESSIBLE.has(mediaType)) return blobToStaged(file, mediaType)
   try {
     const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' })
     const scale = Math.min(1, maxEdge / Math.max(bitmap.width, bitmap.height))
@@ -59,33 +59,33 @@ export async function compressImage(file: File, maxEdge: number): Promise<Staged
     const ctx = canvas.getContext('2d')
     if (!ctx) {
       bitmap.close()
-      return blobToStaged(file)
+      return blobToStaged(file, mediaType)
     }
     ctx.drawImage(bitmap, 0, 0, w, h)
     bitmap.close()
     const blob = await new Promise<Blob | null>((res) => canvas.toBlob(res, 'image/webp', 0.82))
     // At native size a pre-optimized JPEG can re-encode larger — keep the smaller original then.
-    if (!blob || blob.size >= file.size) return blobToStaged(file)
+    if (!blob || blob.size >= file.size) return blobToStaged(file, mediaType)
     return blobToStaged(blob)
   } catch {
-    return blobToStaged(file)
+    return blobToStaged(file, mediaType)
   }
 }
 
 /** Read pasted/dragged/picked files → images downscaled + re-encoded, documents (csv/pdf) staged raw
- *  with their original name. Anything else is ignored. */
+ *  with their original name. Anything else is dropped here and reported by `refusedAttachmentMessage`. */
 export async function stagingFromFiles(files: Iterable<File>): Promise<StagedAttachment[]> {
-  const all = [...files]
-  const imgs = all.filter((f) => f.type.startsWith('image/'))
-  const docs = all
-    .map((f) => ({ file: f, mediaType: docMediaType(f) }))
-    .filter((d): d is { file: File; mediaType: string } => d.mediaType !== null)
+  const accepted = [...files]
+    .map((f) => ({ file: f, mediaType: attachableMediaType(f) }))
+    .filter((a): a is { file: File; mediaType: string } => a.mediaType !== null)
+  const imgs = accepted.filter((a) => a.mediaType.startsWith('image/'))
+  const docs = accepted.filter((a) => !a.mediaType.startsWith('image/'))
   if (!imgs.length && !docs.length) return []
   let staged: (StagedAttachment | null)[] = []
   if (imgs.length) {
     const { imageDetail } = await window.koda.getSettings()
     const maxEdge = IMAGE_DETAIL_CAPS[imageDetail]
-    staged = await Promise.all(imgs.map((f) => compressImage(f, maxEdge)))
+    staged = await Promise.all(imgs.map(({ file, mediaType }) => compressImage(file, maxEdge, mediaType)))
   }
   const docStaged = await Promise.all(
     docs.map(async ({ file, mediaType }) => {
@@ -95,6 +95,55 @@ export async function stagingFromFiles(files: Iterable<File>): Promise<StagedAtt
     }),
   )
   return [...staged, ...docStaged].filter((r): r is StagedAttachment => r !== null)
+}
+
+// Reads as "a picture" for the sake of choosing WHICH sentence to show — never an accept decision
+// (the one accept-list is @shared/attachments). A HEIC off an iPhone needs to hear about exporting;
+// a dropped .zip needs to hear about pointing at it instead. Browsers report a blank type for plenty
+// of files, so the extension carries the guess and the MIME is a second chance.
+const IMAGE_LIKE_EXTENSIONS = new Set([
+  'heic',
+  'heif',
+  'avif',
+  'bmp',
+  'svg',
+  'tif',
+  'tiff',
+  'ico',
+  'jfif',
+  'dng',
+  'raw',
+  'psd',
+])
+
+/**
+ * What to say about files a drop, paste or pick could not attach — null when everything was
+ * attachable. A companion to `stagingFromFiles` rather than a second return value so the verdict
+ * stays pure (no FileReader, no settings round-trip) and is testable on its own.
+ *
+ * The copy names the file and the next action, never the rule: the accept-list's ceiling is the
+ * engine's and the user can do nothing with that fact. Silence here reads as a bug (RB, 2026-08-09).
+ */
+export function refusedAttachmentMessage(files: Iterable<{ name: string; type: string }>): string | null {
+  const refused = [...files].filter((f) => attachableMediaType(f) === null)
+  if (!refused.length) return null
+  const exts = [...new Set(refused.map((f) => extensionOf(f.name)).filter(Boolean))].map((e) => `.${e}`)
+  const what = refused.length === 1 ? refused[0].name : exts.length ? `${joinWords(exts)} files` : 'those files'
+  const imageLike = refused.some(
+    (f) => f.type.startsWith('image/') || IMAGE_LIKE_EXTENSIONS.has(extensionOf(f.name)),
+  )
+  const fix = imageLike
+    ? 'Export as JPEG or PNG.'
+    : refused.length === 1
+      ? 'Point at it with the attach menu so the agent reads it in place.'
+      : 'Point at them with the attach menu so the agent reads them in place.'
+  return `Koda can't attach ${what}. ${fix}`
+}
+
+/** "a", "a and b", "a, b and c" — for naming a handful of things in one sentence. */
+function joinWords(parts: string[]): string {
+  if (parts.length <= 1) return parts[0] ?? ''
+  return `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`
 }
 
 /** The trailing path segment (filename) of an absolute path. */

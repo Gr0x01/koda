@@ -3,9 +3,12 @@ import { Crepe } from '@milkdown/crepe'
 import { editorViewCtx } from '@milkdown/kit/core'
 import { replaceAll } from '@milkdown/kit/utils'
 import { useWorkspace } from '../workspace/store'
+import { IconButton } from '../ui'
 import { useTableColumnResize } from './useTableColumnResize'
 import { buildDocBlockMenu, docBlockPlugins } from './blocks'
+import { DocOutline, docHeadingEls, headingSlug } from './DocOutline'
 import { DocPageChrome } from './DocPageChrome'
+import { TranscriptFind } from './TranscriptFind'
 import './doc-theme.css'
 
 /** A frozen text selection inside the doc + where to join the Canvas controls beneath Crepe's toolbar. */
@@ -24,6 +27,22 @@ const KODA_AI_ICON =
 function splitFrontmatter(raw: string): { frontmatter: string; body: string } {
   const m = /^---\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/.exec(raw)
   return m ? { frontmatter: m[0], body: raw.slice(m[0].length) } : { frontmatter: '', body: raw }
+}
+
+/** Resolve a doc-relative link target against the doc's own folder — a pure string walk (no node:path
+ *  in the renderer). An absolute path passes through (the contained-fs gate downstream judges it); a
+ *  `..` escape above root returns null and the click is simply ignored. */
+function resolveDocLink(docPath: string, ref: string): string | null {
+  if (ref.startsWith('/')) return ref
+  const base = docPath.split('/').slice(0, -1)
+  for (const seg of ref.split('/')) {
+    if (!seg || seg === '.') continue
+    if (seg === '..') {
+      if (base.length <= 1) return null
+      base.pop()
+    } else base.push(seg)
+  }
+  return base.join('/') || null
 }
 
 /**
@@ -62,6 +81,7 @@ export function CrepeDocEditor({
   const wrapRef = useRef<HTMLDivElement>(null)
   const crepeRef = useRef<Crepe | null>(null)
   const sendCanvasEdit = useWorkspace((s) => s.sendCanvasEdit)
+  const openFile = useWorkspace((s) => s.openFile)
   // The live "point at a passage → ask the agent" affordance: a frozen selection + a floating toolbar.
   const [sel, setSel] = useState<CanvasSelection | null>(null)
   const [aiOpen, setAiOpen] = useState(false)
@@ -84,13 +104,112 @@ export function CrepeDocEditor({
   const [dirty, setDirty] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // The last save landed but main couldn't take a recovery point for it. Silence would leave the user
+  // believing this edit is undoable when it isn't. Cleared by the next save that does get one.
+  const [noUndo, setNoUndo] = useState(false)
+  // The pane swaps a new file's content INTO this instance rather than remounting it, so a per-file
+  // flag follows the user to the next doc unless it's cleared here.
+  useEffect(() => setNoUndo(false), [path])
   // Flips true once Crepe finishes mounting — also the re-trigger that lets the live-edit effect catch
   // up on any `body` that advanced during the (async) mount window.
   const [ready, setReady] = useState(false)
 
+  // Per-doc full width (docmeta sidecar): the page spans the pane instead of the reading column.
+  const [fullWidth, setFullWidth] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    void window.koda.getDocMeta({ path }).then((m) => {
+      if (!cancelled) setFullWidth(!!m.fullWidth)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [path])
+  function toggleFullWidth(): void {
+    const next = !fullWidth
+    setFullWidth(next)
+    void window.koda.setDocMeta({ path, meta: { fullWidth: next } })
+  }
+
   // Notion-grade table column resizing — overlaid on Crepe's table NodeView; widths persist to the
   // doc's `.koda/docmeta/` sidecar (the markdown stays plain). Runs once Crepe has mounted.
-  useTableColumnResize({ hostRef, path, ready, readOnly })
+  useTableColumnResize({ hostRef, path, ready, readOnly, fullWidth })
+
+  // ⌘F finds inside THIS doc when the user is working in it (focus inside the editor); the
+  // conversation's own ⌘F handler stands down for that case (it skips [data-doc-editor], the same
+  // way it skips Monaco). The bar reuses TranscriptFind over the doc's scroll host.
+  const [findOpen, setFindOpen] = useState(false)
+  useEffect(() => {
+    function onKey(e: KeyboardEvent): void {
+      if (!(e.metaKey || e.ctrlKey) || e.shiftKey || e.code !== 'KeyF') return
+      const wrap = wrapRef.current
+      if (!wrap || !wrap.contains(document.activeElement)) return
+      e.preventDefault()
+      // One find bar at a time — see ConversationSurface's twin (shared global highlight registry).
+      window.dispatchEvent(new CustomEvent('koda:find-open'))
+      setFindOpen(true)
+    }
+    function onOtherFind(): void {
+      setFindOpen(false)
+    }
+    window.addEventListener('keydown', onKey)
+    window.addEventListener('koda:find-open', onOtherFind)
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('koda:find-open', onOtherFind)
+    }
+  }, [])
+
+  // Links are LIVE (Notion behavior): a click navigates instead of dying in the editor. http(s) → the
+  // user's browser (main's window-open handler enforces the scheme), `#anchor` → smooth-scroll to the
+  // matching heading (GitHub-slug vocabulary), a relative path → that file opens in the workspace
+  // (markdown lands back here as a doc). Any other scheme stays inert — main would refuse it anyway.
+  useEffect(() => {
+    const host = hostRef.current
+    if (!host) return
+    const onClick = (e: MouseEvent): void => {
+      const a = e.target instanceof Element ? e.target.closest('a[href]') : null
+      if (!a || !host.contains(a)) return
+      const href = a.getAttribute('href') ?? ''
+      if (!href) return
+      e.preventDefault()
+      if (/^https?:\/\//i.test(href)) {
+        window.open(href)
+        return
+      }
+      if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith('//')) return
+      const [target, fragment] = href.split('#')
+      if (!target) {
+        const want = decodeURIComponent(fragment ?? '').toLowerCase()
+        const el = docHeadingEls(host).find((h) => headingSlug(h.textContent ?? '') === want)
+        el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+        return
+      }
+      const resolved = resolveDocLink(path, decodeURIComponent(target))
+      if (resolved) openFile(resolved)
+    }
+    host.addEventListener('click', onClick)
+    return () => host.removeEventListener('click', onClick)
+  }, [path, openFile])
+
+  // File → Export as PDF…: the VISIBLE doc editor answers (panes for other files stay mounted but
+  // display:none — offsetParent is null there). Sends the rendered ProseMirror HTML; main owns the
+  // print page, save dialog, and opening the result.
+  useEffect(() => {
+    function onExport(): void {
+      const root = crepeRootRef.current
+      if (!root || root.offsetParent === null) return
+      const html = root.querySelector('.ProseMirror')?.innerHTML
+      if (!html) return
+      const name = path.split('/').pop() ?? 'Document'
+      const title = name.replace(/\.[^.]+$/, '')
+      window.koda.exportPdf?.({ title, html }).catch((e: unknown) => {
+        window.koda.logFromRenderer({ level: 'error', args: [`PDF export failed: ${String(e)}`] })
+      })
+    }
+    window.addEventListener('koda:export-pdf', onExport)
+    return () => window.removeEventListener('koda:export-pdf', onExport)
+  }, [path])
 
   // Mount Crepe once per open. `path` is the surface key (SurfacePane remounts on file switch), so a
   // single mount per file is correct — no need to react to content changes here.
@@ -247,7 +366,8 @@ export function CrepeDocEditor({
     baselineRef.current = crepe.getMarkdown()
     setDirty(false)
     try {
-      await window.koda.writeFile({ path, content: frontmatter + target })
+      const res = await window.koda.writeFile({ path, content: frontmatter + target })
+      setNoUndo(res.checkpointed === false)
     } catch (e) {
       setError(String(e))
     }
@@ -268,9 +388,10 @@ export function CrepeDocEditor({
     setSaving(true)
     setError(null)
     try {
-      await window.koda.writeFile({ path, content: frontmatter + markdown })
+      const res = await window.koda.writeFile({ path, content: frontmatter + markdown })
       baselineRef.current = markdown
       setDirty(false)
+      setNoUndo(res.checkpointed === false)
     } catch (e) {
       setError(String(e))
     } finally {
@@ -363,11 +484,41 @@ export function CrepeDocEditor({
 
   return (
     <div className={`flex flex-col overflow-hidden ${className}`}>
-      <div ref={wrapRef} className={`relative min-h-0 flex-1 ${aiOpen ? 'koda-ai-toolbar-open' : ''}`}>
-        <div ref={hostRef} className="h-full overflow-auto bg-surface">
-          <DocPageChrome path={path} readOnly={readOnly} />
+      <div ref={wrapRef} data-doc-editor className={`relative min-h-0 flex-1 ${aiOpen ? 'koda-ai-toolbar-open' : ''}`}>
+        <div
+          ref={hostRef}
+          data-doc-fullwidth={fullWidth ? 'true' : undefined}
+          className="h-full overflow-auto bg-surface"
+        >
+          <DocPageChrome path={path} readOnly={readOnly} fullWidth={fullWidth} />
           <div ref={crepeRootRef} />
         </div>
+        {/* Quiet page-layout control — reading column ⇄ full width, persisted per doc. */}
+        <IconButton
+          label={fullWidth ? 'Reading column' : 'Full width'}
+          size="sm"
+          onClick={toggleFullWidth}
+          className="absolute right-2 top-2 z-10"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            {fullWidth ? (
+              <>
+                <path d="m5 8 4 4-4 4" />
+                <path d="m19 8-4 4 4 4" />
+              </>
+            ) : (
+              <>
+                <path d="M8 8 4 12l4 4" />
+                <path d="m16 8 4 4-4 4" />
+                <path d="M4 12h16" />
+              </>
+            )}
+          </svg>
+        </IconButton>
+        <DocOutline hostRef={hostRef} ready={ready} />
+        {findOpen && (
+          <TranscriptFind containerRef={hostRef} placeholder="Find in document" onClose={() => setFindOpen(false)} />
+        )}
         {sel && aiOpen && !readOnly && (
           <CanvasToolbar
             top={sel.top}
@@ -399,20 +550,26 @@ export function CrepeDocEditor({
             </button>
           </div>
         </div>
-      ) : (dirty || error) && !readOnly ? (
+      ) : (dirty || error || noUndo) && !readOnly ? (
         <div className="flex items-center justify-between gap-3 border-t border-border px-4 py-1.5">
           {error ? (
             <span className="truncate text-[11px] text-red-400">Couldn't save: {error}</span>
-          ) : (
+          ) : dirty ? (
             <span className="text-[11px] text-text-muted">Unsaved changes</span>
+          ) : (
+            <span role="status" className="truncate text-[11px] text-amber-600 dark:text-amber-400">
+              Saved, but Koda couldn't add this to the recovery timeline.
+            </span>
           )}
-          <button
-            onClick={() => void save()}
-            disabled={saving}
-            className="shrink-0 rounded-lg bg-accent px-3 py-1 text-[11px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
-          >
-            {saving ? 'Saving…' : 'Save'}
-          </button>
+          {(dirty || error) && (
+            <button
+              onClick={() => void save()}
+              disabled={saving}
+              className="shrink-0 rounded-lg bg-accent px-3 py-1 text-[11px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+            >
+              {saving ? 'Saving…' : 'Save'}
+            </button>
+          )}
         </div>
       ) : null}
     </div>

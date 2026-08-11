@@ -120,9 +120,9 @@ export function SessionRow({
             <path d="M11 18h2" />
           </svg>
         )}
-        {/* Unsaved-changes chip — this session's dirty file count. Click jumps to the Changes tab
-            focused on this session's group (not the row's select). Hidden when nothing's unsaved.
-            Names the unit ("edits") in the chip itself — a bare number badge on a chat-shaped row
+        {/* Loose-files chip — this session's dirty file count. Click jumps to the Changes tab
+            focused on this session's group (not the row's select). Hidden when nothing is loose.
+            Names the unit ("files") in the chip itself — a bare number badge on a chat-shaped row
             reads as an unread-message count, and hover text fires only after the misread. */}
         {dirtyCount > 0 && (
           <button
@@ -130,10 +130,10 @@ export function SessionRow({
               e.stopPropagation()
               onOpenChanges()
             }}
-            title={`${dirtyCount} unsaved ${dirtyCount === 1 ? 'change' : 'changes'} — review & save`}
+            title={`Needs cleanup · ${dirtyCount} loose ${dirtyCount === 1 ? 'file' : 'files'}`}
             className="shrink-0 whitespace-nowrap rounded-full bg-accent/12 px-1.5 text-[10.5px] font-semibold tabular-nums text-accent transition-colors hover:bg-accent/20"
           >
-            {dirtyCount} {dirtyCount === 1 ? 'edit' : 'edits'}
+            {dirtyCount} {dirtyCount === 1 ? 'file' : 'files'}
           </button>
         )}
         {/* The fuel gauge — how the user sees context filling and knows when to start fresh. On the

@@ -1,6 +1,6 @@
 {
   "name": "koda",
-  "version": "0.1.6",
+  "version": "0.1.10",
   "description": "A guardrailed Claude Code distribution as a Mac desktop app for non-engineers.",
   "private": true,
   "author": "RB",
@@ -9,6 +9,8 @@
     "dev": "npm run build-assist-helper && npm run build-voice-helper && npm run vendor-playwright && electron-vite dev",
     "build": "npm run typecheck && electron-vite build",
     "start": "electron-vite preview",
+    "storybook": "storybook dev -p 6006 --no-open",
+    "build-storybook": "storybook build",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "lint": "eslint .",
     "test": "vitest run",
@@ -25,6 +27,7 @@
     "test:e2e": "npm run build-assist-helper && npm run build-voice-helper && npm run vendor-playwright && npm run build && playwright test"
   },
   "dependencies": {
+    "@capacitor-community/sqlite": "^8.1.0",
     "@fontsource-variable/schibsted-grotesk": "^5.2.8",
     "@fontsource-variable/spline-sans-mono": "^5.2.8",
     "@fontsource/be-vietnam-pro": "^5.2.8",
@@ -53,6 +56,7 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@playwright/test": "^1.61.0",
+    "@storybook/react-vite": "^10.5.5",
     "@tailwindcss/vite": "^4.3.1",
     "@types/node": "^26.0.0",
     "@types/qrcode": "^1.5.5",
@@ -66,6 +70,7 @@
     "eslint": "^10.6.0",
     "eslint-plugin-react-hooks": "^7.1.1",
     "globals": "^17.7.0",
+    "storybook": "^10.5.5",
     "tailwindcss": "^4.3.1",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.62.1",

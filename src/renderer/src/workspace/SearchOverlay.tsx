@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { SearchResult, SearchScope } from '@shared/ipc'
+import { undoPointRefusal, type SearchResult, type SearchScope } from '@shared/ipc'
 import { Overlay } from '../motion'
 import { useWorkspace, activeEditor } from './store'
 
@@ -126,8 +126,10 @@ export function SearchOverlay() {
           : `Replaced ${res.replacements} ${res.replacements === 1 ? 'occurrence' : 'occurrences'} in ${res.files} ${res.files === 1 ? 'file' : 'files'} · undo from the recovery timeline`,
       )
       setRefreshTick((n) => n + 1) // re-run the search so the list reflects the replacement
-    } catch {
-      setReplaceMsg("Couldn't complete the replacement.")
+    } catch (e) {
+      // Main refuses the replace when it can't first take an undo point. Saying only "couldn't
+      // complete" would send the user back to retry forever against a broken recovery store.
+      setReplaceMsg(undoPointRefusal(e) ?? "Couldn't complete the replacement.")
     } finally {
       setReplacing(false)
     }

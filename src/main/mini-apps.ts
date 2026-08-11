@@ -12,13 +12,15 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { readFile, writeFile } from 'node:fs/promises'
-import { basename, join, relative } from 'node:path'
+import { readFile, stat, writeFile } from 'node:fs/promises'
+import { basename, extname, join, relative } from 'node:path'
 import { createServer, type AddressInfo } from 'node:net'
 import http from 'node:http'
-import { app } from 'electron'
+import { app, nativeImage } from 'electron'
 import { z } from 'zod'
+import { MiniAppThemeSchema, type MiniAppTheme } from '@shared/ipc'
 import { BROKER_TOKEN_ENV } from './broker/server'
+import { ensureBridgeServer, issueBridgeToken } from './app-bridge'
 import { userPath } from './engine/user-path'
 import { loadMiniAppsEnabled } from './settings'
 import { log } from './logger'
@@ -43,8 +45,18 @@ const AppManifestSchema = z.object({
   /** Project-relative paths OUTSIDE the app folder the app may touch, with access mode — the sanctioned
    *  exception to self-containment. */
   shared: z.array(z.object({ path: z.string().min(1), mode: z.enum(['read', 'readwrite']) })).optional(),
+  /** The app's design tokens (any subset) — Koda's overlay chrome on the face wears them so the summon
+   *  pill / reply / question chips read as part of the app. Shape mirrors MiniAppThemeSchema. */
+  theme: MiniAppThemeSchema.optional(),
 })
 export type AppManifest = z.infer<typeof AppManifestSchema>
+
+/** Accepted only at the parser boundary so old generated apps can be normalized into today's
+ * canonical manifest without leaking retired keys to the rest of the supervisor. */
+const AppManifestInputSchema = AppManifestSchema.extend({
+  start: z.string().min(1).optional(),
+  data_paths: z.array(z.string()).optional(),
+})
 
 /** Parse + validate manifest JSON text (pure — the testable half of loadAppManifest). */
 export function parseAppManifest(raw: string): AppManifest {
@@ -54,12 +66,19 @@ export function parseAppManifest(raw: string): AppManifest {
   } catch {
     throw new Error(`${APP_MANIFEST} is not valid JSON`)
   }
-  const parsed = AppManifestSchema.safeParse(json)
+  const parsed = AppManifestInputSchema.safeParse(json)
   if (!parsed.success) {
     const issues = parsed.error.issues.map((i) => `${i.path.join('.') || 'manifest'}: ${i.message}`).join('; ')
     throw new Error(`${APP_MANIFEST} is invalid — ${issues}`)
   }
-  return parsed.data
+  const { start, data_paths: dataPaths, ...manifest } = parsed.data
+  // A malformed early-recipe manifest used `entry: "server.mjs", start: "node server.mjs"`.
+  // Honour that exact shape so already-graduated apps launch instead of forcing their owners to
+  // repair generated metadata. `start` never overrides a real entry command.
+  const entry = start && !/\s/.test(manifest.entry) && manifest.entry === start.split(/\s+/).at(-1)
+    ? start
+    : manifest.entry
+  return { ...manifest, entry, data: manifest.data ?? dataPaths }
 }
 
 async function loadAppManifest(dir: string): Promise<AppManifest> {
@@ -83,6 +102,9 @@ interface RegistryEntry {
   /** Desired state, not observed state: true = the supervisor keeps it running, incl. across Koda
    *  relaunches. Set true only once a start actually served (a broken app never sticks as desired). */
   desiredRunning: boolean
+  /** True only after the supervisor has observed this app serving. Launcher and phone tiles are
+   *  derived from this, so registration metadata can never masquerade as a working app. */
+  graduated: boolean
 }
 
 /** In-memory registry, persisted to <userData>/mini-apps.json (app-lifetime state, same posture as
@@ -92,12 +114,30 @@ let registryLoaded: Promise<void> | null = null
 
 const registryFile = (): string => join(app.getPath('userData'), 'mini-apps.json')
 
+/** Normalize one persisted row. Exported as the pure migration seam so an upgrade cannot silently
+ *  hide every app registered before the graduation field existed. */
+export function normalizeRegistryEntry(input: unknown): RegistryEntry | null {
+  if (!input || typeof input !== 'object') return null
+  const e = input as Partial<RegistryEntry>
+  if (typeof e.dir !== 'string' || typeof e.projectPath !== 'string' || typeof e.name !== 'string') return null
+  return {
+    dir: e.dir,
+    projectPath: e.projectPath,
+    name: e.name,
+    desiredRunning: e.desiredRunning === true,
+    // Registries written before this field existed already powered visible tiles. Preserve those
+    // apps; only newly registered apps must earn graduation through a successful start.
+    graduated: e.graduated ?? true,
+  }
+}
+
 function ensureRegistry(): Promise<void> {
   registryLoaded ??= (async () => {
     try {
-      const raw = JSON.parse(await readFile(registryFile(), 'utf8')) as { apps?: RegistryEntry[] }
-      for (const e of raw.apps ?? []) {
-        if (e && typeof e.dir === 'string' && typeof e.projectPath === 'string') registry.set(e.dir, e)
+      const raw = JSON.parse(await readFile(registryFile(), 'utf8')) as { apps?: Array<Partial<RegistryEntry>> }
+      for (const input of raw.apps ?? []) {
+        const entry = normalizeRegistryEntry(input)
+        if (entry) registry.set(entry.dir, entry)
       }
     } catch {
       // first run / unreadable — start empty (fail-soft, same as settings.ts)
@@ -114,17 +154,57 @@ async function saveRegistry(): Promise<void> {
   }
 }
 
-/** ipc.ts hooks this to push list changes to open windows. A callback (not a BrowserWindow import)
- *  keeps the supervisor window-free and the tests electron-light. */
-let onAppsChanged: (() => void) | null = null
-export function setMiniAppsChangedListener(fn: (() => void) | null): void {
-  onAppsChanged = fn
+/** Registry/run-state changes. A subscriber LIST, not a single slot: ipc.ts pushes to open windows and
+ *  the remote seam reacts to port moves, and the old one-nullable-callback shape meant whoever
+ *  registered last silently replaced the other (the renderer had claimed it, so nothing in the remote
+ *  lane could ever learn an app changed). Callbacks (not a BrowserWindow import) keep the supervisor
+ *  window-free and the tests electron-light. Returns an unsubscribe. */
+const appsChanged = new Set<() => void>()
+export function onMiniAppsChanged(fn: () => void): () => void {
+  appsChanged.add(fn)
+  return () => appsChanged.delete(fn)
 }
+
+/** A port MOVE for one app — announced separately from the generic change ping because the subscriber
+ *  that matters (the phone's exposed face) has to tear something down, and "something about apps
+ *  changed" fires on registration, spend and crash-count edits too. Reacting to those would close a
+ *  face RB is looking at. `port` is the app's new serving port, or undefined when it stopped serving. */
+const portChanged = new Set<(dir: string, port: number | undefined) => void>()
+export function onMiniAppPortChanged(fn: (dir: string, port: number | undefined) => void): () => void {
+  portChanged.add(fn)
+  return () => portChanged.delete(fn)
+}
+
+/** What each app's port was at the last announcement. Lives HERE, inside the owner, on purpose: a
+ *  subscriber that remembered the previous port to diff against would be exactly the invalidator-less
+ *  copy this whole consolidation exists to remove. */
+const announcedPorts = new Map<string, number>()
+
+function announcePortMoves(): void {
+  for (const dir of procs.keys()) {
+    const port = miniAppPort(dir)
+    if (announcedPorts.get(dir) === port) continue
+    if (port == null) announcedPorts.delete(dir)
+    else announcedPorts.set(dir, port)
+    for (const fn of portChanged) {
+      try {
+        fn(dir, port)
+      } catch {
+        // a broken subscriber must never fail the verb that triggered it
+      }
+    }
+  }
+}
+
 function notifyChanged(): void {
-  try {
-    onAppsChanged?.()
-  } catch {
-    // a broken push must never fail the verb that triggered it
+  // Port moves first: the seam's teardown should land before the renderer's re-fetch round-trip.
+  announcePortMoves()
+  for (const fn of appsChanged) {
+    try {
+      fn()
+    } catch {
+      // a broken push must never fail the verb that triggered it
+    }
   }
 }
 
@@ -134,6 +214,8 @@ export type MiniAppState = 'starting' | 'running' | 'stopped' | 'crashed'
 
 interface AppProc {
   child?: ChildProcess
+  /** The port this app is SERVING on — set only once a start has probed successfully, cleared on every
+   *  path out of serving. Nothing else in Koda owns an app's port; see miniAppPort(). */
   port?: number
   url?: string
   state: MiniAppState
@@ -148,6 +230,22 @@ interface AppProc {
 }
 
 const procs = new Map<string, AppProc>()
+
+/**
+ * The port this app is SERVING on right now — the read-only door to the process table, which owns it.
+ * Without this the only way to ask was `startApp`, a *command* that spawns processes, so consumers
+ * either started an app to find out or scraped the number back out of a URL string.
+ *
+ * Undefined when the app isn't serving, INCLUDING while it is still starting: a starting app has been
+ * assigned a port it has not bound yet, and handing that out is how a caller ends up pointed at a port
+ * nothing answers on. Ask again each time; never remember the answer.
+ *
+ * Deliberately NOT guarded by `state === 'running'`. That guard is what made the never-cleared `port`
+ * field harmless, and therefore invisible — it would mask exactly the staleness this door exposes.
+ */
+export function miniAppPort(dir: string): number | undefined {
+  return procs.get(dir)?.port
+}
 
 /** How long a starting app gets to serve on its assigned port before we give up and kill it. */
 const START_TIMEOUT_MS = 30_000
@@ -234,14 +332,20 @@ export async function installApp(dir: string, projectPath: string): Promise<Inst
   await ensureRegistry()
   const manifest = await loadAppManifest(dir)
   const existing = registry.get(dir)
-  registry.set(dir, { dir, projectPath, name: manifest.name, desiredRunning: existing?.desiredRunning ?? false })
+  registry.set(dir, {
+    dir,
+    projectPath,
+    name: manifest.name,
+    desiredRunning: existing?.desiredRunning ?? false,
+    graduated: existing?.graduated ?? false,
+  })
   await saveRegistry()
   notifyChanged()
   return {
     installed: true,
     name: manifest.name,
     entry: manifest.entry,
-    note: 'registered with the lifecycle supervisor — install its dependencies yourself (npm install in the app folder) before starting it',
+    note: 'registered internally — install its dependencies, then start it through Koda; its tile appears only after the supervisor confirms it is serving',
   }
 }
 
@@ -263,7 +367,13 @@ export async function startApp(dir: string, projectPath: string): Promise<{ url:
 
   const manifest = await loadAppManifest(dir) // re-read every start, so build turns' manifest edits apply
   const prior = registry.get(dir)
-  registry.set(dir, { dir, projectPath, name: manifest.name, desiredRunning: prior?.desiredRunning ?? false })
+  registry.set(dir, {
+    dir,
+    projectPath,
+    name: manifest.name,
+    desiredRunning: prior?.desiredRunning ?? false,
+    graduated: prior?.graduated ?? false,
+  })
 
   // Carry crash history across restarts (that's what catches a loop); a NEW proc object per attempt so
   // a stale child's exit handler can't touch the current one.
@@ -283,6 +393,10 @@ async function launch(
   proc: AppProc,
   projectPath: string,
 ): Promise<{ url: string; port: number }> {
+  // Timed end-to-end so a slow start is visible in the log — the old path wrote nothing until the app
+  // served (or the 30s timeout), leaving the exact window we chase as a silent gap.
+  const t0 = Date.now()
+  log.info('mini-apps', 'app start begin', { dir, name: manifest.name })
   const port = await freePort()
   // A stop that landed during the manifest/port awaits must win — spawning now would un-stop the app.
   if (procs.get(dir) !== proc || proc.state === 'stopped') {
@@ -294,6 +408,15 @@ async function launch(
   delete env[BROKER_TOKEN_ENV]
   env.PATH = userPath()
   env.PORT = String(port)
+  // Lane B bridge (app-bridge.ts): loopback URL + per-app token, handed over exactly like PORT.
+  // Always injected — the endpoint checks the per-app consent toggle per call, so allowing an app
+  // later needs no restart. Fail-soft: the app must still run if the bridge can't listen.
+  try {
+    env.KODA_BRIDGE_URL = `http://127.0.0.1:${await ensureBridgeServer()}`
+    env.KODA_BRIDGE_TOKEN = issueBridgeToken(dir)
+  } catch (err) {
+    log.warn('mini-apps', 'bridge unavailable for this start', err instanceof Error ? err.message : err)
+  }
   const child = spawn(manifest.entry, {
     cwd: dir,
     shell: true,
@@ -301,7 +424,6 @@ async function launch(
     detached: true, // own process group → killGroup can signal the whole tree
   })
   proc.child = child
-  proc.port = port
   const url = `http://localhost:${port}`
 
   let spawnError: Error | undefined
@@ -331,12 +453,20 @@ async function launch(
       if (!isCurrent()) bail(new Error(`"${manifest.name}" was stopped while starting`))
       proc.state = 'running'
       proc.url = url
+      // Recorded ONLY here — the port is a fact about an app that is proven to be serving, so a start
+      // that never gets this far (the bail path) leaves nothing stale behind by construction.
+      proc.port = port
       // NOW it's proven to run — keep it running, including across Koda relaunches.
       const entry = registry.get(dir)
-      registry.set(dir, entry ? { ...entry, desiredRunning: true } : { dir, projectPath, name: manifest.name, desiredRunning: true })
+      registry.set(
+        dir,
+        entry
+          ? { ...entry, desiredRunning: true, graduated: true }
+          : { dir, projectPath, name: manifest.name, desiredRunning: true, graduated: true },
+      )
       await saveRegistry()
       notifyChanged()
-      log.info('mini-apps', 'app serving', { dir, url })
+      log.info('mini-apps', 'app serving', { dir, url, ms: Date.now() - t0 })
       return { url, port }
     }
     await delay(PROBE_INTERVAL_MS)
@@ -357,6 +487,7 @@ function onExit(dir: string, proc: AppProc, child: ChildProcess, code: number | 
   proc.exits = [...proc.exits.filter((t) => now - t < CRASH_WINDOW_MS), now]
   proc.child = undefined
   proc.url = undefined
+  proc.port = undefined // the dead process took its port with it — the table must not still claim it
   if (proc.exits.length >= CRASH_MAX) {
     proc.state = 'crashed'
     log.warn('mini-apps', 'app crash-looped — giving up until the next explicit start', { dir, code })
@@ -366,6 +497,7 @@ function onExit(dir: string, proc: AppProc, child: ChildProcess, code: number | 
   const wait = crashBackoffMs(proc.exits.length)
   proc.state = 'starting'
   proc.restarts += 1
+  notifyChanged() // the listing must stop advertising the dead url the moment the restart begins
   log.info('mini-apps', `app exited unexpectedly (code ${code}) — restarting in ${wait}ms`, { dir })
   proc.backoff = setTimeout(() => {
     proc.backoff = undefined
@@ -402,6 +534,7 @@ export async function stopApp(dir: string): Promise<void> {
   const child = proc.child
   proc.child = undefined
   proc.url = undefined
+  proc.port = undefined
   if (child) killGroup(child)
   notifyChanged()
 }
@@ -443,10 +576,55 @@ export interface MiniAppListing {
   name: string
   state: MiniAppState
   url?: string
+  /** The manifest's icon inlined as a data URL — the launcher tile / face identity. Absent when the
+   *  manifest declares none (or it's missing/oversized/unreadable) — renderers fall back to the
+   *  monogram. */
+  iconDataUrl?: string
+  /** The manifest's `theme` tokens for Koda's overlay chrome on the face; absent ⇒ Koda defaults. */
+  theme?: MiniAppTheme
 }
 
-/** Every registered app + live state, across all projects — the launcher rail's data (the rail lives
- *  on ProjectHome, which has no project context yet). */
+/** Icons are tile assets, not artwork — cap what gets inlined and shipped to every window. */
+const ICON_MAX_BYTES = 256 * 1024
+const ICON_MIME: Record<string, string> = {
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+}
+
+/** Read the app's declared icon, fail-soft to undefined (monogram fallback) — a broken icon must
+ *  never break the list. Re-read per list call so an agent's icon edit shows on the next push. */
+async function appIconDataUrl(dir: string, manifest: AppManifest | null): Promise<string | undefined> {
+  try {
+    if (!manifest?.icon) return undefined
+    const path = join(dir, manifest.icon)
+    if (relative(dir, path).startsWith('..')) return undefined // the icon must live inside the app folder
+    const mime = ICON_MIME[extname(path).toLowerCase()]
+    if (!mime) return undefined
+    const buf = await readFile(path)
+    if (buf.length > ICON_MAX_BYTES) return undefined
+    return `data:${mime};base64,${buf.toString('base64')}`
+  } catch {
+    return undefined
+  }
+}
+
+/** Does this project own a registered mini app (and are faces on)? Feeds the pack's `requires:
+ *  'mini-app'` rule gate at session spawn — the agent must know the face wears Koda's summon pill
+ *  unless the app claims the agent line. Sync against the in-memory registry (spawn assembly is
+ *  sync): loaded at boot via bootStartMiniApps whenever the flag is on, so a miss here only means
+ *  the rule sits out one early session — fail-soft, same posture as the rest of the pack. */
+export function projectHasMiniApp(projectPath: string): boolean {
+  if (!loadMiniAppsEnabled()) return false
+  void ensureRegistry()
+  return [...registry.values()].some((e) => e.projectPath === projectPath && e.graduated)
+}
+
+/** Every graduated app + live state, across all projects — registration stays internal until the
+ *  supervisor has observed the app serving, so a broken build can never produce a launcher tile. */
 export async function listMiniApps(): Promise<MiniAppListing[]> {
   await ensureRegistry()
   // Prune entries whose folder vanished (project deleted in Finder or by the agent) — a dead tile on
@@ -456,16 +634,22 @@ export async function listMiniApps(): Promise<MiniAppListing[]> {
     for (const e of gone) registry.delete(e.dir)
     await saveRegistry()
   }
-  return [...registry.values()].map((e) => {
-    const p = procs.get(e.dir)
-    return {
-      dir: e.dir,
-      projectPath: e.projectPath,
-      name: e.name,
-      state: p?.state ?? 'stopped',
-      url: p?.state === 'running' ? p.url : undefined,
-    }
-  })
+  return Promise.all(
+    [...registry.values()].filter((e) => e.graduated).map(async (e) => {
+      const p = procs.get(e.dir)
+      // One manifest read feeds both face-identity fields; a broken manifest costs the extras, not the tile.
+      const manifest = await loadAppManifest(e.dir).catch(() => null)
+      return {
+        dir: e.dir,
+        projectPath: e.projectPath,
+        name: e.name,
+        state: p?.state ?? 'stopped',
+        url: p?.state === 'running' ? p.url : undefined,
+        iconDataUrl: await appIconDataUrl(e.dir, manifest),
+        theme: manifest?.theme,
+      }
+    }),
+  )
 }
 
 /** Project deletion: stop every app under the project and drop it from the registry entirely —
@@ -482,6 +666,64 @@ export async function deleteProjectApps(projectPath: string): Promise<void> {
     await saveRegistry()
     notifyChanged()
   }
+}
+
+/** Remote icons ride a 3s launcher poll (and the relay), so a full-size ICON_MAX_BYTES data URL per app
+ *  per poll is real bandwidth. Downscale rasters to tile size once (Electron nativeImage) and cache by
+ *  path+mtime; small SVGs pass through as-is (vector, already tiny, nativeImage can't rasterize them). */
+const REMOTE_ICON_PX = 128
+const REMOTE_SVG_MAX_BYTES = 32 * 1024
+const remoteIconCache = new Map<string, { key: string; url?: string }>()
+
+async function appIconForRemote(dir: string): Promise<string | undefined> {
+  try {
+    const manifest = await loadAppManifest(dir)
+    if (!manifest.icon) return undefined
+    const path = join(dir, manifest.icon)
+    if (relative(dir, path).startsWith('..')) return undefined
+    const key = `${path}:${(await stat(path)).mtimeMs}`
+    const hit = remoteIconCache.get(dir)
+    if (hit?.key === key) return hit.url
+    let url: string | undefined
+    if (extname(path).toLowerCase() === '.svg') {
+      const buf = await readFile(path)
+      if (buf.length <= REMOTE_SVG_MAX_BYTES) url = `data:image/svg+xml;base64,${buf.toString('base64')}`
+    } else if (ICON_MIME[extname(path).toLowerCase()]) {
+      const img = nativeImage.createFromPath(path)
+      if (!img.isEmpty()) url = img.resize({ width: REMOTE_ICON_PX, height: REMOTE_ICON_PX }).toDataURL()
+    }
+    remoteIconCache.set(dir, { key, url })
+    return url
+  } catch {
+    return undefined
+  }
+}
+
+/** The phone launcher's app tiles (remote-control seam). Reads the flag itself — an activation seam,
+ *  same posture as bootStartMiniApps — so the phone never learns app dirs while the feature is off.
+ *  No `url`: a localhost URL is meaningless off-Mac; the phone resolves a face URL for its own route
+ *  through the app-face hooks. */
+export async function miniAppsForRemote(): Promise<
+  Array<{
+    dir: string
+    projectPath: string
+    name: string
+    state: MiniAppState
+    iconDataUrl?: string
+    theme?: MiniAppTheme
+  }>
+> {
+  if (!loadMiniAppsEnabled()) return []
+  return Promise.all(
+    (await listMiniApps()).map(async ({ dir, projectPath, name, state, theme }) => ({
+      dir,
+      projectPath,
+      name,
+      state,
+      theme,
+      iconDataUrl: await appIconForRemote(dir),
+    })),
+  )
 }
 
 /** Start an app the renderer names by dir — but only one the agent actually registered. The renderer
@@ -529,6 +771,7 @@ export function disposeMiniApps(): Promise<void> {
       p.backoff = undefined
     }
     p.state = 'stopped' // suppress crash-restart on the way down
+    p.port = undefined // same invariant as stop/exit: the table only ever claims a port that is serving
   }
   if (running.length === 0) return Promise.resolve()
   return new Promise((resolve) => {

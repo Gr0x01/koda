@@ -9,32 +9,80 @@
  * Plus a single `koda-app-state.json` (which projects were open + a recents list) so boot can
  * reopen one window per remembered project.
  *
- * Deliberately NOT a library (small files, same call style as settings.ts). All access is fail-soft:
- * a missing/corrupt file restores nothing, and a failed write never breaks the caller.
+ * Deliberately NOT a library (small files, same call style as settings.ts). Writes are fail-soft (a
+ * failed write never breaks the caller), but reads are NOT uniformly so: an ABSENT store restores
+ * nothing, while a store that EXISTS and can't be read throws. That distinction is load-bearing — an
+ * unreadable store reported as "empty" hydrates the renderer, which un-gates its debounced save and
+ * writes the emptiness back over the user's real file ~500ms later, unattended. `koda-app-state.json`
+ * has no renderer to gate on, so it enforces the same refusal main-side instead: every AUTOMATIC
+ * mutator (noteProjectClosed/Deleted, saveWindowBounds, backfillKnownProjects) loads through
+ * `loadAppStateForWrite`, which returns nothing rather than `EMPTY_STATE` on a corrupt file, and the
+ * mutator skips its save entirely. `noteProjectOpened` is the one exception and the way back out —
+ * see its `'user-open'` consent below.
  */
 import { app } from 'electron'
 import { createHash } from 'node:crypto'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, realpathSync, unlinkSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, realpathSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { z } from 'zod'
 import {
   ArchivedSessionMetaSchema,
   ArchivedSessionSchema,
+  PersistedSessionSchema,
   PersistedSessionsSchema,
   type ArchivedPreviewTurn,
   type ArchivedSession,
+  type BackupKept,
   type ArchivedSessionMeta,
+  type PersistedSession,
   type PersistedSessions,
   type ReplayEntry,
 } from '@shared/ipc'
 import { writeFileAtomic } from './atomic-write'
 import { loadArchiveRetentionDays } from './settings'
 import { log } from './logger'
+import {
+  mergeReplayIntoTranscript,
+  normalizeReplaySequence,
+  settleRestoredDelegationReplay,
+  transcriptFromReplay,
+} from '@shared/delegation'
+import { deleteRemoteReplay, loadRemoteReplay, purgeRemoteReplayProject } from './remote-replay-store'
+
+/** A store that exists but could not be read, carrying whether the copy `keepCorrupt` tried to make
+ *  actually landed. Every failure path below reports that real answer instead of discarding it: the
+ *  user-facing banner says "Koda kept a copy beside it", and two failures make that a lie if it isn't
+ *  checked — an EACCES/EIO store (the re-read inside `keepCorrupt` fails for the same reason the
+ *  original read did) and a `copyFileSync` that itself fails (ENOSPC, a read-only userData). */
+export class StoreReadError extends Error {
+  constructor(
+    message: string,
+    readonly backupKept: boolean,
+  ) {
+    super(message)
+    this.name = 'StoreReadError'
+  }
+}
+
+/** Out-param for a load that SUCCEEDS but had to set rows aside. The drop is invisible in the return
+ *  value (a shorter list looks exactly like a shorter list), and the user has to be told — a silently
+ *  short list is the one case where the file IS then overwritten, because saving stays on. Callers that
+ *  show it (the IPC boundary) pass one in; everyone else ignores it. */
+export interface StoreReadReport {
+  dropped: number
+}
 
 /** The on-disk per-project shape = the renderer's blob + the project it belongs to (main-stamped). */
 const StoredProjectSchema = PersistedSessionsSchema.extend({ projectPath: z.string() })
 type StoredProject = z.infer<typeof StoredProjectSchema>
+
+/** The READ-time shape of a stored project file — same as `StoredProjectSchema` except `sessions` is
+ *  `unknown[]`, validated row-by-row below (keepValidRows/W5) instead of all-or-nothing. The WRITE path
+ *  (ipc.ts's save boundary) still validates incoming renderer data against the strict
+ *  `PersistedSessionsSchema` — that data was just computed by the live renderer, so schema drift can't
+ *  have happened yet; only DISK data ages across builds. */
+const StoredProjectReadSchema = StoredProjectSchema.extend({ sessions: z.array(z.unknown()) })
 
 /** Stable per-project filename: hash the project path so no path chars / length leak into the name. */
 function projectStorePath(projectPath: string): string {
@@ -53,8 +101,10 @@ function projectStorePath(projectPath: string): string {
 // Each transcript body lives in its own file, fetched only when that archive is restored. Deleting one
 // unlinks one small file + rewrites the (small) index, never a multi-MB blob.
 
-/** v2 = the light metadata index (bodies split out). v1 = the old single blob with transcripts inline. */
-const ArchiveIndexSchema = z.object({ version: z.literal(2), archived: z.array(ArchivedSessionMetaSchema) })
+/** v2 = the light metadata index (bodies split out). v1 = the old single blob with transcripts inline.
+ *  The v2 rows are `unknown` here and validated ONE BY ONE (keepValidRows) — as `z.array(Meta)` a
+ *  single malformed row failed the whole parse and took every valid archive with it. */
+const ArchiveIndexSchema = z.object({ version: z.literal(2), archived: z.array(z.unknown()) })
 const ArchiveFileV1Schema = z.object({ version: z.literal(1), archived: z.array(ArchivedSessionSchema) })
 const ArchivedBodySchema = z.object({ items: z.array(z.unknown()) })
 
@@ -115,39 +165,180 @@ function splitArchive(projectPath: string, full: ArchivedSession): ArchivedSessi
 }
 
 /** A project's archived-session metadata, newest first. Migrates a v1 blob in place on first read, and
- *  applies the opt-in retention purge. Fail-soft: missing/corrupt reads as none. */
-export function loadArchivedMeta(projectPath: string): ArchivedSessionMeta[] {
+ *  applies the opt-in retention purge.
+ *
+ *  NO index file = nothing archived yet: returns [] (benign — there's nothing to save over). A
+ *  zero-length/whitespace-only file is treated the same way (see loadProjectSessions). An index that
+ *  EXISTS, is non-empty, and can't be read or parsed THROWS instead of reading as none: the boot path
+ *  installs whatever this returns and then persists it, so "[] because it failed" is how a whole archive
+ *  list gets rewritten to empty. Individual malformed ROWS are dropped, not fatal (keepValidRows), and
+ *  counted into `report` so the caller can tell the user how many. */
+export function loadArchivedMeta(projectPath: string, report?: StoreReadReport): ArchivedSessionMeta[] {
+  const path = archiveIndexPath(projectPath)
+  if (!existsSync(path)) return []
   let metas: ArchivedSessionMeta[] = []
+  let text: string
   try {
-    const raw = JSON.parse(readFileSync(archiveIndexPath(projectPath), 'utf8'))
-    const v2 = ArchiveIndexSchema.safeParse(raw)
-    if (v2.success) {
-      metas = v2.data.archived
-    } else {
-      const v1 = ArchiveFileV1Schema.safeParse(raw)
-      if (v1.success && v1.data.archived.length) {
-        // One-shot: write each transcript to its own body file, build the light index, and keep the
-        // original blob as `.v1.bak` (a real user's archives are irreplaceable — don't destroy on migrate).
-        // COPY (not move) the backup so the original v1 stays at the index path until the new v2 index
-        // atomically overwrites it — a crash mid-migration then re-reads valid v1 and re-migrates, rather
-        // than finding no index and reading empty.
-        try {
-          copyFileSync(archiveIndexPath(projectPath), `${archiveIndexPath(projectPath)}.v1.bak`)
-        } catch {
-          /* couldn't back up — proceed; the new index overwrites the old blob below */
-        }
-        metas = v1.data.archived.map((f) => splitArchive(projectPath, f))
-        saveArchivedMeta(projectPath, metas)
-        log.info('session-store', 'split archived transcripts into per-session bodies', {
-          project: projectPath,
-          count: metas.length,
-        })
-      }
+    text = readFileSync(path, 'utf8')
+  } catch (err) {
+    // No `content`: keepCorrupt re-reads the file, which fails for the same reason this read did, so
+    // this is exactly the case where no copy gets kept. Report that rather than promising one.
+    const backupKept = keepCorrupt(path)
+    log.warn('session-store', 'archive index unreadable — refusing to report it as empty', {
+      project: projectPath,
+      error: err instanceof Error ? err.message : String(err),
+      backupKept,
+    })
+    throw new StoreReadError(err instanceof Error ? err.message : String(err), backupKept)
+  }
+  // A zero-length (or whitespace-only) file holds no data at all — e.g. `writeFileAtomic`'s rename lands
+  // but a power cut hits before the bytes are flushed to disk. That is indistinguishable from "nothing
+  // archived yet" and has nothing to protect; treating it as corrupt would brick the project forever
+  // (every boot reads it, fails to parse, refuses to save over it, on a file worth nothing).
+  if (!text.trim()) return []
+  let raw: unknown
+  try {
+    raw = JSON.parse(text)
+  } catch (err) {
+    const backupKept = keepCorrupt(path, text)
+    log.warn('session-store', 'archive index unreadable — refusing to report it as empty', {
+      project: projectPath,
+      error: err instanceof Error ? err.message : String(err),
+      backupKept,
+    })
+    throw new StoreReadError(err instanceof Error ? err.message : String(err), backupKept)
+  }
+  const v2 = ArchiveIndexSchema.safeParse(raw)
+  if (v2.success) {
+    metas = keepValidRows(ArchivedSessionMetaSchema, path, v2.data.archived, projectPath, 'archive', text, report)
+  } else {
+    const v1 = ArchiveFileV1Schema.safeParse(raw)
+    if (!v1.success) {
+      const backupKept = keepCorrupt(path, text)
+      log.warn('session-store', 'archive index matches neither v2 nor v1 — refusing to report it as empty', {
+        project: projectPath,
+        backupKept,
+      })
+      throw new StoreReadError('archive index is present but unreadable', backupKept)
     }
-  } catch {
-    return []
+    if (v1.data.archived.length) {
+      // One-shot: write each transcript to its own body file, build the light index, and keep the
+      // original blob as `.v1.bak` (a real user's archives are irreplaceable — don't destroy on migrate).
+      // COPY (not move) the backup so the original v1 stays at the index path until the new v2 index
+      // atomically overwrites it — a crash mid-migration then re-reads valid v1 and re-migrates, rather
+      // than finding no index and reading empty.
+      try {
+        copyFileSync(path, `${path}.v1.bak`)
+      } catch {
+        /* couldn't back up — proceed; the new index overwrites the old blob below */
+      }
+      metas = v1.data.archived.map((f) => splitArchive(projectPath, f))
+      saveArchivedMeta(projectPath, metas)
+      log.info('session-store', 'split archived transcripts into per-session bodies', {
+        project: projectPath,
+        count: metas.length,
+      })
+    }
   }
   return applyArchiveRetention(projectPath, metas)
+}
+
+/** Validate an array's rows INDIVIDUALLY against `schema`, dropping the ones that fail rather than
+ *  failing the whole array. The realistic trigger is schema drift (a user reinstalls an older build, or
+ *  a new build tightens a field — e.g. a new `approvalMode` enum value an older session-store reader
+ *  doesn't know), and one drifted row must not cost the user every other row — the same reason
+ *  `rateLimits` carries `.catch` in shared/ipc.ts. Shared by the archive index (W5's original case) and
+ *  the session list (W5's extension — the named trigger for this whole branch hits sessions, not
+ *  archives).
+ *
+ *  Dropping rows means the next save writes a SHORTER array, so back the original up first
+ *  (`keepCorrupt`) — the dropped rows stay recoverable from it. If that backup can't be made (e.g.
+ *  ENOSPC), refuse to drop anything and throw instead: an unrecoverable drop is a failed read, not a
+ *  partial one, and this module's whole contract is that a failed read never reports as empty/shorter. */
+function keepValidRows<T>(
+  schema: z.ZodType<T>,
+  path: string,
+  rows: unknown[],
+  projectPath: string,
+  kind: string,
+  content?: string,
+  report?: StoreReadReport,
+): T[] {
+  const kept: T[] = []
+  for (const row of rows) {
+    const parsed = schema.safeParse(row)
+    if (parsed.success) kept.push(parsed.data)
+  }
+  if (kept.length !== rows.length) {
+    if (!keepCorrupt(path, content)) {
+      throw new StoreReadError(
+        `could not back up ${basename(path)} before dropping ${rows.length - kept.length} ${kind} row(s) — refusing to drop them`,
+        false,
+      )
+    }
+    // The load SUCCEEDS from here, so saving stays on and the shorter list will be written back. That
+    // makes the count the user's only warning that a chat left the list, which is why it travels out
+    // (StoreReadReport → the IPC boundary → the data-integrity banner) instead of only being logged.
+    if (report) report.dropped = rows.length - kept.length
+    log.warn('session-store', `dropped ${rows.length - kept.length} unreadable ${kind} row(s)`, {
+      project: projectPath,
+      kept: kept.length,
+    })
+  }
+  return kept
+}
+
+/** How many distinct-content backups `keepCorrupt` keeps per store, oldest pruned first — bounds the
+ *  pile so months of boots each hitting a different drifted row don't leave an ever-growing stack of
+ *  `.bak` files. */
+export const MAX_CORRUPT_BACKUPS = 5
+
+/** Copy a store that failed to load (or is about to lose rows) aside as `<name>.corrupt-<hash>.bak`
+ *  BEFORE anything can overwrite it. A store we can't parse — or a row we're about to drop — is still
+ *  the user's only copy of that data; losing it to our own next write is the failure this whole module
+ *  guards against (same instinct as the v1 migration's `.v1.bak`).
+ *
+ *  Keyed by a hash of the CONTENT, not mere existence: the old "one copy per file, ever" rule meant a
+ *  single benign drop on boot A permanently consumed the only backup slot, so boot B's *different* drop
+ *  months later got no copy at all — the backup voided the very mechanism it exists for. Content-keying
+ *  means a later boot hitting different bad bytes gets its own backup; a boot re-hitting the exact same
+ *  bad bytes is a no-op (already covered). Bounded by `MAX_CORRUPT_BACKUPS` (oldest pruned by mtime).
+ *
+ *  Returns whether a copy of `content` now verifiably exists on disk — callers that are about to DROP
+ *  data conditional on it (`keepValidRows`) must not proceed when this is false. Best-effort otherwise:
+ *  a failed copy must never mask the read failure that prompted it. */
+function keepCorrupt(path: string, content?: string): boolean {
+  try {
+    const text = content ?? readFileSync(path, 'utf8')
+    const hash = createHash('sha256').update(text).digest('hex').slice(0, 12)
+    const dir = dirname(path)
+    const prefix = `${basename(path)}.corrupt-`
+    const backup = join(dir, `${prefix}${hash}.bak`)
+    if (!existsSync(backup)) {
+      copyFileSync(path, backup)
+      log.warn('session-store', 'kept a copy of an unreadable store', { backup })
+      pruneOldCorruptBackups(dir, prefix)
+    }
+    return true
+  } catch (err) {
+    log.warn('session-store', 'could not back up an unreadable store', err instanceof Error ? err.message : err)
+    return false
+  }
+}
+
+/** Keep only the `MAX_CORRUPT_BACKUPS` most-recently-written backups for one store, oldest first
+ *  deleted. Best-effort: a failed prune just leaves an extra file around, never blocks the backup that
+ *  triggered it. */
+function pruneOldCorruptBackups(dir: string, prefix: string): void {
+  try {
+    const files = readdirSync(dir)
+      .filter((n) => n.startsWith(prefix) && n.endsWith('.bak'))
+      .map((n) => ({ name: n, mtime: statSync(join(dir, n)).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime)
+    for (const f of files.slice(MAX_CORRUPT_BACKUPS)) unlinkSync(join(dir, f.name))
+  } catch {
+    /* best-effort */
+  }
 }
 
 /** Persist the metadata index (light — no transcript bodies). Returns whether the write landed, so a
@@ -169,7 +360,14 @@ export function saveArchivedMeta(projectPath: string, archived: ArchivedSessionM
 export function loadArchivedBody(projectPath: string, sessionId: string): unknown[] | null {
   try {
     const parsed = ArchivedBodySchema.safeParse(JSON.parse(readFileSync(archiveBodyPath(projectPath, sessionId), 'utf8')))
-    return parsed.success ? parsed.data.items : null
+    if (!parsed.success) return null
+    const replay = normalizeReplaySequence(
+      settleRestoredDelegationReplay(loadRemoteReplay(projectPath, sessionId, sessionId)),
+    )
+    if (!replay.length) return parsed.data.items
+    return parsed.data.items.length
+      ? mergeReplayIntoTranscript(parsed.data.items, replay)
+      : transcriptFromReplay(replay)
   } catch {
     return null
   }
@@ -193,12 +391,16 @@ export function deleteArchivedBody(projectPath: string, sessionId: string): void
   } catch {
     /* already gone / never written */
   }
+  deleteRemoteReplay(projectPath, sessionId)
 }
 
 /** Ingest full archives found still inline in a pre-split hot blob (loadProjectSessions migration) —
  *  split each to a body + metadata and merge into the index, newest-first. Returns whether the index
  *  write landed: the migration MUST NOT strip these archives from the hot file unless this is true, or a
- *  failed cold write would lose them from both places. */
+ *  failed cold write would lose them from both places. Can also THROW (via `loadArchivedMeta`, e.g. a
+ *  present-but-unreadable index) — callers that are about to remove the same session from the hot store
+ *  (`archiveSession` below) must call this FIRST and let a throw propagate before touching the hot
+ *  store, or a throwing ingest deletes the session from both places at once (C2). */
 export function ingestFullArchives(projectPath: string, full: ArchivedSession[]): boolean {
   const existing = loadArchivedMeta(projectPath)
   const metas = full.map((f) => splitArchive(projectPath, f))
@@ -214,8 +416,18 @@ function applyArchiveRetention(projectPath: string, metas: ArchivedSessionMeta[]
   const cutoff = Date.now() - days * 86_400_000
   const kept = metas.filter((m) => m.archivedAt >= cutoff)
   if (kept.length === metas.length) return metas
+  // Index first and only carry on if it took the write — the same order `deleteArchived` follows, and
+  // for the same reason. Unlinking the bodies first leaves rows on disk whose transcripts are gone, and
+  // nothing says so while retention is on because this filter hides those rows on every load. Setting
+  // retention back to Forever then hands the user back a list of chats that all open to nothing.
+  if (!saveArchivedMeta(projectPath, kept)) {
+    log.warn('session-store', 'retention purge skipped — the archived index refused the write', {
+      project: projectPath,
+      days,
+    })
+    return metas
+  }
   for (const m of metas) if (m.archivedAt < cutoff) deleteArchivedBody(projectPath, m.id)
-  saveArchivedMeta(projectPath, kept)
   log.info('session-store', `auto-deleted ${metas.length - kept.length} archived session(s) past retention`, {
     project: projectPath,
     days,
@@ -223,36 +435,93 @@ function applyArchiveRetention(projectPath: string, metas: ArchivedSessionMeta[]
   return kept
 }
 
-/** The persisted sessions for a project, or null when its file is missing/corrupt/invalid. */
-export function loadProjectSessions(projectPath: string): PersistedSessions | null {
+/** The persisted sessions for a project, or `null` when the project has NO store file yet (nothing was
+ *  ever saved here — safe to start empty and save over). A zero-length/whitespace-only file reads the
+ *  same way (see the comment inline below).
+ *
+ *  A non-empty store that can't be read/parsed/validated THROWS. It used to return the same `null`,
+ *  which the renderer flattens to "no sessions", hydrates, and — 500ms later, unattended — saves back
+ *  over the file it just failed to read. The renderer's boot-load `.catch` deliberately does not
+ *  hydrate, so the throw is what keeps persistence read-only for the run and leaves the file intact. */
+export function loadProjectSessions(projectPath: string, report?: StoreReadReport): PersistedSessions | null {
+  const path = projectStorePath(projectPath)
+  if (!existsSync(path)) return null
+  let text: string
   try {
-    const stored = StoredProjectSchema.safeParse(JSON.parse(readFileSync(projectStorePath(projectPath), 'utf8')))
-    if (!stored.success) return null
-    // One-shot migration to the cold archive store: a pre-split store carries `archived` inline — move
-    // them out (split to body + metadata) and rewrite the hot file without (shrinking it by whatever the
-    // archive had grown to). After this runs once the branch never triggers again for that project.
-    if (stored.data.archived?.length) {
-      // Only strip the archives from the hot file once the cold write is CONFIRMED — otherwise a failed
-      // cold write would delete them from both places (they're irreplaceable). On failure, leave the hot
-      // file untouched so the archives survive inline and the migration retries next boot.
-      if (ingestFullArchives(projectPath, stored.data.archived)) {
-        const { archived: _archived, ...hot } = stored.data
-        writeFileAtomic(projectStorePath(projectPath), JSON.stringify(hot, null, 2))
-        log.info('session-store', 'migrated archived sessions to the cold store', {
-          project: projectPath,
-          count: stored.data.archived.length,
-        })
-        return PersistedSessionsSchema.parse(hot)
-      }
-      log.warn('session-store', 'archive cold-store migration write failed — kept inline for retry', {
-        project: projectPath,
-      })
-    }
-    // The renderer doesn't need projectPath back — PersistedSessionsSchema strips it.
-    return PersistedSessionsSchema.parse(stored.data)
-  } catch {
-    return null
+    text = readFileSync(path, 'utf8')
+  } catch (err) {
+    // Same as the archive index above: with no `content` to hand, keepCorrupt re-reads a file that has
+    // just proved unreadable, so this is the path where no copy exists. Say so honestly.
+    const backupKept = keepCorrupt(path)
+    log.warn('session-store', 'session store unreadable — refusing to report it as empty', {
+      project: projectPath,
+      error: err instanceof Error ? err.message : String(err),
+      backupKept,
+    })
+    throw new StoreReadError(err instanceof Error ? err.message : String(err), backupKept)
   }
+  // A zero-length (or whitespace-only) file holds no data — `writeFileAtomic` doesn't fsync, so a power
+  // cut right after its rename can land exactly this. It's indistinguishable from "nothing saved yet"
+  // and has nothing to protect; treating it as corrupt bricks the project (every boot fails to parse it
+  // and refuses to save over it — forever — for a file worth nothing).
+  if (!text.trim()) return null
+  let raw: unknown
+  try {
+    raw = JSON.parse(text)
+  } catch (err) {
+    const backupKept = keepCorrupt(path, text)
+    log.warn('session-store', 'session store unreadable — refusing to report it as empty', {
+      project: projectPath,
+      error: err instanceof Error ? err.message : String(err),
+      backupKept,
+    })
+    throw new StoreReadError(err instanceof Error ? err.message : String(err), backupKept)
+  }
+  const stored = StoredProjectReadSchema.safeParse(raw)
+  if (!stored.success) {
+    const backupKept = keepCorrupt(path, text)
+    log.warn('session-store', 'session store present but invalid — refusing to report it as empty', {
+      project: projectPath,
+      issue: stored.error.issues[0]?.message,
+      backupKept,
+    })
+    throw new StoreReadError('session store is present but unreadable', backupKept)
+  }
+  // Sessions are validated row-by-row (keepValidRows/W5) rather than all-or-nothing — one drifted field
+  // on one session (e.g. a new `approvalMode` enum value an older build doesn't know, the named trigger
+  // for this whole branch) must not cost the user every other chat in the project.
+  const sessions = keepValidRows(
+    PersistedSessionSchema,
+    path,
+    stored.data.sessions,
+    projectPath,
+    'session',
+    text,
+    report,
+  )
+  const data = { ...stored.data, sessions }
+  // One-shot migration to the cold archive store: a pre-split store carries `archived` inline — move
+  // them out (split to body + metadata) and rewrite the hot file without (shrinking it by whatever the
+  // archive had grown to). After this runs once the branch never triggers again for that project.
+  if (data.archived?.length) {
+    // Only strip the archives from the hot file once the cold write is CONFIRMED — otherwise a failed
+    // cold write would delete them from both places (they're irreplaceable). On failure, leave the hot
+    // file untouched so the archives survive inline and the migration retries next boot.
+    if (ingestFullArchives(projectPath, data.archived)) {
+      const { archived: _archived, ...hot } = data
+      writeFileAtomic(path, JSON.stringify(hot, null, 2))
+      log.info('session-store', 'migrated archived sessions to the cold store', {
+        project: projectPath,
+        count: data.archived.length,
+      })
+      return PersistedSessionsSchema.parse(hot)
+    }
+    log.warn('session-store', 'archive cold-store migration write failed — kept inline for retry', {
+      project: projectPath,
+    })
+  }
+  // The renderer doesn't need projectPath back — PersistedSessionsSchema strips it.
+  return PersistedSessionsSchema.parse(data)
 }
 
 /** Lean read of ONE session's persisted record, for the remote transcript path. `loadProjectSessions`
@@ -296,6 +565,30 @@ export function saveProjectSessions(projectPath: string, data: PersistedSessions
   } catch (err) {
     log.warn('session-store', 'failed to persist sessions', err instanceof Error ? err.message : err)
   }
+}
+
+/** Archive one session: write it to the cold archive store FIRST, and only remove it from the hot
+ *  store once that write is durably confirmed (C2). `ingestFullArchives` can THROW (a present-but-
+ *  unreadable archive index) or return `false` (a failed write) — either way the session must survive in
+ *  the hot store rather than vanish from both places. A throw here propagates to the caller untouched;
+ *  the hot store is never rewritten unless this returns `true`.
+ *
+ *  Shared by both of the engine's archive paths (a live session ended from the phone, and a past/history
+ *  one) so the ordering lives in exactly one place instead of being duplicated (and re-broken) per
+ *  caller. Returns whether the archive — and the hot-store removal — actually happened. */
+export function archiveSession(
+  projectPath: string,
+  store: PersistedSessions,
+  session: PersistedSession,
+  storedId: string,
+): boolean {
+  if (!ingestFullArchives(projectPath, [{ ...session, archivedAt: Date.now() }])) return false
+  saveProjectSessions(projectPath, {
+    ...store,
+    activeId: store.activeId === storedId ? null : store.activeId,
+    sessions: store.sessions.filter((s) => s.id !== storedId),
+  })
+  return true
 }
 
 // ── Ghost-session hygiene ──────────────────────────────────────────────────────
@@ -537,24 +830,150 @@ const AppStateSchema = z.object({
   openProjects: z.array(z.string()),
   /** Most-recent-first, capped — shown in ProjectHome. */
   recentProjects: z.array(z.string()),
+  /** Every project ever opened on this Mac, most-recent-first, UNCAPPED — the full set the phone Home
+   *  lists (recents is only the desktop's short list). Seeded once from the on-disk session stores
+   *  (backfillKnownProjects) so it's complete for projects that predate this field. `.default` so older
+   *  state files parse. */
+  knownProjects: z.array(z.string()).default([]),
   /** Optional so older state files (pre-bounds) still parse — absent ⇒ default size. */
   windowBounds: WindowBoundsSchema.optional(),
 })
 export type AppState = z.infer<typeof AppStateSchema>
 
+/** READ-time shape of the same file — the three project-path arrays are `unknown[]`, validated row by
+ *  row below (keepValidRows) instead of all-or-nothing, same reasoning as `StoredProjectReadSchema`: one
+ *  drifted entry must not cost every other one. `windowBounds` is left as `unknown` and re-validated
+ *  separately (an invalid rect is one field, not a reason to fail the whole file). `version` stays a
+ *  strict literal — a MISMATCHED version (the realistic trigger: a downgrade reading a newer build's
+ *  file) is a shape change, not a bad row, and fails the whole file rather than being tolerated.
+ *  DERIVED from the strict schema rather than restated, so the read and write shapes cannot drift
+ *  apart — a second hand-kept copy is the defect this whole branch exists to stop. */
+const AppStateLooseSchema = AppStateSchema.extend({
+  openProjects: z.array(z.unknown()).default([]),
+  recentProjects: z.array(z.unknown()).default([]),
+  knownProjects: z.array(z.unknown()).default([]),
+  windowBounds: z.unknown().optional(),
+})
+
 const RECENTS_CAP = 20
-const EMPTY_STATE: AppState = { version: 1, openProjects: [], recentProjects: [] }
+const EMPTY_STATE: AppState = { version: 1, openProjects: [], recentProjects: [], knownProjects: [] }
 
 function appStatePath(): string {
   return join(app.getPath('userData'), 'koda-app-state.json')
 }
 
+/** Strict load: absent (or blank/whitespace-only — the same power-cut case `loadProjectSessions` treats
+ *  as benign) returns `EMPTY_STATE`, nothing to protect. Present-but-unreadable (bad bytes, bad JSON, or
+ *  a version mismatch) THROWS after backing the file up via `keepCorrupt` — same contract as
+ *  `loadProjectSessions`/`loadArchivedMeta`. Not exported: the public `loadAppState` below never lets
+ *  this throw escape (see its doc for why), so every WRITE path in this file that would otherwise save
+ *  right back over an unreadable file goes through `loadAppStateForWrite` instead, which does. */
+function loadAppStateStrict(): AppState {
+  const path = appStatePath()
+  if (!existsSync(path)) return EMPTY_STATE
+  let text: string
+  try {
+    text = readFileSync(path, 'utf8')
+  } catch (err) {
+    const backupKept = keepCorrupt(path)
+    log.warn('session-store', 'app state unreadable — refusing to report it as empty', {
+      error: err instanceof Error ? err.message : String(err),
+      backupKept,
+    })
+    throw new StoreReadError(err instanceof Error ? err.message : String(err), backupKept)
+  }
+  if (!text.trim()) return EMPTY_STATE
+  let raw: unknown
+  try {
+    raw = JSON.parse(text)
+  } catch (err) {
+    const backupKept = keepCorrupt(path, text)
+    log.warn('session-store', 'app state unreadable — refusing to report it as empty', {
+      error: err instanceof Error ? err.message : String(err),
+      backupKept,
+    })
+    throw new StoreReadError(err instanceof Error ? err.message : String(err), backupKept)
+  }
+  const loose = AppStateLooseSchema.safeParse(raw)
+  if (!loose.success) {
+    const backupKept = keepCorrupt(path, text)
+    log.warn('session-store', 'app state present but invalid — refusing to report it as empty', {
+      issue: loose.error.issues[0]?.message,
+      backupKept,
+    })
+    throw new StoreReadError('app state is present but unreadable', backupKept)
+  }
+  const openProjects = keepValidRows(z.string(), path, loose.data.openProjects, path, 'open-project', text)
+  const recentProjects = keepValidRows(z.string(), path, loose.data.recentProjects, path, 'recent-project', text)
+  const knownProjects = keepValidRows(z.string(), path, loose.data.knownProjects, path, 'known-project', text)
+  const bounds = WindowBoundsSchema.safeParse(loose.data.windowBounds)
+  return {
+    version: 1,
+    openProjects,
+    recentProjects,
+    knownProjects,
+    windowBounds: bounds.success ? bounds.data : undefined,
+  }
+}
+
+/** Lenient wrapper for the many READ-ONLY call sites across main (default window bounds, the app menu's
+ *  recents, boot's reopen loop, the phone's project list via `knownProjectPaths`) — none of them save
+ *  appState back, so there's nothing for them to clobber, and they already tolerate an empty list the
+ *  same way a `null` from `loadProjectSessions` flattens to "no sessions" for the renderer. The corrupt
+ *  file is still backed up inside `loadAppStateStrict` even though this wrapper swallows the throw, so
+ *  the data isn't silently gone — `loadAppStateForWrite` below is what actually refuses to save. */
 export function loadAppState(): AppState {
   try {
-    const parsed = AppStateSchema.safeParse(JSON.parse(readFileSync(appStatePath(), 'utf8')))
-    return parsed.success ? parsed.data : EMPTY_STATE
-  } catch {
+    const state = loadAppStateStrict()
+    appStateFailure = null
+    return state
+  } catch (err) {
+    appStateFailure = { backupKept: err instanceof StoreReadError ? err.backupKept : null }
     return EMPTY_STATE
+  }
+}
+
+/** What the last strict load found, for the renderer (`app:dataIntegrity` → ProjectHome). `null` once a
+ *  load succeeds again, which is what a user-open recovery below produces — so the notice takes itself
+ *  down rather than outliving the problem. Without this the failure is INVISIBLE: every reader here
+ *  falls back to an empty list, and an empty ProjectHome is pixel-identical to a fresh install. */
+let appStateFailure: { backupKept: BackupKept } | null = null
+
+export function appStateHealth(): { unreadable: boolean; backupKept: BackupKept } {
+  return { unreadable: !!appStateFailure, backupKept: appStateFailure?.backupKept ?? null }
+}
+
+/** Why a write path is loading. `'automatic'` is everything that happens on its own — a window moving,
+ *  boot's backfill, a window closing — and none of it may write over a file we could not read.
+ *  `'user-open'` is the single path a person drives on purpose (see `noteProjectOpened`), and it is the
+ *  way out of an otherwise permanent dead end: refusing every write means the project they just picked
+ *  is forgotten again at the next launch, forever, with the app looking freshly installed each time. */
+type WriteConsent = 'automatic' | 'user-open'
+
+/** For WRITE paths only: every one of this file's appState mutators does load-then-save with no gate in
+ *  between, and (unlike the per-project session store) nothing downstream — there is no renderer here —
+ *  can refuse to persist on its behalf. So the refusal has to live at the load itself: a corrupt file
+ *  returns `undefined` instead of `EMPTY_STATE`, and every automatic caller below skips its save
+ *  entirely rather than write emptiness over the file it just failed to read.
+ *
+ *  A `'user-open'` load starts over from `EMPTY_STATE` instead, but ONLY once `keepCorrupt` has
+ *  confirmed the copy landed: replacing a file we still hold beside the original costs nothing that
+ *  can't be brought back, while replacing the only copy there is would be the exact loss this whole
+ *  refusal exists to prevent. */
+function loadAppStateForWrite(consent: WriteConsent = 'automatic'): AppState | undefined {
+  try {
+    const state = loadAppStateStrict()
+    appStateFailure = null
+    return state
+  } catch (err) {
+    const backupKept = err instanceof StoreReadError ? err.backupKept : null
+    appStateFailure = { backupKept }
+    if (consent === 'user-open' && backupKept === true) {
+      log.warn('session-store', 'app state unreadable — starting a fresh one from a project the user just opened (the original is kept beside it)')
+      return EMPTY_STATE
+    }
+    log.warn('session-store', 'app state unreadable — refusing to let a write clobber it', err instanceof Error ? err.message : err)
+    return undefined
   }
 }
 
@@ -566,29 +985,100 @@ function saveAppState(state: AppState): void {
   }
 }
 
-/** Record a project as open + bump it to the front of recents (deduped, capped). */
+/** Where the open-a-project dialogs should start: ~/Koda (where new projects are created), falling
+ *  back to home before the first project ever exists. Not used by projectCreate, which mkdirs ~/Koda
+ *  unconditionally. */
+export function projectsHomeDir(): string {
+  const dir = join(homedir(), 'Koda')
+  return existsSync(dir) ? dir : homedir()
+}
+
+/** Record a project as open + bump it to the front of recents (deduped, capped) and of the uncapped
+ *  known-projects registry (so it never falls off the phone's full list the way recents does).
+ *
+ *  The ONE `'user-open'` write path. Every call site is a person choosing a project — the folder picker
+ *  (ProjectHome and ⌘O), a recents/Open-Recent entry, a worktree opened from Versions, a project just
+ *  created — so reaching here means someone asked for this list to change. Nothing automatic may be
+ *  routed through this function; add it to `noteProjectClosed`'s side of the file instead. */
 export function noteProjectOpened(projectPath: string): void {
-  const s = loadAppState()
+  const s = loadAppStateForWrite('user-open')
+  if (!s) return
   const openProjects = s.openProjects.includes(projectPath) ? s.openProjects : [...s.openProjects, projectPath]
   const recentProjects = [projectPath, ...s.recentProjects.filter((p) => p !== projectPath)].slice(0, RECENTS_CAP)
-  saveAppState({ ...s, openProjects, recentProjects })
+  const knownProjects = [projectPath, ...s.knownProjects.filter((p) => p !== projectPath)]
+  saveAppState({ ...s, openProjects, recentProjects, knownProjects })
 }
 
 /** Record a project window as closed (drops it from openProjects; stays in recents). */
 export function noteProjectClosed(projectPath: string): void {
-  const s = loadAppState()
+  const s = loadAppStateForWrite()
+  if (!s) return
   saveAppState({ ...s, openProjects: s.openProjects.filter((p) => p !== projectPath) })
 }
 
 /** Project deleted (moved to the Trash): drop it from both lists — a dead recents entry would
  *  otherwise linger until the cap pushes it out. */
 export function noteProjectDeleted(projectPath: string): void {
-  const s = loadAppState()
+  const s = loadAppStateForWrite()
+  if (!s) return
   saveAppState({
     ...s,
     openProjects: s.openProjects.filter((p) => p !== projectPath),
     recentProjects: s.recentProjects.filter((p) => p !== projectPath),
+    knownProjects: s.knownProjects.filter((p) => p !== projectPath),
   })
+}
+
+/** Run once at boot. Seed knownProjects from the on-disk session stores so a Mac that predates the
+ *  field (or that opened projects on an older build) still lists ALL of them on the phone, not just the
+ *  20 in recents. Each `koda-sessions-<hash>.json` stamps its own `projectPath`, so the store set IS the
+ *  registry of projects ever worked in here. Idempotent (a union) and fail-soft: a corrupt store is
+ *  skipped, a read/write failure just leaves the seed for next boot. */
+export function backfillKnownProjects(): void {
+  try {
+    const dir = app.getPath('userData')
+    const fromStores: string[] = []
+    for (const name of readdirSync(dir)) {
+      if (!name.startsWith('koda-sessions-') || !name.endsWith('.json')) continue
+      try {
+        const p = (JSON.parse(readFileSync(join(dir, name), 'utf8')) as { projectPath?: unknown }).projectPath
+        if (typeof p === 'string' && p) fromStores.push(p)
+      } catch {
+        /* corrupt/partial store — skip it */
+      }
+    }
+    const s = loadAppStateForWrite()
+    if (!s) return
+    // recents on top (freshest), then the already-known set, then anything new the stores turned up.
+    const merged: string[] = []
+    const seen = new Set<string>()
+    for (const p of [...s.recentProjects, ...s.knownProjects, ...fromStores]) {
+      if (seen.has(p)) continue
+      seen.add(p)
+      merged.push(p)
+    }
+    if (merged.length !== s.knownProjects.length || merged.some((p, i) => p !== s.knownProjects[i])) {
+      saveAppState({ ...s, knownProjects: merged })
+    }
+  } catch (err) {
+    log.warn('session-store', 'known-projects backfill failed (skipped)', err instanceof Error ? err.message : err)
+  }
+}
+
+/** The phone's full project list: every project ever worked in on this Mac that still exists on disk,
+ *  most-recent-first. Recents float on top (the freshness the phone Home relies on), then the rest of the
+ *  known set. This is the phone's start/resume/browse whitelist too — the phone can act in any project
+ *  the user has here, never an arbitrary directory. */
+export function knownProjectPaths(): string[] {
+  const s = loadAppState()
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const p of [...s.recentProjects, ...s.knownProjects]) {
+    if (seen.has(p)) continue
+    seen.add(p)
+    if (existsSync(p)) out.push(p)
+  }
+  return out
 }
 
 /** Delete every per-project session artifact when a project is deleted. All of these are keyed by the
@@ -604,6 +1094,16 @@ export function purgeProjectSessions(projectPath: string): void {
   ]
   for (const f of kodaStores) rmQuiet(f)
   rmQuiet(archiveBodiesDir(projectPath), true)
+  purgeRemoteReplayProject(projectPath)
+  // …plus any `.corrupt-<ts>.bak` kept aside for those two stores — they hold the same project's data.
+  for (const f of [projectStorePath(projectPath), archiveIndexPath(projectPath)]) {
+    try {
+      const prefix = `${basename(f)}.corrupt-`
+      for (const n of readdirSync(dirname(f))) if (n.startsWith(prefix) && n.endsWith('.bak')) rmQuiet(join(dirname(f), n))
+    } catch {
+      /* userData unreadable — the delete must still finish */
+    }
+  }
   // The engine keyed its jsonl store by the cwd it was spawned with — either the path as given or its
   // realpath — so purge both slug forms.
   const engineDirs = new Set(
@@ -624,5 +1124,7 @@ function rmQuiet(path: string, recursive = false): void {
 
 /** Remember the window's size + position so the next launch reopens at it (see createWindow). */
 export function saveWindowBounds(bounds: WindowBounds): void {
-  saveAppState({ ...loadAppState(), windowBounds: bounds })
+  const s = loadAppStateForWrite()
+  if (!s) return
+  saveAppState({ ...s, windowBounds: bounds })
 }

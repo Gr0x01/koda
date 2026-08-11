@@ -27,12 +27,13 @@ import { promisify } from 'node:util'
 const execFileP = promisify(execFile)
 
 // ── Claude ─────────────────────────────────────────────────────────────────────────────────────────
-// Pinned to the npm `stable` dist-tag (not `latest`) — our posture favors stable over bleeding-edge.
-// 2.1.197 brings Sonnet 5 + native 1M context while staying BEFORE background-subagents-by-default
-// (2.1.198) and the permission-default→Manual flip (2.1.200), both of which touch seams Koda renders.
-// Bump deliberately (the engine-contract workflow opens the PR). NOTE: check-engine-floor.mjs + the
-// workflow read `PINNED_VERSION` by regex — keep the name.
-const PINNED_VERSION = '2.1.205'
+// Normally pinned to the npm `stable` dist-tag (not `latest`) — our posture favors stable over
+// bleeding-edge. 2.1.221 is a deliberate exception: it's `latest` (stable was 2.1.220 at pin time)
+// because the fixes that motivate this bump land only in 221 — the `-p` stream-json MCP first-turn
+// connect fix (Koda's exact launch path) and the zsh `[[ ]]` Bash permission-bypass fix — while 220
+// was bug-fixes-only. Re-converge on `stable` at the next bump. Bump deliberately (the engine-contract
+// workflow opens the PR). NOTE: check-engine-floor.mjs + the workflow read `PINNED_VERSION` by regex — keep the name.
+const PINNED_VERSION = '2.1.221'
 const CLAUDE_BASE = 'https://downloads.claude.ai/claude-code-releases'
 
 // ── Codex ──────────────────────────────────────────────────────────────────────────────────────────

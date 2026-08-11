@@ -1,0 +1,17 @@
+{
+  "description": "Keep existing project and user agents foreground while Koda's bounded leaves run in the background.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/osascript -l JavaScript \"${CLAUDE_PLUGIN_ROOT}/hooks/constrain-delegation.js\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

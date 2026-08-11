@@ -163,7 +163,13 @@ export function RecentImages() {
               <button
                 type="button"
                 onClick={() =>
-                  addAttachments(activeId, [{ mediaType: img.mediaType, dataBase64: img.dataBase64 }])
+                  addAttachments(activeId, [
+                    {
+                      mediaType: img.mediaType,
+                      dataBase64: img.dataBase64,
+                      scratchPath: img.relPath,
+                    },
+                  ])
                 }
                 title="Add to message"
                 aria-label="Add to message"

@@ -25,10 +25,23 @@ let status: UpdateStatus = { state: 'idle' }
 // The version being downloaded — tracked independently of `status` so a stray download-progress event
 // (or one that races a re-check) can't emit a blank version.
 let downloadingVersion = ''
+// The durable fact: this build is downloaded and staged on disk, installable right now. Kept apart
+// from `status` because `status` also carries transient check outcomes.
+let staged: { version: string } | null = null
 
 function broadcast(next: UpdateStatus): void {
-  status = next
-  for (const win of BrowserWindow.getAllWindows()) win.webContents.send(IpcChannels.updateStatus, next)
+  // A staged update outlives every later check. The 6-hourly re-check emits checking / up-to-date /
+  // error (and re-download churn for the version already on disk); none of that unstages anything, so
+  // none of it may erase the install offer. Only news of a genuinely different build supersedes it.
+  // A blank version is a stray progress event, not a new build — `next.version` is '' when progress
+  // arrives before any update-available, and treating that as superseding would replace a real offer
+  // with an untitled "Downloading…".
+  const supersedes = 'version' in next && !!next.version && next.version !== staged?.version
+  const effective: UpdateStatus =
+    staged && !supersedes ? { state: 'ready', version: staged.version } : next
+  status = effective
+  for (const win of BrowserWindow.getAllWindows())
+    win.webContents.send(IpcChannels.updateStatus, effective)
 }
 
 /** Wire autoUpdater + kick the first check. Packaged-only: autoUpdater throws in dev ("application is
@@ -56,6 +69,11 @@ export function initUpdater(): void {
   autoUpdater.on('checking-for-update', () => broadcast({ state: 'checking' }))
   autoUpdater.on('update-available', (info) => {
     downloadingVersion = info.version
+    // electron-updater empties its pending-update cache before downloading a DIFFERENT build, so the
+    // previously staged file is deleted from disk the moment this fires. Forget it here or a later
+    // failure would coerce the offer back to a build that no longer exists — "Restart to update" that
+    // can never succeed. Same-version churn re-downloads over the same file and is left alone.
+    if (staged && info.version !== staged.version) staged = null
     broadcast({ state: 'downloading', version: info.version, percent: 0 })
   })
   autoUpdater.on('update-not-available', () => broadcast({ state: 'up-to-date' }))
@@ -63,7 +81,10 @@ export function initUpdater(): void {
     // Progress events don't carry the version; use the one captured at update-available.
     broadcast({ state: 'downloading', version: downloadingVersion, percent: Math.round(p.percent) })
   })
-  autoUpdater.on('update-downloaded', (info) => broadcast({ state: 'ready', version: info.version }))
+  autoUpdater.on('update-downloaded', (info) => {
+    staged = { version: info.version }
+    broadcast({ state: 'ready', version: info.version })
+  })
   autoUpdater.on('error', (err) => {
     broadcast({ state: 'error', message: err instanceof Error ? err.message : String(err) })
   })
@@ -88,9 +109,10 @@ export function getUpdateStatus(): UpdateStatus {
   return status
 }
 
-/** Restart into the downloaded update. Guarded to `ready` so a stray call can't quit mid-download. */
+/** Restart into the downloaded update. Guarded on the staged build (not the possibly-transient
+ *  `status`) so a stray call can't quit with nothing on disk to install. */
 export function quitAndInstallUpdate(): void {
-  if (status.state !== 'ready') return
+  if (!staged) return
   autoUpdater.quitAndInstall()
 }
 

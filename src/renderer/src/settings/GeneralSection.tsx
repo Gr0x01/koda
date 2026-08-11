@@ -24,6 +24,8 @@ export function GeneralSection() {
   const [notifications, setNotifications] = useState<boolean | null>(null)
   const [usageResetNotify, setUsageResetNotify] = useState<boolean | null>(null)
   const [providerStatusNotify, setProviderStatusNotify] = useState<boolean | null>(null)
+  const [daySessions, setDaySessions] = useState<boolean | null>(null)
+  const [critiquePass, setCritiquePass] = useState<boolean | null>(null)
   const [imageDetail, setImageDetail] = useState<ImageDetail | null>(null)
   const [retentionDays, setRetentionDays] = useState<number | null>(null)
 
@@ -34,6 +36,8 @@ export function GeneralSection() {
         setNotifications(s.notificationsEnabled)
         setUsageResetNotify(s.usageResetNotify)
         setProviderStatusNotify(s.providerStatusNotify)
+        setDaySessions(s.appDaySessions)
+        setCritiquePass(s.critiquePass)
         setImageDetail(s.imageDetail)
         setRetentionDays(s.scratchRetentionDays)
       })
@@ -54,6 +58,16 @@ export function GeneralSection() {
   const toggleProviderStatusNotify = (next: boolean): void => {
     setProviderStatusNotify(next)
     window.koda.updateSettings({ providerStatusNotify: next }).catch(console.error) // main reads it live
+  }
+
+  const toggleDaySessions = (next: boolean): void => {
+    setDaySessions(next)
+    window.koda.updateSettings({ appDaySessions: next }).catch(console.error) // both heads read it live
+  }
+
+  const toggleCritiquePass = (next: boolean): void => {
+    setCritiquePass(next)
+    window.koda.updateSettings({ critiquePass: next }).catch(console.error) // applies to the next session
   }
 
   const changeImageDetail = (next: ImageDetail): void => {
@@ -100,6 +114,34 @@ export function GeneralSection() {
               checked={providerStatusNotify ?? true}
               onChange={toggleProviderStatusNotify}
               label="Provider back up"
+            />
+          }
+        />
+      </SettingsSection>
+
+      <SettingsSection title="Apps">
+        <SettingsRow
+          label="A new conversation each day"
+          description="What you say to an app's ask-or-fix line starts a fresh conversation each day, named for that day — so a month of logging is a month of dated chats you can look back through, instead of one endless thread. Turn it off to keep a single running conversation per app."
+          control={
+            <Toggle
+              checked={daySessions ?? true}
+              onChange={toggleDaySessions}
+              label="A new conversation each day"
+            />
+          }
+        />
+      </SettingsSection>
+
+      <SettingsSection title="Finishing work">
+        <SettingsRow
+          label="Check the work before calling it done"
+          description="Nothing substantial gets finished on the builder's own say-so. Something you'll actually look at — a screen, a page, a document — is opened by a second agent that didn't build it and compared against the standard agreed on up front; a finished feature gets its change read for real problems and checked against the rest of the project for duplicate paths and competing owners. Either way the biggest thing it finds gets fixed, and you never have to ask. Small fixes and routine edits skip it. Adds a few minutes and a bit more of your usage window each time — turn it off when you'd rather spend that on building."
+          control={
+            <Toggle
+              checked={critiquePass ?? true}
+              onChange={toggleCritiquePass}
+              label="Check the work before calling it done"
             />
           }
         />

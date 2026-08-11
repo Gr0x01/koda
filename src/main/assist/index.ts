@@ -22,9 +22,9 @@ function getEngine(): AssistEngine {
   return engine
 }
 
-/** A clean session title for the user's first prompt. */
-export function assistTitle(text: string): Promise<string> {
-  return getEngine().assist('title', text)
+/** A clean session title from a prompt or work digest; `avoid` = sibling names it must not collide with. */
+export function assistTitle(text: string, avoid: string[] = []): Promise<string> {
+  return getEngine().assist('title', text, avoid)
 }
 
 /** A calm, human-readable label for a safety-git recovery point. */

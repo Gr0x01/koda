@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { docMention, docMentionLabel } from '../../doc-mentions'
 
 type DocEntry = { path: string; rel: string; name: string; mtimeMs: number }
 
@@ -42,11 +43,6 @@ function formatWhen(ms: number): string {
   const d = new Date(ms)
   const s = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
   return d.getFullYear() === new Date().getFullYear() ? s : `${s}, ${d.getFullYear()}`
-}
-
-/** Filenames read better without the extension in a documents list ("ship-checklist-iphone"). */
-function displayName(name: string): string {
-  return name.replace(/\.[^.]+$/, '')
 }
 
 /** The doc's opening as a two-part excerpt: a lead (its first heading or sentence, shown in the text
@@ -96,7 +92,7 @@ function Kbd({ children }: { children: React.ReactNode }) {
  *  the textarea's own — color only, never weight, or the glyph advance would drift out of register. */
 export function inkTokens(text: string): React.ReactNode {
   const out: React.ReactNode[] = []
-  const re = /(^|\s)(@\S+)/g
+  const re = /(^|\s)(@"(?:\\.|[^"\\])*"|@\S+)/g
   let last = 0
   let m: RegExpExecArray | null
   while ((m = re.exec(text))) {
@@ -223,7 +219,7 @@ export function useMentionPicker(opts: {
       // Insert the pretty name (no folder, no extension), not the raw path — cleaner in the composer.
       // The full path is restored engine-side at send time (`expandDocMentions` in the store), so the
       // agent still gets an exact, readable location.
-      const ref = `@${displayName(doc.name)} `
+      const ref = `${docMention(docMentionLabel(doc.name))} `
       const next = value.slice(0, mention.start) + ref + value.slice(caret)
       setDraft(activeId, next)
       setMention(null)
@@ -312,7 +308,7 @@ export function useMentionPicker(opts: {
                         : 'whitespace-nowrap text-[13.5px] font-medium text-text'
                     }
                   >
-                    {highlightMatch(displayName(doc.name), query)}
+                    {highlightMatch(docMentionLabel(doc.name), query)}
                   </span>
                   <span className="truncate font-mono text-[11px] text-text-muted/80">
                     {doc.rel.replace(/\/[^/]+$/, '')}

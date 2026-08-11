@@ -1,8 +1,17 @@
-import { useState, type ReactNode } from 'react'
+import { createContext, useContext, useState, type ReactNode } from 'react'
 import ReactMarkdown, { defaultUrlTransform, type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import { copyText } from './copy'
+
+/**
+ * Optional interceptor for local-file links inside assistant markdown. When a
+ * provider is present (desktop workspace), a link that points at a file in the
+ * project opens in the Stage instead of the browser. It returns true if it
+ * handled the href; false/absent falls back to window.open. Kept as context so
+ * this shared component stays pure — mobile and other callers provide nothing.
+ */
+export const LocalLinkContext = createContext<((href: string) => boolean) | null>(null)
 
 /**
  * The single render path for assistant markdown — used both live (streaming
@@ -25,6 +34,28 @@ export function Markdown({ children }: { children: string }) {
         {children}
       </ReactMarkdown>
     </div>
+  )
+}
+
+function MarkdownLink({ href, children }: { href?: string; children: ReactNode }) {
+  const openLocal = useContext(LocalLinkContext)
+  return (
+    <a
+      href={href}
+      onClick={(e) => {
+        e.preventDefault()
+        if (!href) return
+        // Web/mail links always go out to the browser. A local-file link (a doc the agent
+        // wrote and linked in its reply) is handed to the Stage handler first; only if there's
+        // no handler, or it declines, does it fall back to window.open (main's handler → shell).
+        const external = /^(https?:|mailto:)/i.test(href)
+        if (!external && openLocal?.(href)) return
+        window.open(href, '_blank')
+      }}
+      className="text-accent underline underline-offset-2 hover:opacity-80"
+    >
+      {children}
+    </a>
   )
 }
 
@@ -77,19 +108,7 @@ const COMPONENTS: Components = {
   hr: () => <hr className="my-5 border-border" />,
   strong: ({ children }) => <strong className="font-semibold text-text">{children}</strong>,
   em: ({ children }) => <em className="italic">{children}</em>,
-  a: ({ href, children }) => (
-    <a
-      href={href}
-      onClick={(e) => {
-        // Route through main's window-open handler → shell.openExternal; never navigate the shell.
-        e.preventDefault()
-        if (href) window.open(href, '_blank')
-      }}
-      className="text-accent underline underline-offset-2 hover:opacity-80"
-    >
-      {children}
-    </a>
-  ),
+  a: ({ href, children }) => <MarkdownLink href={href}>{children}</MarkdownLink>,
   table: ({ children }) => (
     <div className="my-4 overflow-x-auto">
       <table className="w-full border-collapse text-[0.9em]">{children}</table>

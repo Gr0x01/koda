@@ -55,8 +55,17 @@ export class AssistEngine {
   /**
    * Produce a clean string for `task` from `input`. Always resolves to something usable.
    * The smart path is attempted only when enabled AND not already known-unavailable.
+   * `avoid` (titles only): sibling-session names — an answer that exactly collides gets a date
+   * suffix so two same-topic sessions never share a name. The list is deliberately NOT shown to the
+   * model: measured on-device, the ~3B model ignores "don't use these names" on identical inputs, so
+   * divergence comes from the substance-digest input plus this deterministic floor.
    */
-  async assist(task: AssistTask, input: string): Promise<string> {
+  async assist(task: AssistTask, input: string, avoid: string[] = []): Promise<string> {
+    const out = await this.generate(task, input)
+    return task === 'title' ? disambiguate(out, avoid) : out
+  }
+
+  private async generate(task: AssistTask, input: string): Promise<string> {
     const fallback = deterministic(task, input)
     if (!this.opts.enabled() || this.availability === 'unavailable') return fallback
 
@@ -150,6 +159,18 @@ function looksUnusable(text: string): boolean {
   return /\b(i'?m sorry|i apologi[sz]e|i cannot|i can'?t|i can not|as an ai|as a (chat)?bot|as a language model|cannot (comply|assist|fulfil|help)|no quotes|title case|trailing punctuation)\b/i.test(
     text,
   )
+}
+
+/**
+ * Collision floor for titles: when the answer (model or deterministic) exactly matches a sibling
+ * session's name, a date suffix tells them apart. This is the only hard guarantee of distinct names —
+ * it also covers assist-off machines, where the deterministic first-words title would otherwise
+ * repeat identically forever.
+ */
+function disambiguate(title: string, avoid: string[]): string {
+  const norm = (t: string): string => t.replace(/…$/, '').replace(/\s+/g, ' ').trim().toLowerCase()
+  if (!avoid.some((a) => norm(a) === norm(title))) return title
+  return `${title} · ${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`
 }
 
 /**

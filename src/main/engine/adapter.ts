@@ -12,6 +12,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import type { EngineEvent } from '@shared/ipc'
+import { rateLimitBand } from '@shared/rate-limits'
 import { resolveEnginePath } from './binary'
 import { buildEngineEnv, type EngineEnvOptions } from './env'
 import { looksLikeProviderDown } from './status-watch'
@@ -72,6 +73,24 @@ export interface SessionOpts {
    */
   extraDisallowedTools?: string[]
   /**
+   * This project owns a registered mini app — computed by the Electron layer (the registry lives
+   * there, like extraDisallowedTools' runtime state). Gates the pack's summon-pill rule so a session
+   * in a faced project knows Koda's "Ask or fix this app" pill is claimable, not immovable.
+   */
+  miniAppProject?: boolean
+  /**
+   * The mini-apps dogfood flag is on (the staging create-mini-app skill rides extraPluginDirs) —
+   * computed by the Electron layer like the above. Gates the pack's app-ask routing rule so it never
+   * names a skill that isn't loaded.
+   */
+  miniAppsWired?: boolean
+  /**
+   * The user turned the critique pass off (Settings → General → Finishing work) — assembles the rule
+   * standing it down. Default-on assembles nothing: the always-on `critique-before-done` rule already
+   * carries the behavior, so "on" is the absence of a contradiction rather than an extra instruction.
+   */
+  critiqueOff?: boolean
+  /**
    * Extra plugin dirs to load alongside the bundled pack (each `--plugin-dir`, repeatable). The
    * Electron layer resolves these — today the Koda-managed global skills plugin (the user's
    * gallery-activated skills), kept out of `~/.claude`. Already-validated absolute paths; the
@@ -110,6 +129,8 @@ export interface EngineSession {
   readonly id: string
   sendTurn(text: string, images?: TurnImage[]): void
   interrupt(): void
+  /** A targeted stop for an engine-owned delegated child; absent without a task protocol. */
+  stopTask?(taskId: string): boolean
   dispose(): Promise<void>
 }
 
@@ -145,9 +166,12 @@ class ClaudeSession implements EngineSession {
    *  window). Feed the gauge from this instead. Subagent messages excluded (`!parentToolUseId`). */
   private lastAssistantUsage: unknown = undefined
   private readonly onClose?: (sessionId: string) => void
-  /** Agent/Task launch tool_use ids — lets us route the top-level Agent tool_result
-   *  to SubagentCompleted (its text IS the subagent's final output), not a stray ToolResult. */
+  /** Agent/Task launch tool_use ids — lets us route the top-level Agent tool_result to the
+   *  subagent lifecycle rather than a stray ToolResult. */
   private readonly subagentLaunchIds = new Set<string>()
+  /** Background Agent launch ids. Their immediate tool result is only a receipt; their actual
+   *  result arrives later in task_notification. Foreground agents still finish via tool_result. */
+  private readonly backgroundSubagentIds = new Set<string>()
   /** Launch ids of NESTED subagents (an Agent launched by another subagent). The engine doesn't
    *  stream their inner transcript (spike/capture), so we render them as a tool-child under their
    *  parent and SUPPRESS their top-level task_* lifecycle (which would else show a stuck card). */
@@ -179,6 +203,10 @@ class ClaudeSession implements EngineSession {
       cwd: this.cwd,
       resourcesPath: opts.resourcesPath,
       brokerWired: !!opts.mcpConfigJson,
+      miniAppProject: opts.miniAppProject,
+      miniAppsWired: opts.miniAppsWired,
+      critiqueOff: opts.critiqueOff,
+      engine: 'claude',
     })
 
     // Deep-research stays off always; a project's disabled skills/subagents add their denials; the
@@ -197,6 +225,7 @@ class ClaudeSession implements EngineSession {
         '--output-format', 'stream-json',
         '--verbose', // required for stream-json output (spike/layer-a)
         '--include-partial-messages', // emit text_delta for live paint
+        '--forward-subagent-text', // keep each child's prose + tool steps inspectable under its card
         // Guardrail: no auto deep-research fleets — research live in-turn (see consts above) — plus
         // any default skills/subagents this project switched off. Repeated flag = one token each.
         ...disallowedTools.flatMap((t) => ['--disallowedTools', t]),
@@ -274,6 +303,19 @@ class ClaudeSession implements EngineSession {
     if (this.disposed || this.closed || !this.child.stdin.writable) return
     const msg = { type: 'control_request', request_id: randomUUID(), request: { subtype: 'interrupt' }, uuid: randomUUID() }
     this.child.stdin.write(JSON.stringify(msg) + '\n')
+  }
+
+  /** Stop one background child while the parent process and sibling children keep running. */
+  stopTask(taskId: string): boolean {
+    if (!taskId || this.disposed || this.closed || !this.child.stdin.writable) return false
+    const msg = {
+      type: 'control_request',
+      request_id: randomUUID(),
+      request: { subtype: 'stop_task', task_id: taskId },
+      uuid: randomUUID(),
+    }
+    this.child.stdin.write(JSON.stringify(msg) + '\n')
+    return true
   }
 
   async dispose(): Promise<void> {
@@ -358,9 +400,10 @@ class ClaudeSession implements EngineSession {
         for (const block of asArray(ev?.message?.content)) {
           if (block?.type === 'text' && typeof block.text === 'string') {
             // A top-level API failure (5xx/429/auth) arrives as the CLI's own "API Error: …" assistant
-            // text. Lift it out of the transcript into a typed EngineError so the UI can show a calm,
-            // retryable composer banner instead of raw error prose with a bare status link.
-            if (!parentToolUseId && isApiErrorText(block.text)) {
+            // text; a signed-out engine instead prints a terse "Not logged in · Please run /login". Lift
+            // either out of the transcript into a typed EngineError so the UI shows a calm, actionable
+            // banner (auth → a Sign in button) instead of raw prose a non-engineer can't act on.
+            if (!parentToolUseId && (isApiErrorText(block.text) || isAuthRequiredText(block.text))) {
               this.emitApiError(block.text)
             } else {
               this.onEvent({ type: 'AssistantBlock', sessionId: this.id, markdown: block.text, parentToolUseId })
@@ -399,15 +442,29 @@ class ClaudeSession implements EngineSession {
         for (const block of asArray(ev?.message?.content)) {
           if (block?.type === 'tool_result') {
             const id = String(block.tool_use_id ?? '')
-            // The Agent tool's result IS the subagent's final output → close the card.
+            // Foreground Agent results close the card; background Agents return a launch receipt here.
             if (!parentToolUseId && this.subagentLaunchIds.has(id)) {
-              this.onEvent({
-                type: 'SubagentCompleted',
-                sessionId: this.id,
-                toolUseId: id,
-                resultText: cleanSubagentResult(toolResultText(block.content)),
-                isError: block.is_error === true,
-              })
+              const resultText = toolResultText(block.content)
+              // A background Agent returns an immediate launch receipt through the SAME tool_result
+              // slot a foreground Agent uses for its final answer. The receipt is not evidence and
+              // must not close the card; task_notification carries the real result later.
+              if (isBackgroundSubagentLaunchResult(resultText)) {
+                this.backgroundSubagentIds.add(id)
+                this.onEvent({
+                  type: 'SubagentProgress',
+                  sessionId: this.id,
+                  toolUseId: id,
+                  description: 'Working in background',
+                })
+              } else {
+                this.onEvent({
+                  type: 'SubagentCompleted',
+                  sessionId: this.id,
+                  toolUseId: id,
+                  resultText: cleanSubagentResult(resultText),
+                  isError: block.is_error === true,
+                })
+              }
             } else if (!parentToolUseId && this.workflowLaunchIds.has(id)) {
               // The Workflow launch returned its run id + on-disk dir → open the WorkflowCard and
               // let main watch the journal. The actual result never streams back (spike/capture).
@@ -441,11 +498,15 @@ class ClaudeSession implements EngineSession {
         break
 
       case 'rate_limit_event': {
-        // The account-level subscription window (5-hour / weekly), emitted each turn — surfaces
-        // the reset time + status band in the status bar. The stream carries no precise "% used"
-        // (only what's here); that lives behind a separate authenticated call. spike confirmed shape.
+        // The account-level subscription window (5-hour / seven_day), emitted per turn — surfaces
+        // the reset time + status band in the status bar. Since ~2026-07 the event also carries a
+        // precise `utilization` (0–1), and the server may report only the windows it deems
+        // newsworthy (observed 07-22: seven_day past its 75% threshold, five_hour silent) — so an
+        // absent window means "nothing to report", not "gone". Status gained an `allowed_warning`
+        // variant; normalized to the `warning` band every surface already keys on.
         const info = ev.rate_limit_info
         if (info && typeof info.rateLimitType === 'string' && typeof info.resetsAt === 'number') {
+          const status = typeof info.status === 'string' ? info.status : 'allowed'
           this.onEvent({
             type: 'RateLimitUpdate',
             sessionId: this.id,
@@ -453,8 +514,19 @@ class ClaudeSession implements EngineSession {
             info: {
               rateLimitType: info.rateLimitType,
               resetsAt: info.resetsAt,
-              status: typeof info.status === 'string' ? info.status : 'allowed',
+              status:
+                typeof info.utilization === 'number'
+                  ? rateLimitBand(info.utilization * 100)
+                  : status === 'allowed_warning'
+                    ? 'warning'
+                    : status,
               isUsingOverage: info.isUsingOverage === true,
+              usedPercent:
+                typeof info.utilization === 'number'
+                  ? Math.round(info.utilization * 100)
+                  : undefined,
+              observedAt: Date.now(),
+              source: 'stream',
             },
           })
         }
@@ -466,12 +538,19 @@ class ClaudeSession implements EngineSession {
   /** Open a SubagentCard (idempotent per launch id — both the Agent tool_use and
    *  system/task_started describe the same launch; whichever lands first wins). */
   private emitSubagentStarted(id: string, input: Record<string, any>): void {
-    if (!id || this.subagentLaunchIds.has(id)) return
+    if (!id) return
+    const taskId = typeof input.task_id === 'string' ? input.task_id : undefined
+    if (this.subagentLaunchIds.has(id)) {
+      if (taskId)
+        this.onEvent({ type: 'SubagentProgress', sessionId: this.id, toolUseId: id, taskId })
+      return
+    }
     this.subagentLaunchIds.add(id)
     this.onEvent({
       type: 'SubagentStarted',
       sessionId: this.id,
       toolUseId: id,
+      taskId,
       subagentType: typeof input.subagent_type === 'string' ? input.subagent_type : 'subagent',
       description: typeof input.description === 'string' ? input.description : '',
       prompt: typeof input.prompt === 'string' ? input.prompt : undefined,
@@ -497,6 +576,7 @@ class ClaudeSession implements EngineSession {
    *  `tool_use_id` = the Agent launch id. Drives the card's live status + usage. */
   private translateTask(ev: Record<string, any>): void {
     const toolUseId = typeof ev.tool_use_id === 'string' ? ev.tool_use_id : undefined
+    const taskId = typeof ev.task_id === 'string' ? ev.task_id : undefined
     // Nested subagents render as a tool-child under their parent (their inner transcript isn't
     // streamed) — drop their top-level lifecycle so they don't double-render as a stuck card.
     if (toolUseId && this.nestedSubagentIds.has(toolUseId)) return
@@ -510,23 +590,33 @@ class ClaudeSession implements EngineSession {
             type: 'SubagentProgress',
             sessionId: this.id,
             toolUseId,
+            taskId,
             description: typeof ev.description === 'string' ? ev.description : undefined,
             lastToolName: typeof ev.last_tool_name === 'string' ? ev.last_tool_name : undefined,
             usage: normalizeUsage(ev.usage),
           })
         break
       case 'task_notification':
-        if (toolUseId)
-          this.onEvent({
-            type: 'SubagentProgress',
-            sessionId: this.id,
-            toolUseId,
-            status: typeof ev.status === 'string' ? ev.status : undefined,
-            usage: normalizeUsage(ev.usage),
-          })
+        if (toolUseId) {
+          this.emitSubagentStarted(toolUseId, ev)
+          if (this.backgroundSubagentIds.has(toolUseId)) {
+            this.onEvent(taskNotificationToCompletion(this.id, toolUseId, ev))
+          } else {
+            // Foreground agents also announce their task status here, but their full answer follows
+            // in the Agent tool_result. Keep the card live until that evidence-bearing result lands.
+            this.onEvent({
+              type: 'SubagentProgress',
+              sessionId: this.id,
+              toolUseId,
+              taskId,
+              description: typeof ev.status === 'string' ? ev.status : undefined,
+              usage: normalizeUsage(ev.usage),
+            })
+          }
+        }
         break
-      // task_updated carries only task_id + patch (no tool_use_id to join on); completion
-      // is covered by the Agent tool_result → SubagentCompleted. Ignored.
+      // task_updated carries only task_id + patch (no tool_use_id to join on). The joinable foreground
+      // tool_result / background task_notification paths above carry the lifecycle Koda can render.
     }
   }
 
@@ -577,9 +667,23 @@ function isApiErrorText(text: string): boolean {
   return /^\s*api error:/i.test(text)
 }
 
+/** The bundled CLI's terse "not signed in" notice (e.g. "Not logged in · Please run /login"). Length-
+ *  capped so a real answer that merely mentions logging in isn't mistaken for the CLI's own notice. */
+function isAuthRequiredText(text: string): boolean {
+  const t = text.trim()
+  if (t.length > 120) return false
+  return /^not logged in\b/i.test(t) || /please run\s*\/?login/i.test(t)
+}
+
 /** The subagent-launch tool — "Agent" on 2.1.x, legacy "Task" (spike/subagent §Q1). */
 function isSubagentTool(name: unknown): boolean {
   return name === 'Agent' || name === 'Task'
+}
+
+/** The exact metadata receipt Claude 2.1.x returns immediately for an async Agent launch. It is not
+ *  the child's answer; treating it as one is the empty/premature-card bug the background spike found. */
+export function isBackgroundSubagentLaunchResult(text: string): boolean {
+  return /^Async agent launched successfully\./.test(text) && text.includes('working in the background')
 }
 
 /** The background multi-agent orchestration tool (spike/capture). */
@@ -593,6 +697,27 @@ function normalizeUsage(u: unknown): { totalTokens?: number; toolUses?: number; 
   const o = u as Record<string, unknown>
   const num = (v: unknown) => (typeof v === 'number' ? v : undefined)
   return { totalTokens: num(o.total_tokens), toolUses: num(o.tool_uses), durationMs: num(o.duration_ms) }
+}
+
+/** Background children finish through system/task_notification, not an Agent tool_result. Kept pure
+ *  so the normal unit lane can pin this version-sensitive wire translation. */
+export function taskNotificationToCompletion(
+  sessionId: string,
+  toolUseId: string,
+  ev: Record<string, any>,
+): Extract<EngineEvent, { type: 'SubagentCompleted' }> {
+  const status = typeof ev.status === 'string' ? ev.status : ''
+  const interrupted = status === 'stopped' || status === 'interrupted' || status === 'cancelled'
+  return {
+    type: 'SubagentCompleted',
+    sessionId,
+    toolUseId,
+    taskId: typeof ev.task_id === 'string' ? ev.task_id : undefined,
+    resultText: typeof ev.summary === 'string' ? ev.summary : undefined,
+    outcome: interrupted ? 'interrupted' : 'completed',
+    isError: !interrupted && status !== '' && status !== 'completed',
+    usage: normalizeUsage(ev.usage),
+  }
 }
 
 /**

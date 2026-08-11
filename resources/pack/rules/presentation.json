@@ -6,7 +6,7 @@
       "title": "Work like this",
       "section": "core",
       "summary": "Gets on with it — does the work instead of describing it, takes the simplest path that solves the task, and explains things in plain terms.",
-      "members": ["do-the-work", "smallest-thing", "try-it", "talk-like-a-person"]
+      "members": ["do-the-work", "smallest-thing", "try-it", "check-for-a-skill", "critique-before-done", "talk-like-a-person"]
     },
     {
       "id": "thinks-it-through",
@@ -26,22 +26,22 @@
       "id": "careful-where-it-counts",
       "title": "Careful where it counts",
       "section": "core",
-      "summary": "Moves freely on anything that can be undone, but stops to ask before the few things that can't — and when something breaks, looks at going back before patching over it.",
-      "members": ["confirm-at-the-edge", "recover-before-patch", "never-destructive-git"]
+      "summary": "Moves freely on anything that can be undone, but stops to ask before the few things that can't — tells you plainly what changed (including anything you didn't ask for), and when something breaks, looks at going back before patching over it.",
+      "members": ["confirm-at-the-edge", "recap-what-changed", "recover-before-patch", "never-destructive-git"]
     },
     {
       "id": "code",
       "title": "When it writes code",
       "section": "capability",
-      "summary": "How it works with code — checks that things actually work before calling them done, matches your project's existing style, keeps each change small and on-target, and starts backends and data on your machine.",
-      "members": ["verify-before-done", "touch-only-needed", "no-over-engineering", "match-surrounding-code", "local-first-data", "keep-files-focused", "comment-why-not-what", "skip-ceremony", "new-tool-is-users-call", "commit-skillfully", "durable-backup-is-user-git", "finish-the-merge"]
+      "summary": "How it works with code — checks that the current branch fits the work before editing, verifies the result, matches your project's style, and keeps each change small and on-target.",
+      "members": ["verify-before-done", "delegate-independent-work", "delegate-independent-work-codex", "outside-eyes-before-done", "touch-only-needed", "no-over-engineering", "match-surrounding-code", "local-first-data", "keep-files-focused", "comment-why-not-what", "skip-ceremony", "new-tool-is-users-call", "commit-skillfully", "durable-backup-is-user-git", "finish-the-merge"]
     },
     {
       "id": "working-in-koda",
       "title": "Works through Koda",
       "section": "capability",
-      "summary": "Uses Koda's own tools the way they're meant to be used — researches live while you wait, shows running output in the preview instead of a server you can't see, and asks Koda to install any runtime or tool it needs.",
-      "members": ["research-live", "preview-through-koda", "terminal-in-stage", "ask-koda-for-tools"]
+      "summary": "Uses Koda's own tools the way they're meant to be used — researches live while you wait, shows running output in the preview instead of a server you can't see, asks Koda to install any runtime or tool it needs, and builds app ideas as mini apps Koda can run and put on your phone.",
+      "members": ["research-live", "preview-through-koda", "terminal-in-stage", "ask-koda-for-tools", "connectors-check-dont-invent", "app-ask-uses-recipe", "faced-app-summon"]
     }
   ]
 }

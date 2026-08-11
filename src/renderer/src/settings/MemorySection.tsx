@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useWorkspace } from '../workspace/store'
 import { Button } from '../ui'
-import { SettingsSection, SettingsRow } from './controls'
+import { SettingsSection, SettingsRow, Toggle } from './controls'
 import { IconWarning } from './icons'
 
 /**
@@ -21,11 +21,23 @@ export function MemorySection() {
   // there being an idle active session to borrow.
   const canSend = useWorkspace((s) => !!s.projectPath)
   const [hint, setHint] = useState<string | null>(null)
+  const [dream, setDream] = useState<boolean | null>(null)
 
   // Re-read on open — the pill's slow ambient poll may be minutes stale.
   useEffect(() => {
     void refreshMemoryWeight()
+    window.koda.getSettings().then((s) => setDream(s.dreamEnabled)).catch(console.error)
   }, [refreshMemoryWeight])
+
+  const toggleDream = (next: boolean): void => {
+    setDream(next)
+    // Trust the echo, not the optimistic flip: a main process that dropped the field (the 08-04
+    // stale-dev-main incident) snaps the toggle back OFF instead of lying that it took.
+    window.koda
+      .updateSettings({ dreamEnabled: next })
+      .then((s) => setDream(s.dreamEnabled === true))
+      .catch(console.error)
+  }
 
   const tidy = async () => {
     setHint(null)
@@ -84,6 +96,11 @@ export function MemorySection() {
           }
         />
         {hint && <div className="px-4 py-2.5 text-[12px] text-amber-500">{hint}</div>}
+        <SettingsRow
+          label="Tidy overnight"
+          description="A couple of quiet hours after you stop working, Koda tidies the memory of the projects you worked in that day and leaves the session for you to read in the morning. Anything needing your judgment is flagged, never decided. Uses your plan while you're away."
+          control={<Toggle checked={dream ?? false} onChange={toggleDream} label="Tidy overnight" />}
+        />
       </SettingsSection>
     </>
   )

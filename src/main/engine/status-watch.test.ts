@@ -4,8 +4,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 vi.mock('../settings', () => ({ loadProviderStatusNotify: () => true }))
 vi.mock('../logger', () => ({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } }))
 
+import { friendlyEngineError } from '@shared/engine-error'
 import {
+  __setIdleProbe,
   currentProviderStatus,
+  looksLikeProviderDown,
   noteProviderError,
   noteTurnOk,
   refreshProviderStatus,
@@ -51,6 +54,7 @@ beforeEach(() => {
   )
   Object.values(hooks).forEach((h) => h.mockClear())
   setStatusWatchHooks(hooks)
+  __setIdleProbe(() => 3600) // default: away from the desk → recovery pings as normal
 })
 
 afterEach(() => {
@@ -60,6 +64,7 @@ afterEach(() => {
   vi.useRealTimers()
   vi.unstubAllGlobals()
   setStatusWatchHooks(null)
+  __setIdleProbe(null)
 })
 
 describe('provider outage watch — one failed turn, no retrying', () => {
@@ -130,6 +135,31 @@ describe('provider outage watch — one failed turn, no retrying', () => {
     expect(hooks.phonePush).not.toHaveBeenCalled() // silent — the server already handled any ping
   })
 
+  it('skips the phone ping on recovery when you are sitting at the Mac working', async () => {
+    __setIdleProbe(() => 5) // input 5s ago → at the desk
+    feedComponent = 'major_outage'
+    await error('claude') // confirmed down, desktop notification path armed
+
+    feedComponent = 'operational'
+    await vi.advanceTimersByTimeAsync(60_000) // local poll sees green → recovery
+
+    expect(hooks.phonePush).not.toHaveBeenCalled() // desktop notification is enough; no phone ping
+    expect(isDown('claude')).toBeUndefined()
+  })
+
+  it('cancels the server-side watch on recovery when at the desk, so it cannot push either', async () => {
+    hooks.registerRemoteWatch.mockResolvedValueOnce(true) // phone paired → server watch registered
+    __setIdleProbe(() => 5)
+    feedComponent = 'major_outage'
+    await error('claude')
+
+    feedComponent = 'operational'
+    await vi.advanceTimersByTimeAsync(60_000)
+
+    expect(hooks.cancelRemoteWatch).toHaveBeenCalledWith('claude') // server row dropped, no phone push
+    expect(hooks.phonePush).not.toHaveBeenCalled()
+  })
+
   it('reports the honest severity — a slowdown surfaces as degraded, not an outage', async () => {
     feedComponent = 'degraded_performance'
     await error('claude')
@@ -140,5 +170,29 @@ describe('provider outage watch — one failed turn, no retrying', () => {
     )
     // Never overstated as an outage.
     expect(hooks.broadcast).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'outage' }))
+  })
+})
+
+// The pill and the banner used to carry their own copies of this pattern and had drifted, so one failure
+// could light the pill while the banner said something unrelated. Both now read the same predicate.
+describe('provider-down classification agrees between the pill and the banner copy', () => {
+  const providerDown = [
+    'API Error: 500 Internal server error',
+    'API Error: 502 Bad gateway',
+    'API Error: 503 Service unavailable',
+    'API Error: 504 Gateway timeout',
+    'API Error: 529 Overloaded',
+    'Anthropic is temporarily unavailable',
+    'upstream unavailable', // the case only the pill used to catch
+  ]
+
+  it.each(providerDown)('classifies %j as provider-down on both paths', (message) => {
+    expect(looksLikeProviderDown(message)).toBe(true)
+    expect(friendlyEngineError(message, false).tone).toBe('provider')
+  })
+
+  it('still leaves non-provider failures alone on both paths', () => {
+    expect(looksLikeProviderDown('fetch failed: ENOTFOUND')).toBe(false)
+    expect(friendlyEngineError('fetch failed: ENOTFOUND', false).tone).toBe('network')
   })
 })

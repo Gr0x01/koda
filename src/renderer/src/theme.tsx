@@ -61,8 +61,6 @@ type ThemeContextValue = {
   /** The user's mode choice, including 'system'. */
   preference: ThemePreference
   setPreference: (p: ThemePreference) => void
-  /** Quick flip to the opposite EXPLICIT mode (status-bar button) — leaves 'system' behind. */
-  toggle: () => void
   /** The chosen light-mode and dark-mode pack ids (the paired model). */
   lightTheme: string
   darkTheme: string
@@ -116,15 +114,12 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     localStorage.setItem(DARK_THEME_KEY, resolved)
   }
 
-  const toggle = (): void => setPreference(theme === 'dark' ? 'light' : 'dark')
-
   return (
     <ThemeContext.Provider
       value={{
         theme,
         preference,
         setPreference,
-        toggle,
         lightTheme,
         darkTheme,
         setLightTheme,

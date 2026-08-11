@@ -8,7 +8,7 @@ import { Sidebar } from './Sidebar'
 import { SourceControl } from './SourceControl'
 import { SearchOverlay } from './SearchOverlay'
 import { TitleBar } from './TitleBar'
-import { StatusBar, BillingFallbackBanner } from './StatusBar'
+import { StatusBar, BillingFallbackBanner, AccountSignInBanner, DataIntegrityBanner } from './StatusBar'
 import { useWorkspace, activeEditor, PREVIEW_SURFACE_ID } from './store'
 
 // Settings / Versions swap in over the workspace: a soft fade + short rise, quicker fade-out. No scale
@@ -49,6 +49,8 @@ export function Chassis() {
         return void s.newFolder(undefined, true).then((path) => {
           if (path) window.dispatchEvent(new CustomEvent('koda:rename-doc-folder', { detail: path }))
         })
+      // The visible doc editor answers (it owns the rendered DOM); no doc on the Stage = no-op.
+      if (command === 'exportPdf') return window.dispatchEvent(new CustomEvent('koda:export-pdf'))
       useWorkspace.setState((state) => ({ filesRev: state.filesRev + 1 }))
     }), [])
 
@@ -109,6 +111,15 @@ export function Chassis() {
     if (!anyBusy) maybeReveal()
   }, [anyBusy])
 
+  // Already-open handoff: main surfaced this window because the user clicked its app tile elsewhere.
+  // Front that app's face (openFace flips to the app view) so the click lands on the running app.
+  useEffect(() => {
+    return window.koda.onFrontFace?.((dir) => {
+      const s = useWorkspace.getState()
+      if (s.miniApps.some((a) => a.dir === dir)) s.openFace(dir)
+    })
+  }, [])
+
   // ⌘\ flips figure and ground (matches the TitleBar toggle's hint). Only bound while the project
   // actually has an app fronted or frontable.
   useEffect(() => {
@@ -130,7 +141,9 @@ export function Chassis() {
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-bg text-text antialiased">
       <TitleBar />
+      <DataIntegrityBanner />
       <BillingFallbackBanner />
+      <AccountSignInBanner />
       {/* The workspace stays mounted underneath; Settings / Versions animate in as a full-cover layer
           over it (fade + soft rise) and fall away on close instead of hard-cutting. AnimatePresence lives
           here — the parent that owns the open flags — so the exit actually plays. */}

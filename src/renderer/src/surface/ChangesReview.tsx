@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { type SessionChangeGroup } from '../workspace/store'
 import { FileButton } from '../workspace/source-control/shared'
 import { Button } from '../ui'
+import { gitErrorCopy } from '../git-error-copy'
 
 /** A version we just saved — kept so the calm "Saved as …" strip can offer a rename while it's fresh. */
 export type SavedInfo = { sha: string; name: string }
@@ -19,12 +20,18 @@ export function ChangeGroup({
   alsoBy,
   stagedPath,
   onSelect,
+  onOpen,
+  onReveal,
   onDiscard,
 }: {
   group: SessionChangeGroup
   alsoBy: Record<string, string[]>
   stagedPath: string | null
   onSelect: (path: string) => void
+  /** Open the actual file in the editor (read/edit), not its diff. */
+  onOpen: (path: string) => void
+  /** Reveal the file in Finder. */
+  onReveal: (path: string) => void
   /** Discard one file's change (revert an edit, or remove a new file); returns error copy or null. */
   onDiscard: (path: string) => Promise<string | null>
 }) {
@@ -57,6 +64,8 @@ export function ChangeGroup({
               active={stagedPath === f.path}
               onClick={() => onSelect(f.path)}
               title={`See what changed in ${f.path}`}
+              onOpen={() => onOpen(f.path)}
+              onReveal={() => onReveal(f.path)}
               onDiscard={() => onDiscard(f.path)}
               trailing={
                 stagedPath === f.path ? (
@@ -107,7 +116,7 @@ export function Footer({
     try {
       const res = await window.koda.gitCommit({ message: name })
       if (res.ok) await onSaved({ sha: res.sha, name })
-      else setError(saveErrorCopy(res.code))
+      else setError(gitErrorCopy(res.code, 'save'))
     } catch (err) {
       setError('Could not save.')
       console.error('save version failed', err)
@@ -192,7 +201,7 @@ export function SavedStrip({
       } else if (res.code === 'not_head') {
         setNote("This isn't the latest version anymore — rename it from History.")
       } else {
-        setNote(saveErrorCopy(res.code))
+        setNote(gitErrorCopy(res.code, 'save'))
       }
     } catch (err) {
       setNote('Could not rename.')
@@ -282,24 +291,4 @@ export function BranchGlyph({ size = 26 }: { size?: number }) {
       <path d="M6 8.5v7M18 10.5c0 3-2.5 4.5-6 4.5" />
     </svg>
   )
-}
-
-/** Plain-language copy for a tagged commit failure (shared by the save / rename paths). */
-function saveErrorCopy(
-  code: 'no_identity' | 'nothing_to_commit' | 'not_a_repo' | 'not_head' | 'not_clean' | 'git_failed',
-): string {
-  switch (code) {
-    case 'no_identity':
-      return 'Git needs your name and email first. Ask Claude to set them up.'
-    case 'nothing_to_commit':
-      return 'Nothing changed to save.'
-    case 'not_a_repo':
-      return "This project isn't tracked by Git yet."
-    case 'not_head':
-      return "This isn't the latest version anymore."
-    case 'not_clean':
-      return 'Save or discard your other changes first.'
-    default:
-      return 'Could not save. See the logs for details.'
-  }
 }

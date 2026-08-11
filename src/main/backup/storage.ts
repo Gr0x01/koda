@@ -1,8 +1,10 @@
 /**
  * Supabase Storage door for backups — the ONLY file that talks to the bucket, so the blind-E2E
  * invariant has one seam: everything uploaded here is ciphertext from crypto.ts, plus a small
- * plaintext manifest that carries METADATA ONLY (name/time/size — the same class of metadata
- * rc_devices already holds; never file content, never readable bytes).
+ * plaintext manifest that carries METADATA ONLY (project name, time, size — never file content, never
+ * readable bytes). It is the only place a project's NAME is stored server-side; the relay's old
+ * `rc_devices`/`rc_audit` registry, which used to be the yardstick for "metadata we already keep", is
+ * gone — the relay is a blind forwarder that records nothing.
  *
  * Layout (owner-only storage policies; see the `backups` bucket migration):
  *   backups/{user_id}/{project_hash}/bundle.enc    — the sealed safety-git bundle, overwritten in place
@@ -15,7 +17,7 @@
 import { createHash } from 'node:crypto'
 import { realpath } from 'node:fs/promises'
 import { basename } from 'node:path'
-import { getSupabase } from '../remote/supabase-client'
+import { getSupabase } from '../remote-control'
 
 const BUCKET = 'backups'
 

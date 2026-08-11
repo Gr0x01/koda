@@ -147,4 +147,42 @@ describe.skipIf(!API_KEY)('codex engine contract', () => {
     const turn = await h.runTurn('Reply with exactly the word ALIVE and nothing else.')
     expect(blockText(turn)).toContain('ALIVE')
   })
+
+  it('Check 5 — two collaboration children stay nested and cannot complete the parent turn early', async () => {
+    const turn = await h.runTurn(
+      'Start exactly two subagents before waiting for either one. Give one the bounded task “reply ' +
+        'with ALPHA” and the other “reply with BETA”. After both are running, wait for both, then ' +
+        'reply with exactly SYNTHESIZED.',
+      180_000,
+    )
+    const started = turn.filter(
+      (event): event is Extract<EngineEvent, { type: 'SubagentStarted' }> => event.type === 'SubagentStarted',
+    )
+    const completed = turn.filter(
+      (event): event is Extract<EngineEvent, { type: 'SubagentCompleted' }> => event.type === 'SubagentCompleted',
+    )
+    const nestedAnswers = turn.filter(
+      (event): event is Extract<EngineEvent, { type: 'AssistantBlock' }> =>
+        event.type === 'AssistantBlock' && Boolean(event.parentToolUseId),
+    )
+    const parentAnswers = turn.filter(
+      (event): event is Extract<EngineEvent, { type: 'AssistantBlock' }> =>
+        event.type === 'AssistantBlock' && !event.parentToolUseId,
+    )
+
+    expect(started).toHaveLength(2)
+    expect(completed).toHaveLength(2)
+    const lastStartIndex = Math.max(
+      ...turn.map((event, index) => (event.type === 'SubagentStarted' ? index : -1)),
+    )
+    const firstCompletionIndex = turn.findIndex((event) => event.type === 'SubagentCompleted')
+    expect(lastStartIndex).toBeLessThan(firstCompletionIndex)
+    expect(completed.every((event) => event.taskId && event.resultText && !event.isError)).toBe(true)
+    expect(nestedAnswers.length).toBeGreaterThanOrEqual(2)
+    const childResults = completed.map((event) => event.resultText).join('\n').toUpperCase()
+    expect(childResults).toContain('ALPHA')
+    expect(childResults).toContain('BETA')
+    expect(parentAnswers.map((event) => event.markdown).join('\n').toUpperCase()).toContain('SYNTHESIZED')
+    expect(turn.filter((event) => event.type === 'TurnComplete')).toHaveLength(1)
+  }, 210_000)
 })

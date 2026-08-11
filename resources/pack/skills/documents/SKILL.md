@@ -29,4 +29,8 @@ The `<summary>` is the always-visible title; everything until `</details>` is th
 
 **Everything else is normal markdown** and already renders well: GFM tables (the user can drag to resize columns), task lists (`- [ ]`), fenced code with a language hint, images, headings, links.
 
+**Tables carry short facts, not prose.** A table earns its place when every cell is a number, a name, or a few words — things the eye compares down a column. The moment a cell wants a full sentence or a paragraph, the content belongs in headed prose or a list instead: a comparison across options reads far better as one short titled section per option than as a grid of paragraph-stuffed cells. If you're writing sentences into cells, stop and restructure.
+
+**Structure long documents with headings.** A reader navigates a long page by its `##` sections (the doc surface shows a heading outline), so give a report real sections rather than one unbroken scroll. Link between documents with ordinary relative links (`[the plan](plans/roadmap.md)`) and within a page with anchor links (`[see results](#results)`) — both are clickable in the doc view.
+
 **Keep documents portable.** The file is the source of truth, so stay in plain markdown plus the two blocks above — no other raw HTML, no invented syntax. A page's emoji icon, cover image, and table column widths are the user's to set and live outside the file: you own the words and the structure, not the look.

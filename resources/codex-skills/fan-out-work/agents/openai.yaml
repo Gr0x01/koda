@@ -1,0 +1,6 @@
+interface:
+  display_name: "Fan Out Work"
+  short_description: "Delegate independent work to parallel specialists"
+  default_prompt: "Use $fan-out-work to split this task across independent specialists."
+policy:
+  allow_implicit_invocation: false

@@ -1,0 +1,105 @@
+/**
+ * face-kit.css — the kit's STRUCTURAL styles only. COPY VERBATIM (do not edit per app), import
+ * once in your entry css (or index.html) alongside your own styles.
+ *
+ * Positioning, layout, and motion live here; every visual choice (color, surface, radius, shadow,
+ * type) is the app's, via the className props each primitive takes. The sheet's curve is the iOS
+ * presentation spring; Reduce Motion swaps the slide for a fade.
+ */
+
+/* ── AppShell ── */
+.fk-shell {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden; /* the shell never scrolls — .fk-main does; this kills body rubber-band */
+}
+.fk-main {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  padding-top: var(--inset-top, 0px);
+  /* Room for the home indicator, the keyboard when up, and Koda's summon corner (--fk-reserve,
+     set by AppShell: 90px unclaimed, 16px with a bar or a claimed line). */
+  padding-bottom: calc(var(--kb, 0px) + var(--inset-bottom, 0px) + var(--fk-reserve, 90px));
+}
+.fk-bar {
+  flex: none;
+  /* Deliberately NOT padded by --kb: a native tab bar stays put and the keyboard covers it.
+     A composer that must ride the keys is the app's own transform on just that element
+     (translateY(min(0px, calc(<chrome-below-it>px - var(--kb))))) — lifting the whole bar
+     shoves the tab bar and content up on every focus. */
+  padding-bottom: var(--inset-bottom, 0px);
+}
+
+/* ── Sheet ── */
+.fk-veil {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  touch-action: none; /* the background must not scroll under an open sheet */
+  background: rgba(0, 0, 0, 0.55);
+  opacity: 0;
+  transition: opacity 0.25s ease;
+}
+.fk-veil.fk-open {
+  opacity: 1;
+}
+.fk-sheet {
+  position: fixed;
+  inset-inline: 0;
+  bottom: 0;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  max-height: 92dvh;
+  padding-bottom: calc(var(--kb, 0px) + var(--inset-bottom, 0px)); /* clears keyboard + indicator */
+  transform: translateY(103%);
+  transition: transform 0.32s cubic-bezier(0.32, 0.72, 0.28, 1);
+  will-change: transform;
+}
+.fk-sheet.fk-open {
+  transform: translateY(0);
+}
+.fk-sheet.fk-dragging {
+  transition: none; /* the finger owns the position while dragging */
+}
+.fk-grab {
+  display: flex;
+  justify-content: center;
+  padding: 10px 0 6px;
+  flex: none;
+}
+.fk-handle {
+  height: 4px;
+  width: 40px;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: 0.25;
+}
+.fk-sheet-content {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+
+/* ── Pressable ── */
+[data-pressed] {
+  opacity: 0.7; /* the default press dip — override with your own [data-pressed] styles */
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fk-sheet {
+    transform: none;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+  }
+  .fk-sheet.fk-open {
+    opacity: 1;
+  }
+}

@@ -111,7 +111,12 @@ export async function checkpoint(projectDir: string, label: string): Promise<Che
     }
   }
 
-  await runGit(projectDir, ['commit', '--quiet', '--message', subject])
+  // A brand-new EMPTY project stages nothing, and a plain `commit` refuses an empty first commit —
+  // which made the very first checkpoint of every fresh intake project fail (both fresh health
+  // projects, 2026-08-02). One --allow-empty ROOT commit gives the timeline its anchor; with a
+  // prior commit the no-change case above has already returned, so this can never litter the
+  // timeline with empty commits.
+  await runGit(projectDir, ['commit', '--quiet', ...(prior ? [] : ['--allow-empty']), '--message', subject])
   const id = (await headSha(projectDir))!
   return { id, label: subject, createdAt: await commitTime(projectDir, id), skipped: false }
 }

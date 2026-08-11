@@ -3,10 +3,19 @@
  * user preferences don't justify one). Today it holds just the approval mode so "Ask me" survives a
  * restart; add keys here as real settings appear. All access is fail-soft: a bad/missing file falls
  * back to defaults, and a failed write never breaks the caller (the in-memory value still applies).
+ *
+ * Unlike session-store.ts, a corrupt settings file does NOT refuse the next write: every loader below
+ * already reads its own field with its own per-call fallback, so the data is effectively lost at READ
+ * time regardless — a write-refusal would only protect a `{}` that's already forensically useless. What
+ * still matters: telling first-run (absent, benign) apart from real corruption (log it), keeping a copy
+ * of the unreadable file before the next write overwrites it, and not letting `billingMode` revert from
+ * 'api' to 'subscription' with nothing said (CLAUDE.md: billing-mode changes are "user-visible, never
+ * silent") — see `noteCorruptRead`, which both warns ONCE and latches the billing fact for the
+ * data-integrity banner to show. A log line is not "user-visible"; the banner is.
  */
 import { app } from 'electron'
 import { randomUUID } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { writeFileAtomic } from './atomic-write'
 import {
@@ -31,13 +40,88 @@ function settingsPath(): string {
   return join(app.getPath('userData'), 'koda-settings.json')
 }
 
-function readSettings(): Record<string, unknown> {
+/** Best-effort forensic copy of a settings file that failed to parse, made BEFORE any writer's
+ *  read-modify-write can overwrite it. One fixed slot (not session-store's rotating, content-keyed
+ *  pile) — settings are already effectively lost at READ time (every loader falls back to its own
+ *  default per field), so this is for support/forensics, not row-level recovery. Never overwrites an
+ *  existing backup: the FIRST corruption is the one worth keeping. */
+function keepCorruptSettings(path: string, text: string): void {
+  const backup = `${path}.corrupt.bak`
+  if (existsSync(backup)) return
   try {
-    const parsed = JSON.parse(readFileSync(settingsPath(), 'utf8'))
-    return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {}
-  } catch {
-    return {} // missing/corrupt → defaults
+    writeFileSync(backup, text)
+  } catch (err) {
+    log.warn('settings', 'could not back up an unreadable settings file', err instanceof Error ? err.message : err)
   }
+}
+
+/** The corrupt bytes the warnings below have already been said about. `readSettings` has no cache and
+ *  36 call sites in this file, so ONE `loadSettings()` on a corrupt file used to emit 38 warnings (19 of
+ *  them the billing one) — and `loadSettings` runs on every `settings:get` and every `updateSettings`
+ *  return, so opening Settings a few times buried the log this warning exists to be found in. Keyed by
+ *  content rather than a plain boolean so a file that goes corrupt a SECOND, different way still says so. */
+let warnedCorruptText: string | null = null
+
+/** `billingMode` flipping from 'api' to 'subscription' is the one field CLAUDE.md calls out as
+ *  "user-visible, never silent" — a lost read otherwise defaults it back to subscription with nothing
+ *  said. Latched here and served over `app:dataIntegrity`, so the data-integrity banner says it in the
+ *  window; the log line alone was never "user-visible". Cleared when the user sets a billing mode
+ *  themselves (updateSettings), because at that point they've said which one they want.
+ *
+ *  A raw scan of the bytes is all that's left once JSON.parse has thrown, so it's a hint, not a proof:
+ *  it can miss (those bytes were the destroyed ones) and it can false-positive (that text inside some
+ *  other key's value). Both are acceptable for a "check your billing" nudge; neither would be
+ *  acceptable if this were the only mechanism, which is exactly why it now reaches a surface. The flip
+ *  itself is safe-direction (api can't materialize out of nothing), so this is a trust gap rather than
+ *  a spend one. */
+let billingModeLost = false
+
+export function settingsHealth(): { billingModeReset: boolean } {
+  return { billingModeReset: billingModeLost }
+}
+
+/** One place for everything a corrupt read has to say, said once per distinct corruption. */
+function noteCorruptRead(path: string, text: string): void {
+  keepCorruptSettings(path, text)
+  // THIS read's bytes, never the latch: the latch stays true for the run once set, and warning off it
+  // would report a lost API-key choice about a file that plainly still shows a different one.
+  const lostApiChoice = /"billingMode"\s*:\s*"api"/.test(text)
+  if (lostApiChoice) billingModeLost = true
+  if (warnedCorruptText === text) return
+  warnedCorruptText = text
+  if (lostApiChoice) {
+    log.warn(
+      'settings',
+      'settings file unreadable and appears to have had billingMode "api" — falling back to ' +
+        'subscription; this is a silent billing-mode change',
+    )
+  }
+  log.warn('settings', 'settings file present but invalid — starting from defaults, original kept aside as .corrupt.bak')
+}
+
+function readSettings(): Record<string, unknown> {
+  const path = settingsPath()
+  let text: string
+  try {
+    text = readFileSync(path, 'utf8')
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+      log.warn('settings', 'settings file unreadable — starting from defaults', err instanceof Error ? err.message : err)
+    }
+    return {} // absent (first run, benign) or a read error with nothing left to copy
+  }
+  // A zero-length (or whitespace-only) file holds no data — same torn-write case session-store treats as
+  // benign (a power cut right after `writeFileAtomic`'s rename). Nothing to protect, not corruption.
+  if (!text.trim()) return {}
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    parsed = undefined
+  }
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>
+  noteCorruptRead(path, text)
+  return {}
 }
 
 /** The persisted DEFAULT posture new sessions start at, or 'auto' when unset/invalid. `plan` is a
@@ -135,6 +219,22 @@ export function loadProviderStatusNotify(): boolean {
  *  Read by the gate to decide whether to confirm the `preview` capability before spawning. */
 export function loadPreviewAutoStart(): boolean {
   const v = readSettings().previewAutoStart
+  return typeof v === 'boolean' ? v : true
+}
+
+/** Mini-app day threads — default-on. Both heads read it at face-turn dispatch (the phone gets it in
+ *  the launcher payload), so flipping it applies to the very next thing said to an app. */
+export function loadAppDaySessions(): boolean {
+  const v = readSettings().appDaySessions
+  return typeof v === 'boolean' ? v : true
+}
+
+/** Fresh-critic pass on finished work the user will look at — default-on, and general (not just mini
+ *  apps). Read at spawn: it gates the `critique-stood-down` rule, so flipping it applies to the next
+ *  session rather than mid-turn. Off only when the user would rather spend the usage window building
+ *  than checking. */
+export function loadCritiquePass(): boolean {
+  const v = readSettings().critiquePass
   return typeof v === 'boolean' ? v : true
 }
 
@@ -254,6 +354,19 @@ export function loadMiniAppsEnabled(): boolean {
   return process.env.KODA_MINI_APPS === '1' || readSettings().miniAppsEnabled === true
 }
 
+/** Overnight dream consolidation (dream-plan.md) — a real user setting (Settings → Memory toggle),
+ *  default OFF because it spends the user's plan while they're away. Read live by the scheduler in
+ *  engine/dream.ts at every arm/fire, so flipping the toggle applies without a restart. */
+export function loadDreamEnabled(): boolean {
+  return readSettings().dreamEnabled === true
+}
+
+/** Generative REM is a second, more speculative turn after the proven memory tidy. Keep its
+ *  dogfood gate separate so existing "Tidy overnight" users are never silently opted into it. */
+export function loadRemEnabled(): boolean {
+  return process.env.KODA_REM === '1' || readSettings().remEnabled === true
+}
+
 /**
  * Provisioned-runtime record — NOT a user preference (so it's out of the Settings surface below): it's
  * internal state recording which on-demand runtime (Node / Python) Koda installed and where. Read at
@@ -327,11 +440,14 @@ export function loadSettings(): KodaSettings {
     scratchRetentionDays: loadScratchRetentionDays(),
     archiveRetentionDays: loadArchiveRetentionDays(),
     playwrightEnabled: loadPlaywrightEnabled(),
+    dreamEnabled: loadDreamEnabled(),
     hasOnboarded: loadHasOnboarded(),
     billingMode: loadBillingMode(),
     codexBillingMode: loadCodexBillingMode(),
     remoteEnabled: loadRemoteEnabled(),
     telemetryEnabled: loadTelemetryEnabled(),
+    appDaySessions: loadAppDaySessions(),
+    critiquePass: loadCritiquePass(),
     layout: loadLayout(),
   }
 }
@@ -360,14 +476,20 @@ export function updateSettings(patch: Partial<KodaSettings>): KodaSettings {
   if (patch.usageResetNotify !== undefined) next.usageResetNotify = patch.usageResetNotify
   if (patch.providerStatusNotify !== undefined) next.providerStatusNotify = patch.providerStatusNotify
   if (patch.previewAutoStart !== undefined) next.previewAutoStart = patch.previewAutoStart
+  if (patch.appDaySessions !== undefined) next.appDaySessions = patch.appDaySessions
+  if (patch.critiquePass !== undefined) next.critiquePass = patch.critiquePass
   if (patch.imageDetail !== undefined) next.imageDetail = patch.imageDetail
   if (patch.scratchRetentionDays !== undefined)
     next.scratchRetentionDays = Math.max(0, Math.floor(patch.scratchRetentionDays))
   if (patch.archiveRetentionDays !== undefined)
     next.archiveRetentionDays = Math.max(0, Math.floor(patch.archiveRetentionDays))
   if (patch.playwrightEnabled !== undefined) next.playwrightEnabled = patch.playwrightEnabled
+  if (patch.dreamEnabled !== undefined) next.dreamEnabled = patch.dreamEnabled
   if (patch.hasOnboarded !== undefined) next.hasOnboarded = patch.hasOnboarded
-  if (patch.billingMode !== undefined) next.billingMode = patch.billingMode
+  if (patch.billingMode !== undefined) {
+    next.billingMode = patch.billingMode
+    billingModeLost = false // they've now said which mode they want, so there's nothing left to report
+  }
   if (patch.codexBillingMode !== undefined) next.codexBillingMode = patch.codexBillingMode
   if (patch.remoteEnabled !== undefined) next.remoteEnabled = patch.remoteEnabled
   if (patch.telemetryEnabled !== undefined) next.telemetryEnabled = patch.telemetryEnabled

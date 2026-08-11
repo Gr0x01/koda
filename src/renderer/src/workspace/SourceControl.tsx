@@ -2,7 +2,6 @@ import { Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import type {
   DiffFileResult,
   GitCommitGraphResult,
-  GitCommitResult,
   GitRepoInfo,
   GitStatusFile,
   GitSyncState,
@@ -21,12 +20,10 @@ import { LooseEnds } from './source-control/LooseEnds'
 import { RestoreBox } from './source-control/RestoreBox'
 import { SideBranchBanner } from './source-control/SideBranchBanner'
 import { Button, lazyWithRetry } from '../ui'
+import { gitErrorCopy } from '../git-error-copy'
 
 // Reuse the live-edits diff body (lazy — keeps monaco out of the bundle until a diff is shown).
 const MonacoDiffEditor = lazyWithRetry(() => import('../surface/MonacoDiffEditor'))
-
-/** The failure codes from a tagged commit result — derived so it can't drift from the schema. */
-type CommitErrorCode = Extract<GitCommitResult, { ok: false }>['code']
 
 /** What the right pane shows. Exactly one at a time; the left panel's selection drives it. */
 type RightView =
@@ -317,6 +314,12 @@ function BrowseView({
   // Only OTHER checkouts are worth surfacing — this window's own is fully covered by Changes above.
   // (Merged-leftover checkouts are already gone: they're auto-tidied on refresh.)
   const siblings = worktrees.filter((w) => !w.isCurrent)
+  const looseWorktrees = siblings.filter((w) => !w.statusKnown || w.dirtyCount > 0 || w.prunable)
+  const branchesNotReady = new Set(
+    looseWorktrees
+      .filter((w) => (!w.statusKnown || w.dirtyCount > 0) && w.branch)
+      .map((w) => w.branch as string),
+  )
   const hasVersions = !!graph && graph.layout.rows.length > 0
   return (
     <div className="flex flex-col">
@@ -362,10 +365,12 @@ function BrowseView({
 
       <LooseEnds
         tidiedCount={tidiedCount}
-        sideLines={unmerged.map((b) => b.name)}
+        // A dirty or unreadable checkout is not "ready" merely because its committed tip is
+        // reviewable. Its one truthful row is below; once confirmed clean, the ready side line returns.
+        sideLines={unmerged.filter((branch) => !branchesNotReady.has(branch.name))}
         // A clean sibling checkout is already represented by its side line (or was auto-tidied); only
-        // surface the ones holding work that lives nowhere else — unsaved changes, or a missing folder.
-        worktrees={siblings.filter((w) => w.dirtyCount > 0 || w.prunable)}
+        // surface the ones holding work that lives nowhere else, a failed status check, or a missing folder.
+        worktrees={looseWorktrees}
         onReview={onReview}
         onChanged={onCommitted}
       />
@@ -594,7 +599,7 @@ export function CommitBox({
         setComposing(false)
         onCommitted()
       } else {
-        setError(errorCopy(res.code))
+        setError(gitErrorCopy(res.code, 'save'))
       }
     } catch (err) {
       setError('Could not save a version.')
@@ -660,18 +665,4 @@ export function CommitBox({
       {error && <p className="mt-1.5 text-[11px] leading-relaxed text-red-400">{error}</p>}
     </div>
   )
-}
-
-// ── bits ──────────────────────────────────────────────────────────────────────────────
-function errorCopy(code: CommitErrorCode): string {
-  switch (code) {
-    case 'no_identity':
-      return "Git needs your name and email before it can save a version. Ask Claude to set them up, or run `git config --global user.name` / `user.email` in Terminal."
-    case 'nothing_to_commit':
-      return 'Nothing changed to save. Your project is already up to date.'
-    case 'not_a_repo':
-      return 'This project isn’t tracked by Git yet.'
-    default:
-      return 'Could not save a version. See the logs for details.'
-  }
 }

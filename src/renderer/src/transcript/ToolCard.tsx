@@ -10,11 +10,13 @@ import { Caret } from '../Caret'
 export function ToolCard({
   name,
   input,
+  liveOutput,
   result,
   isError,
 }: {
   name: string
   input: unknown
+  liveOutput?: string
   result?: string
   isError?: boolean
 }) {
@@ -47,13 +49,16 @@ export function ToolCard({
           <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-text-muted">
             {JSON.stringify(input, null, 2)}
           </pre>
-          {result !== undefined && (
+          {(result !== undefined || liveOutput) && (
             <pre
               className={`overflow-x-auto whitespace-pre-wrap font-mono ${
                 isError ? 'text-red-400' : 'text-text-muted'
               }`}
             >
-              {result.length > 2000 ? result.slice(0, 2000) + '\n… (truncated)' : result}
+              {(() => {
+                const output = result ?? liveOutput ?? ''
+                return output.length > 2000 ? '… (showing latest)\n' + output.slice(-2000) : output
+              })()}
             </pre>
           )}
         </div>

@@ -1,7 +1,45 @@
 import { useEffect, useRef } from 'react'
-import type { EngineEvent } from '@shared/ipc'
+import type {
+  ArchivedLoadResult,
+  ArchivedSessionMeta,
+  EngineEvent,
+  PersistedSessions,
+  SessionsLoadResult,
+} from '@shared/ipc'
 import type { Entry } from '../transcript/Transcript'
-import { setNotifyEnabled, setNotifyOk, useWorkspace, activeEditor, PREVIEW_SURFACE_ID } from './store'
+import {
+  setNotifyEnabled,
+  setNotifyOk,
+  useWorkspace,
+  activeEditor,
+  PREVIEW_SURFACE_ID,
+  type PersistedBlob,
+} from './store'
+import { connectApprovals } from './approval-catchup'
+
+/** Keep the main-owned persisted shape and renderer hydration shape in one explicit mapping. A missing
+ * replay cursor here makes adoption replay the entire sidecar through a non-idempotent live reducer. */
+export function sessionForHydration(
+  s: PersistedSessions['sessions'][number],
+): PersistedBlob['sessions'][number] {
+  return {
+    id: s.id,
+    label: s.label,
+    cwd: s.cwd,
+    userNamed: s.userNamed,
+    approvalMode: s.approvalMode,
+    model: s.model,
+    effort: s.effort,
+    engineId: s.engineId,
+    engineNativeId: s.engineNativeId,
+    context: s.context,
+    spendUsd: s.spendUsd,
+    byModel: s.byModel,
+    lastPreview: s.lastPreview,
+    replaySeq: s.replaySeq,
+    items: s.items as Entry[],
+  }
+}
 
 /**
  * Wires the workspace store to the main process: engine-event demux, approval queue, persistence,
@@ -30,6 +68,7 @@ export function useEngineBridge(): void {
   const renameSession = useWorkspace((s) => s.renameSession)
   const applyRemoteUserTurn = useWorkspace((s) => s.applyRemoteUserTurn)
   const openTerminalShelf = useWorkspace((s) => s.openTerminalShelf)
+  const setStoreIntegrity = useWorkspace((s) => s.setStoreIntegrity)
 
   // Engine event stream → store demux.
   useEffect(() => window.koda.onEngineEvent((e: EngineEvent) => applyEngineEvent(e)), [applyEngineEvent])
@@ -49,14 +88,15 @@ export function useEngineBridge(): void {
   // Approval gate ("Ask me"): queue requests; drop one when it's answered (on any head, so this window's
   // prompt clears even if the phone answered it); clear a session's whole queue when it ends.
   useEffect(() => {
-    const offReq = window.koda.onApprovalRequest((req) => addPending(req))
-    const offResolved = window.koda.onApprovalResolved((e) => resolvePending(e.requestId))
-    const offCancel = window.koda.onApprovalCancelled((e) => cancelPending(e.sessionId))
-    return () => {
-      offReq()
-      offResolved()
-      offCancel()
-    }
+    // A renderer reload drops its in-memory queue, but the gate and blocked engine stay alive in main.
+    // Subscribe first so requests raised during the catch-up read are not missed; addPending dedupes a
+    // request that arrives through both paths.
+    return connectApprovals(window.koda, {
+      add: addPending,
+      resolve: (e) => resolvePending(e.requestId),
+      cancel: (e) => cancelPending(e.sessionId),
+      failed: console.error,
+    })
   }, [addPending, resolvePending, cancelPending])
 
   // Default approval posture (for new sessions) + the notification preference + native-notification
@@ -171,31 +211,61 @@ export function useEngineBridge(): void {
   useEffect(() => {
     // Sessions (hot blob) + archived (cold file) load together — archived moved out of the hot blob so
     // its weight stops riding every debounced save (the 53MB-freeze bug); hydrate still sees one shape.
-    // Archived is fail-soft AND optional-chained: an archived-load problem must never take sessions down,
-    // and under `electron-vite dev` the renderer hot-reloads INSTANTLY while preload only updates on
-    // restart — a renderer calling a just-added preload API crashes boot in that mixed-version window
-    // (this exact gap once let the empty-hydrate catch below save over a real store and lose the archive).
-    Promise.all([window.koda.loadSessions(), Promise.resolve(window.koda.loadArchived?.() ?? []).catch(() => [])])
-      .then(([data, archived]) => {
+    // Archived is fail-soft so an archive problem never takes the open sessions down with it — but a
+    // FAILED read is not an empty list. Hydrating `[]` from a failure and letting the save effect run is
+    // exactly how a real index gets rewritten to empty, so a failure disables the archive save instead.
+    //
+    // Both loads come back as a RESULT rather than a bare payload, because the result also carries the
+    // two facts the data-integrity banner needs and the renderer cannot see for itself: whether a copy
+    // of an unreadable file actually landed on disk, and how many rows a readable-but-drifted file had
+    // to set aside (that case keeps saving, so the shortened list is otherwise silent).
+    //
+    // Both normalize the PRE-result shape too. `electron-vite dev` hot-reloads the renderer INSTANTLY
+    // while preload + main only update on restart, so a renderer newer than main gets the old payload
+    // back and must read it as the success it is instead of as a failure.
+    const loadSessions = async (): Promise<SessionsLoadResult> => {
+      const raw = (await window.koda.loadSessions()) as SessionsLoadResult | PersistedSessions | null
+      return raw && 'ok' in raw ? raw : { ok: true, data: raw, droppedSessions: 0 }
+    }
+    const loadArchived = async (): Promise<ArchivedLoadResult> => {
+      try {
+        // Optional-chained for the same mixed-version window: a just-added preload API can be missing
+        // outright. A missing API is "unknown", not "empty" — it disables the save like a failure does.
+        const call = window.koda.loadArchived
+        if (!call) throw new Error('loadArchived unavailable (preload is out of date)')
+        const raw = (await call()) as ArchivedLoadResult | ArchivedSessionMeta[]
+        return Array.isArray(raw) ? { ok: true, archived: raw, droppedArchives: 0 } : raw
+      } catch (err) {
+        console.error('archived load failed — archive persistence disabled for this run', err)
+        return { ok: false, backupKept: null }
+      }
+    }
+    Promise.all([loadSessions(), loadArchived()])
+      .then(([sessionsResult, archivedResult]) => {
+        // Set before the hydrate branch: the banner must be right whether or not this run hydrates.
+        setStoreIntegrity({
+          sessionsLoadFailed: !sessionsResult.ok,
+          sessionsBackupKept: sessionsResult.ok ? null : sessionsResult.backupKept,
+          droppedSessions: sessionsResult.ok ? sessionsResult.droppedSessions : 0,
+          archiveLoadFailed: !archivedResult.ok,
+          archiveBackupKept: archivedResult.ok ? null : archivedResult.backupKept,
+          droppedArchives: archivedResult.ok ? archivedResult.droppedArchives : 0,
+        })
+        // The sessions read FAILED (as opposed to reading an empty store, which succeeds with no data).
+        // Deliberately do NOT hydrate: hydrating un-gates the debounced save, and the very first save
+        // would then overwrite the real on-disk store with this empty state — that's how a boot crash
+        // once destroyed the archived list. Chat persistence stays read-only for this run; the store on
+        // disk survives untouched, and DataIntegrityBanner is what makes that visible.
+        if (!sessionsResult.ok) {
+          console.error("session load failed — this project's chat persistence is disabled for this run")
+          return
+        }
+        const data = sessionsResult.data
+        const archived = archivedResult.ok ? archivedResult.archived : []
         hydrate({
           version: 2,
           activeId: data?.activeId ?? null,
-          sessions: (data?.sessions ?? []).map((s) => ({
-            id: s.id,
-            label: s.label,
-            cwd: s.cwd,
-            userNamed: s.userNamed, // preserve the manual-rename lock across restart
-            approvalMode: s.approvalMode, // preserve per-session posture across restart
-            model: s.model, // restore the chosen model (was dropped → "Default" after restart)
-            effort: s.effort, // restore spawn-time reasoning effort for lazy reattach
-            engineId: s.engineId, // preserve Claude vs Codex; hydrate falls back only for old blobs
-            engineNativeId: s.engineNativeId, // preserve Codex's thread id for thread/resume
-            context: s.context, // restore the fuel gauge (was dropped → blank meter after restart)
-            spendUsd: s.spendUsd,
-            byModel: s.byModel,
-            lastPreview: s.lastPreview,
-            items: s.items as Entry[],
-          })),
+          sessions: (data?.sessions ?? []).map(sessionForHydration),
           // Archived-session metadata from the cold index. Any archives still inline in an old hot blob
           // are migrated out (split to body + metadata) by main's loadProjectSessions before we get here.
           archived,
@@ -210,13 +280,13 @@ export function useEngineBridge(): void {
         void adoptHeadless()
       })
       .catch((err) => {
-        // Load FAILED (as opposed to loading an empty store, which resolves fine above). Deliberately do
-        // NOT hydrate: hydrating un-gates the debounced save, and the very first save would then overwrite
-        // the real on-disk store with this empty state — that's how a boot crash once destroyed the
-        // archived list. Persistence stays read-only for this run; the store on disk survives untouched.
+        // The call itself failed (main gone, an older main that still rejected, a preload without the
+        // API). Same posture as `ok: false` above, minus any detail about the file: nobody got to say
+        // whether a copy was kept, so `null` keeps the banner from claiming one either way.
+        setStoreIntegrity({ sessionsLoadFailed: true, sessionsBackupKept: null })
         console.error('session load failed — persistence disabled for this run', err)
       })
-  }, [hydrate, maybeOfferIntake, adoptHeadless])
+  }, [hydrate, maybeOfferIntake, adoptHeadless, setStoreIntegrity])
 
   // A phone just started/resumed a session in this window's project → adopt it live (appears in the
   // list + streams from here on). adoptHeadless is idempotent, so a redundant nudge is harmless.
@@ -235,25 +305,26 @@ export function useEngineBridge(): void {
     [renameSession],
   )
 
-  // A phone turn landed on a session this window already owns (adopted empty, before the turn). The
-  // engine stream never echoes the human's prompt, so main forwards it here → append it + auto-title.
+  // A user-side row this window didn't send itself — a phone turn. The engine stream never echoes
+  // these, so main forwards them here → append (+ auto-title for real first prompts).
   useEffect(
-    () => window.koda.onRemoteUserTurn(({ sessionId, text }) => applyRemoteUserTurn(sessionId, text)),
+    () =>
+      window.koda.onRemoteUserTurn(({ sessionId, text, replaySeq, append }) =>
+        applyRemoteUserTurn(sessionId, text, replaySeq, append),
+      ),
     [applyRemoteUserTurn],
   )
 
-  // Persist the archived list to its cold file — only when it actually changes (archive / restore /
-  // delete swap the array reference; streaming never touches it). Separate from the hot save below so
-  // archives never ride the every-500ms blob again.
-  useEffect(() => {
-    let prev = useWorkspace.getState().archived
-    return useWorkspace.subscribe((st) => {
-      if (!st.hydrated || st.archived === prev) return
-      prev = st.archived
-      // Optional-chained for the dev-mode mixed-version window (renderer hot-reloads before preload).
-      window.koda.saveArchived?.(st.archived)
-    })
-  }, [])
+  // A phone turn's image was saved to scratch main-side → refresh the Recent images strip live.
+  // Optional-chained: dev HMR reloads the renderer against a preload that predates this API.
+  useEffect(() => window.koda.onScratchChanged?.(() => useWorkspace.getState().bumpScratch()), [])
+
+  // The archived list has NO subscription-driven save. It used to have one here, watching the array
+  // reference and writing fire-and-forget, so the three actions that move a session between the hot
+  // store and the archive changed state first and never learned whether the file took it. Persistence
+  // now lives inside those actions (store.ts `persistArchived`): they wait for the answer and only then
+  // commit, so there is exactly one writer and it is acknowledged. Anything new that mutates `archived`
+  // has to go through them.
 
   // Persist open sessions + transcripts (debounced). Subscribes OUTSIDE React render so streaming
   // deltas don't thrash the disk: only durable fields are saved, an unchanged blob is skipped, and

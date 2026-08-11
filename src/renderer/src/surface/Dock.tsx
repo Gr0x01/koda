@@ -10,6 +10,8 @@ import { Caret } from '../Caret'
 import { useWorkspace, activeEditor, type FileSurface } from '../workspace/store'
 
 const isMarkdown = (path: string): boolean => /\.(md|markdown)$/i.test(path)
+// A displayable image has only one meaningful view (the picture) — no File/Diff/Doc toggle.
+const isImagePath = (path: string): boolean => /\.(png|jpe?g|gif|webp|svg|ico|bmp|avif)$/i.test(path)
 const PREVIEW_PRESET_DOCK_WIDTH: Record<PreviewViewport, number> = {
   desktop: 1100,
   tablet: 820,
@@ -373,6 +375,8 @@ export function DockEmpty({
  */
 function ViewToggle({ surface }: { surface: FileSurface }) {
   const setSurfaceView = useWorkspace((s) => s.setSurfaceView)
+  // An image renders as a picture with no alternate view — hide the toggle entirely.
+  if (isImagePath(surface.path)) return null
   const md = isMarkdown(surface.path)
   // Markdown gets the rich Doc default + a "Markdown" escape hatch to the raw editor (the advanced
   // "show real markdown" path). Other files keep the plain File/Diff toggle.

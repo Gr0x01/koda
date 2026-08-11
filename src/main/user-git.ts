@@ -21,7 +21,8 @@ import { readFile, realpath } from 'node:fs/promises'
 import { relative, resolve, sep } from 'node:path'
 import { excludeKodaFromUserGit } from './safety-git/repo'
 import { buildGraph, type RawCommit, type GraphLayout } from './git-graph'
-import { userPath } from './engine/user-path'
+import { gitEnv } from './engine/user-path'
+import { log } from './logger'
 
 const execFileP = promisify(execFile)
 
@@ -95,9 +96,9 @@ export interface StatusResult {
  * so dropping it left in-app git with no way to reach the saved GitHub login → pushes failed as "bad
  * credentials." We deliberately mirror the terminal instead of sandboxing here.
  *
- * PATH caveat (same as repo.ts): a Finder-launched .app inherits no shell PATH, so bare `git` is a
- * packaging concern — resolve it alongside the engine binary path at bundling. Bare `git` is correct
- * for dev.
+ * PATH comes from gitEnv() — without it a Finder-launched .app can't find git or its credential
+ * helpers (git-credential-osxkeychain lives beside git in Homebrew/CLT) and pushes fail as "bad
+ * credentials".
  */
 function runUserGit(
   projectDir: string,
@@ -106,16 +107,9 @@ function runUserGit(
 ): Promise<{ stdout: string; stderr: string }> {
   return execFileP('git', args, {
     cwd: projectDir,
-    env: {
-      ...process.env,
-      // A Finder-launched .app has only launchd's minimal PATH, so git can't find its credential
-      // helpers (git-credential-osxkeychain lives beside git in Homebrew/CLT) — pushes then fail as
-      // "bad credentials". Same chokepoint as terminal.ts/preview.ts: user tooling needs userPath().
-      PATH: userPath(),
-      // noPrompt (network ops): a GUI app has no terminal for git to ask credentials on — fail fast
-      // with a real error instead of hanging until the timeout. Keychain/agent helpers still work.
-      ...(opts.noPrompt ? { GIT_TERMINAL_PROMPT: '0' } : {}),
-    },
+    // noPrompt (network ops): a GUI app has no terminal for git to ask credentials on — fail fast
+    // with a real error instead of hanging until the timeout. Keychain/agent helpers still work.
+    env: gitEnv(opts.noPrompt ? { GIT_TERMINAL_PROMPT: '0' } : undefined),
     maxBuffer: 64 * 1024 * 1024,
     timeout: opts.timeout ?? 30_000,
   })
@@ -206,7 +200,7 @@ export interface CommitGraphResult {
   /** Per-row draw instructions + lane palette (see git-graph.ts). */
   layout: GraphLayout
   /** Local branches with work not in the current branch — powers the "stranded work" banner. */
-  unmergedBranches: { name: string }[]
+  unmergedBranches: { name: string; ahead: number }[]
   /** Current branch name (null on detached HEAD / unborn). */
   headBranch: string | null
   /** True when more commits exist than the cap. */
@@ -221,7 +215,7 @@ const EMPTY_GRAPH: CommitGraphResult = {
 }
 
 /** Local branches not merged into the current branch. Empty on detached HEAD or any failure. */
-async function getUnmergedBranches(projectDir: string): Promise<string[]> {
+async function getUnmergedBranches(projectDir: string): Promise<Array<{ name: string; ahead: number }>> {
   try {
     // `--format` MUST precede `--no-merged`: the latter takes an optional commit arg and would
     // otherwise swallow `--format=…` as a (malformed) object name.
@@ -230,10 +224,16 @@ async function getUnmergedBranches(projectDir: string): Promise<string[]> {
       '--format=%(refname:short)',
       '--no-merged',
     ])
-    return stdout
+    const names = stdout
       .split('\n')
       .map((s) => s.trim())
       .filter(Boolean)
+    return Promise.all(
+      names.map(async (name) => {
+        const count = await runUserGit(projectDir, ['rev-list', '--count', `HEAD..${name}`])
+        return { name, ahead: Number.parseInt(count.stdout.trim(), 10) || 0 }
+      }),
+    )
   } catch {
     return []
   }
@@ -288,10 +288,10 @@ export async function getCommitGraph(projectDir: string, limit = 50): Promise<Co
     if (raw.length === 0) return EMPTY_GRAPH
     const unmerged = await getUnmergedBranches(projectDir)
     const layout = buildGraph(raw, {
-      unmergedBranchNames: new Set(unmerged),
+      unmergedBranchNames: new Set(unmerged.map((branch) => branch.name)),
       headBranch,
     })
-    return { layout, unmergedBranches: unmerged.map((name) => ({ name })), headBranch, truncated }
+    return { layout, unmergedBranches: unmerged, headBranch, truncated }
   } catch {
     // No commits yet / not a repo — fail soft like detect/status.
     return EMPTY_GRAPH
@@ -334,6 +334,7 @@ export interface WorktreeInfo {
   branch: string | null // null on a detached HEAD
   isCurrent: boolean // this window's own checkout
   dirtyCount: number
+  statusKnown: boolean // false when the status probe failed; dirtyCount must not be read as clean
   lastActivity: string // relative date of the worktree's HEAD commit; '' if unreadable
   locked: boolean
   prunable: boolean // the folder is gone — git would prune it
@@ -341,18 +342,28 @@ export interface WorktreeInfo {
 
 /**
  * Dirty-file count + last-commit relative date for a worktree, run in ITS OWN dir (not projectDir).
- * Rename entries consume their trailing old-path token so the count matches getStatus. Fails soft — a
- * prunable/missing dir yields zeros.
+ * Rename entries consume their trailing old-path token so the count matches getStatus. Fails soft but
+ * keeps statusKnown=false: a silent zero is indistinguishable from a clean worktree, which is how a
+ * packaged .app read every row as "0 changed files" while the spawn underneath was failing. The
+ * swallowed failure is the bug; a starved PATH was one way to cause it.
  */
-async function worktreeMeta(worktreePath: string): Promise<{ dirtyCount: number; lastActivity: string }> {
+async function worktreeMeta(
+  worktreePath: string,
+): Promise<{ dirtyCount: number; statusKnown: boolean; lastActivity: string }> {
   const run = (args: string[]): Promise<{ stdout: string; stderr: string }> =>
     execFileP('git', args, {
       cwd: worktreePath,
-      env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1' },
+      env: gitEnv({ GIT_CONFIG_NOSYSTEM: '1' }),
       maxBuffer: 64 * 1024 * 1024,
       timeout: 30_000,
     })
-  const [dirtyCount, lastActivity] = await Promise.all([
+  const warn = (what: string, err: unknown): void => {
+    const error = err instanceof Error ? err.message : String(err)
+    // A repo with no commits yet is a normal state, and this polls after every turn — don't log it.
+    if (/does not have any commits yet/i.test(error)) return
+    log.warn('user-git', 'worktree probe failed', { what, path: worktreePath, error })
+  }
+  const [status, lastActivity] = await Promise.all([
     run(['status', '--porcelain=v1', '-z', '--untracked-files=normal'])
       .then(({ stdout }) => {
         const tokens = stdout.split('\0')
@@ -363,14 +374,20 @@ async function worktreeMeta(worktreePath: string): Promise<{ dirtyCount: number;
           if (e[0] === 'R' || e[1] === 'R') i++ // rename: skip the following old-path token
           n++
         }
-        return n
+        return { dirtyCount: n, statusKnown: true }
       })
-      .catch(() => 0),
+      .catch((err) => {
+        warn('status', err)
+        return { dirtyCount: 0, statusKnown: false }
+      }),
     run(['log', '-1', '--format=%cr'])
       .then(({ stdout }) => stdout.trim())
-      .catch(() => ''),
+      .catch((err) => {
+        warn('log', err)
+        return ''
+      }),
   ])
-  return { dirtyCount, lastActivity }
+  return { ...status, lastActivity }
 }
 
 /**
@@ -417,13 +434,16 @@ export async function getWorktrees(projectDir: string): Promise<WorktreeInfo[]> 
   return Promise.all(
     usable.map(async (b) => {
       const meta =
-        needMeta && !b.prunable ? await worktreeMeta(b.path) : { dirtyCount: 0, lastActivity: '' }
+        needMeta && !b.prunable
+          ? await worktreeMeta(b.path)
+          : { dirtyCount: 0, statusKnown: !b.prunable, lastActivity: '' }
       const real = await realpath(b.path).catch(() => b.path)
       return {
         path: b.path,
         branch: b.branch,
         isCurrent: real === realProject,
         dirtyCount: meta.dirtyCount,
+        statusKnown: meta.statusKnown,
         lastActivity: meta.lastActivity,
         locked: b.locked,
         prunable: b.prunable,
@@ -443,8 +463,8 @@ export interface MergedStray {
  * clean worktrees still checked out on them. These are safe to remove — nothing exists only there —
  * which is exactly why they're invisible mess: the graph shows their labels but nothing says "this is
  * done, tidy it". Excluded (NOT strays): the trunk itself, this window's own checkout, and any merged
- * branch whose worktree has unsaved changes or is locked — those keep their existing surfaces
- * (Changes / Other checkouts). Fails soft to [].
+ * branch whose worktree has unsaved changes, unreadable status, or is locked — those keep their
+ * existing surfaces (Changes / Other checkouts). Fails soft to [].
  */
 export async function getMergedStrays(projectDir: string): Promise<MergedStray[]> {
   try {
@@ -475,10 +495,10 @@ export async function getMergedStrays(projectDir: string): Promise<MergedStray[]
         continue // this window's own checkout (side-branch banner territory) / deliberately pinned
       } else if (wt.prunable) {
         strays.push({ branch, worktreePath: wt.path }) // folder already gone — prune + delete
-      } else if (wt.dirtyCount === 0) {
+      } else if (wt.statusKnown && wt.dirtyCount === 0) {
         strays.push({ branch, worktreePath: wt.path })
       }
-      // dirty sibling checkout of a merged branch: not safe — stays in "Other checkouts"
+      // Dirty or unreadable sibling checkout: not provably safe — stays in "Other checkouts".
     }
     return strays
   } catch {

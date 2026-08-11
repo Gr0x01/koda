@@ -123,6 +123,13 @@ function ChangesSurface({ onCollapse }: { onCollapse: () => void }) {
   // which is what "Changes" means here (not the narrower since-this-turn baseline agent edits use).
   const onSelect = (path: string): void => openFile(path, undefined, { view: 'diff' })
 
+  // Open the actual file on the stage (its editable/doc view, not the diff) — "let me read or edit it".
+  const onOpen = (path: string): void => openFile(path)
+
+  // Reveal in Finder — a Mac table-stakes for "where does this live?". Contained to the project root
+  // in the main process, so a bad path is refused there rather than guarded here.
+  const onReveal = (path: string): void => void window.koda.revealPath({ path })
+
   // Discard one file's change — revert an edit to the last version, or remove a new file. The main
   // process checkpoints the tree first (undoable from Recovery). On success, close its diff if staged
   // (it no longer has a change to show) and refresh. Returns error copy for the row, or null.
@@ -206,13 +213,15 @@ function ChangesSurface({ onCollapse }: { onCollapse: () => void }) {
               alsoBy={alsoBy}
               stagedPath={stagedPath}
               onSelect={onSelect}
+              onOpen={onOpen}
+              onReveal={onReveal}
               onDiscard={onDiscard}
             />
           ))
         )}
         {truncated && (
           <p className="shrink-0 px-3 py-1.5 text-[11px] text-text-muted/70">
-            + more changes. Ask Claude to "save a version" for very large changes.
+            + more changes. Ask the agent to "save a version" for very large changes.
           </p>
         )}
       </div>

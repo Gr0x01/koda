@@ -1,5 +1,7 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { constants, copyFileSync, mkdirSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import { log } from './logger'
+import { writeFileAtomic } from './atomic-write'
 
 /**
  * Per-project behavior-layer config at `<project>/.koda/guardrails.json`. Two parts, both reversible:
@@ -21,38 +23,77 @@ function configPath(projectRoot: string): string {
   return join(projectRoot, '.koda', 'guardrails.json')
 }
 
-/** Read the whole config, normalized. Absent/corrupt ⇒ empty (fail open: every default on, no edits). */
-function readConfig(projectRoot: string): GuardrailsConfig {
-  if (!projectRoot) return { disabled: [], overrides: {} }
+type ReadResult = { config: GuardrailsConfig; writable: boolean }
+
+/**
+ * Reads fail open for prompt assembly, but a failed read must never authorize a later read-modify-write
+ * from empty defaults. A missing file is first use and remains writable.
+ */
+function readConfig(projectRoot: string): ReadResult {
+  const empty = { disabled: [], overrides: {} }
+  if (!projectRoot) return { config: empty, writable: true }
+  const file = configPath(projectRoot)
   try {
-    const raw = JSON.parse(readFileSync(configPath(projectRoot), 'utf8'))
-    const disabled = Array.isArray(raw?.disabled)
-      ? raw.disabled.filter((x: unknown): x is string => typeof x === 'string')
-      : []
-    const overrides: Record<string, string> = {}
-    if (raw?.overrides && typeof raw.overrides === 'object') {
-      for (const [k, v] of Object.entries(raw.overrides)) if (typeof v === 'string') overrides[k] = v
+    const raw = JSON.parse(readFileSync(file, 'utf8'))
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('invalid guardrail settings shape')
+    if (raw.disabled !== undefined && (!Array.isArray(raw.disabled) || raw.disabled.some((x: unknown) => typeof x !== 'string'))) {
+      throw new Error('invalid guardrail disabled settings')
     }
-    return { disabled, overrides }
-  } catch {
-    return { disabled: [], overrides: {} }
+    if (raw.overrides !== undefined && (!raw.overrides || typeof raw.overrides !== 'object' || Array.isArray(raw.overrides))) {
+      throw new Error('invalid guardrail override settings')
+    }
+    const disabled = (raw.disabled ?? []) as string[]
+    const overrides: Record<string, string> = {}
+    for (const [k, v] of Object.entries(raw.overrides ?? {})) {
+      if (typeof v !== 'string') throw new Error('invalid guardrail override text')
+      overrides[k] = v
+    }
+    return { config: { disabled, overrides }, writable: true }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { config: empty, writable: true }
+    log.warn(
+      'guardrails',
+      'guardrail settings are present but unreadable; preserving them',
+      err instanceof Error ? err.message : err,
+    )
+    try {
+      copyFileSync(file, `${file}.corrupt.bak`, constants.COPYFILE_EXCL)
+    } catch {
+      // The original stays in place; most importantly, this read cannot authorize a write.
+    }
+    return { config: empty, writable: false }
   }
+}
+
+function configForWrite(projectRoot: string): GuardrailsConfig {
+  const result = readConfig(projectRoot)
+  if (!result.writable) {
+    throw new Error('Guardrail settings could not be read. Your existing settings were left unchanged.')
+  }
+  return result.config
 }
 
 function writeConfig(projectRoot: string, cfg: GuardrailsConfig): void {
   const file = configPath(projectRoot)
   mkdirSync(dirname(file), { recursive: true })
   const sorted = { disabled: [...cfg.disabled].sort(), overrides: cfg.overrides }
-  writeFileSync(file, `${JSON.stringify(sorted, null, 2)}\n`, 'utf8')
+  writeFileAtomic(file, `${JSON.stringify(sorted, null, 2)}\n`)
 }
 
 export function readDisabledSet(projectRoot: string): Set<string> {
-  return new Set(readConfig(projectRoot).disabled)
+  const disabled = new Set(readConfig(projectRoot).config.disabled)
+  // The Codex-specific delegation rule was added after projects could already switch the owning code
+  // principle off. Mirror that established key in memory so the new engine variant cannot silently
+  // re-enable itself; the next explicit principle toggle writes/removes both current member keys.
+  if (disabled.has('rule:delegate-independent-work')) {
+    disabled.add('rule:delegate-independent-work-codex')
+  }
+  return disabled
 }
 
 /** The per-principle edited rule text overriding the bundled default ({ principleId: text }). */
 export function readOverrides(projectRoot: string): Record<string, string> {
-  return readConfig(projectRoot).overrides
+  return readConfig(projectRoot).config.overrides
 }
 
 /**
@@ -63,7 +104,7 @@ export function readOverrides(projectRoot: string): Record<string, string> {
 export function setGuardrailsDisabled(projectRoot: string, keys: string[], disabled: boolean): void {
   if (!projectRoot) throw new Error('Open a project first.')
   if (keys.length === 0) return
-  const cfg = readConfig(projectRoot)
+  const cfg = configForWrite(projectRoot)
   const set = new Set(cfg.disabled)
   for (const key of keys) {
     if (disabled) set.add(key)
@@ -75,11 +116,32 @@ export function setGuardrailsDisabled(projectRoot: string, keys: string[], disab
 /** Set (or clear, with `null`) a principle's edited text. Preserves `disabled`. */
 export function setOverride(projectRoot: string, principleId: string, text: string | null): void {
   if (!projectRoot) throw new Error('Open a project first.')
-  const cfg = readConfig(projectRoot)
+  const cfg = configForWrite(projectRoot)
   const overrides = { ...cfg.overrides }
   if (text === null) delete overrides[principleId]
   else overrides[principleId] = text
   writeConfig(projectRoot, { ...cfg, overrides })
+}
+
+/** Edit/restore a principle and its bundled member switches in one atomic config write. */
+export function setPrincipleOverride(
+  projectRoot: string,
+  principleId: string,
+  text: string | null,
+  memberKeys: string[],
+): void {
+  if (!projectRoot) throw new Error('Open a project first.')
+  const cfg = configForWrite(projectRoot)
+  const overrides = { ...cfg.overrides }
+  const disabled = new Set(cfg.disabled)
+  if (text === null) {
+    delete overrides[principleId]
+    for (const key of memberKeys) disabled.delete(key)
+  } else {
+    overrides[principleId] = text
+    for (const key of memberKeys) disabled.add(key)
+  }
+  writeConfig(projectRoot, { disabled: [...disabled], overrides })
 }
 
 // Typed-key constructors — the one place the key format lives.

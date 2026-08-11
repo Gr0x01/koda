@@ -13,12 +13,13 @@ import { EffortControl } from '../workspace/EffortControl'
 import { Button } from '../ui'
 import { SessionHeader } from './conversation/SessionHeader'
 import { AsideOverlay } from './conversation/AsideOverlay'
-import { ComposerError } from './conversation/ComposerError'
+import { ComposerError, ComposerNotice } from './conversation/ComposerError'
 import { ComposerPrimaryButton } from './conversation/ComposerPrimaryButton'
 import { AttachMenu } from './conversation/AttachMenu'
 import { useMentionPicker, inkTokens } from './conversation/useMentionPicker'
-import { stagingFromFiles, baseName, docMediaType } from './conversation/attach'
+import { stagingFromFiles, refusedAttachmentMessage, baseName } from './conversation/attach'
 import { FileChip } from '../transcript/FileChip'
+import { hasRunningSubagent } from '@shared/delegation'
 
 /**
  * The conversation surface (ui-workspace.md §3) — the always-present, premium center of the
@@ -28,6 +29,7 @@ import { FileChip } from '../transcript/FileChip'
 export function ConversationSurface() {
   const activeId = useWorkspace((s) => s.activeId)
   const session = useWorkspace((s) => (s.activeId ? s.sessions[s.activeId] : null))
+  const postureLocked = !!session && (session.busy || hasRunningSubagent(session.items))
   // Select the stable `pending` ref and filter in render — a selector that returns a fresh array
   // each call makes zustand see a changed snapshot every render (infinite loop).
   const pending = useWorkspace((s) => s.pending)
@@ -38,6 +40,7 @@ export function ConversationSurface() {
   const send = useWorkspace((s) => s.send)
   const answerApproval = useWorkspace((s) => s.answerApproval)
   const interrupt = useWorkspace((s) => s.interrupt)
+  const stopSubagent = useWorkspace((s) => s.stopSubagent)
   const askAside = useWorkspace((s) => s.askAside)
   const dismissAside = useWorkspace((s) => s.dismissAside)
   const promoteAside = useWorkspace((s) => s.promoteAside)
@@ -49,6 +52,7 @@ export function ConversationSurface() {
   const renameSession = useWorkspace((s) => s.renameSession)
   const setSessionApprovalMode = useWorkspace((s) => s.setSessionApprovalMode)
   const addAttachments = useWorkspace((s) => s.addAttachments)
+  const setAttachNotice = useWorkspace((s) => s.setAttachNotice)
   const removeAttachment = useWorkspace((s) => s.removeAttachment)
   // Click a staged thumbnail to inspect it full-size before sending — at 56px square you can't tell two
   // screenshots apart. The shared lightbox (mounted at the Chassis root) handles the overlay + Esc.
@@ -75,13 +79,31 @@ export function ConversationSurface() {
   // The ink layer: a div painted exactly over the textarea that renders `@` references in accent
   // (everything else transparent). Kept in scroll-register with the textarea here and on its onScroll.
   const inkRef = useRef<HTMLDivElement>(null)
-  useLayoutEffect(() => {
+  // Grow the composer to fit its draft (capped at 200px). Bail while the textarea isn't laid out
+  // (offsetParent null = an ancestor is display:none — e.g. hidden behind the App face or an expanded
+  // preview): scrollHeight reads 0 there, and writing height:0px collapses the box so the placeholder
+  // shows only its top sliver when the surface returns. Skipping keeps the last good height instead.
+  const resizeComposer = useCallback(() => {
     const el = composerRef.current
-    if (!el) return
+    if (!el || el.offsetParent === null) return
     el.style.height = 'auto'
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`
     if (inkRef.current) inkRef.current.scrollTop = el.scrollTop
-  }, [session?.draft, activeId])
+  }, [])
+  useLayoutEffect(() => {
+    resizeComposer()
+  }, [resizeComposer, session?.draft, activeId])
+  // Recompute when the composer's box changes size — covers becoming visible again (0 → real width)
+  // and the surface being resized, neither of which is a draft/activeId change. Observe the wrapper
+  // (not the textarea, whose height we mutate) so setting height can't feed back into the observer.
+  const composerWrapRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const el = composerWrapRef.current
+    if (!el) return
+    const ro = new ResizeObserver(() => resizeComposer())
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [resizeComposer])
 
   // The "@" file picker: type @ to reference a project document. Owns its own menu + keyboard nav; the
   // textarea's handlers below defer to it (onKeyDown consumes nav/select keys, sync re-detects the token).
@@ -92,16 +114,27 @@ export function ConversationSurface() {
     textareaRef: composerRef,
   })
 
-  // ⌘F opens find-in-transcript — but only when focus isn't in Monaco (the editor keeps its own ⌘F).
+  // ⌘F opens find-in-transcript — but only when focus isn't in Monaco (its own ⌘F) or a doc
+  // editor (which mounts this same find bar over the doc instead).
   useEffect(() => {
     function onKey(e: KeyboardEvent): void {
       if (!(e.metaKey || e.ctrlKey) || e.shiftKey || e.code !== 'KeyF') return
-      if ((document.activeElement as HTMLElement | null)?.closest('.monaco-editor')) return
+      if ((document.activeElement as HTMLElement | null)?.closest('.monaco-editor, [data-doc-editor]')) return
       e.preventDefault()
+      // One find bar at a time: both bars share the global CSS highlight registry, so an already-open
+      // doc find bar closes (synchronously) before this one opens — and vice versa.
+      window.dispatchEvent(new CustomEvent('koda:find-open'))
       setFindOpen(true)
     }
+    function onOtherFind(): void {
+      setFindOpen(false)
+    }
     window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
+    window.addEventListener('koda:find-open', onOtherFind)
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('koda:find-open', onOtherFind)
+    }
   }, [])
 
   // "Reply instead" on a question card dismisses it and asks us to hand focus to the composer so the
@@ -189,8 +222,9 @@ export function ConversationSurface() {
       ? busyActivity(session)
       : null
 
-  // Submit the composer: an aside while in aside-mode, otherwise a normal turn. (`send` guards empty /
-  // image-only / busy itself.) Pin to the tail before a real turn so the new item snaps into view.
+  // Submit the composer: an aside while in aside-mode, otherwise a normal turn. (`send` guards
+  // empty / image-only / busy itself.) Pin to the tail before a real turn so the new item snaps
+  // into view.
   const submitComposer = (): void => {
     if (!activeId || !session) return
     if (asideMode) {
@@ -224,7 +258,11 @@ export function ConversationSurface() {
   }
 
   async function attachFiles(id: string, files: Iterable<File>): Promise<void> {
-    const ok = await stagingFromFiles(files)
+    const dropped = [...files]
+    // Say what can't come in BEFORE staging the rest: a drop of nothing but HEICs would otherwise read
+    // as the app ignoring it. Also clears a stale notice when the next drop is clean.
+    setAttachNotice(id, refusedAttachmentMessage(dropped))
+    const ok = await stagingFromFiles(dropped)
     if (ok.length) addAttachments(id, ok)
   }
 
@@ -310,7 +348,12 @@ export function ConversationSurface() {
             overflowing content scrolls up under the scrim and softens instead of hard-clipping. */}
         <div ref={scrollRef} onScroll={onScroll} className="h-full overflow-y-auto px-4 pb-10">
           <div ref={contentRef}>
-            <Transcript items={session.items} streaming={session.streaming} working={working} />
+            <Transcript
+              items={session.items}
+              streaming={session.streaming}
+              working={working}
+              onStopSubagent={(taskId) => stopSubagent(session.id, taskId)}
+            />
           </div>
         </div>
         {/* Gradient scrim painted over the bottom of the transcript (bg → transparent). Always present
@@ -401,6 +444,16 @@ export function ConversationSurface() {
               <ComposerError error={session.error} onRetry={() => activeId && retryLastTurn(activeId)} />
             </div>
           )}
+          {/* A file that couldn't be attached reports in the same fused row. Transient by design: the
+              user dismisses it, the next drop replaces it, and sending clears it. */}
+          {session.attachNotice && (
+            <div className="mb-2 border-b border-border/60 px-0.5 pb-2">
+              <ComposerNotice
+                text={session.attachNotice}
+                onDismiss={() => activeId && setAttachNotice(activeId, null)}
+              />
+            </div>
+          )}
           {asideMode && (
             <div className="mb-1 flex items-center gap-1.5 px-0.5 pt-0.5 text-[11px] text-aside">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
@@ -450,7 +503,7 @@ export function ConversationSurface() {
               on the right so the controls read as one group even when the draft grows tall. Buttons
               bottom-align (items-end) so they stay anchored as the textarea grows. */}
           <div className="flex items-end gap-2">
-            <div className="relative min-w-0 flex-1">
+            <div ref={composerWrapRef} className="relative min-w-0 flex-1">
             <textarea
               ref={composerRef}
               rows={1}
@@ -467,7 +520,8 @@ export function ConversationSurface() {
                 if (mentions.onKeyDown(e)) return
                 if (e.key === 'Tab' && e.shiftKey) {
                   e.preventDefault()
-                  if (activeId) setSessionApprovalMode(activeId, nextApprovalMode(session.approvalMode, session.busy))
+                  if (activeId)
+                    setSessionApprovalMode(activeId, nextApprovalMode(session.approvalMode, postureLocked))
                   return
                 }
                 // Enter sends (an aside while in aside-mode, else a turn); Shift+Enter is a newline. Skip
@@ -488,13 +542,19 @@ export function ConversationSurface() {
                 const files = [...e.clipboardData.items]
                   .filter((it) => it.kind === 'file')
                   .map((it) => it.getAsFile())
-                  .filter((f): f is File => f !== null && (f.type.startsWith('image/') || docMediaType(f) !== null))
+                  .filter((f): f is File => f !== null)
                 if (activeId && files.length) {
+                  // We own a file paste either way now — staged, or refused with a reason. (Text pastes
+                  // are `kind: 'string'` and never land here.)
                   e.preventDefault() // don't also paste the filename text
                   attachFiles(activeId, files)
                 }
               }}
-              placeholder={asideMode ? "Ask a quick question — won't interrupt or change anything" : 'Message the agent…'}
+              placeholder={
+                asideMode
+                  ? "Ask a quick question — won't interrupt or change anything"
+                  : 'Message the agent…'
+              }
               className="block max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-1 py-1.5 text-sm leading-5 outline-none placeholder:text-text-muted"
             />
             {/* Color only, never weight — a bolder glyph has a different advance and would drift out
@@ -511,10 +571,14 @@ export function ConversationSurface() {
               onAttach={(staged) => {
                 if (activeId) addAttachments(activeId, staged)
               }}
-              onInsertPath={(path) => {
+              onRefused={(message) => {
+                if (activeId) setAttachNotice(activeId, message)
+              }}
+              onInsertPaths={(paths) => {
                 if (!activeId) return
                 const d = session.draft
-                setDraft(activeId, d && !d.endsWith(' ') ? `${d} \`${path}\` ` : `${d}\`${path}\` `)
+                const refs = paths.map((p) => `\`${p}\``).join(' ')
+                setDraft(activeId, d && !d.endsWith(' ') ? `${d} ${refs} ` : `${d}${refs} `)
                 composerRef.current?.focus()
               }}
             />
@@ -539,7 +603,9 @@ export function ConversationSurface() {
                     onClick={submitComposer}
                     title="Ask aside"
                     aria-label="Ask aside"
-                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-aside text-white transition-colors hover:opacity-90"
+                    className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-white transition-colors hover:opacity-90 ${
+                      asideMode ? 'bg-aside' : 'bg-accent'
+                    }`}
                   >
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
                       <path d="M12 19V5M5 12l7-7 7 7" />
@@ -564,14 +630,18 @@ export function ConversationSurface() {
             }`}
           >
             <div className="flex min-w-0 items-center gap-1.5">
-              <ApprovalModeControl sessionId={session.id} mode={session.approvalMode} busy={session.busy} />
+              <ApprovalModeControl
+                sessionId={session.id}
+                mode={session.approvalMode}
+                busy={postureLocked}
+              />
               <ModelControl
                 sessionId={session.id}
                 model={session.model}
                 activeModel={session.activeModel}
-                busy={session.busy}
+                busy={postureLocked}
               />
-              <EffortControl sessionId={session.id} effort={session.effort} busy={session.busy} />
+              <EffortControl sessionId={session.id} effort={session.effort} busy={postureLocked} />
             </div>
             <div className="flex shrink-0 items-center gap-2">
               <ContinueFreshButton

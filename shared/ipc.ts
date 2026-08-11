@@ -4,9 +4,16 @@ import { z } from 'zod'
  * The typed IPC contract. Zod schemas validate at the main-process boundary;
  * the inferred types flow to the renderer through the preload bridge.
  *
- * This is a scaffold-stage placeholder surface (app info + echo) that proves the
- * round-trip works end to end. The normalized engine-event vocabulary lands here
- * later (see architecture/engine-adapter-and-output-view.md).
+ * This is the whole product surface, grouped by subsystem under the `// ── … ──`
+ * banners: the engine adapter's normalized event vocabulary (THE portability
+ * boundary — see architecture/engine-adapter-and-output-view.md), the approval
+ * gate, dual-git (safety + user), project files, terminal, remote control, and
+ * settings, among others. Not every subsystem has a banner yet — preview and
+ * mini apps carry schemas here without one.
+ *
+ * Adding a call means touching four layers in step: a name in
+ * `shared/channels.ts`, schemas/types here, a handler in `src/main/ipc.ts`, and
+ * a method on `KodaApi` wired in `src/preload/index.ts`.
  */
 
 /**
@@ -31,6 +38,8 @@ export const CodexAuthStatusSchema = z.object({
   signedIn: z.boolean(),
   authMethod: z.string().nullable(),
   requiresOpenaiAuth: z.boolean().nullable(),
+  /** The account state is unknown because the local Codex probe failed; never present on older clients. */
+  probeFailed: z.boolean().optional(),
 })
 export type CodexAuthStatus = z.infer<typeof CodexAuthStatusSchema>
 
@@ -98,17 +107,6 @@ export const FeedbackResultSchema = z.discriminatedUnion('ok', [
   z.object({ ok: z.literal(false), error: z.string() }),
 ])
 export type FeedbackResult = z.infer<typeof FeedbackResultSchema>
-
-// app:echo — proves argument validation across the boundary.
-export const EchoRequestSchema = z.object({
-  message: z.string().min(1).max(1000),
-})
-export type EchoRequest = z.infer<typeof EchoRequestSchema>
-
-export const EchoResponseSchema = z.object({
-  reply: z.string(),
-})
-export type EchoResponse = z.infer<typeof EchoResponseSchema>
 
 // engine:probe — spawns the bundled engine's `--version` to prove it executes.
 export const EngineProbeSchema = z.object({
@@ -190,6 +188,27 @@ export const ToolResultSchema = z.object({
   parentToolUseId: z.string().optional(),
 })
 
+/** Incremental output from a still-running tool. The final ToolResult remains authoritative. */
+export const ToolProgressSchema = z.object({
+  type: z.literal('ToolProgress'),
+  sessionId: z.string(),
+  id: z.string(),
+  output: z.string(),
+})
+
+/** The engine's current turn plan, normalized into the same statuses as Koda's task list. */
+export const PlanUpdateSchema = z.object({
+  type: z.literal('PlanUpdate'),
+  sessionId: z.string(),
+  steps: z.array(z.object({ id: z.string(), subject: z.string(), status: z.string() })),
+})
+
+/** The engine replaced older thread context with a compact summary and continued. */
+export const ContextCompactedSchema = z.object({
+  type: z.literal('ContextCompacted'),
+  sessionId: z.string(),
+})
+
 /**
  * Context-window occupancy after a turn (drives the meter, ui-workspace.md §7a). Derived in the
  * adapter from the engine's `result.usage` + `result.modelUsage`. `contextTokens` is the current
@@ -206,6 +225,13 @@ export const ContextUsageSchema = z.object({
   outputTokens: z.number(),
 })
 export type ContextUsage = z.infer<typeof ContextUsageSchema>
+
+/** A context-only refresh outside turn completion, used when compaction usage arrives late. */
+export const ContextUsageUpdateSchema = z.object({
+  type: z.literal('ContextUsageUpdate'),
+  sessionId: z.string(),
+  context: ContextUsageSchema,
+})
 
 /**
  * Per-model usage for ONE turn — the engine's `result.modelUsage` (keyed by model id) flattened to an
@@ -318,6 +344,8 @@ export const SubagentStartedSchema = z.object({
   type: z.literal('SubagentStarted'),
   sessionId: z.string(),
   toolUseId: z.string(),
+  /** Engine task id — distinct from the Agent tool_use id; required for a targeted stop. */
+  taskId: z.string().optional(),
   subagentType: z.string(),
   description: z.string(),
   prompt: z.string().optional(),
@@ -328,6 +356,7 @@ export const SubagentProgressSchema = z.object({
   type: z.literal('SubagentProgress'),
   sessionId: z.string(),
   toolUseId: z.string(),
+  taskId: z.string().optional(),
   /** Engine status string, e.g. 'completed' (task_notification). */
   status: z.string().optional(),
   /** Live one-liner, e.g. "Writing sub.txt". */
@@ -341,7 +370,10 @@ export const SubagentCompletedSchema = z.object({
   type: z.literal('SubagentCompleted'),
   sessionId: z.string(),
   toolUseId: z.string(),
+  taskId: z.string().optional(),
   resultText: z.string().optional(),
+  /** A user-targeted stop is distinct from a failed or successful finished child. */
+  outcome: z.enum(['completed', 'interrupted', 'unknown']).optional(),
   /** The Agent tool_result's error flag — a failed subagent must not read as success. */
   isError: z.boolean().optional(),
   usage: SubagentUsageSchema.optional(),
@@ -393,11 +425,12 @@ export const WorkflowCompletedSchema = z.object({
 // These are the ACCOUNT-level subscription windows — the same ones the TUI's /usage
 // shows. The engine emits a `rate_limit_event` on every turn carrying the currently
 // binding window (verified vs the real CLI 2.1.187): its type, reset time, and a
-// coarse status band. Note: the stream does NOT carry a precise "% used" — only the
-// reset timestamp + status. All fields are pass-through DISPLAY ONLY (no Koda
-// subsystem branches on `rateLimitType`, honoring the no-model-names spirit).
+// coarse status band. Since ~2026-07 (verified 07-22 vs 2.1.205) the event also
+// carries a precise `utilization`, and the server may report only windows near
+// their cap — a quiet window is simply absent. All fields are pass-through DISPLAY
+// ONLY (no Koda subsystem branches on `rateLimitType` for behavior).
 export const RateLimitInfoSchema = z.object({
-  /** 'five_hour' | 'weekly' (engine vocabulary; rendered to a human label, never branched on). */
+  /** 'five_hour' | 'weekly' | 'seven_day' (engine vocabulary; rendered to a human label). */
   rateLimitType: z.string(),
   /** Unix seconds when this window resets. */
   resetsAt: z.number(),
@@ -405,12 +438,26 @@ export const RateLimitInfoSchema = z.object({
   status: z.string(),
   /** True when the account is currently spending overage past the window. */
   isUsingOverage: z.boolean().optional(),
-  /** Real % of the window consumed (0–100) WHEN the engine reports it — Codex/OpenAI's app-server gives
-   *  an exact `usedPercent`; the Claude stream does NOT (band + reset only). Display-only, a measured
-   *  fill not an estimate. Absent ⇒ render band-only (no bar). */
+  /** Real % of the window consumed (0–100) WHEN the engine reports it — Codex's app-server gives an
+   *  exact `usedPercent`; the Claude stream carries `utilization` since ~2026-07 (mapped to this).
+   *  Display-only, a measured fill not an estimate. Absent ⇒ render band-only (no bar). */
   usedPercent: z.number().optional(),
+  /** Milliseconds since epoch when Koda observed this fact. Optional for persisted back-compat. */
+  observedAt: z.number().optional(),
+  /** Provenance used by the reconciler; stronger complete reads cannot be displaced by sparse pushes. */
+  source: z.enum(['disk', 'stream', 'poll', 'snapshot']).optional(),
 })
 export type RateLimitInfo = z.infer<typeof RateLimitInfoSchema>
+
+/** `rateLimitType` (engine vocabulary) → the human word for that window (the status bar's gauge label). */
+export function windowLabel(type: string): string {
+  if (type === 'five_hour') return '5-hour'
+  // Claude reports its weekly cap as 'seven_day'; same human word as Codex's 'weekly'.
+  if (type === 'weekly' || type === 'seven_day') return 'weekly'
+  // A per-model weekly cap ('seven_day_fable') — its own window, named so it reads as one.
+  if (type.startsWith('seven_day_')) return `weekly · ${type.slice('seven_day_'.length).replace(/_/g, ' ')}`
+  return type.replace(/_/g, ' ')
+}
 
 /** Session usage as one snapshot — context fill + spend from the persisted session, account windows
  *  from the live stream. Rides the remote transcript reply so a phone joining a session seeds its
@@ -435,6 +482,15 @@ export const RateLimitUpdateSchema = z.object({
    *  from its own session state can misfile a window when that state is cold (the phone's cold-open). */
   engine: EngineIdSchema.optional(),
   info: RateLimitInfoSchema,
+  /** When present, this update came from an AUTHORITATIVE full snapshot (Codex's `account/rateLimits/read`),
+   *  and this array is the COMPLETE set of window types the engine currently reports. Receivers prune any
+   *  window for this engine NOT in the list — that's how a stale slot (a window the plan stopped reporting,
+   *  whose real reset is far off) gets dropped instead of lingering as a ghost. Absent ⇒ a sparse push:
+   *  merge only, never prune (Claude's per-turn stream, Codex's opportunistic `updated` push). */
+  authoritativeTypes: z.array(z.string()).optional(),
+  /** Main's reconciled truth after applying this update. New desktop heads replace their local engine
+   *  map with it; optional so older Mac/phone versions keep their merge-only behavior. */
+  reconciledWindows: z.record(z.string(), RateLimitInfoSchema).optional(),
 })
 
 // Per-session approval posture. ask/acceptEdits/auto are implemented in OUR gate (the engine stays in
@@ -474,25 +530,37 @@ export const ModelEffortChangedSchema = z.object({
   engineId: EngineIdSchema.optional(),
 })
 
-export const EngineEventSchema = z.discriminatedUnion('type', [
-  SessionStartedSchema,
-  AssistantDeltaSchema,
-  ThinkingDeltaSchema,
-  AssistantBlockSchema,
-  ToolRequestedSchema,
-  ToolResultSchema,
-  TurnCompleteSchema,
-  EngineErrorSchema,
-  SubagentStartedSchema,
-  SubagentProgressSchema,
-  SubagentCompletedSchema,
-  WorkflowStartedSchema,
-  WorkflowAgentSchema,
-  WorkflowCompletedSchema,
-  RateLimitUpdateSchema,
-  ApprovalModeChangedSchema,
-  ModelEffortChangedSchema,
-])
+const ReplaySequenceSchema = z.object({
+  /** Stable identity inside one session's durable replay. Present only once a phone/headless replay
+   *  log owns the event; optional keeps ordinary local streams and older sidecars compatible. */
+  replaySeq: z.number().int().positive().optional(),
+})
+
+export const EngineEventSchema = z
+  .discriminatedUnion('type', [
+    SessionStartedSchema,
+    AssistantDeltaSchema,
+    ThinkingDeltaSchema,
+    AssistantBlockSchema,
+    ToolRequestedSchema,
+    ToolProgressSchema,
+    ToolResultSchema,
+    PlanUpdateSchema,
+    ContextCompactedSchema,
+    ContextUsageUpdateSchema,
+    TurnCompleteSchema,
+    EngineErrorSchema,
+    SubagentStartedSchema,
+    SubagentProgressSchema,
+    SubagentCompletedSchema,
+    WorkflowStartedSchema,
+    WorkflowAgentSchema,
+    WorkflowCompletedSchema,
+    RateLimitUpdateSchema,
+    ApprovalModeChangedSchema,
+    ModelEffortChangedSchema,
+  ])
+  .and(ReplaySequenceSchema)
 export type EngineEvent = z.infer<typeof EngineEventSchema>
 
 /** The user's own turn text, captured for the replay log. The engine event stream never carries the
@@ -503,6 +571,7 @@ export const RemoteUserTurnSchema = z.object({
   type: z.literal('RemoteUserTurn'),
   sessionId: z.string(),
   text: z.string(),
+  replaySeq: z.number().int().positive().optional(),
 })
 export type RemoteUserTurn = z.infer<typeof RemoteUserTurnSchema>
 
@@ -514,13 +583,27 @@ export type ReplayEntry = z.infer<typeof ReplayEntrySchema>
 /** A live headless (phone-started, windowless) session the desktop is adopting: its identity plus the
  *  full replay log (engine events + user turns) to feed through the reducer so the transcript
  *  materializes like a local session's. `model` is the user's chosen model (undefined ⇒ engine
- *  default); the label is derived in the renderer from the replayed content. See
- *  EngineSessionManager.adoptHeadlessForWindow. */
+ *  default); the label comes from the persisted store when main already settled one, and is derived
+ *  from the replayed content otherwise. See EngineSessionManager.adoptHeadlessForWindow. */
 export const AdoptedHeadlessSessionSchema = z.object({
   id: z.string(),
   cwd: z.string(),
   engineId: EngineIdSchema,
   model: z.string().optional(),
+  effort: z.string().optional(),
+  /** The label main already settled (auto-title or phone rename) — adoption uses it verbatim instead
+   *  of regenerating, so a name the user has seen never changes on open. */
+  label: z.string().optional(),
+  userNamed: z.boolean().optional(),
+  /** The gate's ACTUAL posture for this session (not the window's default) — a phone-started session
+   *  may have had its mode changed before any window ever opened. The tab must display what's really
+   *  enforced, never a guessed default that could silently show a looser posture than the gate has. */
+  approvalMode: ApprovalModeSchema,
+  /** Main-process truth at the instant ownership moves to this window. A renderer may already have a
+   *  cold copy of the same session after a window close/reopen; these fields distinguish an actually
+   *  live parent/child from transcript-only states that hydration correctly settled as inactive. */
+  working: z.boolean().optional(),
+  activeSubagentToolUseIds: z.array(z.string()).optional(),
   events: z.array(ReplayEntrySchema),
 })
 export type AdoptedHeadlessSession = z.infer<typeof AdoptedHeadlessSessionSchema>
@@ -546,7 +629,14 @@ export type RenameRequested = z.infer<typeof RenameRequestedSchema>
  *  started it, so it adopted empty). The engine stream never echoes the human's prompt, so without this
  *  the Mac transcript misses the user bubble and the tab keeps its "From your phone" default. `text` is
  *  the raw prompt ('' for an image-only turn); the renderer derives the bubble and titles from it. */
-export const RemoteUserTurnLiveSchema = z.object({ sessionId: z.string(), text: z.string() })
+export const RemoteUserTurnLiveSchema = z.object({
+  sessionId: z.string(),
+  text: z.string(),
+  replaySeq: z.number().int().positive().optional(),
+  /** Remote turns append a bubble; a local turn already has an optimistic bubble and only needs its
+   *  durable replay identity stamped onto that row. Optional defaults to append for older senders. */
+  append: z.boolean().optional(),
+})
 export type RemoteUserTurnLive = z.infer<typeof RemoteUserTurnLiveSchema>
 
 // ── Engine adapter: renderer→main commands ───────────────────────────────────
@@ -583,6 +673,9 @@ export const StartSessionRequestSchema = z.object({
    *  `SessionStarted.engineNativeId`). Only meaningful with `resumeSessionId` + `engineId:'codex'` —
    *  lets the Codex driver resume THAT thread by id (context preserved) instead of starting fresh. */
   engineNativeId: z.string().optional(),
+  /** Highest durable replay identity already rendered for this restored session. Carries the cursor
+   *  across archive→resume even if the renderer's debounced project save has not landed yet. */
+  replaySeq: z.number().int().nonnegative().optional(),
 }).refine((a) => !(a.resumeSessionId && a.sessionId), {
   message: 'resumeSessionId (--resume) and sessionId (--session-id) are mutually exclusive',
   path: ['sessionId'],
@@ -617,6 +710,10 @@ export type SendTurnRequest = z.infer<typeof SendTurnRequestSchema>
 /** Shared shape for the session-targeted commands that take no other args. */
 export const SessionRefSchema = z.object({ sessionId: z.string() })
 export type SessionRef = z.infer<typeof SessionRefSchema>
+
+/** Stop one background child without interrupting the parent conversation or its other children. */
+export const StopSubagentRequestSchema = z.object({ sessionId: z.string(), taskId: z.string() })
+export type StopSubagentRequest = z.infer<typeof StopSubagentRequestSchema>
 
 // ── Side questions ("btw" / aside) ───────────────────────────────────────────
 //
@@ -731,7 +828,11 @@ export type AttentionCount = z.infer<typeof AttentionCountSchema>
 // assist:title — turn a first prompt into a clean session title via the on-device model, or a
 // deterministic first-words fallback. Always resolves to a usable string (main never throws here).
 
-export const AssistTitleRequestSchema = z.object({ text: z.string() })
+export const AssistTitleRequestSchema = z.object({
+  text: z.string(),
+  /** Sibling-session names — an exactly-colliding answer gets a date suffix so names stay distinct. */
+  avoid: z.array(z.string()).max(24).optional(),
+})
 export type AssistTitleRequest = z.infer<typeof AssistTitleRequestSchema>
 
 export const AssistTitleResponseSchema = z.object({ title: z.string() })
@@ -754,14 +855,19 @@ export const ToolDecisionSchema = z.discriminatedUnion('kind', [
 ])
 export type ToolDecision = z.infer<typeof ToolDecisionSchema>
 
-/** main→renderer: a tool is waiting on the user (Ask-me mode). requestId = the engine's tool_use_id. */
+/** main→renderer: a tool is waiting on the user (Ask-me mode). requestId = the engine's tool_use_id.
+ *  `reason` (optional): why the gate forced this ask when the posture wouldn't have — e.g. the
+ *  self-protection tier naming what the action touches ("this project's guardrail switches"). An
+ *  unexplained card in Auto gets rubber-stamped; the reason is what makes the forced ask meaningful. */
 export const ApprovalRequestSchema = z.object({
   sessionId: z.string(),
   requestId: z.string(),
   toolName: z.string(),
   input: z.unknown(),
+  reason: z.string().optional(),
 })
 export type ApprovalRequest = z.infer<typeof ApprovalRequestSchema>
+export const ApprovalRequestsSchema = z.array(ApprovalRequestSchema)
 
 /** main→renderer: every pending approval for a session is void (its engine ended). Clear the UI. */
 export const ApprovalCancelledSchema = z.object({ sessionId: z.string() })
@@ -923,6 +1029,11 @@ export const KodaSettingsSchema = z.object({
    *  into a shared dir (once, reused by every project). The agent only gets browser tools when this is
    *  on AND the download completed. Install *state* is runtime (playwright:status), not persisted here. */
   playwrightEnabled: z.boolean(),
+  /** Overnight memory tidy (dream-plan.md): a couple of quiet hours after the day's last turn, Koda
+   *  consolidates the memory of the projects it worked in. Runs on the user's own plan while they're
+   *  away, so default-OFF with plain wording at the toggle (Settings → Memory). Read live by the
+   *  main-process scheduler; flipping it applies immediately. */
+  dreamEnabled: z.boolean(),
   /** Whether the user has completed the first-run onboarding wizard (architecture/onboarding.md).
    *  App-global, once per install: App.tsx shows the wizard while this is false, then sets it true. */
   hasOnboarded: z.boolean(),
@@ -947,6 +1058,18 @@ export const KodaSettingsSchema = z.object({
    *  types, not by scrubbing). The site's /privacy Analytics section describes exactly this; change
    *  them together. */
   telemetryEnabled: z.boolean(),
+  /** Whether a mini app's ask-or-fix line starts a FRESH conversation each calendar day (named for
+   *  that day) instead of one ever-growing thread per app. Default-ON: a day thread is what makes an
+   *  app's history browsable by date, and it keeps every turn from re-reading weeks of unrelated
+   *  logging. Off restores the single forever-thread per app. Read live by both heads at dispatch. */
+  appDaySessions: z.boolean(),
+  /** Whether a finished mini-app slice gets a critique pass before it's called done: a fresh agent
+   *  with no build context opens the running face and compares it against the quality bar written
+   *  into the build plan during shaping, then the builder fixes the single biggest gap. Default-ON —
+   *  the builder grading its own work is the failure mode this exists to break. Off trades that for a
+   *  smaller share of the usage window, which is the only reason to want it off. Read at spawn (it
+   *  gates a pack rule), so a change applies to the next session. */
+  critiquePass: z.boolean(),
   /** Persisted workspace pane sizes — the resizable dividers (everything but the fixed rail). Widths
    *  in px; fracs are 0–1 shares. Global (not per-project): pane sizes are a layout preference. Main
    *  clamps on read, so a hand-edited file can't produce an unusable layout. */
@@ -999,6 +1122,9 @@ export const RemoteAuthStateSchema = z.object({
   signedIn: z.boolean(),
   email: z.string().nullable(),
   userId: z.string().nullable(),
+  /** The stored sign-in is dead for good (revoked token family) — retrying can't fix it, only the
+   *  user signing in again can. Drives the workspace banner + Settings prompt. */
+  needsReSignin: z.boolean(),
 })
 export type RemoteAuthState = z.infer<typeof RemoteAuthStateSchema>
 
@@ -1103,6 +1229,9 @@ export const PersistedSessionSchema = z.object({
   engineNativeId: z.string().optional(),
   /** The renderer's rendered transcript (Entry[]); opaque to main. */
   items: z.array(z.unknown()),
+  /** Highest durable replay row this renderer applied. Main filters an adoption/phone replay after
+   *  this cursor, so legitimate repeated text never needs content-based deduplication. */
+  replaySeq: z.number().int().nonnegative().optional(),
   /** Last-known context-window usage, so the sidebar fuel gauge survives a restart instead of going
    *  blank until the session next runs a turn. Optional for backward-compat with older blobs. */
   context: ContextUsageSchema.optional(),
@@ -1163,17 +1292,31 @@ export const PersistedSessionsSchema = z.object({
   /** Archived sessions, restorable from Settings. Optional for back-compat with blobs saved before
    *  archiving existed. */
   archived: z.array(ArchivedSessionSchema).optional(),
-  /** Last-known account-level rate-limit windows, keyed by ENGINE then window type
-   *  ('claude'/'codex' → 'five_hour'/'weekly') — each engine is a separate subscription with its own
-   *  caps. So the footer survives a restart. Optional + `.catch` so a pre-per-engine FLAT blob
-   *  (`{five_hour: …}`) degrades to "no windows" (they refresh on the next turn) rather than failing
-   *  the whole session-blob parse and losing tabs. */
+  /** Legacy per-project copy, read only for back-compat. Account usage now belongs to main's global
+   *  reconciler and is no longer written into every project session file. */
   rateLimits: z
     .record(z.string(), z.record(z.string(), RateLimitInfoSchema))
     .optional()
     .catch(undefined),
 })
 export type PersistedSessions = z.infer<typeof PersistedSessionsSchema>
+
+// A boot-time store read, carrying the two things the renderer cannot otherwise learn: how many rows
+// had to be set aside on an otherwise-fine read, and — when the read failed outright — whether the copy
+// the user is told about actually landed on disk. Both drive the data-integrity banner, which is only
+// honest if it gets the real answers (it used to claim a kept copy unconditionally, and said nothing at
+// all about set-aside rows). A FAILED read is `ok: false`, never an empty list: the renderer must not
+// hydrate on it, because hydrating un-gates the debounced save that writes emptiness over the real file.
+/** `null` = nobody got to say (a failure short of the store layer, e.g. the IPC itself). */
+export type BackupKept = boolean | null
+
+export type SessionsLoadResult =
+  | { ok: true; data: PersistedSessions | null; droppedSessions: number }
+  | { ok: false; backupKept: BackupKept }
+
+export type ArchivedLoadResult =
+  | { ok: true; archived: ArchivedSessionMeta[]; droppedArchives: number }
+  | { ok: false; backupKept: BackupKept }
 
 // ── Project Files browser: read-only, path-contained filesystem access ────────
 //
@@ -1212,6 +1355,9 @@ export const ReadFileResultSchema = z.object({
   truncated: z.boolean(),
   /** True when the file looks binary (NUL byte) — `content` is empty, the view shows a notice. */
   binary: z.boolean(),
+  /** A displayable image (png/jpg/gif/webp/svg/…): its loadable `koda-preview://` URL. The surface
+   *  renders it as an image instead of the "binary" notice. Absent for non-image files. */
+  imageUrl: z.string().optional(),
 })
 export type ReadFileResult = z.infer<typeof ReadFileResultSchema>
 
@@ -1224,8 +1370,31 @@ export const WriteFileRequestSchema = z.object({
 })
 export type WriteFileRequest = z.infer<typeof WriteFileRequestSchema>
 
-export const WriteFileResultSchema = z.object({ path: z.string() })
+export const WriteFileResultSchema = z.object({
+  path: z.string(),
+  /** False when the pre-edit checkpoint could not be taken: the save landed, but there is no recovery
+   *  point behind it. The editors say so — Koda's whole promise is that every change has an undo, and
+   *  a user who is never told believes in one that isn't there. */
+  checkpointed: z.boolean(),
+})
 export type WriteFileResult = z.infer<typeof WriteFileResultSchema>
+
+/**
+ * Main REFUSES a content-destroying edit (delete, overwrite, bulk replace) it could not first make
+ * undoable, and rejects with a message opening with this exact phrase followed by ", so <what did not
+ * happen>." Electron wraps a rejection's message inside its own text and loses the error type across
+ * the boundary, so the renderer recovers the user-facing sentence by matching the phrase.
+ *
+ * A save is deliberately NOT in this set: refusing it would strand the user's typed work with nowhere
+ * to put it. `WriteFileResult.checkpointed` carries that case instead.
+ */
+export const NO_UNDO_POINT = "Couldn't make an undo point"
+
+/** The user-facing refusal sentence inside a rejected IPC call, or null if this wasn't that failure. */
+export function undoPointRefusal(err: unknown): string | null {
+  const at = String(err).indexOf(NO_UNDO_POINT)
+  return at === -1 ? null : String(err).slice(at)
+}
 
 /** fs:createFile — create a new empty document in Documents/ or an existing contained folder. */
 export const CreateFileRequestSchema = z.object({
@@ -1489,9 +1658,9 @@ export type PickedFile = z.infer<typeof PickedFileSchema>
 export const PickFilesResultSchema = z.object({ files: z.array(PickedFileSchema) })
 export type PickFilesResult = z.infer<typeof PickFilesResultSchema>
 
-/** composer:pickPath — "point at a file or folder": a native dialog that returns the chosen absolute
- *  path (or null on cancel). Nothing is copied — the path is referenced in the message as-is. */
-export const PickPathResultSchema = z.object({ path: z.string().nullable() })
+/** composer:pickPath — "point at files or folders": a native dialog that returns the chosen absolute
+ *  paths (empty on cancel). Nothing is copied — the paths are referenced in the message as-is. */
+export const PickPathResultSchema = z.object({ paths: z.array(z.string()) })
 export type PickPathResult = z.infer<typeof PickPathResultSchema>
 
 // ── Terminal surface (a real interactive shell in the window's project) ────────
@@ -1541,9 +1710,11 @@ export const DocTableMetaSchema = z.object({
 /** A document's sidecar. Each key is independent presentation state for the doc, kept beside the plain
  *  markdown file; designed to grow (new keys join with no migration). Written via a top-level MERGE so
  *  the doc's separate writers never clobber each other — see docmeta.ts.
- *   - `tables`: column widths (the table-resize overlay). */
+ *   - `tables`: column widths (the table-resize overlay).
+ *   - `fullWidth`: the doc renders edge-to-edge instead of the reading column. */
 export const DocMetaSchema = z.object({
   tables: z.array(DocTableMetaSchema).optional(),
+  fullWidth: z.boolean().optional(),
 })
 export type DocMeta = z.infer<typeof DocMetaSchema>
 
@@ -1733,6 +1904,17 @@ export const RevealPathRequestSchema = z.object({ path: z.string() })
 export type RevealPathRequest = z.infer<typeof RevealPathRequestSchema>
 export const OpenPathRequestSchema = z.object({ path: z.string() })
 export type OpenPathRequest = z.infer<typeof OpenPathRequestSchema>
+
+/** fs:startDrag — start a native OS drag of a project file/folder (drag out to Finder/Mail/etc). */
+export const StartDragRequestSchema = z.object({ path: z.string() })
+export type StartDragRequest = z.infer<typeof StartDragRequestSchema>
+
+/** doc:exportPdf — save the open doc as a PDF. `html` is the doc surface's rendered body; main owns
+ *  the page template. Resolves with the saved path, or null when the user cancels the save dialog. */
+export const ExportPdfRequestSchema = z.object({ title: z.string(), html: z.string() })
+export type ExportPdfRequest = z.infer<typeof ExportPdfRequestSchema>
+export const ExportPdfResultSchema = z.object({ path: z.string().nullable() })
+export type ExportPdfResult = z.infer<typeof ExportPdfResultSchema>
 
 /** fs:createDir — create a new folder (name optional ⇒ "New folder", deduped). `parent` (an existing
  *  dir within the root) places it inside that folder; omitted ⇒ the project root. Returns the path. */
@@ -1925,7 +2107,13 @@ export const GitCommitGraphResultSchema = z.object({
     /** color key → palette family ('main' | 'branch' | 'unmerged'). JSON keys are strings. */
     laneKinds: z.record(z.string(), z.enum(['main', 'branch', 'unmerged'])),
   }),
-  unmergedBranches: z.array(z.object({ name: z.string() })),
+  unmergedBranches: z.array(
+    z.object({
+      name: z.string(),
+      /** Commits this side line has that the current branch does not. */
+      ahead: z.number().int().nonnegative(),
+    }),
+  ),
   headBranch: z.string().nullable(),
   truncated: z.boolean(),
 })
@@ -2061,13 +2249,15 @@ export type GitPushResult = z.infer<typeof GitPushResultSchema>
 
 /** git:worktrees — the checkouts on disk (`git worktree list`). Surfaces the worktrees a past session
  *  left behind: invisible otherwise (their branches show in the graph, but their *uncommitted* work
- *  has no surface at all). `dirtyCount` is that stranded working-tree change count; `isCurrent` marks
- *  this window's own checkout (no "open" action for it). */
+ *  has no surface at all). `dirtyCount` is that stranded working-tree change count when `statusKnown`
+ *  is true; a failed probe stays explicit instead of masquerading as clean. `isCurrent` marks this
+ *  window's own checkout (no "open" action for it). */
 export const GitWorktreeSchema = z.object({
   path: z.string(),
   branch: z.string().nullable(), // null on a detached HEAD
   isCurrent: z.boolean(),
   dirtyCount: z.number().int().nonnegative(),
+  statusKnown: z.boolean(),
   lastActivity: z.string(), // relative date of the worktree's HEAD commit ('' if none / unreadable)
   locked: z.boolean(),
   prunable: z.boolean(), // the folder is gone — git would prune it
@@ -2158,6 +2348,26 @@ export type ProjectOpenResult = z.infer<typeof ProjectOpenResultSchema>
 
 export const RecentProjectsSchema = z.array(z.string())
 
+/** app:dataIntegrity — the two APP-GLOBAL files that fall back to defaults when they can't be read, and
+ *  whose fallback is therefore invisible unless something says so. (Per-PROJECT store failures ride
+ *  SessionsLoadResult/ArchivedLoadResult instead, since those are answers to a specific project's load.)
+ *  Everything here is false on a healthy machine, so the surfaces that ask simply render nothing. */
+export const DataIntegritySchema = z.object({
+  /** koda-app-state.json could not be read, so recents, reopen-on-boot and the window size all came
+   *  back empty. ProjectHome uses this to say so, because an empty ProjectHome is otherwise
+   *  indistinguishable from a first launch. */
+  projectListUnreadable: z.boolean(),
+  /** Whether the copy kept beside the unreadable project list actually landed. Also the gate on the way
+   *  out: only a backed-up file may be replaced by the next project the user opens, so `false` means the
+   *  notice must not promise that opening one fixes it. */
+  projectListBackupKept: z.union([z.boolean(), z.null()]),
+  /** The settings file was unreadable and its bytes still showed `billingMode: "api"`, so billing fell
+   *  back to the subscription. A best-effort scan of the raw bytes (see settings.ts), surfaced because
+   *  CLAUDE.md makes billing switches "user-visible, never silent". */
+  billingModeReset: z.boolean(),
+})
+export type DataIntegrity = z.infer<typeof DataIntegritySchema>
+
 /** project:delete — move a project's folder to the Trash after stopping + deregistering its mini
  *  apps. The renderer can only name paths it learned from project:getRecents / miniApps:list. */
 export const ProjectDeleteRequestSchema = z.object({ path: z.string().min(1) })
@@ -2168,15 +2378,56 @@ export type ProjectDeleteResult = z.infer<typeof ProjectDeleteResultSchema>
 /** miniApps:list — every registered mini app (all projects) + live supervisor state, for the launcher
  *  rail and the face view. Doubles as the renderer's feature gate: flag off ⇒ always [] ⇒ no rail,
  *  no App/Workshop toggle. `dir` is the app's identity (what miniApps:start takes back). */
+/** The app's design tokens from its manifest (`koda-app.json` → `theme`) — CSS color values plus an
+ *  optional font-family, any subset. Koda's overlay chrome on the face (summon pill, reply bubble,
+ *  question chips) wears these so its floating pieces read as part of the app, not foreign chrome.
+ *  Values are style-object CSS values, capped so a manifest can't smuggle novels into every window. */
+export const MiniAppThemeSchema = z.object({
+  accent: z.string().max(120).optional(),
+  surface: z.string().max(120).optional(),
+  text: z.string().max(120).optional(),
+  border: z.string().max(120).optional(),
+  font: z.string().max(200).optional(),
+})
+export type MiniAppTheme = z.infer<typeof MiniAppThemeSchema>
+
 export const MiniAppInfoSchema = z.object({
   dir: z.string(),
   projectPath: z.string(),
   name: z.string(),
   state: z.enum(['starting', 'running', 'stopped', 'crashed']),
   url: z.string().optional(),
+  /** Manifest icon inlined as a data URL; absent ⇒ monogram fallback. */
+  iconDataUrl: z.string().optional(),
+  /** Manifest theme tokens; absent ⇒ Koda's own tokens (the default chrome look). */
+  theme: MiniAppThemeSchema.optional(),
 })
 export type MiniAppInfo = z.infer<typeof MiniAppInfoSchema>
 export const MiniAppListSchema = z.array(MiniAppInfoSchema)
+
+/** The ask-or-fix line's turn wrapper, shared by the desktop summon and the phone summon so the
+ *  grounding never drifts between heads. RUN-mode framing (dogfood 08-03): a face turn lands in a
+ *  fresh summon thread with no conversational context, and without this framing the pack's app-ask
+ *  rule pattern-matched it and re-entered the recipe's shaping gate — clarifying questions plus an
+ *  essay, in a side session the user never reads. So the wrapper must carry: the app already exists
+ *  (operate, don't shape), data entries are recorded immediately with stated assumptions (the user's
+ *  action carries meaning — they log what counts), and the closing message renders INSIDE the app,
+ *  so it stays to a sentence or two. */
+export function faceTurnText(appName: string, rel: string, msg: string): string {
+  return (
+    `I'm using the running "${appName}" mini app (its code and data live in \`${rel}\`): ${msg}\n\n` +
+    `(Sent from the app's ask-or-fix line while looking at the app itself. This app already exists ` +
+    `and I'm in the middle of using it — never re-enter shaping, invoke the create-mini-app skill, ` +
+    `or propose a plan for this message; do the smallest thing that handles it. If it's data to ` +
+    `record, write it through the app's own data contract — see its DATA.md and schema, never a ` +
+    `side note — and record it immediately: my action carries meaning (I log what counts), so ` +
+    `default to the reading that makes my action sensible and state any assumption you made in ` +
+    `your reply rather than asking first. If it reports a problem or asks for a change to the app, ` +
+    `edit the app's code in \`${rel}\`. My app view reloads automatically when your turn finishes, ` +
+    `and your final message is shown to me INSIDE the app — one or two plain sentences, no headers ` +
+    `or lists. Ask a question only if you truly can't proceed; every question pulls me out of the app.)`
+  )
+}
 
 /** miniApps:start — start (or join) a REGISTERED app under the supervisor; resolves once it serves.
  *  Main validates `dir` against the registry — the renderer can only start apps the agent installed. */
@@ -2185,12 +2436,39 @@ export type MiniAppStartRequest = z.infer<typeof MiniAppStartRequestSchema>
 export const MiniAppStartResultSchema = z.object({ url: z.string() })
 export type MiniAppStartResult = z.infer<typeof MiniAppStartResultSchema>
 
+/** miniApps:front — the app's project is already open in another window; surface that window and flip
+ *  it to this app's face. `dir` is the app folder (which face to front); `projectPath` addresses the
+ *  window. Both come from the launcher list, so they're already registry-validated. */
+export const MiniAppFrontRequestSchema = z.object({
+  dir: z.string().min(1),
+  projectPath: z.string().min(1),
+})
+export type MiniAppFrontRequest = z.infer<typeof MiniAppFrontRequestSchema>
+
+/** miniApps:bridgeInfo — per-app Lane B bridge state for the Settings toggle: whether the app may
+ *  use the owner's API key (default off) and what its calls have cost so far. [] when the flag is
+ *  off. Spend is an estimate from recorded token counts, for visibility, not billing. */
+export const MiniAppBridgeInfoSchema = z.object({
+  dir: z.string(),
+  name: z.string(),
+  consent: z.boolean(),
+  spend: z.object({ inputTokens: z.number(), outputTokens: z.number(), usd: z.number() }),
+})
+export type MiniAppBridgeInfo = z.infer<typeof MiniAppBridgeInfoSchema>
+export const MiniAppBridgeListSchema = z.array(MiniAppBridgeInfoSchema)
+
+/** miniApps:setBridgeConsent — the owner's explicit, per-app allow/revoke. */
+export const MiniAppBridgeConsentRequestSchema = z.object({
+  dir: z.string().min(1),
+  allowed: z.boolean(),
+})
+export type MiniAppBridgeConsentRequest = z.infer<typeof MiniAppBridgeConsentRequestSchema>
+
 /** The shape exposed on `window.koda` — implemented in preload, consumed in the renderer. */
-export type FileMenuCommand = 'newDocument' | 'newFolder' | 'filesImported'
+export type FileMenuCommand = 'newDocument' | 'newFolder' | 'filesImported' | 'exportPdf'
 
 export interface KodaApi {
   getAppInfo: () => Promise<AppInfo>
-  echo: (args: EchoRequest) => Promise<EchoResponse>
   probeEngine: () => Promise<EngineProbe>
   // App self-update (releases-and-updates.md).
   getUpdateStatus: () => Promise<UpdateStatus>
@@ -2205,17 +2483,24 @@ export interface KodaApi {
   startSession: (args: StartSessionRequest) => Promise<StartSessionResponse>
   sendTurn: (args: SendTurnRequest) => Promise<void>
   interruptSession: (args: SessionRef) => Promise<void>
+  stopSubagent: (args: StopSubagentRequest) => Promise<void>
   disposeSession: (args: SessionRef) => Promise<void>
-  /** Load persisted sessions on boot (null when there are none). */
-  loadSessions: () => Promise<PersistedSessions | null>
+  /** Load persisted sessions on boot. `ok: true` with `data: null` means this project has nothing saved
+   *  yet; `ok: false` means the store exists and could not be read, which must NOT hydrate. */
+  loadSessions: () => Promise<SessionsLoadResult>
   /** Fire-and-forget: persist the open sessions + transcripts (debounced in the renderer). */
   saveSessions: (data: PersistedSessions) => void
   /** Archived sessions ride a separate COLD store (never the hot blob above — the 53MB-freeze bug).
    *  Split further: this loads/saves only the LIGHT metadata index (transcript bodies live in per-session
    *  files, fetched on restore) so boot and every archive/delete stay small regardless of history size.
-   *  `loadArchived` also runs the opt-in retention purge. Save fires only when the list changes. */
-  loadArchived: () => Promise<ArchivedSessionMeta[]>
-  saveArchived: (archived: ArchivedSessionMeta[]) => void
+   *  `loadArchived` also runs the opt-in retention purge. Save fires only when the list changes.
+   *
+   *  `saveArchived` is ACKNOWLEDGED (`true` = the index is on disk with exactly this list). Archiving,
+   *  restoring and deleting each move a session BETWEEN the hot store and this index, and the hot half
+   *  always lands — so a caller that is about to remove a session from one side must gate that removal on
+   *  this boolean, or a failed index write drops the chat from both places at once. */
+  loadArchived: () => Promise<ArchivedLoadResult>
+  saveArchived: (archived: ArchivedSessionMeta[]) => Promise<boolean>
   /** Fetch one archived session's full transcript body (its `items`) — only needed to restore it. `null`
    *  means the read failed (so restore keeps the archive instead of destroying it); `[]` is a clean but
    *  genuinely empty transcript. */
@@ -2233,8 +2518,10 @@ export interface KodaApi {
   onArchiveRequested: (listener: (payload: ArchiveRequested) => void) => () => void
   /** The phone asked to rename a live session in this window's project → store.renameSession. */
   onRenameRequested: (listener: (payload: RenameRequested) => void) => () => void
-  /** A phone turn on a session THIS window already owns (adopted before the turn) → append + auto-title. */
+  /** A turn appended to a session THIS window owns but didn't send itself: a phone turn. */
   onRemoteUserTurn: (listener: (payload: RemoteUserTurnLive) => void) => () => void
+  /** A scratch image was saved main-side (a phone turn's image) → refresh the Recent images strip. */
+  onScratchChanged: (listener: () => void) => () => void
   /** Subscribe to the normalized event stream; returns an unsubscribe fn. */
   onEngineEvent: (listener: (event: EngineEvent) => void) => () => void
   // Side questions ("btw" / aside) — answered from the live conversation without entering it.
@@ -2290,6 +2577,8 @@ export interface KodaApi {
   revealPath: (args: RevealPathRequest) => Promise<void>
   /** Open a file/folder in the OS default app. */
   openPath: (args: OpenPathRequest) => Promise<void>
+  /** Start a native OS drag of a project file/folder. Resolves once the drag is underway. */
+  startDrag: (args: StartDragRequest) => Promise<void>
   /** Create a new folder (at the root, or inside `parent`). */
   createDir: (args: CreateDirRequest) => Promise<CreateDirResult>
   /** Read a file's pinned pre-turn + current contents for the live-edits diff view. */
@@ -2351,6 +2640,8 @@ export interface KodaApi {
   hasGuidelines: () => Promise<ProjectHasGuidelinesResult>
   /** Recent project paths, most-recent-first (for the ProjectHome screen). */
   getRecentProjects: () => Promise<string[]>
+  /** App-global files main couldn't read this run (project list, settings). All-false when healthy. */
+  getDataIntegrity: () => Promise<DataIntegrity>
   /** A native File-menu action for this project window. */
   onFileMenuCommand: (listener: (command: FileMenuCommand) => void) => () => void
   /** Delete a project (ProjectHome only): stop its apps, move the folder to the Trash, drop recents. */
@@ -2362,6 +2653,14 @@ export interface KodaApi {
   miniAppsStart: (args: MiniAppStartRequest) => Promise<MiniAppStartResult>
   /** Subscribe to registry/run-state changes (re-fetch the list on fire); returns an unsubscribe fn. */
   onMiniAppsChanged: (listener: () => void) => () => void
+  /** Surface the window already showing this app and flip it to the app's face (already-open path). */
+  miniAppsFront: (args: MiniAppFrontRequest) => Promise<void>
+  /** main→renderer: front this window's app face for `dir` (the already-open handoff). Unsubscribe fn. */
+  onFrontFace: (listener: (dir: string) => void) => () => void
+  /** Per-app API-key consent + spend for the Settings toggle; [] when the flag is off. */
+  miniAppsBridgeInfo: () => Promise<MiniAppBridgeInfo[]>
+  /** Allow or revoke one app's use of the owner's API key. */
+  miniAppsSetBridgeConsent: (args: MiniAppBridgeConsentRequest) => Promise<void>
   // Approval gate ("Ask me" mode).
   /** Subscribe to tool-approval requests; returns an unsubscribe fn. */
   onApprovalRequest: (listener: (req: ApprovalRequest) => void) => () => void
@@ -2369,6 +2668,8 @@ export interface KodaApi {
   onApprovalCancelled: (listener: (e: ApprovalCancelled) => void) => () => void
   /** Subscribe to single-request resolutions (answered on any head); returns an unsubscribe fn. */
   onApprovalResolved: (listener: (e: ApprovalResolved) => void) => () => void
+  /** Read this window's still-pending prompts after a renderer reload missed their live push. */
+  getPendingApprovals: () => Promise<ApprovalRequest[]>
   /** Answer a pending approval. */
   resolveApproval: (args: ApprovalResolve) => Promise<void>
   setApprovalMode: (args: SetApprovalMode) => Promise<void>
@@ -2418,6 +2719,8 @@ export interface KodaApi {
   /** Resolve a doc-relative image `ref` (against the doc at `docPath`) to a `koda-preview://` URL the
    *  renderer can load; null if it escapes the project or doesn't exist. */
   docAssetUrl: (docPath: string, ref: string) => Promise<string | null>
+  /** Export the open doc as a PDF (save dialog + auto-open). Null path = user cancelled. */
+  exportPdf: (args: ExportPdfRequest) => Promise<ExportPdfResult>
   /** Re-run a session's last preview (dev command or static file) when it's been torn down — the
    *  "Restart preview" button. Resolves with the served URL (main also pushes `preview:show`), or
    *  rejects if the command fails to come up / the file is gone. */
@@ -2452,8 +2755,10 @@ export interface KodaApi {
   getBackupStatus: () => Promise<BackupStatus>
   /** Bundle + seal + upload this project now (the "Back up now" button). Resolves to fresh status. */
   backupNow: () => Promise<BackupStatus>
-  /** The full recovery code — only ever called from a user-initiated reveal, never auto-shown. */
-  getBackupRecoveryCode: () => Promise<string | null>
+  /** The full recovery code — only ever called from a user-initiated reveal, never auto-shown.
+   *  `unreadable` (vs. plain absent) tells Settings the key file exists but this Mac can't open it —
+   *  a state that must never read as "nothing to show yet". */
+  getBackupRecoveryCode: () => Promise<{ code: string | null; unreadable: boolean }>
   /** Every backed-up project on this account (the restore picker; metadata only). */
   listCloudBackups: () => Promise<BackupManifest[]>
   /** Rebuild a backed-up project into a fresh folder (disaster recovery / fresh Mac). */
@@ -2561,6 +2866,8 @@ export interface KodaApi {
   forgetRelayDevice: () => Promise<RemoteRelayState>
   /** Subscribe to relay pairing-activity changes; returns an unsubscribe fn. */
   onRelayActivity: (listener: (state: RemoteRelayState) => void) => () => void
+  /** Subscribe to cloud-account auth changes (sign-in restored, or dead-token needs-re-sign-in). */
+  onRemoteAuthChanged: (listener: (state: RemoteAuthState) => void) => () => void
   // Terminal surface (a Dock tool — a real interactive shell in the window's project).
   /** Spawn (or re-ensure) the window's shell at this size; respawns if the prior one exited. */
   startTerminal: (size: TerminalSize) => Promise<TerminalStartResult>

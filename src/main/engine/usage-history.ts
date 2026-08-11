@@ -6,7 +6,7 @@
  * equivalent estimate the plan covers, in API mode the real billed amount — same as `spendUsd`.
  */
 import { app } from 'electron'
-import { readFileSync } from 'node:fs'
+import { copyFileSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { writeFileAtomic } from '../atomic-write'
 import type { ModelSpend, ModelTurnUsage, RateLimitInfo, UsageHistoryDay } from '@shared/ipc'
@@ -23,14 +23,25 @@ function filePath(): string {
   return join(app.getPath('userData'), 'koda-usage-history.json')
 }
 
-function read(): Stored {
+type ReadResult = { store: Stored; writable: boolean }
+
+function read(): ReadResult {
   try {
     const p = JSON.parse(readFileSync(filePath(), 'utf8'))
-    if (p && typeof p === 'object' && p.days && typeof p.days === 'object') return p as Stored
-  } catch {
-    /* missing/corrupt → empty */
+    if (p && typeof p === 'object' && p.days && typeof p.days === 'object')
+      return { store: p as Stored, writable: true }
+    throw new Error('usage history has an invalid shape')
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+      return { store: { version: 1, days: {} }, writable: true }
+    log.warn('usage', 'usage history is present but unreadable; preserving it', err instanceof Error ? err.message : err)
+    try {
+      copyFileSync(filePath(), `${filePath()}.corrupt.bak`, 1)
+    } catch {
+      // The original stays in place; the important guard is that this read can never authorize a write.
+    }
   }
-  return { version: 1, days: {} }
+  return { store: { version: 1, days: {} }, writable: false }
 }
 
 function write(s: Stored): void {
@@ -87,7 +98,8 @@ export function recordTurnUsage(
   if (!models?.length && !costEstimate) return
   chain = chain
     .then(() => {
-      const store = read()
+      const { store, writable } = read()
+      if (!writable) return
       const date = localDay()
       const day = store.days[date] ?? emptyDay()
       const turnCost = costEstimate ?? sumCost(models ?? [])
@@ -118,7 +130,7 @@ export function recordTurnUsage(
 
 /** Recent daily rollups, newest first (default last 30 days) — for the Usage view's History section. */
 export function loadUsageHistory(maxDays = 30): UsageHistoryDay[] {
-  const store = read()
+  const { store } = read()
   return Object.entries(store.days)
     .map(([date, d]) => ({ date, ...d }))
     .sort((a, b) => b.date.localeCompare(a.date))
@@ -152,20 +164,11 @@ function readWindows(): StoredWindows {
   return (windowsCache = { version: 1, byEngine: {} })
 }
 
-/** Remember one window update. Fire-and-forget, called on every RateLimitUpdate. */
-export function recordRateLimit(engineId: EngineId, info: RateLimitInfo): void {
+/** Persist the reconciler's complete engine map. Main owns merge/precedence; disk mirrors that answer
+ *  instead of independently replaying the update and risking a different result. */
+export function replaceRateLimits(engineId: EngineId, windows: Record<string, RateLimitInfo>): void {
   const store = readWindows()
-  const windows = store.byEngine[engineId] ?? {}
-  const prev = windows[info.rateLimitType]
-  if (
-    prev &&
-    prev.resetsAt === info.resetsAt &&
-    prev.status === info.status &&
-    prev.isUsingOverage === info.isUsingOverage &&
-    prev.usedPercent === info.usedPercent
-  )
-    return
-  windows[info.rateLimitType] = info
+  if (JSON.stringify(store.byEngine[engineId] ?? {}) === JSON.stringify(windows)) return
   store.byEngine[engineId] = windows
   try {
     writeFileAtomic(windowsPath(), JSON.stringify(store, null, 2))
@@ -186,7 +189,10 @@ export function loadRateLimits(): Partial<Record<EngineId, Record<string, RateLi
         ([, w]) => typeof w?.rateLimitType === 'string' && typeof w.resetsAt === 'number' && w.resetsAt > nowSec,
       ),
     )
-    if (Object.keys(live).length) out[engine as EngineId] = live
+    if (Object.keys(live).length)
+      out[engine as EngineId] = Object.fromEntries(
+        Object.entries(live).map(([type, info]) => [type, { ...info, source: info.source ?? 'disk' }]),
+      )
   }
   return out
 }

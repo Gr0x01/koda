@@ -1,22 +1,22 @@
 import { app, BrowserWindow, dialog, ipcMain, shell, type WebContents } from 'electron'
 import { existsSync, realpathSync } from 'node:fs'
-import { mkdir, readFile } from 'node:fs/promises'
+import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { track, trackFirstTurn } from './telemetry'
 import { checkForUpdatesNow, getUpdateStatus, getWhatsNew, quitAndInstallUpdate } from './updater'
 import { submitFeedback } from './feedback'
 import { z } from 'zod'
 import { IpcChannels } from '@shared/channels'
+import { ATTACHABLE_EXTENSIONS, ATTACHABLE_MIME, extensionOf } from '@shared/attachments'
 import {
   AppInfoSchema,
-  EchoRequestSchema,
-  EchoResponseSchema,
   FeedbackRequestSchema,
   EngineProbeSchema,
   StartSessionRequestSchema,
   StartSessionResponseSchema,
   SendTurnRequestSchema,
   SessionRefSchema,
+  StopSubagentRequestSchema,
   AskAsideRequestSchema,
   CancelAsideRequestSchema,
   CheckpointSchema,
@@ -27,6 +27,8 @@ import {
   SafetyFileDiffRequestSchema,
   SafetyFileDiffResultSchema,
   PersistedSessionsSchema,
+  type SessionsLoadResult,
+  type ArchivedLoadResult,
   ArchivedSessionMetaSchema,
   AdoptedHeadlessListSchema,
   RendererLogSchema,
@@ -35,6 +37,7 @@ import {
   SetApprovalModeSchema,
   SetModelEffortSchema,
   ApprovalModeSchema,
+  ApprovalRequestsSchema,
   AssistTitleRequestSchema,
   AssistTitleResponseSchema,
   ReadDirRequestSchema,
@@ -46,6 +49,7 @@ import {
   DiffFileResultSchema,
   WriteFileRequestSchema,
   WriteFileResultSchema,
+  NO_UNDO_POINT,
   CreateFileRequestSchema,
   CreateFileResultSchema,
   PickFilesResultSchema,
@@ -66,6 +70,9 @@ import {
   ImportFilesResultSchema,
   RevealPathRequestSchema,
   OpenPathRequestSchema,
+  StartDragRequestSchema,
+  ExportPdfRequestSchema,
+  ExportPdfResultSchema,
   CreateDirRequestSchema,
   CreateDirResultSchema,
   SearchRequestSchema,
@@ -105,10 +112,14 @@ import {
   ProjectOpenResultSchema,
   ProjectDeleteRequestSchema,
   ProjectDeleteResultSchema,
+  DataIntegritySchema,
   RecentProjectsSchema,
   MiniAppListSchema,
   MiniAppStartRequestSchema,
+  MiniAppFrontRequestSchema,
   MiniAppStartResultSchema,
+  MiniAppBridgeListSchema,
+  MiniAppBridgeConsentRequestSchema,
   AddRecentModelSchema,
   KodaSettingsSchema,
   KodaSettingsPatchSchema,
@@ -140,11 +151,12 @@ import {
   ApiFallbackRequestSchema,
   PreviewRestartRequestSchema,
 } from '@shared/ipc'
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { projectMemoryWeight } from './engine/pack'
 import { backupNow, getBackupStatus, listCloudBackups, restoreCloudBackup, revealRecoveryCode } from './backup'
 import { probeEngine } from './engine/probe'
 import { EngineSessionManager } from './engine/sessions'
+import { DreamScheduler } from './engine/dream'
 import { loadUsageHistory } from './engine/usage-history'
 import { currentProviderStatus, refreshProviderStatus, setStatusWatchHooks } from './engine/status-watch'
 import { assistTitle } from './assist'
@@ -163,6 +175,7 @@ import {
   searchProject,
   writeProjectFile,
   containedReal,
+  isDisplayableImage,
 } from './fs-browse'
 import { watchProjectFile, unwatchProjectFile } from './file-watch'
 import { watchProjectDocs, unwatchProjectDocs } from './docs-watch'
@@ -197,26 +210,32 @@ import {
   windowForProject,
 } from './window-registry'
 import {
+  appStateHealth,
   deleteArchivedBody,
   loadAppState,
   loadArchivedBody,
   loadArchivedMeta,
   noteProjectDeleted,
+  projectsHomeDir,
   purgeProjectSessions,
   noteProjectOpened,
   saveArchivedMeta,
   writeArchivedBody,
+  StoreReadError,
+  type StoreReadReport,
 } from './session-store'
 import {
   loadRecentModels,
   addRecentModel,
   loadSettings,
+  settingsHealth,
   updateSettings,
   resetSettings,
   loadScratchRetentionDays,
   loadMiniAppsEnabled,
 } from './settings'
-import { deleteProjectApps, listMiniApps, startRegisteredMiniApp, setMiniAppsChangedListener } from './mini-apps'
+import { deleteProjectApps, listMiniApps, startRegisteredMiniApp, onMiniAppsChanged } from './mini-apps'
+import { bridgeAppState, setBridgeConsent, setBridgeSpendListener } from './app-bridge'
 import {
   initRemoteControl,
   registerRemoteIpcHandlers,
@@ -251,6 +270,12 @@ import { reconcileCodexAuth } from './engine/codex-home'
 import { log } from './logger'
 
 let engineSessions: EngineSessionManager | null = null
+let dreamScheduler: DreamScheduler | null = null
+
+/** Dev-menu live-fire of the whole dream, including separately gated REM. */
+export function runDreamNow(): void {
+  dreamScheduler?.dreamNow()
+}
 
 /**
  * Resolve the caller window's project root from the registry. Main owns this — the renderer never
@@ -263,6 +288,62 @@ function rootForSender(sender: WebContents): string {
   if (!path) throw new Error('no project open in this window')
   return path
 }
+
+/**
+ * Checkpoint before a CONTENT-DESTROYING edit, and refuse the edit outright when no recovery point
+ * could be taken. `checkpointProjectEdit` is fail-soft by design and only reports failure through its
+ * return value; dropping that boolean leaves the user believing in an undo that no longer exists.
+ *
+ * Only destroying actions route through here — the user loses nothing by the refusal (their content is
+ * untouched) and everything by proceeding blind. Additive actions (create, duplicate, import, add a
+ * guardrail) still checkpoint fail-soft: nothing existing is destroyed, so the worst case is a new
+ * file that isn't in the timeline, which the user can simply delete. A SAVE is also excluded — see
+ * NO_UNDO_POINT.
+ *
+ * `refusal` completes the sentence: what did NOT happen, in the user's terms.
+ */
+async function requireCheckpoint(root: string, label: string, refusal: string): Promise<void> {
+  if (!(await getEngineSessions().checkpointProjectEdit(root, label))) {
+    throw new Error(`${NO_UNDO_POINT}, so ${refusal}`)
+  }
+}
+
+/** The Settings words for a guardrail item. `subagent` is our word, not the user's — that screen
+ *  calls them specialist helpers, so a refusal has to as well. */
+function guardrailItemNoun(kind: 'skill' | 'subagent'): string {
+  return kind === 'subagent' ? 'specialist helper' : 'skill'
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+}
+
+/** The PDF export's page style: a clean black-on-white print layout, independent of the app theme.
+ *  The body is the doc surface's ProseMirror HTML, so selectors target plain markdown-ish tags. */
+const PDF_CSS = `
+  * { box-sizing: border-box; }
+  body { font: 12pt/1.6 -apple-system, 'Helvetica Neue', sans-serif; color: #111; margin: 0.9in 1in; }
+  .koda-pdf-title { font-size: 22pt; line-height: 1.2; margin: 0 0 0.6em; }
+  h1 { font-size: 17pt; } h2 { font-size: 14pt; } h3, h4 { font-size: 12pt; }
+  h1, h2, h3, h4 { line-height: 1.3; margin: 1.2em 0 0.4em; break-after: avoid; }
+  p, ul, ol { margin: 0.5em 0; }
+  li { margin: 0.15em 0; }
+  li p { margin: 0; }
+  input[type='checkbox'] { margin-right: 0.4em; }
+  a { color: #1a4fd6; text-decoration: none; }
+  img { max-width: 100%; height: auto; }
+  blockquote { margin: 0.6em 0; padding: 0.1em 1em; border-left: 3px solid #bbb; color: #444; }
+  code { font: 10pt/1.5 ui-monospace, Menlo, monospace; background: #f2f2f2; padding: 0.1em 0.3em; border-radius: 3px; }
+  pre { background: #f6f6f6; border: 1px solid #e2e2e2; border-radius: 6px; padding: 0.7em 0.9em; overflow: hidden; white-space: pre-wrap; word-break: break-word; break-inside: avoid; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; margin: 0.7em 0; width: 100%; }
+  th, td { border: 1px solid #ccc; padding: 0.3em 0.6em; text-align: left; vertical-align: top; }
+  th { background: #f4f4f4; }
+  hr { border: none; border-top: 1px solid #ccc; margin: 1.2em 0; }
+  /* Crepe's in-editor affordances ride along in the rendered HTML (image toolbars, caption inputs,
+     drag handles). Markdown itself never produces these, so hiding them wholesale is safe. */
+  button, input:not([type='checkbox']), .milkdown-toolbar, .ProseMirror-gapcursor { display: none !important; }
+`
 
 /** The live session manager — created at IPC registration, drained on quit. */
 export function getEngineSessions(): EngineSessionManager {
@@ -285,6 +366,11 @@ export async function disposeEngineSessions(): Promise<void> {
 export function registerIpcHandlers(): void {
   // resourcesPath is our bundled engine only when packaged; undefined in dev.
   engineSessions = new EngineSessionManager(app.isPackaged ? process.resourcesPath : undefined)
+
+  // Overnight dream consolidation (dream-plan.md) — inert unless the dreamEnabled flag is on.
+  const dream = new DreamScheduler(engineSessions)
+  dreamScheduler = dream
+  engineSessions.setEngineActivityListener((cwd) => dream.noteActivity(cwd))
 
   // The phone-control tier (LAN server + cloud relay + pairing) — one seam, see remote-control.ts.
   initRemoteControl(engineSessions)
@@ -321,11 +407,6 @@ export function registerIpcHandlers(): void {
     submitFeedback(FeedbackRequestSchema.parse(rawArgs)),
   )
 
-  ipcMain.handle(IpcChannels.echo, (_event, rawArgs: unknown) => {
-    const { message } = EchoRequestSchema.parse(rawArgs)
-    return EchoResponseSchema.parse({ reply: message })
-  })
-
   ipcMain.handle(IpcChannels.probeEngine, async () =>
     // resourcesPath is our bundled engine only when packaged; undefined in dev.
     EngineProbeSchema.parse(await probeEngine(app.isPackaged ? process.resourcesPath : undefined)),
@@ -351,6 +432,11 @@ export function registerIpcHandlers(): void {
     getEngineSessions().interrupt(sessionId)
   })
 
+  ipcMain.handle(IpcChannels.stopSubagent, (_event, rawArgs: unknown) => {
+    const { sessionId, taskId } = StopSubagentRequestSchema.parse(rawArgs)
+    getEngineSessions().stopSubagent(sessionId, taskId)
+  })
+
   ipcMain.handle(IpcChannels.askAside, (_event, rawArgs: unknown) => {
     const { sessionId, asideId, question } = AskAsideRequestSchema.parse(rawArgs)
     getEngineSessions().askSideQuestion(sessionId, asideId, question)
@@ -364,17 +450,41 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(IpcChannels.disposeSession, async (_event, rawArgs: unknown) => {
     const { sessionId } = SessionRefSchema.parse(rawArgs)
     removeSessionFromWindow(sessionId)
-    await getEngineSessions().dispose(sessionId)
+    try {
+      await getEngineSessions().dispose(sessionId)
+    } finally {
+      // The tab is truly gone (not a respawn) — forget its approval posture so a resumed conversation
+      // on this id never comes back UNATTENDED-locked (see ApprovalGate.forgetSession). In a finally:
+      // a throwing dispose must not skip this (W5) — it's the same route into the dream critical fix.
+      getEngineSessions().forgetSession(sessionId)
+    }
   })
 
   // Per-project persistence: load on boot (invoke), save debounced (send, fire-and-forget). Both
   // resolve the project from the CALLING window — a ProjectHome window with no project loads nothing
   // and silently drops saves (rootForSender throws → caught here, persistence isn't a crash vector).
-  ipcMain.handle(IpcChannels.sessionsLoad, (event) => {
+  //
+  // "No project in this window" is a legitimate nothing-to-load (`ok` with no data); a load FAILURE
+  // comes back as `ok: false`, so the renderer skips hydrate and leaves its debounced save gated.
+  // Collapsing the two is what let an unreadable store be rewritten to empty.
+  //
+  // The result carries what only main can know: whether the copy the banner promises actually landed
+  // (`backupKept`), and how many rows a read that otherwise succeeded had to set aside. The drop case is
+  // the one where saving stays ON, so an unreported drop means the shortened list IS written back.
+  ipcMain.handle(IpcChannels.sessionsLoad, (event): SessionsLoadResult => {
+    let root: string
     try {
-      return getEngineSessions().loadSessionsForProject(rootForSender(event.sender))
+      root = rootForSender(event.sender)
     } catch {
-      return null
+      return { ok: true, data: null, droppedSessions: 0 }
+    }
+    const report: StoreReadReport = { dropped: 0 }
+    try {
+      const data = getEngineSessions().loadSessionsForProject(root, report)
+      return { ok: true, data, droppedSessions: report.dropped }
+    } catch (err) {
+      log.warn('ipc', 'session store load failed', err instanceof Error ? err.message : err)
+      return { ok: false, backupKept: err instanceof StoreReadError ? err.backupKept : null }
     }
   })
 
@@ -405,23 +515,43 @@ export function registerIpcHandlers(): void {
 
   // Archived sessions: the cold per-project store (see session-store.ts). The metadata index is read on
   // boot and written when the list changes; transcript bodies live in per-session files, fetched only on
-  // restore. Same fail-soft posture as the hot save above.
-  ipcMain.handle(IpcChannels.archivedLoad, (event) => {
+  // restore. Same fail-soft posture as the hot save above — and the same split: no project = an empty
+  // list, but a failed READ comes back `ok: false` so the renderer disables the archive save instead of
+  // writing `[]` over a real index.
+  ipcMain.handle(IpcChannels.archivedLoad, (event): ArchivedLoadResult => {
+    let root: string
     try {
-      return loadArchivedMeta(rootForSender(event.sender))
+      root = rootForSender(event.sender)
     } catch {
-      return []
+      return { ok: true, archived: [], droppedArchives: 0 }
+    }
+    const report: StoreReadReport = { dropped: 0 }
+    try {
+      return { ok: true, archived: loadArchivedMeta(root, report), droppedArchives: report.dropped }
+    } catch (err) {
+      log.warn('ipc', 'archive index load failed', err instanceof Error ? err.message : err)
+      return { ok: false, backupKept: err instanceof StoreReadError ? err.backupKept : null }
     }
   })
 
-  ipcMain.on(IpcChannels.archivedSave, (event, rawArgs: unknown) => {
+  // Answers with whether the index is now on disk holding exactly this list. Unlike the hot save above,
+  // this one is not allowed to fail quietly: the renderer only completes an archive/restore/delete after
+  // it hears `true`, so every `false` here is a move the hot store declines to make either. The
+  // validation branch is the one that used to drop the entire save over a single unparseable row while
+  // the hot save (validated separately) went through — one writer succeeding and the other not.
+  ipcMain.handle(IpcChannels.archivedSave, (event, rawArgs: unknown): boolean => {
     const parsed = z.array(ArchivedSessionMetaSchema).safeParse(rawArgs)
-    if (!parsed.success) return
-    try {
-      saveArchivedMeta(rootForSender(event.sender), parsed.data)
-    } catch {
-      /* no project for this window yet */
+    if (!parsed.success) {
+      log.warn('ipc', 'archive index save refused — the list failed validation', parsed.error.issues[0]?.message)
+      return false
     }
+    let root: string
+    try {
+      root = rootForSender(event.sender)
+    } catch {
+      return false // no project for this window — nothing was written, and claiming otherwise would lie
+    }
+    return saveArchivedMeta(root, parsed.data)
   })
 
   ipcMain.handle(IpcChannels.archivedLoadBody, (event, rawArgs: unknown) => {
@@ -493,6 +623,10 @@ export function registerIpcHandlers(): void {
     ApprovalModeSchema.parse(getEngineSessions().getApprovalMode()),
   )
 
+  ipcMain.handle(IpcChannels.approvalPending, (event) =>
+    ApprovalRequestsSchema.parse(getEngineSessions().pendingRequestsForProject(rootForSender(event.sender))),
+  )
+
   // Model/effort pick-time push — records intent + broadcasts ModelEffortChanged (no respawn; the
   // renderer reattaches lazily on its next turn). Mirrors approvalSetMode.
   ipcMain.handle(IpcChannels.modelEffortSet, (_event, rawArgs: unknown) => {
@@ -530,6 +664,7 @@ export function registerIpcHandlers(): void {
       getEngineSessions().setDefaultApprovalMode(next.defaultApprovalMode)
     if (patch.previewAutoStart !== undefined)
       getEngineSessions().setPreviewAutoStart(next.previewAutoStart)
+    if (patch.dreamEnabled !== undefined) dream.recheck() // toggled on late-evening should still dream tonight
     // Settings are app-global — fan the new values out to every window so per-window live gates (the
     // notification pref, each renderer's default posture) re-sync without a restart.
     const settings = KodaSettingsSchema.parse(next)
@@ -638,20 +773,14 @@ export function registerIpcHandlers(): void {
     const win = BrowserWindow.fromWebContents(event.sender)
     const opts = {
       properties: ['openFile', 'multiSelections'] as ('openFile' | 'multiSelections')[],
-      filters: [
-        { name: 'Attachable files', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'csv', 'pdf'] },
-      ],
+      filters: [{ name: 'Attachable files', extensions: ATTACHABLE_EXTENSIONS }],
     }
     const res = win ? await dialog.showOpenDialog(win, opts) : await dialog.showOpenDialog(opts)
     if (res.canceled) return PickFilesResultSchema.parse({ files: [] })
-    const byExt: Record<string, string> = {
-      png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
-      bmp: 'image/bmp', svg: 'image/svg+xml', csv: 'text/csv', pdf: 'application/pdf',
-    }
     const files = await Promise.all(
       res.filePaths.map(async (p) => {
         const name = basename(p)
-        const mediaType = byExt[name.slice(name.lastIndexOf('.') + 1).toLowerCase()]
+        const mediaType = ATTACHABLE_MIME[extensionOf(name)]
         if (!mediaType) return null
         try {
           return { name, mediaType, dataBase64: (await readFile(p)).toString('base64') }
@@ -663,12 +792,18 @@ export function registerIpcHandlers(): void {
     return PickFilesResultSchema.parse({ files: files.filter((f) => f !== null) })
   })
 
-  // "Point at a file or folder" — returns the chosen absolute path; nothing is copied.
+  // "Point at files or folders" — returns the chosen absolute paths; nothing is copied.
   ipcMain.handle(IpcChannels.composerPickPath, async (event) => {
     const win = BrowserWindow.fromWebContents(event.sender)
-    const opts = { properties: ['openFile', 'openDirectory'] as ('openFile' | 'openDirectory')[] }
+    const opts = {
+      properties: ['openFile', 'openDirectory', 'multiSelections'] as (
+        | 'openFile'
+        | 'openDirectory'
+        | 'multiSelections'
+      )[],
+    }
     const res = win ? await dialog.showOpenDialog(win, opts) : await dialog.showOpenDialog(opts)
-    return PickPathResultSchema.parse({ path: res.canceled ? null : (res.filePaths[0] ?? null) })
+    return PickPathResultSchema.parse({ paths: res.canceled ? [] : res.filePaths })
   })
 
   // Page through the window project's recent scratch images (newest first) for the Recent images strip.
@@ -791,31 +926,34 @@ export function registerIpcHandlers(): void {
   })
 
   // Save an edited skill/subagent body into this project (forks a Koda default; overwrites a project
-  // item). Checkpointed before the write (like saveGuardrail). Returns the path.
+  // item). The overwrite loses the previous body, so the checkpoint thunk REFUSES rather than returns
+  // — saveItemBody awaits it before touching disk, so a refusal leaves the old body intact.
   ipcMain.handle(IpcChannels.guardrailsSaveItemBody, async (event, rawArgs: unknown) => {
     const { kind, name, content } = GuardrailSaveItemBodyRequestSchema.parse(rawArgs)
     const root = rootForSender(event.sender)
     const res = await saveItemBody(root, { kind, name }, content, () =>
-      getEngineSessions().checkpointProjectEdit(root, `edit ${kind} ${name}`),
+      requireCheckpoint(root, `edit ${kind} ${name}`, `your ${guardrailItemNoun(kind)} was left as it was.`),
     )
     return GuardrailSaveResultSchema.parse(res)
   })
 
-  // Remove a project skill/subagent; if it forked a Koda default, the default reappears. Checkpointed.
+  // Remove a project skill/subagent; if it forked a Koda default, the default reappears. A hand-written
+  // one has nothing to fall back to, so refuse the delete when it can't be made undoable.
   ipcMain.handle(IpcChannels.guardrailsRemoveItem, async (event, rawArgs: unknown) => {
     const ref = GuardrailItemRefSchema.parse(rawArgs)
     const root = rootForSender(event.sender)
     await removeGuardrailItem(root, ref, () =>
-      getEngineSessions().checkpointProjectEdit(root, `remove ${ref.kind} ${ref.name}`),
+      requireCheckpoint(root, `remove ${ref.kind} ${ref.name}`, 'nothing was removed.'),
     )
   })
 
-  // Edit a Koda rule principle's wording for this project (or restore it with text:null). Checkpoint
-  // first (recoverable), then fork the override + drop the bundled member rules. Applies next session.
+  // Edit a Koda rule principle's wording for this project (or restore it with text:null). Refuse
+  // without an undo point (it overwrites the user's own edited wording), then fork the override + drop
+  // the bundled member rules. Applies next session.
   ipcMain.handle(IpcChannels.guardrailsSetRuleOverride, async (event, rawArgs: unknown) => {
     const { principleId, text } = GuardrailRuleOverrideRequestSchema.parse(rawArgs)
     const root = rootForSender(event.sender)
-    await getEngineSessions().checkpointProjectEdit(root, `edit rule ${principleId}`)
+    await requireCheckpoint(root, `edit rule ${principleId}`, 'the rule was left as it was.')
     setRuleOverride(root, app.isPackaged ? process.resourcesPath : undefined, principleId, text)
   })
 
@@ -1048,8 +1186,8 @@ export function registerIpcHandlers(): void {
   // Local-assist: clean session title (on-device model, deterministic fallback). assistTitle()
   // never rejects — it always resolves to a usable string — so this handler can't throw.
   ipcMain.handle(IpcChannels.assistTitle, async (_event, rawArgs: unknown) => {
-    const { text } = AssistTitleRequestSchema.parse(rawArgs)
-    return AssistTitleResponseSchema.parse({ title: await assistTitle(text) })
+    const { text, avoid } = AssistTitleRequestSchema.parse(rawArgs)
+    return AssistTitleResponseSchema.parse({ title: await assistTitle(text, avoid) })
   })
 
   // Project Files browser — read-only, contained to the project root in fs-browse. A bad/escaping
@@ -1068,7 +1206,20 @@ export function registerIpcHandlers(): void {
 
   ipcMain.handle(IpcChannels.fsReadFile, async (event, rawArgs: unknown) => {
     const { path } = ReadFileRequestSchema.parse(rawArgs)
-    return ReadFileResultSchema.parse(await readProjectFile(rootForSender(event.sender), path))
+    const root = rootForSender(event.sender)
+    // A displayable image renders as a picture, not text. Skip reading its bytes into the renderer
+    // (they'd just be a NUL-laden "binary" string) — resolve it to a contained koda-preview:// URL and
+    // let the surface's <img> load it directly over the protocol.
+    const win = BrowserWindow.fromWebContents(event.sender)
+    if (win && isDisplayableImage(path)) {
+      const file = containedReal(root, path) // realpath: throws on escape OR missing
+      const rel = relative(root, file).split(sep).join('/')
+      const imageUrl = previewAssetUrl(win.id, rel)
+      if (imageUrl) {
+        return ReadFileResultSchema.parse({ path: file, content: '', truncated: false, binary: true, imageUrl })
+      }
+    }
+    return ReadFileResultSchema.parse(await readProjectFile(root, path))
   })
 
   // Watch/unwatch an open file so its editor re-reads on an on-disk change (see file-watch.ts). send,
@@ -1118,13 +1269,15 @@ export function registerIpcHandlers(): void {
   })
 
   // Editor save: checkpoint the pre-edit project tree FIRST (so the edit is recoverable like an
-  // engine write), THEN write. The checkpoint is fail-soft inside the manager — a safety-git hiccup
-  // is logged, never blocks the save. Root is resolved in main; the renderer never names the cwd.
+  // engine write), THEN write. Alone among the edit paths a failed checkpoint does NOT refuse the
+  // save — that would strand the user's typed work in the editor with nowhere to put it. It writes
+  // and REPORTS instead, so the editor can say this one change has no undo behind it. Root is
+  // resolved in main; the renderer never names the cwd.
   ipcMain.handle(IpcChannels.fsWriteFile, async (event, rawArgs: unknown) => {
     const { path, content } = WriteFileRequestSchema.parse(rawArgs)
     const root = rootForSender(event.sender)
-    await getEngineSessions().checkpointProjectEdit(root, `edit to ${basename(path)}`)
-    return WriteFileResultSchema.parse({ path: await writeProjectFile(root, path, content) })
+    const checkpointed = await getEngineSessions().checkpointProjectEdit(root, `edit to ${basename(path)}`)
+    return WriteFileResultSchema.parse({ path: await writeProjectFile(root, path, content), checkpointed })
   })
 
   // Create a new empty document in Documents/ or a selected contained folder, then return its path.
@@ -1135,6 +1288,8 @@ export function registerIpcHandlers(): void {
 
   // Rename/move a file/folder. Checkpoint the pre-move tree FIRST (so it's recoverable like an engine
   // edit), THEN rename. Returns the new path; the renderer rebases any open tab keyed by the old one.
+  // Fail-soft on purpose (unlike the delete below): renameProjectPath refuses to clobber an existing
+  // target, so no content is destroyed and the move undoes by moving it back.
   ipcMain.handle(IpcChannels.fsRenamePath, async (event, rawArgs: unknown) => {
     const { from, to } = RenamePathRequestSchema.parse(rawArgs)
     const root = rootForSender(event.sender)
@@ -1142,16 +1297,20 @@ export function registerIpcHandlers(): void {
     return RenamePathResultSchema.parse({ path: await renameProjectPath(root, from, to) })
   })
 
-  // Delete a file/folder. Checkpoint first so the delete is undoable from the recovery timeline.
+  // Delete a file/folder. Checkpoint first so the delete is undoable from the recovery timeline — and
+  // REFUSE if that undo point can't be taken, like the bulk replace. A delete with no checkpoint
+  // behind it is unrecoverable, and the tree's own copy promises it can be undone.
   ipcMain.handle(IpcChannels.fsDeletePath, async (event, rawArgs: unknown) => {
     const { path } = DeletePathRequestSchema.parse(rawArgs)
     const root = rootForSender(event.sender)
-    await getEngineSessions().checkpointProjectEdit(root, `delete ${basename(path)}`)
+    await requireCheckpoint(root, `delete ${basename(path)}`, 'nothing was deleted.')
     await deleteProjectPath(root, path)
   })
 
   // Duplicate a file/folder as "<name> copy". Checkpoint first so the copy is undoable. Returns the
-  // new path so the renderer can nudge its tree/docs list to re-read.
+  // new path so the renderer can nudge its tree/docs list to re-read. Fail-soft like the import below:
+  // both only ADD deduped new names (import writes with 'wx'), so a missing checkpoint costs nothing —
+  // undoing an addition is deleting it, which the user can do by hand.
   ipcMain.handle(IpcChannels.fsDuplicatePath, async (event, rawArgs: unknown) => {
     const { path } = DuplicatePathRequestSchema.parse(rawArgs)
     const root = rootForSender(event.sender)
@@ -1183,6 +1342,48 @@ export function registerIpcHandlers(): void {
     if (err) throw new Error(err)
   })
 
+  // Start a native OS drag of a project file/folder — the renderer preventDefaults its HTML5
+  // dragstart and hands the gesture to us, so the file can land in Finder/Mail/a browser. Contained
+  // like reveal/open. Resolving the invoke tells the renderer the native drag is underway (its
+  // drag-state cleanup listeners only attach after that, so they can't fire mid-gesture).
+  ipcMain.handle(IpcChannels.fsStartDrag, async (event, rawArgs: unknown) => {
+    const { path } = StartDragRequestSchema.parse(rawArgs)
+    const file = containedReal(rootForSender(event.sender), path)
+    event.sender.startDrag({ file, icon: await app.getFileIcon(file) })
+  })
+
+  // Export the open doc as a PDF: lay the doc surface's rendered HTML on a clean print page in a
+  // hidden window, printToPDF it, save where the user picks, then open the result. The doc's images
+  // are koda-preview:// URLs, which the hidden window resolves through the same global protocol.
+  ipcMain.handle(IpcChannels.docExportPdf, async (event, rawArgs: unknown) => {
+    const { title, html } = ExportPdfRequestSchema.parse(rawArgs)
+    const parent = BrowserWindow.fromWebContents(event.sender)
+    const safeName = (title.replace(/[/:]/g, '-').trim() || 'Document') + '.pdf'
+    const picked = parent
+      ? await dialog.showSaveDialog(parent, { defaultPath: join(app.getPath('downloads'), safeName) })
+      : await dialog.showSaveDialog({ defaultPath: join(app.getPath('downloads'), safeName) })
+    if (picked.canceled || !picked.filePath) return ExportPdfResultSchema.parse({ path: null })
+
+    const page = `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>${PDF_CSS}</style></head><body><h1 class="koda-pdf-title">${escapeHtml(title)}</h1>${html}</body></html>`
+    // Via a temp file, not a data: URL — a doc with a few images overflows Chromium's data-URL cap.
+    const tmp = join(app.getPath('temp'), `koda-export-${Date.now()}.html`)
+    await writeFile(tmp, page, 'utf8')
+    const win = new BrowserWindow({
+      show: false,
+      webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false },
+    })
+    try {
+      await win.loadFile(tmp)
+      const pdf = await win.webContents.printToPDF({ pageSize: 'Letter', printBackground: true })
+      await writeFile(picked.filePath, pdf)
+    } finally {
+      win.destroy()
+      await unlink(tmp).catch(() => {})
+    }
+    void shell.openPath(picked.filePath)
+    return ExportPdfResultSchema.parse({ path: picked.filePath })
+  })
+
   // Create a new folder (at the root, or inside `parent`) and return its path. No checkpoint.
   ipcMain.handle(IpcChannels.fsCreateDir, async (event, rawArgs: unknown) => {
     const { name, parent, home } = CreateDirRequestSchema.parse(rawArgs)
@@ -1205,8 +1406,7 @@ export function registerIpcHandlers(): void {
     const root = rootForSender(event.sender)
     // A bulk replace touches many files at once, so unlike a single edit it must NOT proceed without an
     // undo point — the overlay promises "undo from the recovery timeline". Abort if the checkpoint failed.
-    const checkpointed = await getEngineSessions().checkpointProjectEdit(root, `replace “${query}”`)
-    if (!checkpointed) throw new Error('Could not create an undo checkpoint — replace cancelled')
+    await requireCheckpoint(root, `replace “${query}”`, 'nothing was replaced.')
     return ReplaceResultSchema.parse(await replaceInProject(root, query, replacement, scope))
   })
 
@@ -1400,12 +1600,12 @@ export function registerIpcHandlers(): void {
     })
   })
 
-  // Native open-directory dialog, parented to the calling window.
+  // Native open-directory dialog, parented to the calling window. Starts in ~/Koda so opening a
+  // project defaults to where Koda creates them, not wherever macOS last browsed.
   ipcMain.handle(IpcChannels.projectChooseFolder, async (event) => {
     const win = BrowserWindow.fromWebContents(event.sender)
-    const res = win
-      ? await dialog.showOpenDialog(win, { properties: ['openDirectory'] })
-      : await dialog.showOpenDialog({ properties: ['openDirectory'] })
+    const opts = { properties: ['openDirectory'] as 'openDirectory'[], defaultPath: projectsHomeDir() }
+    const res = win ? await dialog.showOpenDialog(win, opts) : await dialog.showOpenDialog(opts)
     return ChooseFolderResultSchema.parse({ path: res.canceled ? null : (res.filePaths[0] ?? null) })
   })
 
@@ -1481,6 +1681,19 @@ export function registerIpcHandlers(): void {
     RecentProjectsSchema.parse(loadAppState().recentProjects.filter((p) => existsSync(p))),
   )
 
+  // The empty list above can mean two opposite things, and only main knows which. Asked by ProjectHome
+  // (which would otherwise render a first-launch screen over a project list that exists and couldn't be
+  // read) and by the data-integrity banner (billing). Read fresh per call — both facts un-latch when the
+  // underlying file reads cleanly again, so a stale answer would outlive the problem.
+  ipcMain.handle(IpcChannels.appDataIntegrity, () => {
+    const state = appStateHealth()
+    return DataIntegritySchema.parse({
+      projectListUnreadable: state.unreadable,
+      projectListBackupKept: state.backupKept,
+      billingModeReset: settingsHealth().billingModeReset,
+    })
+  })
+
   // Delete a project: stop + deregister its mini apps, then move the folder (and its orphaned agent
   // worktrees, if any) to the Trash — recoverable, never rm. The path must come from the recents/apps
   // lists (same posture as miniApps:start: a compromised renderer can't trash arbitrary folders), and
@@ -1518,7 +1731,7 @@ export function registerIpcHandlers(): void {
   // Registry/run-state changes push to every window (a project window opened BEFORE the agent built
   // its app must still learn the face exists — the graduation moment happens mid-session). Flag off ⇒
   // never fires (nothing can register), and the re-fetch would return [] anyway.
-  setMiniAppsChangedListener(() => {
+  onMiniAppsChanged(() => {
     for (const win of BrowserWindow.getAllWindows()) win.webContents.send(IpcChannels.miniAppsChanged)
   })
 
@@ -1529,6 +1742,44 @@ export function registerIpcHandlers(): void {
     const { dir } = MiniAppStartRequestSchema.parse(rawArgs)
     const { url } = await startRegisteredMiniApp(dir)
     return MiniAppStartResultSchema.parse({ url })
+  })
+
+  // Already-open handoff: the tile's project has a live window. Surface it properly (project:open only
+  // calls focus(), which does nothing for a minimized/backgrounded window) and tell it to front the
+  // app's face, so clicking a tile always lands on the running app instead of a dead "already open" note.
+  ipcMain.handle(IpcChannels.miniAppsFront, async (_event, rawArgs: unknown) => {
+    if (!loadMiniAppsEnabled()) return
+    const { dir, projectPath } = MiniAppFrontRequestSchema.parse(rawArgs)
+    const win = windowForProject(realpathSync(projectPath))
+    if (!win) return // the window closed between list and click — the caller falls back to a fresh open
+    if (win.isMinimized()) win.restore()
+    win.show()
+    win.focus()
+    win.webContents.send(IpcChannels.uiFrontFace, dir)
+  })
+
+  // Lane B bridge: the Settings "may use your API key" toggle + per-app spend. Names come from the
+  // registry (the bridge store is keyed by dir only); same flag gate as the list.
+  ipcMain.handle(IpcChannels.miniAppsBridgeInfo, async () => {
+    if (!loadMiniAppsEnabled()) return MiniAppBridgeListSchema.parse([])
+    const apps = await listMiniApps()
+    const info = await Promise.all(
+      apps.map(async (a) => {
+        const s = await bridgeAppState(a.dir)
+        return { dir: a.dir, name: a.name, consent: s.consent, spend: s.spend }
+      }),
+    )
+    return MiniAppBridgeListSchema.parse(info)
+  })
+  ipcMain.handle(IpcChannels.miniAppsSetBridgeConsent, async (_event, rawArgs: unknown) => {
+    const { dir, allowed } = MiniAppBridgeConsentRequestSchema.parse(rawArgs)
+    // Only registered apps can be granted — a stray dir can't be pre-consented into the store.
+    if (!(await listMiniApps()).some((a) => a.dir === dir)) throw new Error('that app is not registered')
+    await setBridgeConsent(dir, allowed)
+  })
+  // Spend changes ride the existing miniApps:changed push so the Settings line refreshes live.
+  setBridgeSpendListener(() => {
+    for (const win of BrowserWindow.getAllWindows()) win.webContents.send(IpcChannels.miniAppsChanged)
   })
 
   // Renderer log forwarding is fire-and-forget (send/on, no reply). safeParse so a

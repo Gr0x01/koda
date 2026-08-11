@@ -121,6 +121,11 @@ export function ApprovalPrompt({
         <span className="font-mono text-accent">⚙ {request.toolName}</span>
         <span className="text-text-muted">wants to run</span>
       </div>
+      {request.reason && (
+        <div className="mt-2 text-xs text-text">
+          {request.reason}
+        </div>
+      )}
       <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] text-text-muted">
         {summarize(request.input)}
       </pre>

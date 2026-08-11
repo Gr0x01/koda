@@ -8,11 +8,17 @@
  * for a KDF to combine with, so a second tier buys nothing). Losing the Mac's Keychain AND the code
  * means the backup is unrecoverable by anyone, including Koda — that's the promise, not a bug.
  * (iCloud Keychain sync of this key is a Phase 2 spike; Phase 1 cross-Mac recovery is the code.)
+ *
+ * `readVaultKeyState()` is the load-bearing distinction: a key file that EXISTS but can't be
+ * decrypted (Keychain reset, corrupt bytes, a stray truncated write) is `'unreadable'`, never
+ * `'absent'`. Only `'absent'` may mint a fresh key — minting over an unreadable file would silently
+ * re-key the vault out from under every blob it already sealed (see decision-log 2026-08-08).
  */
 import { app, safeStorage } from 'electron'
 import { createHash, randomBytes } from 'node:crypto'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { writeFileAtomic } from '../atomic-write'
 import { log } from '../logger'
 
 const KEY_BYTES = 32
@@ -22,33 +28,52 @@ function keyPath(): string {
   return join(app.getPath('userData'), 'backup-vault-key.enc')
 }
 
-/** Decrypt the stored vault key, or null on any failure (missing, encryption unavailable, corrupt). */
-export function getVaultKey(): Buffer | null {
+export type VaultKeyState = { state: 'absent' } | { state: 'unreadable' } | { state: 'ok'; key: Buffer }
+
+/** The three-state read: distinguishes "no key file yet" (safe to mint) from "a key file exists
+ *  but this Mac can't open it right now" (must NEVER be treated as absent). */
+export function readVaultKeyState(): VaultKeyState {
+  const p = keyPath()
+  if (!existsSync(p)) return { state: 'absent' }
   try {
-    const p = keyPath()
-    if (!existsSync(p)) return null
-    if (!safeStorage.isEncryptionAvailable()) return null
+    if (!safeStorage.isEncryptionAvailable()) return { state: 'unreadable' }
     const key = Buffer.from(safeStorage.decryptString(Buffer.from(readFileSync(p, 'utf8'), 'base64')), 'base64')
-    return key.length === KEY_BYTES ? key : null
+    if (key.length !== KEY_BYTES) {
+      log.warn('backup', 'vault key file decrypted to the wrong length — treating as unreadable')
+      return { state: 'unreadable' }
+    }
+    return { state: 'ok', key }
   } catch (err) {
     log.warn('backup', 'could not read vault key', err instanceof Error ? err.message : err)
-    return null
+    return { state: 'unreadable' }
   }
 }
 
-/** Get the vault key, generating + persisting one on first use. Null means safeStorage is
- *  unavailable or the write failed — backup stays disabled rather than holding a key only in RAM
+/** Decrypt the stored vault key. Null covers absent, unreadable, and encryption-unavailable alike —
+ *  callers that only need "do I have a usable key" (e.g. restoreCloudBackup's "fall back to the typed
+ *  recovery code" branch) treat both the same way already. Callers that must NOT mint over an
+ *  unreadable file use `readVaultKeyState()` directly. */
+export function getVaultKey(): Buffer | null {
+  const s = readVaultKeyState()
+  return s.state === 'ok' ? s.key : null
+}
+
+/** Get the vault key, generating + persisting one on first use. Mints ONLY when no key file exists
+ *  at all — an unreadable file returns null without ever being touched, so a Keychain hiccup can
+ *  never overwrite a key that already sealed real blobs. Null also covers safeStorage being
+ *  unavailable or the write failing — backup stays disabled rather than holding a key only in RAM
  *  (a key that evaporates on quit would strand every blob it sealed). */
 export function ensureVaultKey(): Buffer | null {
-  const existing = getVaultKey()
-  if (existing) return existing
+  const existing = readVaultKeyState()
+  if (existing.state === 'ok') return existing.key
+  if (existing.state === 'unreadable') return null
   try {
     if (!safeStorage.isEncryptionAvailable()) {
       log.warn('backup', 'encryption unavailable — refusing to create a vault key')
       return null
     }
     const key = randomBytes(KEY_BYTES)
-    writeFileSync(keyPath(), safeStorage.encryptString(key.toString('base64')).toString('base64'), {
+    writeFileAtomic(keyPath(), safeStorage.encryptString(key.toString('base64')).toString('base64'), {
       mode: 0o600,
     })
     return key
@@ -63,7 +88,7 @@ export function setVaultKey(key: Buffer): boolean {
   if (key.length !== KEY_BYTES) return false
   try {
     if (!safeStorage.isEncryptionAvailable()) return false
-    writeFileSync(keyPath(), safeStorage.encryptString(key.toString('base64')).toString('base64'), {
+    writeFileAtomic(keyPath(), safeStorage.encryptString(key.toString('base64')).toString('base64'), {
       mode: 0o600,
     })
     return true

@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
-import type { CodexModel, EngineId } from '@shared/ipc'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import type { CodexAuthStatus, CodexModel, EngineId } from '@shared/ipc'
 import { Menu } from '../motion'
 import { Caret } from '../Caret'
 import { BusyText } from '../ui'
@@ -12,6 +12,7 @@ import { QUICK_ALIASES, isModelAlias, prettyModel } from './models'
 // but from a stable starting point instead of an empty one.
 let cachedCodexModels: CodexModel[] = []
 let cachedCodexSignedIn: boolean | null = null
+let cachedCodexCheckFailed = false
 
 /**
  * Per-session model + engine picker — a compact pill (active model + chevron) beside the approval-mode
@@ -48,28 +49,43 @@ export function ModelControl({
   const [recent, setRecent] = useState<string[]>([])
   const [codexModels, setCodexModels] = useState<CodexModel[]>(cachedCodexModels)
   const [codexSignedIn, setCodexSignedIn] = useState<boolean | null>(cachedCodexSignedIn)
+  const [codexCheckFailed, setCodexCheckFailed] = useState(cachedCodexCheckFailed)
   const [showCustom, setShowCustom] = useState(false)
   const [custom, setCustom] = useState('')
   const ref = useRef<HTMLDivElement>(null)
+  const codexAuthRequest = useRef(0)
+  const applyCodexAuth = useCallback((status: CodexAuthStatus | null): void => {
+    cachedCodexCheckFailed = status?.probeFailed ?? true
+    cachedCodexSignedIn = cachedCodexCheckFailed ? null : status!.signedIn
+    setCodexCheckFailed(cachedCodexCheckFailed)
+    setCodexSignedIn(cachedCodexSignedIn)
+  }, [])
+  const refreshCodexAuth = useCallback((): void => {
+    const request = ++codexAuthRequest.current
+    window.koda
+      .getCodexAuthStatus()
+      .then((status) => request === codexAuthRequest.current && applyCodexAuth(status))
+      .catch(() => request === codexAuthRequest.current && applyCodexAuth(null))
+  }, [applyCodexAuth])
 
   // Warm the Codex cache once so the first open already renders at full height (no upward shift).
   useEffect(() => {
     if (cachedCodexSignedIn !== null) return
     window.koda.getCodexModels().then((m) => { cachedCodexModels = m; setCodexModels(m) }).catch(() => {})
-    window.koda.getCodexAuthStatus().then((s) => { cachedCodexSignedIn = s.signedIn; setCodexSignedIn(s.signedIn) }).catch(() => { cachedCodexSignedIn = false; setCodexSignedIn(false) })
-  }, [])
+    refreshCodexAuth()
+  }, [refreshCodexAuth])
 
   useEffect(() => {
     if (!open) return
     window.koda.getRecentModels().then(setRecent).catch(() => {})
     window.koda.getCodexModels().then((m) => { cachedCodexModels = m; setCodexModels(m) }).catch(() => {})
-    window.koda.getCodexAuthStatus().then((s) => { cachedCodexSignedIn = s.signedIn; setCodexSignedIn(s.signedIn) }).catch(() => { cachedCodexSignedIn = false; setCodexSignedIn(false) })
+    refreshCodexAuth()
     const onDown = (e: MouseEvent) => {
       if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
     }
     document.addEventListener('mousedown', onDown)
     return () => document.removeEventListener('mousedown', onDown)
-  }, [open])
+  }, [open, refreshCodexAuth])
 
   // Preference-first display (matches the dropdown checkmark): show the user's chosen model immediately
   // (it's what the next turn reattaches with), else the model the engine actually reported defaulting to.
@@ -161,7 +177,9 @@ export function ModelControl({
 
         {/* ── OpenAI (Codex) ── */}
         <Divider label="OpenAI" />
-        {codexSignedIn === false ? (
+        {codexCheckFailed ? (
+          <div className="px-2.5 py-1.5 text-[11px] text-text-muted">Couldn’t check sign-in.</div>
+        ) : codexSignedIn === false ? (
           <div className="px-2.5 py-1.5 text-[11px] text-text-muted">Sign in to OpenAI in Settings → AI providers.</div>
         ) : codexModels.length === 0 ? (
           <div className="px-2.5 py-1.5 text-[11px] text-text-muted">

@@ -20,11 +20,9 @@ import { promisify } from 'node:util'
 import { runGit, safetyGitDir, ensureRepo } from '../safety-git/repo'
 import { listCheckpoints } from '../safety-git/checkpoint'
 import { restore } from '../safety-git/restore'
+import { gitEnv } from '../engine/user-path'
 
 const execFileP = promisify(execFile)
-
-/** Same config isolation as runGit, for git commands that don't target an existing store. */
-const GIT_ENV = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' }
 
 async function refExists(projectDir: string, ref: string): Promise<boolean> {
   try {
@@ -94,8 +92,10 @@ export async function restoreFromBundle(projectDir: string, bundle: Buffer): Pro
   const bundlePath = join(dir, 'safety.bundle')
   try {
     await writeFile(bundlePath, bundle)
+    // Same config isolation as runGit (this clone predates the store it creates, so it can't use it),
+    // resolved on the login-shell PATH like every other git spawn.
     await execFileP('git', ['clone', '--mirror', '--quiet', bundlePath, storeDir], {
-      env: GIT_ENV,
+      env: gitEnv({ GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' }),
       timeout: 60_000,
     })
     // A mirror clone marks itself bare=true and carries no local config — ensureRepo re-inits

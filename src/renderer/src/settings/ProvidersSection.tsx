@@ -5,6 +5,7 @@ import type {
   CodexAuthStatus,
   CodexBillingMode,
   EngineId,
+  MiniAppBridgeInfo,
   ModelSpend,
   RateLimitInfo,
   UsageHistoryDay,
@@ -13,8 +14,9 @@ import { Collapse, motion, spring } from '../motion'
 import { Caret } from '../Caret'
 import { useWorkspace } from '../workspace/store'
 import { engineLabel, engineOrder, engineAccent } from '../workspace/models'
-import { SegmentedControl, SettingsRow, SettingsSection } from './controls'
+import { SegmentedControl, SettingsRow, SettingsSection, Toggle } from './controls'
 import { BusyText, Button, Card, PixelGlyph, cx } from '../ui'
+import { liveRateLimitWindows } from '@shared/rate-limits'
 
 // ── AI providers (engine billing, one tab per provider) ─────────────────────────────
 // How the LLM that powers each session is authenticated and paid for. Each provider (Anthropic → Claude,
@@ -46,7 +48,9 @@ export function ProvidersSection() {
     window.koda
       .getCodexAuthStatus()
       .then(setCodexAuth)
-      .catch(() => setCodexAuth({ signedIn: false, authMethod: null, requiresOpenaiAuth: null }))
+      .catch(() =>
+        setCodexAuth({ signedIn: false, authMethod: null, requiresOpenaiAuth: null, probeFailed: true }),
+      )
   }, [])
   useEffect(() => {
     refresh()
@@ -134,6 +138,7 @@ export function ProvidersSection() {
                 apiActive={apiActive}
               />
             )}
+            <AppKeyAccess hasKey={billing?.hasKey ?? false} />
           </ProviderPanel>
         </div>
 
@@ -667,6 +672,7 @@ function OpenAiSignIn({
   }
 
   const signedIn = auth?.signedIn ?? false
+  const checkFailed = auth?.probeFailed ?? false
   // Both pre-URL ('verifying') and post-URL ('awaiting-browser') are in-flight: a real child is running,
   // so Cancel must be reachable in either (otherwise a URL that never parses strands "Working…" until the
   // 5-min timeout with no escape).
@@ -683,8 +689,8 @@ function OpenAiSignIn({
           ) : phase === 'verifying' ? (
             <BusyText className="text-[13px] text-text-muted">Working…</BusyText>
           ) : (
-            <Button variant="secondary" onClick={start}>
-              {signedIn ? 'Re-authenticate' : 'Sign in'}
+            <Button variant="secondary" onClick={checkFailed ? () => onChanged() : start}>
+              {checkFailed ? 'Check again' : signedIn ? 'Re-authenticate' : 'Sign in'}
             </Button>
           )
         }
@@ -712,7 +718,12 @@ function OpenAiSignIn({
           </button>
         </div>
       )}
-      {phase === 'idle' && auth && !signedIn && (
+      {phase === 'idle' && checkFailed && (
+        <div className="px-4 pb-3.5 pt-0.5 text-[12.5px] leading-snug text-text-muted">
+          Koda couldn’t check the current ChatGPT sign-in. Your account may still be connected.
+        </div>
+      )}
+      {phase === 'idle' && auth && !signedIn && !checkFailed && (
         <div className="px-4 pb-3.5 pt-0.5 text-[12.5px] leading-snug text-text-muted">
           Sign in with your ChatGPT plan to use OpenAI models. Koda reads the login — it never stores your
           OpenAI credentials.
@@ -874,6 +885,7 @@ function claudeStatusOf(billing: BillingState | null): ProviderStatus {
  *  key, or not set up. */
 function codexStatusOf(auth: CodexAuthStatus | null, billing: BillingState | null): ProviderStatus {
   if (!auth) return { dot: false, short: '…', full: '…' }
+  if (auth.probeFailed) return { dot: false, short: 'check failed', full: 'Could not check sign-in status' }
   if (auth.signedIn) {
     const method = auth.authMethod === 'chatgpt' ? 'ChatGPT' : auth.authMethod === 'apikey' ? 'API key' : auth.authMethod
     return { dot: true, short: 'signed in', full: `Signed in${method ? ` · ${method}` : ''}` }
@@ -941,8 +953,15 @@ function EngineUsage({
   showPlanLimits: boolean
   apiActive: boolean
 }) {
-  const five = windows['five_hour']
-  const weekly = windows['weekly']
+  const [nowSec, setNowSec] = useState(() => Math.floor(Date.now() / 1000))
+  useEffect(() => {
+    const timer = setInterval(() => setNowSec(Math.floor(Date.now() / 1000)), 30_000)
+    return () => clearInterval(timer)
+  }, [])
+  const liveWindows = liveRateLimitWindows(windows, nowSec)
+  const five = liveWindows['five_hour']
+  // Claude's stream names the weekly cap 'seven_day'; Codex names it 'weekly'. Same row.
+  const weekly = liveWindows['weekly'] ?? liveWindows['seven_day']
   const models = Object.entries(byModel).sort((a, b) => b[1].costUsd - a[1].costUsd)
   // Anchor the 5-hour row for Anthropic (always-present empty state); for any other engine only show a
   // window once it actually reports one (never fabricate a gauge we can't see).
@@ -1077,14 +1096,15 @@ function fmtTokens(n: number): string {
   return String(n)
 }
 
-/** One subscription window. Claude gives only a coarse band (no precise %); Codex reports a real
- *  `usedPercent` — show the exact figure when present (a measured fill), else the band text. */
+/** One subscription window — the exact `usedPercent` when the engine reports one (a measured fill),
+ *  else the coarse band text. Absent info covers both "no turn yet" and the server having nothing
+ *  to report on a quiet window (it only pushes windows near their cap since ~2026-07). */
 function PlanWindowRow({ label, info }: { label: string; info?: RateLimitInfo }) {
   if (!info)
     return (
       <SettingsRow
         label={label}
-        control={<span className="text-[13px] text-text-muted">After your next turn</span>}
+        control={<span className="text-[13px] text-text-muted">Nothing to report yet</span>}
       />
     )
   const tone =
@@ -1122,4 +1142,57 @@ function fmtReset(resetsAt: number): string {
   const time = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
   const sameDay = d.toDateString() === new Date().toDateString()
   return sameDay ? time : `${d.toLocaleDateString(undefined, { weekday: 'short' })} ${time}`
+}
+
+// ── App AI calls (the Lane B bridge consent) ─────────────────────────────────────────
+/** Per-app "may use your API key" toggles + what each app's own AI calls have cost. Only mini apps
+ *  the agent registered appear; nothing renders while there are none (or the mini-apps flag is off —
+ *  main returns [] then, same gate as the launcher rail). Consent is off by default and only ever
+ *  flipped here — user-visible, never silent. Optional-chained: a dev-HMR renderer can be newer than
+ *  its preload. */
+function AppKeyAccess({ hasKey }: { hasKey: boolean }) {
+  const [apps, setApps] = useState<MiniAppBridgeInfo[]>([])
+  useEffect(() => {
+    const refresh = (): void => {
+      window.koda.miniAppsBridgeInfo?.().then(setApps).catch(console.error)
+    }
+    refresh()
+    // Spend updates and app installs both ride the miniApps:changed push.
+    return window.koda.onMiniAppsChanged?.(refresh)
+  }, [])
+  if (apps.length === 0) return null
+
+  const setConsent = (dir: string, allowed: boolean): void => {
+    // Optimistic — the push confirms; a failure snaps back on the next refresh.
+    setApps((prev) => prev.map((a) => (a.dir === dir ? { ...a, consent: allowed } : a)))
+    window.koda.miniAppsSetBridgeConsent?.({ dir, allowed }).catch(console.error)
+  }
+
+  return (
+    <SettingsSection title="App AI calls">
+      <div className="px-4 py-3 text-[12.5px] leading-snug text-text-muted">
+        An app with AI built into its own screens pays for those calls with your API key, never your
+        subscription. Each app needs your permission first.
+        {!hasKey && ' No API key is connected yet, so allowed apps still can’t call until you add one above.'}
+      </div>
+      {apps.map((a) => (
+        <SettingsRow
+          key={a.dir}
+          label={a.name}
+          description={
+            a.spend.usd > 0
+              ? `${fmtUsd(a.spend.usd)} so far · ${a.spend.inputTokens.toLocaleString()} in / ${a.spend.outputTokens.toLocaleString()} out`
+              : 'No AI calls yet'
+          }
+          control={
+            <Toggle
+              checked={a.consent}
+              onChange={(next) => setConsent(a.dir, next)}
+              label={`${a.name} may use your API key`}
+            />
+          }
+        />
+      ))}
+    </SettingsSection>
+  )
 }

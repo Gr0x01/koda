@@ -45,7 +45,7 @@ export function ProjectIntake() {
 
   return (
     <div className="flex h-full w-full items-center justify-center px-6">
-      <div className="w-full max-w-md rounded-2xl border border-border bg-surface p-8 shadow-soft">
+      <div className="w-full max-w-xl rounded-2xl border border-border bg-surface p-8 shadow-soft">
         {name && (
           <span className="mb-3 inline-flex items-center gap-2 font-mono text-[11px] text-accent">
             <span className="h-1.5 w-1.5 rounded-full bg-accent" />
@@ -54,12 +54,15 @@ export function ProjectIntake() {
         )}
         <h1 className="font-display text-xl font-semibold tracking-tight">What are we building?</h1>
         <p className="mt-2 text-sm leading-relaxed text-text-muted">
-          A line about this project lets the agent set up the right guidelines. It'll take a look at
-          what's here, ask a couple of quick questions, then you're off.
+          Lay out the whole idea, like you'd explain it to a friend. The more you share, the better
+          the agent sets things up. It'll take a look at what's here, ask a couple of quick
+          questions, then you're off.
         </p>
 
         <div className="mt-5">
-          <label className="mb-1.5 block text-xs font-medium text-text">Tell me about it</label>
+          <label className="mb-1.5 block text-xs font-medium text-text">
+            Tell me about it <span className="font-normal text-text-muted">(the more the better)</span>
+          </label>
           <textarea
             autoFocus
             value={description}
@@ -71,9 +74,9 @@ export function ProjectIntake() {
                 start()
               }
             }}
-            rows={3}
-            placeholder="a recipe app to share meals with my family, simple and works on my phone"
-            className="w-full resize-none rounded-xl border border-border bg-bg px-3 py-2.5 text-sm leading-relaxed outline-none transition-colors placeholder:text-text-muted focus:border-accent"
+            rows={7}
+            placeholder="a recipe app to share meals with my family. My wife and I both cook, and we plan the week together on Sundays. I want to pull it up on my phone at the grocery store. Simple, no accounts, works for just the two of us."
+            className="max-h-80 min-h-44 w-full field-sizing-content resize-none rounded-xl border border-border bg-bg px-3 py-2.5 text-sm leading-relaxed outline-none transition-colors placeholder:text-text-muted focus:border-accent"
           />
         </div>
 

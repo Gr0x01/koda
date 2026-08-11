@@ -56,8 +56,12 @@ export async function checkpointChanges(
   const tmpIndex = join(safetyGitDir(projectDir), `changes-index-${process.pid}-${Date.now()}`)
   const env = { GIT_INDEX_FILE: tmpIndex }
   try {
-    // Scratch index starts empty; `add -A` makes it mirror the working tree (new files become adds,
-    // missing files become deletes relative to the checkpoint we diff against next).
+    // Seed the scratch index from the checkpoint, then `add -A` refreshes it to mirror the working
+    // tree (new files become adds, missing files become deletes). Seeding matters: files tracked by
+    // the store but ignored by a later .gitignore (a real proxmox case — .env.local, tmp/) stay
+    // tracked and refresh from disk; an empty index would drop them (`add -A` skips ignored
+    // untracked files) and report them as phantom deletions against every checkpoint.
+    await runGit(projectDir, ['read-tree', checkpointId], { extraEnv: env })
     await runGit(projectDir, ['add', '-A'], { extraEnv: env })
 
     // name-status for the A/M/D letter, numstat for the +/- counts — both checkpoint → scratch index.

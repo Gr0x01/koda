@@ -44,6 +44,10 @@ export const CLAUDE_PROFILE: EngineProfile = {
     'AWS_BEARER_TOKEN_BEDROCK',
     'CLAUDE_CODE_USE_BEDROCK',
     'CLAUDE_CODE_USE_VERTEX',
+    'CLAUDE_CODE_USE_FOUNDRY',
+    // Koda needs explicit scout/worker leaves to run in the background. An ambient value of 1 disables
+    // the entire engine subsystem (including explicit `background: true` profiles), so never inherit it.
+    'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS',
     // Endpoint redirects: a stray base-url silently points the subscription engine at a different
     // server (wrong billing / data-exfil surface). Never inherit them.
     'ANTHROPIC_BASE_URL',

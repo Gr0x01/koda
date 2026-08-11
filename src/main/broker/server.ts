@@ -13,7 +13,7 @@
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
+import { CallToolRequestSchema, isInitializeRequest, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http'
 import { randomUUID, timingSafeEqual } from 'node:crypto'
 import type { ToolDecision } from '@shared/ipc'
@@ -92,6 +92,13 @@ interface SessionEntry {
   server: Server
   transport: StreamableHTTPServerTransport
   token: string
+  /** Codex rebuilds every MCP connection between turns. Keep the logical Koda session while allowing
+   *  each fresh MCP initialize request to replace this transport (Claude normally keeps one). */
+  initialized: boolean
+  closing: boolean
+  /** Serializes only MCP initialize/reconnect requests. Tool calls remain concurrent (an approval may
+   *  wait on the user), but two client retries cannot replace the shared transport underneath each other. */
+  initializeChain: Promise<void>
   /** Keeps the server→client standalone SSE stream warm (see register()); cleared in unregister(). */
   keepalive: ReturnType<typeof setInterval>
 }
@@ -291,7 +298,7 @@ export class PermissionBroker {
         {
           name: TOOL_APP_START,
           description:
-            "Start a mini app under Koda's supervisor — the ONLY way to run an app server (never start one with Bash; a Bash-started server dies with the session and nobody owns its port). Koda assigns the port (the app must read the PORT env var and bind 127.0.0.1), waits until it's actually serving, restarts it on crashes with backoff, and keeps it running across Koda relaunches until app_stop. Auto-registers a valid manifest, so a prior app_install isn't required. Returns { url, port }.",
+            "Start a mini app under Koda's supervisor — the ONLY way to run an app server (never start one with Bash; a Bash-started server dies with the session and nobody owns its port). Koda assigns the port (the app must read the PORT env var and bind 127.0.0.1), waits until it's actually serving, restarts it on crashes with backoff, and keeps it running across Koda relaunches until app_stop. Auto-registers a valid manifest, so a prior app_install isn't required. Returns { url } — the app's address AS OF THIS CALL. Koda reassigns the port on every restart, so never remember a url or a port from an earlier message: call app_status when you need the current one.",
           inputSchema: {
             type: 'object',
             properties: {
@@ -317,7 +324,7 @@ export class PermissionBroker {
         {
           name: TOOL_APP_STATUS,
           description:
-            "List this project's mini apps with their live state (starting / running / stopped / crashed), URL, pid, restart count, and whether they start when Koda launches. 'crashed' means it exited repeatedly and the supervisor gave up — fix the app, then app_start again.",
+            "List this project's mini apps with their live state (starting / running / stopped / crashed), URL, pid, restart count, and whether they start when Koda launches. This is the way to get a running app's CURRENT url — Koda reassigns the port on every restart, so a url from an earlier message may already be dead. 'crashed' means it exited repeatedly and the supervisor gave up — fix the app, then app_start again.",
           inputSchema: { type: 'object', properties: {}, additionalProperties: false },
         },
       ].filter(
@@ -463,20 +470,27 @@ export class PermissionBroker {
     // Edit, Write — the whole gate). A periodic ping (a byte on that stream) resets the client's timer.
     // Fire-and-forget: a dropped ping is harmless and a truly dead session is healed by the manager's
     // reconnect path; the overlap guard avoids stacking pings if one is slow to answer.
-    let pinging = false
-    const keepalive = setInterval(() => {
-      if (pinging) return
-      pinging = true
-      server.ping().catch(() => {}).finally(() => { pinging = false })
-    }, STANDALONE_KEEPALIVE_MS)
-    this.sessions.set(sessionId, { server, transport, token, keepalive })
+    const keepalive = startStandaloneKeepalive(server)
+    this.sessions.set(sessionId, {
+      server,
+      transport,
+      token,
+      initialized: false,
+      closing: false,
+      initializeChain: Promise.resolve(),
+      keepalive,
+    })
   }
 
   /** Tear down a session's MCP server (engine ended). Safe if never registered. */
   async unregister(sessionId: string): Promise<void> {
     const entry = this.sessions.get(sessionId)
     if (!entry) return
+    entry.closing = true
     this.sessions.delete(sessionId)
+    // A Codex reconnect may already be queued behind another initialization. Let that queue observe
+    // `closing` before tearing down the final transport, so it cannot resurrect an orphaned keepalive.
+    await entry.initializeChain.catch(() => {})
     clearInterval(entry.keepalive)
     try {
       await entry.transport.close()
@@ -538,7 +552,36 @@ export class PermissionBroker {
     }
     try {
       const body = req.method === 'POST' ? await readJsonBody(req) : undefined
-      await entry.transport.handleRequest(req, res, body)
+      // Codex intentionally tears down and rebuilds all MCP services between turns. The MCP SDK's
+      // stateful transport accepts exactly one initialization, so reusing it leaves Codex with
+      // `startup_complete=true` but no cached Koda tools after turn one. Preserve the logical Koda
+      // session (token + handlers + window ownership), but give each new MCP connection a fresh
+      // transport. Claude's long-lived connection never enters this branch.
+      if (isInitializeRequest(body)) {
+        const initialize = entry.initializeChain.then(async () => {
+          if (entry.closing) {
+            if (!res.headersSent) res.writeHead(404).end('unknown session')
+            return
+          }
+          if (entry.initialized) {
+            clearInterval(entry.keepalive)
+            await entry.server.close()
+            entry.transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID() })
+            await entry.server.connect(entry.transport)
+            entry.keepalive = startStandaloneKeepalive(entry.server)
+          }
+          // Capture the selected transport: another request may queue a replacement, but cannot start
+          // it until this initialization has finished writing its response.
+          const transport = entry.transport
+          await transport.handleRequest(req, res, body)
+          entry.initialized = true
+        })
+        entry.initializeChain = initialize.catch(() => {})
+        await initialize
+        return
+      }
+      const transport = entry.transport
+      await transport.handleRequest(req, res, body)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       log.error('broker', 'request handling failed', { sessionId, message })
@@ -546,6 +589,15 @@ export class PermissionBroker {
       if (!res.headersSent) res.writeHead(500).end('broker error')
     }
   }
+}
+
+function startStandaloneKeepalive(server: Server): ReturnType<typeof setInterval> {
+  let pinging = false
+  return setInterval(() => {
+    if (pinging) return
+    pinging = true
+    server.ping().catch(() => {}).finally(() => { pinging = false })
+  }, STANDALONE_KEEPALIVE_MS)
 }
 
 /** The curated installable tools + runtimes, as a phrase for the ensure_tool description ("'python'

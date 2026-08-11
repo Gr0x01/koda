@@ -4,9 +4,9 @@ import { Button } from '../../ui'
 import { Section, basename } from './shared'
 
 /**
- * Loose ends — the odds and ends the agent leaves behind, gathered into one place instead of three
- * quiet sections. Only what needs a human decision shows: side lines never brought into your project
- * (review → bring in / discard) and other workspaces left with UNSAVED work (open to pick it up). The
+ * Loose ends — the odds and ends an agent leaves behind, gathered into one place instead of three
+ * quiet sections. Only what needs a human decision shows: clean side lines ready to review
+ * (bring in / discard) and other workspaces with loose or unreadable state (open to pick it up). The
  * provably-safe leftovers — fully-merged branches + their clean checkouts — are auto-tidied on refresh
  * (SourceControl), so `tidiedCount` just reports how many, turning "Claude left branches everywhere"
  * into "Koda cleaned up after it." Renders nothing when there's nothing to say.
@@ -19,8 +19,8 @@ export function LooseEnds({
   onChanged,
 }: {
   tidiedCount: number
-  sideLines: string[]
-  /** Sibling checkouts worth surfacing — those with unsaved work or a missing folder. */
+  sideLines: Array<{ name: string; ahead: number }>
+  /** Sibling checkouts worth surfacing — loose, unreadable, or missing. */
   worktrees: GitWorktree[]
   onReview: (branch: string) => void
   onChanged: () => void
@@ -34,13 +34,19 @@ export function LooseEnds({
   return (
     <Section label="Loose ends" count={sideLines.length + worktrees.length}>
       <p className="px-3 pb-2 text-[11px] leading-relaxed text-text-muted/85">
-        Bits Claude left open — side lines it never brought in, and workspaces with unsaved work.
-        Nothing here is lost; sort them out whenever.
+        Agent work waiting for your decision. Clean side lines are ready to review; other workspaces
+        still need cleanup or a quick check. Review, discard, or clean them up when you’re ready.
       </p>
       {tidiedCount > 0 && <TidyLine count={tidiedCount} />}
       <ul className="flex flex-col gap-1.5 px-3 pb-1">
         {sideLines.map((b) => (
-          <SideLineRow key={b} branch={b} onReview={() => onReview(b)} onDiscarded={onChanged} />
+          <SideLineRow
+            key={b.name}
+            branch={b.name}
+            commitCount={b.ahead}
+            onReview={() => onReview(b.name)}
+            onDiscarded={onChanged}
+          />
         ))}
         {worktrees.map((w) => (
           <WorkspaceRow key={w.path} worktree={w} />
@@ -63,10 +69,12 @@ function TidyLine({ count, standalone }: { count: number; standalone?: boolean }
 // Discard is the one destructive move here, so it takes an inline confirm before it fires.
 function SideLineRow({
   branch,
+  commitCount,
   onReview,
   onDiscarded,
 }: {
   branch: string
+  commitCount: number
   onReview: () => void
   onDiscarded: () => void
 }) {
@@ -81,7 +89,7 @@ function SideLineRow({
       await window.koda.gitDiscardBranch({ branch })
       onDiscarded()
     } catch (e) {
-      setError('Could not discard it. Ask Claude to take a look.')
+      setError('Could not discard it. Ask the agent to take a look.')
       console.error('gitDiscardBranch failed', e)
       setBusy(false)
     }
@@ -89,23 +97,25 @@ function SideLineRow({
 
   return (
     <li className="rounded-lg border border-[#b5862f]/30 bg-[#b5862f]/[0.07] px-2.5 py-2">
-      <div className="flex items-center gap-2">
-        <div className="min-w-0 flex-1">
-          <span className="block truncate font-mono text-[12.5px] text-text" title={branch}>
-            {branch}
+      <div className="min-w-0">
+        <span className="block truncate font-mono text-[12.5px] text-text" title={branch}>
+          {branch}
+        </span>
+        <div className="mt-0.5 flex items-center justify-between gap-2">
+          <span className="text-[11px] text-emerald-500/80">
+            Ready · clean · {commitCount} {commitCount === 1 ? 'commit' : 'commits'}
           </span>
-          <span className="text-[11px] text-text-muted">Not in your project yet</span>
+          {!confirming && (
+            <div className="flex shrink-0 gap-1.5">
+              <Button variant="secondary" size="sm" onClick={onReview}>
+                Review
+              </Button>
+              <Button variant="danger" size="sm" onClick={() => setConfirming(true)}>
+                Discard
+              </Button>
+            </div>
+          )}
         </div>
-        {!confirming && (
-          <div className="flex shrink-0 gap-1.5">
-            <Button variant="secondary" size="sm" onClick={onReview}>
-              Review
-            </Button>
-            <Button variant="danger" size="sm" onClick={() => setConfirming(true)}>
-              Discard
-            </Button>
-          </div>
-        )}
       </div>
       {confirming && (
         <div className="mt-2 rounded-md border border-border bg-surface px-2.5 py-2">
@@ -127,7 +137,7 @@ function SideLineRow({
   )
 }
 
-// A separate checkout the agent left with unsaved work (or whose folder is gone). Open it in its own
+// A separate checkout the agent left with loose work (or whose folder is gone). Open it in its own
 // window to pick the work back up — its uncommitted changes live nowhere else.
 function WorkspaceRow({ worktree: w }: { worktree: GitWorktree }) {
   const [busy, setBusy] = useState(false)
@@ -154,18 +164,23 @@ function WorkspaceRow({ worktree: w }: { worktree: GitWorktree }) {
           <span className="block truncate text-[12.5px] text-text" title={w.path}>
             {basename(w.path)}
           </span>
-          <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-[11px] text-text-muted/85">
-            <span className="truncate font-mono">{w.branch ?? 'detached'}</span>
-            <span aria-hidden>·</span>
+          <span className="mt-0.5 block truncate font-mono text-[11px] text-text-muted/85">
+            {w.branch ?? 'detached'}
+          </span>
+          <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 text-[11px] text-text-muted/85">
             {w.prunable ? (
-              <span className="shrink-0 whitespace-nowrap text-red-400">folder missing</span>
+              <span className="whitespace-nowrap text-red-400">folder missing</span>
+            ) : !w.statusKnown ? (
+              <span className="whitespace-nowrap text-[#9a6f1e] dark:text-[#e0c178]">
+                Needs a check · status unavailable
+              </span>
             ) : (
-              <span className="shrink-0 whitespace-nowrap text-[#9a6f1e] dark:text-[#e0c178]">
-                {w.dirtyCount} unsaved {w.dirtyCount === 1 ? 'change' : 'changes'}
+              <span className="whitespace-nowrap text-[#9a6f1e] dark:text-[#e0c178]">
+                Needs cleanup · {w.dirtyCount} loose {w.dirtyCount === 1 ? 'file' : 'files'}
               </span>
             )}
             {w.lastActivity && (
-              <span className="shrink-0 whitespace-nowrap text-text-muted/60">· {w.lastActivity}</span>
+              <span className="whitespace-nowrap text-text-muted/60">· {w.lastActivity}</span>
             )}
           </div>
           {note && <p className="mt-0.5 text-[11px] text-text-muted/70">{note}</p>}

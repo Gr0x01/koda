@@ -235,6 +235,16 @@ const IMAGE_MIME: Record<string, string> = {
   tiff: 'image/tiff',
   ico: 'image/x-icon',
 }
+/** Extensions Chromium can render directly in an `<img>` (served over `koda-preview://`). Drives the
+ *  file surface's image preview. Narrower than IMAGE_MIME: tiff has no browser support, so it stays a
+ *  "binary" notice rather than a broken image. */
+const DISPLAYABLE_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico', 'bmp', 'avif'])
+
+/** True when `path`'s extension is an image the file surface can render inline. */
+export function isDisplayableImage(path: string): boolean {
+  return DISPLAYABLE_IMAGE_EXTS.has(extname(path).replace(/^\./, '').toLowerCase())
+}
+
 /** Cap on a single inlined image — big enough for a normal doc picture, bounded so a huge asset can't
  *  bloat one doc read (over the wire the base64 costs ~1.33×). Oversized/non-image → null (the phone
  *  keeps the original ref → a broken image, never a crash). */

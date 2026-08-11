@@ -68,6 +68,14 @@ export function FileSurfaceView({
           <p className="px-4 py-3 text-xs text-red-400">Couldn't open this file: {error}</p>
         ) : !file ? (
           <p className="px-4 py-3 text-xs text-text-muted">Loading…</p>
+        ) : file.imageUrl ? (
+          <div className="flex h-full items-center justify-center overflow-auto p-6">
+            <img
+              src={file.imageUrl}
+              alt={path.split('/').pop() ?? 'image'}
+              className="max-h-full max-w-full object-contain"
+            />
+          </div>
         ) : file.binary ? (
           <p className="px-4 py-3 text-xs text-text-muted">Binary file: can't display.</p>
         ) : (

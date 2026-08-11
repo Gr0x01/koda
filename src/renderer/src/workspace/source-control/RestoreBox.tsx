@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { GitCommitResult } from '@shared/ipc'
+import { gitErrorCopy } from '../../git-error-copy'
 import { Button } from '../../ui'
 
 // Non-destructive by construction (restoreVersion never rewrites history — a restore is undone by
@@ -25,7 +25,7 @@ export function RestoreBox({ sha, onRestored }: { sha: string; onRestored: () =>
         setConfirming(false)
         onRestored()
       } else {
-        setError(restoreErrorCopy(res.code))
+        setError(gitErrorCopy(res.code, 'restore'))
       }
     } catch (err) {
       setError('Could not restore this version.')
@@ -79,17 +79,4 @@ export function RestoreBox({ sha, onRestored }: { sha: string; onRestored: () =>
       {error && <p className="mt-1.5 text-[11px] leading-relaxed text-red-400">{error}</p>}
     </div>
   )
-}
-
-type CommitErrorCode = Extract<GitCommitResult, { ok: false }>['code']
-
-function restoreErrorCopy(code: CommitErrorCode): string {
-  switch (code) {
-    case 'not_clean':
-      return 'You have unsaved changes — save a version (or discard them) before restoring.'
-    case 'nothing_to_commit':
-      return 'Your files already match this version.'
-    default:
-      return 'Could not restore this version.'
-  }
 }

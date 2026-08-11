@@ -17,6 +17,7 @@ import {
   isSelfCheckpointing,
   isUserQuestion,
   isPreviewTool,
+  protectedTarget,
 } from './policy'
 
 /**
@@ -40,6 +41,30 @@ export type PushResolved = (sessionId: string, requestId: string) => void
 /** Tell the renderer recovery may be limited for the action just allowed (checkpoint failed). */
 export type WarnFn = (sessionId: string, message: string) => void
 
+/** What an unattended (overnight-dream) session hears instead of a prompt. */
+const UNATTENDED_REASON =
+  'This is an unattended overnight run: anything needing a human is declined, not asked. The user has NOT consented to this action — do not retry it or attempt the same outcome via a different path. Skip it and flag it for a normal session instead.'
+
+/** REM may inspect only local evidence. This is intentionally narrower than policy.isMutating:
+ *  browser/preview/web/task tools may not edit project files, but they still act outside the dream. */
+const REM_EVIDENCE_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LS', 'NotebookRead'])
+
+/** Attached to a user's deny when they gave no reason of their own. Without it the engine sees a
+ *  bare rejection and commonly retries the same action reworded or reaches the same outcome down a
+ *  different path — the denial has to say the user's no covers the OUTCOME, not this one phrasing
+ *  (the Hermes denial register: "silence is not consent" engineering, applied to an explicit no). */
+const USER_DENY_REASON =
+  "The user declined this. Do not retry it, rephrase it, or attempt the same outcome via a different path — ask what they'd prefer instead."
+
+/** Not every deny is a no — some tools' deny buttons mean something specific, and the blanket
+ *  register would contradict them (review catch: "Keep planning" got told never to re-present the
+ *  plan). These carry their own voice instead. */
+const TOOL_DENY_REASONS: Record<string, string> = {
+  ExitPlanMode: 'The user wants to keep planning — revise the plan from their feedback and present it again.',
+  mcp__koda_broker__ensure_tool:
+    "The user declined the install. Don't install it another way (no brew/curl/npm end-runs) — continue with the tools already on the machine.",
+}
+
 export class ApprovalGate {
   /** The posture new sessions start at (seeded from the persisted setting). */
   private defaultMode: ApprovalMode = 'auto'
@@ -48,12 +73,24 @@ export class ApprovalGate {
   private previewAutoStart = true
   /** Per-session posture overrides — the renderer owns each session's mode and pushes it here. */
   private readonly modes = new Map<string, ApprovalMode>()
+  /** Unattended sessions (the overnight dream): anything that would ASK is DENIED instead — no
+   *  window will ever show the prompt, so waiting means hanging the turn until the MCP timeout. */
+  private readonly unattended = new Set<string>()
+  /** Mechanically paralyzed sessions (REM): reads pass; every project/state mutation is denied. */
+  private readonly readOnly = new Set<string>()
   /** requestId (= engine tool_use_id) → pending "Ask me" resolver. `at` feeds the phone's
    *  "Needs you · waiting Xm" readout; `toolName`/`input` let a late-joining head (the phone) rebuild
    *  the prompt it never saw pushed live (pendingRequests). */
   private readonly pending = new Map<
     string,
-    { resolve: (d: ToolDecision) => void; sessionId: string; at: number; toolName: string; input: unknown }
+    {
+      resolve: (d: ToolDecision) => void
+      sessionId: string
+      at: number
+      toolName: string
+      input: unknown
+      reason?: string
+    }
   >()
 
   constructor(
@@ -76,6 +113,14 @@ export class ApprovalGate {
   setSessionMode(sessionId: string, mode: ApprovalMode): void {
     this.modes.set(sessionId, mode)
   }
+  setUnattended(sessionId: string, on: boolean): void {
+    if (on) this.unattended.add(sessionId)
+    else this.unattended.delete(sessionId)
+  }
+  setReadOnly(sessionId: string, on: boolean): void {
+    if (on) this.readOnly.add(sessionId)
+    else this.readOnly.delete(sessionId)
+  }
   /** A session's posture, or the default until the renderer has set one. Public so a remote head can
    *  read the same mode the local window shows (remote-control-security.md §4 — remote inherits local
    *  policy exactly; the phone is another head with the same controls, not a stricter regime). */
@@ -95,9 +140,19 @@ export class ApprovalGate {
   async decide(sessionId: string, req: ApproveRequest): Promise<ToolDecision> {
     const tripwire = destructiveGit(req.toolName, req.input)
     if (tripwire) {
+      // A denial is a prompt the model reads — it must close every door, not just this one call
+      // (the Hermes denial register: no retry, no rephrase, no same outcome via a different path).
       return {
         kind: 'deny',
-        reason: `Koda blocks destructive git (${tripwire.what}) — it rewrites history that safety-git can't recover. Ask the user to run this themselves if they're sure.`,
+        reason: `Koda blocks destructive git (${tripwire.what}) — it rewrites history that safety-git can't recover. Do NOT retry this, rephrase it, or attempt the same outcome via a different path. Ask the user to run this themselves if they're sure.`,
+      }
+    }
+
+    if (this.readOnly.has(sessionId) && !REM_EVIDENCE_TOOLS.has(req.toolName)) {
+      return {
+        kind: 'deny',
+        reason:
+          'This is a read-only overnight REM pass. Do not edit files, run commands, launch tools, or act on the idea. Continue with read-only evidence and put the proposal in the waking brief.',
       }
     }
 
@@ -108,7 +163,10 @@ export class ApprovalGate {
     // renderer's QuestionCard surfaces the options and resolves this pending request with
     // `allow-with-edit` carrying {questions, answers}. Read-only → no checkpoint. (See the memory note
     // askuserquestion-answer-via-updatedinput for the engine-side mechanism.)
-    if (isUserQuestion(req.toolName)) return this.askUser(sessionId, req)
+    if (isUserQuestion(req.toolName)) {
+      if (this.unattended.has(sessionId)) return { kind: 'deny', reason: UNATTENDED_REASON }
+      return this.askUser(sessionId, req)
+    }
 
     // Recovery restore (any always-confirm tool) ALWAYS surfaces a confirm — even in Auto-approve —
     // because it can throw away forward work. Different tier from the tripwire above: that's a hard
@@ -120,9 +178,23 @@ export class ApprovalGate {
     // shouldn't be silently bypassed (PREVIEW_TOOL is read-only, so shouldAsk would never catch it).
     const forcePreviewConfirm =
       isPreviewTool(req.toolName) && (!this.previewAutoStart || this.modeFor(sessionId) !== 'auto')
+    // Self-protection tier: a mutation aimed at Koda's own machinery (guardrail switches, the
+    // recovery store, app settings/bundle) is a forced ASK even in Auto — the user can allow it,
+    // but it never happens without them seeing it (policy.ts protectedTarget). The hit's human-terms
+    // `what` rides the request as `reason` so the card can say WHY Auto suddenly asked — an
+    // unexplained prompt just gets rubber-stamped.
+    const protectedHit = protectedTarget(req.toolName, req.input)
     const ask =
-      forcePreviewConfirm || isAlwaysConfirm(req.toolName) || this.shouldAsk(this.modeFor(sessionId), req.toolName)
-    const decision: ToolDecision = ask ? await this.askUser(sessionId, req) : { kind: 'allow' }
+      forcePreviewConfirm ||
+      isAlwaysConfirm(req.toolName) ||
+      protectedHit !== null ||
+      this.shouldAsk(this.modeFor(sessionId), req.toolName)
+    const reason = protectedHit ? `This changes ${protectedHit.what} — Koda always checks with you first.` : undefined
+    const decision: ToolDecision = ask
+      ? this.unattended.has(sessionId)
+        ? { kind: 'deny', reason: UNATTENDED_REASON }
+        : await this.askUser(sessionId, req, reason)
+      : { kind: 'allow' }
 
     // Skip the pre-checkpoint for self-snapshotting tools (restore_checkpoint snapshots internally) —
     // a second one here is redundant and would leak the raw tool name into the recovery timeline.
@@ -152,10 +224,17 @@ export class ApprovalGate {
   }
 
   /** "Ask me" mode — push to the renderer and wait indefinitely (no timeout; the engine waits too). */
-  private askUser(sessionId: string, req: ApproveRequest): Promise<ToolDecision> {
+  private askUser(sessionId: string, req: ApproveRequest, reason?: string): Promise<ToolDecision> {
     return new Promise<ToolDecision>((resolve) => {
-      this.pending.set(req.toolUseId, { resolve, sessionId, at: Date.now(), toolName: req.toolName, input: req.input })
-      this.pushRequest({ sessionId, requestId: req.toolUseId, toolName: req.toolName, input: req.input })
+      this.pending.set(req.toolUseId, {
+        resolve,
+        sessionId,
+        at: Date.now(),
+        toolName: req.toolName,
+        input: req.input,
+        reason,
+      })
+      this.pushRequest({ sessionId, requestId: req.toolUseId, toolName: req.toolName, input: req.input, reason })
     })
   }
 
@@ -182,7 +261,7 @@ export class ApprovalGate {
     const out: ApprovalRequest[] = []
     for (const [requestId, slot] of this.pending) {
       if (slot.sessionId === sessionId)
-        out.push({ sessionId, requestId, toolName: slot.toolName, input: slot.input })
+        out.push({ sessionId, requestId, toolName: slot.toolName, input: slot.input, reason: slot.reason })
     }
     return out
   }
@@ -195,13 +274,27 @@ export class ApprovalGate {
     // Broadcast the resolution so every head clears this one prompt — the answering head already
     // dropped it optimistically (idempotent there); a second head that didn't answer needs telling.
     this.pushResolved(slot.sessionId, requestId)
+    // A bare deny from the user gets the standing register: the no covers the outcome, not this one
+    // phrasing. Exceptions: AskUserQuestion ("deny" = answer in the composer instead, not a no) and
+    // the tools whose deny has its own meaning (TOOL_DENY_REASONS).
+    if (decision.kind === 'deny' && !decision.reason && !isUserQuestion(slot.toolName)) {
+      slot.resolve({ kind: 'deny', reason: TOOL_DENY_REASONS[slot.toolName] ?? USER_DENY_REASON })
+      return
+    }
     slot.resolve(decision)
   }
 
   /**
-   * The session's engine ended (dispose/crash) — every pending approval for it is now answerable
-   * by no one. Resolve them as deny so the awaiting broker handlers unblock and don't leak, and
-   * tell the renderer to clear its prompts. (The deny response goes to a dead socket; harmless.)
+   * The session's ENGINE PROCESS ended (dispose/crash) — every pending approval for it is now
+   * answerable by no one. Resolve them as deny so the awaiting broker handlers unblock and don't
+   * leak, and tell the renderer to clear its prompts. (The deny response goes to a dead socket;
+   * harmless.)
+   *
+   * This is NOT a session-identity event: the process dies and respawns under the SAME session id
+   * on every broker recovery, model/effort change, and plan-mode crossing — this fires every time.
+   * It must never touch `modes`/`unattended` (a session's posture), or every respawn would silently
+   * reset the user's approval mode back to default. That's `forgetSession`'s job, called only from
+   * the sites where the session itself is truly over.
    */
   cancelSession(sessionId: string): void {
     for (const [requestId, slot] of this.pending) {
@@ -210,7 +303,25 @@ export class ApprovalGate {
         slot.resolve({ kind: 'deny', reason: 'session ended' })
       }
     }
-    this.modes.delete(sessionId)
     this.pushCancelled(sessionId)
+  }
+
+  /**
+   * The session ITSELF is over — its identity is gone, not just its process. Forgets its posture
+   * override and unattended flag. Call this from true end sites only (tab closed, archived, reaped,
+   * remote tier disabled, window closed, app quit) — never from the engine-process-exit path (see
+   * cancelSession).
+   *
+   * Session ids are randomUUID()s, so no LATER, DIFFERENT session ever reuses one — the only way
+   * either flag reactivates is a human resuming this exact conversation. For `modes` that's harmless
+   * hygiene: worst case a resume restores the user's own last posture to their own chat. `unattended`
+   * is the one that matters — left set, a resumed overnight-dream conversation would auto-deny every
+   * forced ask (AskUserQuestion, exit-plan-mode, checkpoint restore, protected-target writes) with
+   * text telling the model the user has NOT consented, while the user sits there watching it refuse.
+   */
+  forgetSession(sessionId: string): void {
+    this.modes.delete(sessionId)
+    this.unattended.delete(sessionId)
+    this.readOnly.delete(sessionId)
   }
 }

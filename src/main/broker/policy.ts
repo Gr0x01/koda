@@ -178,6 +178,72 @@ export interface TripwireHit {
 }
 
 /**
+ * Self-protection: mutations aimed at Koda's OWN machinery always look the user in the eye — even in
+ * Auto-approve. The agent operates on the user's content and config, never silently on the thing
+ * that runs and governs it (CLAUDE.md governing principle; the Hermes-agent audit is the prior art:
+ * their config file is agent-unwritable because "a prompt-injected agent could silently disable
+ * exec approval"). Forced ASK, not deny — the user may genuinely want the change; what's banned is
+ * it happening without them seeing it.
+ *
+ * Protected targets:
+ * - `.koda/guardrails.json` — the per-project switch that turns guardrail rules OFF. A silent edit
+ *   here is the agent rewriting its own rules for every future session.
+ * - `.koda/safety.git` — the safety store. Writing into it (or `rm`-ing `.koda` wholesale) destroys
+ *   the undo net; the destructive-git tripwire can't see it because it isn't the user's git history.
+ * - `koda-settings.json` — the app's settings file (approval default, billing mode, feature
+ *   toggles) in userData. Matched by basename so this module stays pure (no Electron path lookups);
+ *   a project file coincidentally named this false-positives into an ask, which is acceptable.
+ * - `Koda*.app/Contents/` — the installed app bundle (the pack, the binary) on packaged installs.
+ *
+ * Like the tripwire, this is a deliberately small heuristic over file paths and Bash strings — it
+ * catches cooperative-mode drift and casual injection, not a determined obfuscated attacker (the
+ * honest Hermes framing: in-process screening is a heuristic, the OS is the boundary). Note
+ * `.koda/scratch` and `.koda/memory` stay frictionless: only the named targets match.
+ */
+const PROTECTED_PATH_PATTERNS: ReadonlyArray<{ re: RegExp; what: string; bashNeedsWriteShape?: boolean }> = [
+  // guardrails.json + koda-settings.json only ask in Bash when the command LOOKS like a write —
+  // the agent grepping/catting these names is routine in dogfood (and reads are frictionless via
+  // the Read tool anyway); it's the silent WRITE that must surface. Patterns are case-insensitive
+  // because the macOS filesystem is.
+  { re: /\.koda[\\/]guardrails\.json/i, what: "this project's guardrail switches", bashNeedsWriteShape: true },
+  { re: /\.koda[\\/]safety\.git/i, what: "this project's recovery store" },
+  { re: /(^|[\\/\s"'])koda-settings\.json/i, what: "Koda's app settings", bashNeedsWriteShape: true },
+  // Anchored at the .app boundary so DELETING the bundle matches, not just writes inside Contents/.
+  { re: /\bKoda[^/\\]*\.app(?=[\\/\s"';&|]|$)/i, what: "Koda's app bundle" },
+]
+
+/** Does this Bash command look like it writes/moves/deletes (vs a pure read like grep/cat)? A loose
+ *  shape check, only used to keep read-ish mentions of protected names frictionless. */
+const BASH_WRITE_SHAPE_RE = /(\brm\b|\bmv\b|\bcp\b|\bsed\b[^&|;]*\s-i\b|\btee\b|>>?|\btruncate\b|\bchmod\b|\bln\b|\binstall\b)/i
+
+/** Bash shapes that take out the whole `.koda` dir (and the safety store with it) without naming it.
+ *  Terminators cover `;`-chaining and quoted bare targets (`rm -rf ".koda"`). */
+const KODA_DIR_DELETE_RE = /\brm\b[^&|;]*\s["']?(?:\S*[\\/])?\.koda[\\/]?(?:[\s;&|"')]|$)/i
+
+export function protectedTarget(toolName: string, input: unknown): TripwireHit | null {
+  const i = input as Record<string, unknown> | null | undefined
+  if (isEditTool(toolName)) {
+    const target = [i?.file_path, i?.path, i?.notebook_path].find((v) => typeof v === 'string') as
+      | string
+      | undefined
+    if (!target) return null
+    for (const { re, what } of PROTECTED_PATH_PATTERNS) if (re.test(target)) return { what }
+    return null
+  }
+  if (toolName === 'Bash') {
+    const command = i?.command
+    if (typeof command !== 'string') return null
+    for (const { re, what, bashNeedsWriteShape } of PROTECTED_PATH_PATTERNS) {
+      if (!re.test(command)) continue
+      if (bashNeedsWriteShape && !BASH_WRITE_SHAPE_RE.test(command)) continue
+      return { what }
+    }
+    if (KODA_DIR_DELETE_RE.test(command)) return { what: "this project's .koda folder (holds the recovery store)" }
+  }
+  return null
+}
+
+/**
  * Returns the matched destructive op when this tool call is a destructive git command, else null.
  * Only Bash can run git in our setup; the engine's own edit tools can't force-push.
  */

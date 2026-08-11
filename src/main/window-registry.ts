@@ -101,3 +101,9 @@ export function windowForProject(projectPath: string): BrowserWindow | undefined
   for (const ctx of registry.values()) if (ctx.projectPath === projectPath) return ctx.win
   return undefined
 }
+
+/** The projects actively open on this Mac. Developer ambient surfaces use this rather than
+ * scanning disk: the system view should only show work the person has deliberately opened. */
+export function openProjectPaths(): string[] {
+  return [...new Set([...registry.values()].map((ctx) => ctx.projectPath).filter(Boolean))]
+}

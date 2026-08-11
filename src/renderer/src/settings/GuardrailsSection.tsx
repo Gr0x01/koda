@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
-import type { GuardrailsLayer, SkillState } from '@shared/ipc'
+import { undoPointRefusal, type GuardrailsLayer, type SkillState } from '@shared/ipc'
 import { AnimatePresence, duration, ease, motion } from '../motion'
 import { useWorkspace } from '../workspace/store'
 import { SegmentedControl, SettingsRow, SettingsSection, Toggle } from './controls'
@@ -19,10 +19,30 @@ const SCOPE_OPTIONS: { value: ScopeFilter; label: string }[] = [
   { value: 'project', label: 'This project' },
 ]
 
+const GUARDRAIL_GENERIC_ERROR = "Couldn't update guardrails. Your existing settings were left unchanged."
+
+/** Same sentence the file + doc editors use for a save that landed without a recovery point behind it. */
+const SAVED_WITHOUT_UNDO = "Saved, but Koda couldn't add this to the recovery timeline."
+
+/** Main refuses a guardrail edit it couldn't first make undoable. That refusal already names what did
+ *  NOT happen, and the generic line would send the user back to retry against a broken recovery store
+ *  forever, so pass it through. */
+function guardrailErrorCopy(err: unknown): string {
+  return undoPointRefusal(err) ?? GUARDRAIL_GENERIC_ERROR
+}
+
+/** The row version. A row sits directly under the rule it belongs to while the section banner carries
+ *  the long sentence, so it stays terse for ordinary failures and speaks up only when it holds
+ *  something the banner's generic line doesn't: why the edit was refused. */
+function guardrailRowErrorCopy(err: unknown): string {
+  return undoPointRefusal(err) ?? "Couldn't update. Try again."
+}
+
 export function GuardrailsSection() {
   const [layer, setLayer] = useState<GuardrailsLayer | null>(null)
   const [scope, setScope] = useState<ScopeFilter>('all')
   const [tick, setTick] = useState(0)
+  const [error, setError] = useState('')
   const canAuthor = useWorkspace((s) => !!s.activeId && !!s.sessions[s.activeId])
 
   useEffect(() => {
@@ -44,6 +64,10 @@ export function GuardrailsSection() {
   const toggle = async (key: string, enabled: boolean): Promise<void> => {
     try {
       await window.koda.setGuardrailEnabled({ key, enabled })
+      setError('')
+    } catch {
+      setError(GUARDRAIL_GENERIC_ERROR)
+      throw new Error('Guardrail update failed')
     } finally {
       refresh()
     }
@@ -66,17 +90,38 @@ export function GuardrailsSection() {
     protectedItem: r.kind === 'safety',
     canToggle: !!r.toggleKey,
     resetLabel: r.customized ? 'restore' : null,
-    onToggle: (next) => r.toggleKey && toggle(r.toggleKey, next),
+    onToggle: async (next) => {
+      if (r.toggleKey) await toggle(r.toggleKey, next)
+    },
     onSave: async (text) => {
-      if (r.principleId) await window.koda.setRuleOverride({ principleId: r.principleId, text })
-      else if (r.path) await window.koda.writeFile({ path: r.path, content: text })
-      refresh()
+      try {
+        // The project CLAUDE.md row is a plain overwrite, which main lets through even when it has no
+        // recovery point (refusing would strand the user's typed rules). It reports instead, so say so.
+        let noUndo = false
+        if (r.principleId) {
+          await window.koda.setRuleOverride({ principleId: r.principleId, text })
+        } else if (r.path) {
+          const res = await window.koda.writeFile({ path: r.path, content: text })
+          noUndo = res.checkpointed === false
+        }
+        setError(noUndo ? SAVED_WITHOUT_UNDO : '')
+        refresh()
+      } catch (err) {
+        setError(guardrailErrorCopy(err))
+        throw err
+      }
     },
     onReset:
       r.customized && r.principleId
         ? async () => {
-            await window.koda.setRuleOverride({ principleId: r.principleId!, text: null })
-            refresh()
+            try {
+              await window.koda.setRuleOverride({ principleId: r.principleId!, text: null })
+              setError('')
+              refresh()
+            } catch (err) {
+              setError(guardrailErrorCopy(err))
+              throw err
+            }
           }
         : undefined,
   })
@@ -91,7 +136,9 @@ export function GuardrailsSection() {
     enabled: s.enabled,
     canToggle: !!s.toggleKey,
     resetLabel: s.scope === 'project' ? (s.isOverride ? 'restore' : 'delete') : null,
-    onToggle: (next) => s.toggleKey && toggle(s.toggleKey, next),
+    onToggle: async (next) => {
+      if (s.toggleKey) await toggle(s.toggleKey, next)
+    },
     onSave: async (text) => {
       await window.koda.saveItemBody({ kind, name: s.name, content: text })
       refresh()
@@ -115,6 +162,11 @@ export function GuardrailsSection() {
           <span className="text-text">Flip any off, open one to edit it, or add your own.</span> Nothing
           is lost: anything you change can be restored. Safety rules ask first.
         </p>
+        {error && (
+          <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[12px] text-text-muted">
+            {error}
+          </div>
+        )}
         <div className="pt-0.5">
           <SegmentedControl ariaLabel="Scope" value={scope} options={SCOPE_OPTIONS} onChange={setScope} />
         </div>
@@ -409,7 +461,7 @@ interface RowProps {
   protectedItem?: boolean
   canToggle: boolean
   resetLabel: ResetKind | null
-  onToggle: (next: boolean) => void
+  onToggle: (next: boolean) => Promise<void>
   onSave: (text: string) => Promise<void>
   onReset?: () => Promise<void>
 }
@@ -424,7 +476,9 @@ function GuardrailRow(p: RowProps) {
   const [open, setOpen] = useState(false)
   const [draft, setDraft] = useState(p.body)
   const [saving, setSaving] = useState(false)
-  const [failed, setFailed] = useState(false)
+  // The failure LINE, not a flag: a refused edit (no undo point) has to say why, or the user retries
+  // forever against a recovery store that isn't coming back on its own.
+  const [failed, setFailed] = useState<string | null>(null)
   const [confirmOff, setConfirmOff] = useState(false)
   const [confirmReset, setConfirmReset] = useState(false)
 
@@ -438,12 +492,12 @@ function GuardrailRow(p: RowProps) {
   const save = async (): Promise<void> => {
     if (saving || !dirty) return
     setSaving(true)
-    setFailed(false)
+    setFailed(null)
     try {
       await p.onSave(draft)
       setOpen(false)
-    } catch {
-      setFailed(true)
+    } catch (e) {
+      setFailed(guardrailRowErrorCopy(e))
     } finally {
       setSaving(false)
     }
@@ -454,12 +508,17 @@ function GuardrailRow(p: RowProps) {
       setConfirmOff(true)
       return
     }
-    p.onToggle(!p.enabled)
+    void p.onToggle(!p.enabled).catch((e) => setFailed(guardrailRowErrorCopy(e)))
   }
 
   const reset = async (): Promise<void> => {
     setConfirmReset(false)
-    if (p.onReset) await p.onReset()
+    setFailed(null)
+    try {
+      if (p.onReset) await p.onReset()
+    } catch (e) {
+      setFailed(guardrailRowErrorCopy(e))
+    }
   }
 
   return (
@@ -502,6 +561,11 @@ function GuardrailRow(p: RowProps) {
         {p.subtitle && (
           <div className="mt-0.5 line-clamp-2 text-[12.5px] leading-snug text-text-muted">{p.subtitle}</div>
         )}
+        {failed && !open && (
+          <div role="status" className="mt-1 text-[12px] text-text-muted">
+            {failed}
+          </div>
+        )}
       </div>
 
       <AnimatePresence initial={false}>
@@ -520,7 +584,7 @@ function GuardrailRow(p: RowProps) {
               <button
                 onClick={() => {
                   setConfirmOff(false)
-                  p.onToggle(false)
+                  void p.onToggle(false).catch((e) => setFailed(guardrailRowErrorCopy(e)))
                 }}
                 className="font-medium text-amber-700 transition-opacity hover:opacity-80 dark:text-amber-400"
               >
@@ -551,7 +615,11 @@ function GuardrailRow(p: RowProps) {
                 rows={p.mono ? 14 : 9}
                 className="w-full resize-y rounded-lg border border-border bg-surface px-3 py-2.5 font-mono text-[11.5px] leading-relaxed text-text focus:border-accent focus:outline-none"
               />
-              {failed && <div className="text-[12px] text-text-muted">Couldn't save. Try again.</div>}
+              {failed && (
+                <div role="status" className="text-[12px] text-text-muted">
+                  {failed}
+                </div>
+              )}
               <div className="flex items-center gap-2">
                 {p.onReset && p.resetLabel && !confirmReset && (
                   // Inline reset trigger: delete = red text-only; restore = muted text-only.

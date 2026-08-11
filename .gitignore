@@ -58,5 +58,11 @@ playwright-report/
 
 /temp*
 
+
 # Xcode build output
 ios/build/
+ios/App/CapApp-SPM/build/
+
+# Storybook build output + debug log
+storybook-static/
+*storybook.log

@@ -9,7 +9,7 @@ import {
   readOverrides,
   ruleKey,
   setGuardrailsDisabled,
-  setOverride,
+  setPrincipleOverride,
   skillKey,
   subagentKey,
 } from './guardrails-config'
@@ -189,12 +189,10 @@ export function setRuleOverride(
   if (!projectRoot) throw new Error('Open a project first.')
   const memberKeys = principleMemberKeys(principleKey(principleId), resourcesPath)
   if (text === null) {
-    setOverride(projectRoot, principleId, null)
-    setGuardrailsDisabled(projectRoot, memberKeys, false)
+    setPrincipleOverride(projectRoot, principleId, null, memberKeys)
   } else {
     if (!text.trim()) throw new Error('A rule can’t be empty — restore the default instead.')
-    setOverride(projectRoot, principleId, text.trim())
-    setGuardrailsDisabled(projectRoot, memberKeys, true)
+    setPrincipleOverride(projectRoot, principleId, text.trim(), memberKeys)
   }
 }
 

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Trash2 } from 'lucide-react'
-import type { MiniAppInfo } from '@shared/ipc'
+import type { BackupKept, MiniAppInfo } from '@shared/ipc'
 import { useWorkspace } from './store'
 import { Button } from '../ui'
 
@@ -12,6 +12,12 @@ import { Button } from '../ui'
  * Mini apps (the FACE model): faced projects graduate OFF the recents list and onto the left app
  * rail — always visible, one click opens the project landing on its running face. The rail only
  * exists when registered apps exist (mini-apps flag off ⇒ the list is always empty ⇒ no rail).
+ *
+ * This screen is also the ONLY place a broken `koda-app-state.json` can be reported (the workspace's
+ * data-integrity banner lives in Chassis, which a project-less window never renders). Its default state
+ * — no recents, two ways in — is pixel-identical to a first launch, so without `unreadable` below a
+ * user whose project list was lost sees a screen that says nothing is wrong, picks their project back
+ * by hand, and finds it gone again at every launch after that.
  */
 export function ProjectHome({ openCreate = false }: { openCreate?: boolean }) {
   const setProjectPath = useWorkspace((s) => s.setProjectPath)
@@ -24,10 +30,18 @@ export function ProjectHome({ openCreate = false }: { openCreate?: boolean }) {
   // Opened via "New Project…": land with the create modal up (main sends this one-shot).
   const [creating, setCreating] = useState(openCreate)
   const [deleting, setDeleting] = useState<{ path: string; name: string } | null>(null)
+  // null = the list is genuinely empty (or main hasn't answered yet); set = it exists and couldn't be read.
+  const [unreadable, setUnreadable] = useState<{ backupKept: BackupKept } | null>(null)
 
   useEffect(() => {
     window.koda.getRecentProjects().then(setRecents).catch(() => {})
     window.koda.miniAppsList().then(setApps).catch(() => {})
+    // Optional-chained like the subscription below: a dev HMR reload can pair this renderer with a
+    // preload that predates the channel, and staying quiet beats crashing the only way back in.
+    window.koda
+      .getDataIntegrity?.()
+      .then((d) => setUnreadable(d?.projectListUnreadable ? { backupKept: d.projectListBackupKept } : null))
+      .catch(() => {})
     // A project graduating in another window surfaces on the rail here without a relaunch.
     // Optional-chained: in dev, HMR can hand this renderer to a preload that predates the API.
     return window.koda.onMiniAppsChanged?.(() => {
@@ -70,7 +84,9 @@ export function ProjectHome({ openCreate = false }: { openCreate?: boolean }) {
     try {
       const res = await window.koda.openProject({ path: app.projectPath })
       if (res.alreadyOpen) {
-        setNote(`${app.name} is already open in another window.`)
+        // Already running in another window — surface it and front its face instead of dead-ending
+        // on a note that reads as "couldn't open". This window stays on Home.
+        await window.koda.miniAppsFront({ dir: app.dir, projectPath: app.projectPath })
         setBusy(false)
         return
       }
@@ -120,9 +136,17 @@ export function ProjectHome({ openCreate = false }: { openCreate?: boolean }) {
               title={app.name}
               className="flex w-full flex-col items-center gap-1 px-1.5 py-1 disabled:opacity-50"
             >
-              <span className="flex h-11 w-11 items-center justify-center rounded-xl bg-accent font-display text-lg font-semibold text-white shadow-soft transition-transform hover:scale-105">
-                {(app.name[0] ?? '?').toUpperCase()}
-              </span>
+              {app.iconDataUrl ? (
+                <img
+                  src={app.iconDataUrl}
+                  alt=""
+                  className="h-11 w-11 rounded-xl object-cover shadow-soft transition-transform hover:scale-105"
+                />
+              ) : (
+                <span className="flex h-11 w-11 items-center justify-center rounded-xl bg-accent font-display text-lg font-semibold text-white shadow-soft transition-transform hover:scale-105">
+                  {(app.name[0] ?? '?').toUpperCase()}
+                </span>
+              )}
               <span className="w-full truncate text-center text-[10px] text-text-muted">{app.name}</span>
             </button>
           ))}
@@ -159,6 +183,19 @@ export function ProjectHome({ openCreate = false }: { openCreate?: boolean }) {
           sessions, files, and history all live with the project.
         </p>
       </div>
+
+      {unreadable && (
+        <div
+          role="status"
+          className="max-w-md rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-[12.5px] leading-relaxed text-text"
+        >
+          <span className="font-medium">Koda couldn’t read your list of projects.</span>{' '}
+          Your projects are still on your Mac and nothing inside them has changed.{' '}
+          {unreadable.backupKept === true
+            ? 'Koda kept a copy of the list beside the original. Open a project below and Koda will start the list again.'
+            : 'Koda was not able to make a copy of that list this time. Ask Koda to take a look at it.'}
+        </div>
+      )}
 
       <div className="flex items-center gap-2.5">
         <Button size="lg" onClick={() => setCreating(true)} disabled={busy}>

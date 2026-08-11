@@ -38,7 +38,9 @@ export function FilesBrowser() {
   // dragenter/leave fire per child, so count depth rather than toggle.
   const [dropActive, setDropActive] = useState(false)
   const dropDepth = useRef(0)
-  const isFileDrag = (e: React.DragEvent): boolean => e.dataTransfer.types.includes('Files')
+  // External Finder drags only — our own native drags also carry Files, and without this guard an
+  // internal drag that misses its target falls through to the panel's import-to-root (a duplicate).
+  const isFileDrag = (e: React.DragEvent): boolean => e.dataTransfer.types.includes('Files') && !draggingPath
 
   useEffect(() => {
     let alive = true

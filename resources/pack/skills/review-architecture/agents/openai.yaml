@@ -1,0 +1,4 @@
+interface:
+  display_name: "Architecture Review"
+  short_description: "Catch duplicated paths and architectural drift"
+  default_prompt: "Use $review-architecture to audit this finished feature for duplicated work and architectural drift."

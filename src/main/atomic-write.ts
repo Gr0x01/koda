@@ -7,8 +7,8 @@
  */
 import { renameSync, writeFileSync } from 'node:fs'
 
-export function writeFileAtomic(path: string, data: string): void {
+export function writeFileAtomic(path: string, data: string, opts?: { mode?: number }): void {
   const tmp = `${path}.tmp`
-  writeFileSync(tmp, data)
+  writeFileSync(tmp, data, opts)
   renameSync(tmp, path)
 }

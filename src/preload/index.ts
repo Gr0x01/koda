@@ -19,6 +19,7 @@ import type {
   ProviderStatusEvent,
   UpdateStatus,
   RemoteActivity,
+  RemoteAuthState,
   RemoteRelayState,
   RemoteUserTurnLive,
   TerminalData,
@@ -30,7 +31,6 @@ import type {
 
 const api: KodaApi = {
   getAppInfo: () => ipcRenderer.invoke(IpcChannels.getAppInfo),
-  echo: (args) => ipcRenderer.invoke(IpcChannels.echo, args),
   probeEngine: () => ipcRenderer.invoke(IpcChannels.probeEngine),
   getUpdateStatus: () => ipcRenderer.invoke(IpcChannels.updateGetState),
   checkForUpdates: () => ipcRenderer.invoke(IpcChannels.updateCheckNow),
@@ -45,11 +45,14 @@ const api: KodaApi = {
   startSession: (args) => ipcRenderer.invoke(IpcChannels.startSession, args),
   sendTurn: (args) => ipcRenderer.invoke(IpcChannels.sendTurn, args),
   interruptSession: (args) => ipcRenderer.invoke(IpcChannels.interruptSession, args),
+  stopSubagent: (args) => ipcRenderer.invoke(IpcChannels.stopSubagent, args),
   disposeSession: (args) => ipcRenderer.invoke(IpcChannels.disposeSession, args),
   loadSessions: () => ipcRenderer.invoke(IpcChannels.sessionsLoad),
   saveSessions: (data) => ipcRenderer.send(IpcChannels.sessionsSave, data),
   loadArchived: () => ipcRenderer.invoke(IpcChannels.archivedLoad),
-  saveArchived: (archived) => ipcRenderer.send(IpcChannels.archivedSave, archived),
+  // invoke, not send: the caller has to know whether the index landed before it removes the session
+  // from the other store (see KodaApi.saveArchived).
+  saveArchived: (archived) => ipcRenderer.invoke(IpcChannels.archivedSave, archived),
   loadArchivedBody: (id) => ipcRenderer.invoke(IpcChannels.archivedLoadBody, id),
   writeArchivedBody: (id, items) => ipcRenderer.invoke(IpcChannels.archivedWriteBody, { id, items }),
   deleteArchivedBody: (id) => ipcRenderer.invoke(IpcChannels.archivedDeleteBody, id),
@@ -73,6 +76,11 @@ const api: KodaApi = {
     const handler = (_e: IpcRendererEvent, payload: RemoteUserTurnLive) => listener(payload)
     ipcRenderer.on(IpcChannels.sessionRemoteUserTurn, handler)
     return () => ipcRenderer.removeListener(IpcChannels.sessionRemoteUserTurn, handler)
+  },
+  onScratchChanged: (listener) => {
+    const handler = () => listener()
+    ipcRenderer.on(IpcChannels.scratchChanged, handler)
+    return () => ipcRenderer.removeListener(IpcChannels.scratchChanged, handler)
   },
   onEngineEvent: (listener) => {
     // Wrap so the renderer never receives the raw IpcRendererEvent (no leak of
@@ -120,6 +128,7 @@ const api: KodaApi = {
   importFiles: (args) => ipcRenderer.invoke(IpcChannels.fsImportFiles, args),
   revealPath: (args) => ipcRenderer.invoke(IpcChannels.fsRevealPath, args),
   openPath: (args) => ipcRenderer.invoke(IpcChannels.fsOpenPath, args),
+  startDrag: (args) => ipcRenderer.invoke(IpcChannels.fsStartDrag, args),
   createDir: (args) => ipcRenderer.invoke(IpcChannels.fsCreateDir, args),
   diffFile: (args) => ipcRenderer.invoke(IpcChannels.fsDiffFile, args),
   search: (args) => ipcRenderer.invoke(IpcChannels.fsSearch, args),
@@ -150,6 +159,7 @@ const api: KodaApi = {
   createProject: (args) => ipcRenderer.invoke(IpcChannels.projectCreate, args),
   hasGuidelines: () => ipcRenderer.invoke(IpcChannels.projectHasGuidelines),
   getRecentProjects: () => ipcRenderer.invoke(IpcChannels.projectGetRecents),
+  getDataIntegrity: () => ipcRenderer.invoke(IpcChannels.appDataIntegrity),
   onFileMenuCommand: (listener) => {
     const handler = (_e: IpcRendererEvent, command: FileMenuCommand): void => listener(command)
     ipcRenderer.on(IpcChannels.uiFileCommand, handler)
@@ -163,6 +173,14 @@ const api: KodaApi = {
     ipcRenderer.on(IpcChannels.miniAppsChanged, handler)
     return () => ipcRenderer.removeListener(IpcChannels.miniAppsChanged, handler)
   },
+  miniAppsFront: (args) => ipcRenderer.invoke(IpcChannels.miniAppsFront, args),
+  onFrontFace: (listener) => {
+    const handler = (_e: IpcRendererEvent, dir: string): void => listener(dir)
+    ipcRenderer.on(IpcChannels.uiFrontFace, handler)
+    return () => ipcRenderer.removeListener(IpcChannels.uiFrontFace, handler)
+  },
+  miniAppsBridgeInfo: () => ipcRenderer.invoke(IpcChannels.miniAppsBridgeInfo),
+  miniAppsSetBridgeConsent: (args) => ipcRenderer.invoke(IpcChannels.miniAppsSetBridgeConsent, args),
   onApprovalRequest: (listener) => {
     const handler = (_e: IpcRendererEvent, req: ApprovalRequest) => listener(req)
     ipcRenderer.on(IpcChannels.approvalRequest, handler)
@@ -178,6 +196,7 @@ const api: KodaApi = {
     ipcRenderer.on(IpcChannels.approvalResolved, handler)
     return () => ipcRenderer.removeListener(IpcChannels.approvalResolved, handler)
   },
+  getPendingApprovals: () => ipcRenderer.invoke(IpcChannels.approvalPending),
   resolveApproval: (args) => ipcRenderer.invoke(IpcChannels.approvalResolve, args),
   setApprovalMode: (args) => ipcRenderer.invoke(IpcChannels.approvalSetMode, args),
   getApprovalMode: () => ipcRenderer.invoke(IpcChannels.approvalGetMode),
@@ -220,6 +239,7 @@ const api: KodaApi = {
     ipcRenderer.invoke(IpcChannels.previewStaticUrl, filePath),
   docAssetUrl: (docPath: string, ref: string) =>
     ipcRenderer.invoke(IpcChannels.docAssetUrl, { docPath, ref }),
+  exportPdf: (args) => ipcRenderer.invoke(IpcChannels.docExportPdf, args),
   previewRestart: (sessionId, restart) =>
     ipcRenderer.invoke(IpcChannels.previewRestart, { sessionId, restart }),
   onPreviewShow: (listener) => {
@@ -324,6 +344,11 @@ const api: KodaApi = {
     const handler = (_e: IpcRendererEvent, state: RemoteRelayState): void => listener(state)
     ipcRenderer.on(IpcChannels.remoteRelayActivity, handler)
     return () => ipcRenderer.removeListener(IpcChannels.remoteRelayActivity, handler)
+  },
+  onRemoteAuthChanged: (listener) => {
+    const handler = (_e: IpcRendererEvent, state: RemoteAuthState): void => listener(state)
+    ipcRenderer.on(IpcChannels.remoteAuthChanged, handler)
+    return () => ipcRenderer.removeListener(IpcChannels.remoteAuthChanged, handler)
   },
   startTerminal: (size) => ipcRenderer.invoke(IpcChannels.terminalStart, size),
   sendTerminalInput: (args) => ipcRenderer.send(IpcChannels.terminalInput, args),

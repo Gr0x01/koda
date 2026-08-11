@@ -80,7 +80,7 @@ function SessionsSection({
   const gitFiles = useWorkspace((s) => s.gitFiles)
 
   const list = order.map((id) => sessions[id]).filter(Boolean)
-  // Per-session dirty count for the row chip — the passive "this session has unsaved work" glance,
+  // Per-session dirty count for the row chip — the passive "this session still has loose work" glance,
   // attributed from the aggregate working tree (one git tree, sliced by who edited each file).
   const dirtyBySession = useMemo(
     () => computeSessionChanges(sessions, order, gitFiles).countBySession,
@@ -185,6 +185,8 @@ function FilesSection() {
   const openSearch = useWorkspace((s) => s.setSearchOpen)
   const docs = filesView === 'docs'
   const [docsFolder, setDocsFolder] = useState<string | null>(null)
+  // The Docs list's Recent lens (flat, by last-edited) — a view toggle, not a mode, so plain local state.
+  const [docsRecent, setDocsRecent] = useState(false)
   useEffect(() => {
     const onSelected = (e: Event): void => setDocsFolder((e as CustomEvent<string | null>).detail)
     window.addEventListener('koda:docs-folder-selected', onSelected)
@@ -200,7 +202,28 @@ function FilesSection() {
             <circle cx="11" cy="11" r="7" />
             <path d="m20 20-3.5-3.5" />
           </HeaderIconButton>
-          <HeaderIconButton onClick={() => void newDocument(docs ? docsFolder ?? undefined : undefined)} title={docsFolder && docs ? `New document in ${docsFolder.split('/').pop()}` : 'New document'} aria-label="New document">
+          {docs && (
+            <HeaderIconButton
+              onClick={() => setDocsRecent((v) => !v)}
+              title={docsRecent ? 'Back to folders' : 'Recently edited'}
+              aria-label={docsRecent ? 'Show folders' : 'Show recently edited'}
+              active={docsRecent}
+            >
+              <circle cx="12" cy="12" r="9" />
+              <path d="M12 7v5l3 2" />
+            </HeaderIconButton>
+          )}
+          {/* The target folder rests closed in the doc list, so ask it to reveal — otherwise the doc
+              opens in the editor but never shows up where it was filed. */}
+          <HeaderIconButton
+            onClick={() => {
+              if (docs && docsFolder)
+                window.dispatchEvent(new CustomEvent('koda:reveal-doc-folder', { detail: docsFolder }))
+              void newDocument(docs ? docsFolder ?? undefined : undefined)
+            }}
+            title={docsFolder && docs ? `New document in ${docsFolder.split('/').pop()}` : 'New document'}
+            aria-label="New document"
+          >
             <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
             <path d="M14 2v4a2 2 0 0 0 2 2h4M9 15h6M12 18v-6" />
           </HeaderIconButton>
@@ -218,7 +241,7 @@ function FilesSection() {
           </HeaderIconButton>
         </div>
       </PanelHeader>
-      {docs ? <DocsBrowser /> : <FilesBrowser />}
+      {docs ? <DocsBrowser view={docsRecent ? 'recent' : 'tree'} /> : <FilesBrowser />}
     </div>
   )
 }
@@ -248,11 +271,14 @@ function HeaderIconButton({
   onClick,
   title,
   'aria-label': ariaLabel,
+  active = false,
   children,
 }: {
   onClick: () => void
   title: string
   'aria-label': string
+  /** Toggle-style buttons (the Docs Recent lens) tint accent while on. */
+  active?: boolean
   children: React.ReactNode
 }) {
   return (
@@ -260,7 +286,10 @@ function HeaderIconButton({
       onClick={onClick}
       title={title}
       aria-label={ariaLabel}
-      className="flex h-6 w-6 items-center justify-center rounded-md text-text-muted transition-colors hover:bg-surface hover:text-text"
+      aria-pressed={active || undefined}
+      className={`flex h-6 w-6 items-center justify-center rounded-md transition-colors ${
+        active ? 'bg-accent/15 text-accent' : 'text-text-muted hover:bg-surface hover:text-text'
+      }`}
     >
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
         {children}

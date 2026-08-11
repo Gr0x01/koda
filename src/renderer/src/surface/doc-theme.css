@@ -84,8 +84,9 @@
  * in-gutter at any width.
  */
 .milkdown .ProseMirror {
-  max-width: 46rem;
-  margin: 0 auto;
+  /* The COLUMN cap lives on the top-level blocks (below), not here: prose reads at 46rem while wide
+     blocks (tables) may break out toward the pane edge, Notion-style. */
+  max-width: none;
   /* Tight top pad: the page-chrome title (DocPageChrome) sits directly above in the same scroll host
      and owns the top breathing room (its pt-9), so the body just needs to clear the title — not add a
      second big gap. The first-child margin reset below removes the leading heading's own top margin. */
@@ -94,6 +95,32 @@
      so Appearance → Text size (which shifts --doc-fs) scales the whole document proportionally. */
   font-size: var(--doc-fs);
   line-height: var(--doc-lh);
+}
+/* Every top-level block caps at the reading column, centered. margin-inline only — the vertical rhythm
+   (the margin-top rules below) must survive. */
+.milkdown .ProseMirror > * {
+  max-width: 46rem;
+  margin-inline: auto;
+}
+/* Breakout blocks: a table sizes to its CONTENT, centered, up to the pane — a 5-column comparison the
+   agent wrote is no longer crushed into the prose column. Code gets a wider cap (long lines), while
+   plain prose stays a reading column. min() keeps the floor sane in a narrow pane. */
+.milkdown .ProseMirror > .milkdown-table-block {
+  max-width: 100%;
+  width: fit-content;
+  min-width: min(46rem, 100%);
+}
+.milkdown .ProseMirror > milkdown-code-block,
+.milkdown .ProseMirror > .milkdown-code-block {
+  max-width: min(62rem, 100%);
+}
+/* Full width (the per-doc toggle, persisted in the docmeta sidecar): everything spans the pane. */
+[data-doc-fullwidth] .milkdown .ProseMirror > * {
+  max-width: 100%;
+}
+[data-doc-fullwidth] .milkdown .ProseMirror > milkdown-code-block,
+[data-doc-fullwidth] .milkdown .ProseMirror > .milkdown-code-block {
+  max-width: 100%;
 }
 
 /*

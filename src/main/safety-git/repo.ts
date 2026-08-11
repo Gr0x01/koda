@@ -8,6 +8,7 @@ import { mkdir, readFile, appendFile, realpath, writeFile } from 'node:fs/promis
 import { dirname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { log } from '../logger'
+import { gitEnv } from '../engine/user-path'
 
 const execFileP = promisify(execFile)
 
@@ -28,26 +29,39 @@ export function safetyGitDir(projectDir: string): string {
  * ONLY its own local config. `timeout` is a backstop so a wedged git can never stall the broker.
  * Big maxBuffer so large-tree `ls-tree`/`log` don't clip.
  *
- * NB: resolving the git binary path (a Finder-launched .app inherits no shell PATH) is a packaging
- * concern — bare `git` is correct for dev. Revisit at bundling alongside the engine path resolver.
+ * PATH comes from gitEnv(): a Finder-launched .app inherits launchd's minimal PATH, where bare `git`
+ * doesn't resolve at all — the undo net would silently have no git to run.
  */
-export function runGit(
+export async function runGit(
   projectDir: string,
   args: string[],
   opts?: { extraEnv?: Record<string, string> },
 ): Promise<{ stdout: string; stderr: string }> {
-  return execFileP(
-    'git',
-    ['--git-dir', safetyGitDir(projectDir), '--work-tree', projectDir, ...args],
-    {
-      cwd: projectDir,
-      // extraEnv is for read-only side-paths that need a scratch index (GIT_INDEX_FILE) — it must
-      // NOT override the config isolation, so it's spread first.
-      env: { ...process.env, ...opts?.extraEnv, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
-      maxBuffer: 64 * 1024 * 1024,
-      timeout: 30_000,
-    },
-  )
+  try {
+    return await execFileP(
+      'git',
+      ['--git-dir', safetyGitDir(projectDir), '--work-tree', projectDir, ...args],
+      {
+        cwd: projectDir,
+        // extraEnv is for read-only side-paths that need a scratch index (GIT_INDEX_FILE) — it must
+        // NOT override the config isolation, so it's spread first.
+        env: gitEnv({ ...opts?.extraEnv, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' }),
+        maxBuffer: 64 * 1024 * 1024,
+        timeout: 30_000,
+      },
+    )
+  } catch (err) {
+    // git explains failures on stderr — and some ("nothing to commit") on STDOUT — but execFile's
+    // error message carries only the command line, which left the 08-02 checkpoint failure blank in
+    // the log. Fold both streams into the message so the next failure names itself. `code` and the
+    // stdout/stderr props stay untouched for callers that branch on them.
+    if (err instanceof Error) {
+      const e = err as Error & { stdout?: string; stderr?: string }
+      const detail = [e.stderr?.trim(), e.stdout?.trim()].filter(Boolean).join(' | ')
+      if (detail && !e.message.includes(detail)) e.message = `${e.message.trim()} — ${detail}`
+    }
+    throw err
+  }
 }
 
 /** Local config isolating safety commits from the user's identity, signing, and hooks. */
@@ -113,7 +127,7 @@ export async function ensureRepo(projectDir: string): Promise<void> {
 /**
  * Keep `.koda/` out of the USER's git. The safety store lives *inside* the project
  * (`<project>/.koda/safety.git`), so when the project is itself a git repo, that store shows up as
- * untracked — and the user-git layer (Claude commits on request, dual-git.md §3) would commit it.
+ * untracked — and the user-git layer's task-boundary commit (dual-git.md §3) could include it.
  * We add `.koda/` to the user repo's `.git/info/exclude` (NOT the tracked `.gitignore` — never edit
  * the user's file). No-op when the project isn't a git repo (the case safety-git exists for).
  */
@@ -125,10 +139,16 @@ export async function excludeKodaFromUserGit(projectDir: string): Promise<void> 
     // scribble `.koda/` into a repo the user never opened (code-reviewer Critical). `--show-toplevel`
     // pins the root; realpath both sides (macOS resolves /var → /private/var). Plain git in the
     // user's repo, NOT runGit (which targets the safety store).
-    const { stdout: top } = await execFileP('git', ['rev-parse', '--show-toplevel'], { cwd: projectDir })
+    const { stdout: top } = await execFileP('git', ['rev-parse', '--show-toplevel'], {
+      cwd: projectDir,
+      env: gitEnv(),
+    })
     if ((await realpath(top.trim())) !== (await realpath(projectDir))) return // nested subdir — not ours
     // `--git-path` gives the right info/exclude even for worktrees/submodules.
-    const { stdout } = await execFileP('git', ['rev-parse', '--git-path', 'info/exclude'], { cwd: projectDir })
+    const { stdout } = await execFileP('git', ['rev-parse', '--git-path', 'info/exclude'], {
+      cwd: projectDir,
+      env: gitEnv(),
+    })
     excludePath = resolve(projectDir, stdout.trim())
   } catch {
     return // not a git repo (or bare repo: empty toplevel → realpath throws) — nothing to ignore
@@ -140,7 +160,7 @@ export async function excludeKodaFromUserGit(projectDir: string): Promise<void> 
   // every NEW memory note from the user's git. Our job is "safety store not committable", which
   // check-ignore proves is already true — not to impose the blanket exclude.
   try {
-    await execFileP('git', ['check-ignore', '-q', '.koda/safety.git'], { cwd: projectDir })
+    await execFileP('git', ['check-ignore', '-q', '.koda/safety.git'], { cwd: projectDir, env: gitEnv() })
     return // already ignored by the repo's own rules
   } catch {
     /* not ignored yet — fall through and add our exclude */

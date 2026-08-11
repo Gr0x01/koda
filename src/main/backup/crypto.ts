@@ -21,6 +21,14 @@ export function replicaAad(projectHash: string): string {
   return `koda-replica:v1:${projectHash}`
 }
 
+/** A mini app's SQLite snapshot — its OWN domain, scoped to project + app, so a binary `.db` blob is
+ *  cryptographically separable from the (text-only) docs replica and the safety-git bundle: feeding an
+ *  app-data blob to the replica reader, or one app's blob to another app, fails decrypt instead of
+ *  loading the wrong database. The phone hardcodes this same string. */
+export function appDataAad(projectHash: string, appId: string): string {
+  return `koda-appdata:v1:${projectHash}:${appId}`
+}
+
 export function encryptBlob(plain: Buffer, aad: string, key: Buffer): Buffer {
   const nonce = randomBytes(NONCE_BYTES)
   const cipher = createCipheriv('aes-256-gcm', key, nonce)

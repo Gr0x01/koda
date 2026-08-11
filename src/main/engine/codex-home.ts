@@ -17,13 +17,13 @@ import { promisify } from 'node:util'
 import { app } from 'electron'
 import { resolveEnginePath } from './binary'
 import { buildEngineEnv } from './env'
+import { codexCleanFinishHooksJson } from './codex-clean-finish'
 import {
   CODEX_PACK_SKILLS,
   GATED_PACK_SKILLS,
   codexPackMarker,
   resolvePack,
   resolveStagingPack,
-  toCodexToolNames,
 } from './pack'
 import { loadMiniAppsEnabled } from '../settings'
 import { log } from '../logger'
@@ -182,7 +182,7 @@ const marketplaceJson = () =>
     2,
   )
 
-const pluginJson = (version: string) =>
+export const codexPluginJson = (version: string, hooksAvailable: boolean) =>
   JSON.stringify(
     {
       name: PLUGIN_NAME,
@@ -191,6 +191,7 @@ const pluginJson = (version: string) =>
       author: { name: 'Koda' },
       license: 'MIT',
       skills: './skills/',
+      ...(hooksAvailable ? { hooks: './hooks/hooks.json' } : {}),
       // No `agents` — Codex plugins don't load named subagents (verified: it reports "no installed
       // code-reviewer agent"). Its subagents are generic spawn_agent workers, not Claude-style personas.
       interface: {
@@ -251,11 +252,20 @@ async function setup(opts: {
   const srcRoot = join(home, 'koda-plugin-src')
   rmSync(srcRoot, { recursive: true, force: true })
   const pluginDir = join(srcRoot, 'plugins', PLUGIN_NAME)
+  const codexHooks = join(pack.dir, 'codex-hooks')
+  const cleanFinishScript = join(codexHooks, 'clean-finish.js')
+  const hooksAvailable = existsSync(cleanFinishScript)
   mkdirSync(join(srcRoot, '.agents', 'plugins'), { recursive: true })
   mkdirSync(join(pluginDir, '.codex-plugin'), { recursive: true })
   mkdirSync(join(pluginDir, 'skills'), { recursive: true })
   writeFileSync(join(srcRoot, '.agents', 'plugins', 'marketplace.json'), marketplaceJson())
-  writeFileSync(join(pluginDir, '.codex-plugin', 'plugin.json'), pluginJson(opts.appVersion))
+  writeFileSync(join(pluginDir, '.codex-plugin', 'plugin.json'), codexPluginJson(opts.appVersion, hooksAvailable))
+  if (hooksAvailable) {
+    const pluginHooks = join(pluginDir, 'hooks')
+    mkdirSync(pluginHooks, { recursive: true })
+    copyFileSync(cleanFinishScript, join(pluginHooks, 'clean-finish.js'))
+    writeFileSync(join(pluginHooks, 'hooks.json'), codexCleanFinishHooksJson())
+  }
   const packSkills = opts.playwrightWired ? [...CODEX_PACK_SKILLS, BROWSER_VERIFY_SKILL] : [...CODEX_PACK_SKILLS]
   for (const name of packSkills) {
     const from = join(pack.dir, 'skills', name)
@@ -279,15 +289,6 @@ async function setup(opts: {
       if (existsSync(join(from, 'SKILL.md'))) cpSync(from, join(pluginDir, 'skills', name), { recursive: true })
     }
   }
-  // Skills author tool names the Claude way (`mcp__<server>__<tool>`, e.g. browser-verify's
-  // `mcp__playwright__browser_navigate`); rewrite them to the Codex convention (`<server>__<tool>`) so the
-  // guidance names the tools Codex actually surfaces. No-op for skills that reference no tools.
-  const skillsRoot = join(pluginDir, 'skills')
-  for (const name of readdirSync(skillsRoot)) {
-    const md = join(skillsRoot, name, 'SKILL.md')
-    if (existsSync(md)) writeFileSync(md, toCodexToolNames(readFileSync(md, 'utf8')))
-  }
-
   // Install via the codex binary. CODEX_HOME rides buildEngineEnv (engineId:'codex') → these spawns
   // target the isolated home, same as every session spawn. marketplace-add is idempotent.
   const bin = resolveEnginePath({ resourcesPath: opts.resourcesPath, binaryName: 'codex' }).path

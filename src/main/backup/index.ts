@@ -14,7 +14,7 @@ import { readdir } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import { log } from '../logger'
 import { loadBackupEnabled, loadReplicaEnabled } from '../settings'
-import { onAuthState } from '../remote/supabase-session'
+import { onAuthState } from '../remote-control'
 import { replicaNow } from './replica'
 import { bundleFingerprint, createBundle, restoreFromBundle } from './bundle'
 import { backupAad, decryptBlob, encryptBlob } from './crypto'
@@ -27,7 +27,7 @@ import {
   uploadBackup,
   type BackupManifest,
 } from './storage'
-import { decodeRecoveryCode, encodeRecoveryCode, ensureVaultKey, getVaultKey, setVaultKey } from './vault-key'
+import { decodeRecoveryCode, encodeRecoveryCode, ensureVaultKey, getVaultKey, readVaultKeyState, setVaultKey } from './vault-key'
 
 export interface BackupStatus {
   enabled: boolean
@@ -148,8 +148,23 @@ async function runBackup(projectDir: string): Promise<void> {
   try {
     const userId = await currentUserId()
     if (!userId) throw new Error('not signed in')
-    const key = ensureVaultKey()
-    if (!key) throw new Error('could not create or read the vault key')
+    // An existing-but-unreadable key file must never be minted over (that silently re-keys the
+    // vault out from under every blob it already sealed) — so this checks the three-state read
+    // before falling through to ensureVaultKey's "absent" mint path.
+    //
+    // The wording has to hold for all three causes of `unreadable`: a transient safeStorage blip
+    // (the local key is fine), corrupt bytes, and a reset login Keychain (the local key is gone for
+    // good). Since the recovery code IS the key, the cloud blobs open only via the code in the last
+    // two — and this same failure makes Reveal refuse, so the code can't be obtained now. "Your
+    // existing backups are safe" read as "nothing to do"; this routes to the one thing that helps.
+    const keyState = readVaultKeyState()
+    if (keyState.state === 'unreadable') {
+      throw new Error(
+        'This Mac can’t open its backup key. New backups are paused. Your saved recovery code still opens the backups already in the cloud, so make sure you have it somewhere safe.',
+      )
+    }
+    const key = keyState.state === 'ok' ? keyState.key : ensureVaultKey()
+    if (!key) throw new Error('Could not create a backup key on this Mac.')
 
     // The debounce now also arms on no-op checkpoints (for the replica's sake) — unchanged lane
     // tips mean a byte-equivalent bundle, so don't re-seal and re-upload half a gig of it.
@@ -216,10 +231,21 @@ export async function getBackupStatus(projectDir: string): Promise<BackupStatus>
   }
 }
 
-/** The whole secret, shown only on a user-initiated reveal. Never logged. */
-export function revealRecoveryCode(): string | null {
-  const key = ensureVaultKey()
-  return key ? encodeRecoveryCode(key) : null
+/** The whole secret, shown only on a user-initiated reveal. Never logged.
+ *
+ *  Minting here is safe by the same invariant runBackup relies on — ONLY an absent key file may be
+ *  minted over, and an unreadable one is refused outright, so this can never present a freshly
+ *  invented key as though it were the user's real, already-in-use one. It has to mint: Reveal is
+ *  the only user-initiated way to see the code, and there is no enable flow, so refusing on `absent`
+ *  would mean the key first appears via a background backup and the user can end up with real cloud
+ *  backups having never once seen their only cross-Mac recovery. `unreadable` lets the UI tell that
+ *  refusal apart from a mint that failed. */
+export function revealRecoveryCode(): { code: string | null; unreadable: boolean } {
+  const s = readVaultKeyState()
+  if (s.state === 'ok') return { code: encodeRecoveryCode(s.key), unreadable: false }
+  if (s.state === 'unreadable') return { code: null, unreadable: true }
+  const minted = ensureVaultKey()
+  return { code: minted ? encodeRecoveryCode(minted) : null, unreadable: false }
 }
 
 export async function listCloudBackups(): Promise<BackupManifest[]> {
@@ -252,7 +278,14 @@ export async function restoreCloudBackup(args: {
       if (!decoded) return { ok: false, error: 'That recovery code isn’t valid — check it for typos.' }
       key = decoded
     }
-    if (!key) return { ok: false, error: 'No key on this Mac — enter your recovery code.' }
+    // Restore is the flow you're in WHEN your key is unreadable, so the two causes can't share one
+    // string here: "no key on this Mac" tells a user whose key file is sitting right there, intact
+    // but unopenable, something they can see is false.
+    if (!key) {
+      return readVaultKeyState().state === 'unreadable'
+        ? { ok: false, error: 'This Mac can’t open its backup key. Enter your recovery code to restore.' }
+        : { ok: false, error: 'No key on this Mac. Enter your recovery code.' }
+    }
 
     // Restore never writes over existing work — the target must be absent or an empty folder
     // (bundle.ts separately refuses a dir that already has a safety store; this catches the rest).

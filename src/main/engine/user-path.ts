@@ -52,6 +52,23 @@ export function userPath(): string {
   return prov.length ? `${prov.join(':')}:${loginPath()}` : loginPath()
 }
 
+/**
+ * Env for every `git` spawn — user-git AND safety-git/backup alike. The hole is narrower than "bare
+ * `git` always ENOENTs": launchd's minimal PATH still has /usr/bin, so on a machine with Xcode CLT
+ * the spawn resolves fine. It bites machines WITHOUT CLT (where /usr/bin/git is a stub that fires the
+ * installer dialog and exits non-zero) and any git installed only under /opt/homebrew/bin — plus
+ * git's own PATH lookup of subcommands and credential helpers, which is the already-proven
+ * runUserGit "bad credentials" failure. One resolver so a new call site can't quietly reopen it.
+ *
+ * Trade-off taken deliberately: safety-git and backup/bundle.ts are Koda-owned helpers designed to be
+ * independent of the user's environment (GIT_CONFIG_NOSYSTEM, GIT_CONFIG_GLOBAL=/dev/null), and this
+ * routes them through the login-shell PATH — so a version-manager shim (mise/asdf) early on PATH now
+ * supplies the git that runs the undo net. Caller `extra` folds in BEFORE PATH — nobody drops the fix.
+ */
+export function gitEnv(extra?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return { ...process.env, ...extra, PATH: userPath() }
+}
+
 function resolve(): string {
   const ambient = process.env.PATH ?? ''
   const shell = process.env.SHELL

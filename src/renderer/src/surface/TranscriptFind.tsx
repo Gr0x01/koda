@@ -46,9 +46,11 @@ function collectRanges(container: HTMLElement, query: string): Range[] {
 export function TranscriptFind({
   containerRef,
   onClose,
+  placeholder = 'Find in conversation',
 }: {
   containerRef: React.RefObject<HTMLDivElement | null>
   onClose: () => void
+  placeholder?: string
 }) {
   const [query, setQuery] = useState('')
   const [matches, setMatches] = useState<Range[]>([])
@@ -116,7 +118,7 @@ export function TranscriptFind({
         value={query}
         onChange={(e) => setQuery(e.target.value)}
         onKeyDown={onKeyDown}
-        placeholder="Find in conversation"
+        placeholder={placeholder}
         className="w-44 bg-transparent text-xs text-text outline-none placeholder:text-text-muted"
       />
       <span className="min-w-[3.5rem] text-right text-[11px] tabular-nums text-text-muted">

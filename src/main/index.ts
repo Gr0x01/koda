@@ -3,17 +3,19 @@ import { existsSync, realpathSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, screen, session, shell } from 'electron'
 import { IpcChannels } from '@shared/channels'
-import { disposeEngineSessions, getEngineSessions, registerIpcHandlers } from './ipc'
+import { disposeEngineSessions, getEngineSessions, registerIpcHandlers, runDreamNow } from './ipc'
 import { probeEngine } from './engine/probe'
 import { initUpdater } from './updater'
 import { activateProvisionedRuntimes, activateToolsBinDir } from './runtime/provision'
 import { ensureGlobalSkillsSeeded } from './engine/skills-catalog'
 import { projectPathForWindow, registerWindow, unregisterWindow, windowForProject } from './window-registry'
 import {
+  backfillKnownProjects,
   loadAppState,
   migrateV1IfPresent,
   noteProjectClosed,
   noteProjectOpened,
+  projectsHomeDir,
   pruneGhostSessions,
   saveWindowBounds,
 } from './session-store'
@@ -31,7 +33,9 @@ import { voiceController } from './voice'
 import { resumePlaywrightIfEnabled } from './playwright'
 import { killTerminal, registerTerminalIpc } from './terminal'
 import { track } from './telemetry'
+import { startSuspensionWatchdog } from './suspension-watchdog'
 import { importFilesIntoProject } from './fs-browse'
+import { closeAllNeuralViews, openNeuralView } from './neural-view'
 
 // Pin the app name before any getPath() call (unpackaged Electron would otherwise name it
 // "Electron"). In dev we deliberately use a DISTINCT name so a `npm run dev` instance and the
@@ -135,6 +139,9 @@ function restoreWindowBounds():
  * workspace. The renderer asks which it is via `project:getContext`.
  */
 function createWindow(projectPath: string, newProjectIntent = false): void {
+  // Timed so a slow "opening an app / project" is diagnosable after the fact — the cold window+renderer
+  // boot is the dominant cost of first-open (warm on retry) and otherwise leaves no trace in the log.
+  const openStart = Date.now()
   const win = new BrowserWindow({
     ...restoreWindowBounds(),
     minWidth: MIN_SIZE.width,
@@ -192,7 +199,23 @@ function createWindow(projectPath: string, newProjectIntent = false): void {
     }
   })
 
-  win.on('ready-to-show', () => win.show())
+  // Timing base: ready-to-show re-fires on every reload, and measuring all of them from the window's
+  // ORIGINAL openStart poisoned the stall data — a 6-day-old window logged ms≈its uptime (the broken
+  // instrumentation flagged 07-28). First paint measures the true cold open; each reload measures
+  // from its own load start under a distinct label so cold-open reads stay clean.
+  let paintStart = openStart
+  let firstPaint = true
+  win.webContents.on('did-start-loading', () => {
+    if (!firstPaint) paintStart = Date.now()
+  })
+  win.on('ready-to-show', () => {
+    log.info('window', firstPaint ? 'project window ready' : 'project window reloaded', {
+      projectPath,
+      ms: Date.now() - paintStart,
+    })
+    firstPaint = false
+    win.show()
+  })
 
   // A crashed renderer (OOM is the realistic case: Monaco + xterm + a long transcript) would
   // otherwise sit as a dead blank window while its engine sessions keep running invisibly.
@@ -201,6 +224,27 @@ function createWindow(projectPath: string, newProjectIntent = false): void {
     if (details.reason === 'clean-exit') return
     log.error('window', `renderer gone (${details.reason}) — reloading`)
     if (!win.isDestroyed()) win.webContents.reload()
+  })
+
+  // Native right-click menu for text. Electron ships none, so without this the spellchecker
+  // underlines words but offers no fixes — and text fields have no cut/copy/paste menu at all.
+  // Only pops on editable fields or a text selection; surfaces with their own custom menus
+  // (file tree, sessions) aren't those, so the two never stack.
+  win.webContents.on('context-menu', (_event, params) => {
+    const template: Electron.MenuItemConstructorOptions[] = []
+    for (const suggestion of params.dictionarySuggestions.slice(0, 5))
+      template.push({ label: suggestion, click: () => win.webContents.replaceMisspelling(suggestion) })
+    if (params.misspelledWord)
+      template.push(
+        {
+          label: 'Add to Dictionary',
+          click: () => win.webContents.session.addWordToSpellCheckerDictionary(params.misspelledWord),
+        },
+        { type: 'separator' }
+      )
+    if (params.isEditable) template.push({ role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'selectAll' })
+    else if (params.selectionText.trim()) template.push({ role: 'copy' })
+    if (template.length) Menu.buildFromTemplate(template).popup({ window: win })
   })
 
   // External links open in the user's browser, never inside the app shell — and
@@ -230,9 +274,10 @@ function createProjectHomeWindow(newProject = false): void {
   createWindow('', newProject)
 }
 
-/** Menu "Open…" (⌘O): pick a folder, then open it in its OWN window (focus it if already open). */
+/** Menu "Open…" (⌘O): pick a folder, then open it in its OWN window (focus it if already open).
+ *  Starts in ~/Koda — where projects live — not wherever macOS last browsed. */
 async function openFolderInNewWindow(): Promise<void> {
-  const res = await dialog.showOpenDialog({ properties: ['openDirectory'] })
+  const res = await dialog.showOpenDialog({ properties: ['openDirectory'], defaultPath: projectsHomeDir() })
   if (res.canceled || !res.filePaths[0]) return
   const projectPath = realpathSync(res.filePaths[0])
   const existing = windowForProject(projectPath)
@@ -249,6 +294,8 @@ export function openProjectInNewWindow(path: string): { projectPath: string; alr
   const projectPath = realpathSync(path)
   const existing = windowForProject(projectPath)
   if (existing) {
+    if (existing.isMinimized()) existing.restore()
+    existing.show()
     existing.focus()
     return { projectPath, alreadyOpen: true }
   }
@@ -269,7 +316,7 @@ function focusedProject(): { win: BrowserWindow; path: string } | undefined {
   return win && path ? { win, path } : undefined
 }
 
-function sendFileCommand(command: 'newDocument' | 'newFolder' | 'filesImported'): void {
+function sendFileCommand(command: import('@shared/ipc').FileMenuCommand): void {
   focusedProject()?.win.webContents.send(IpcChannels.uiFileCommand, command)
 }
 
@@ -297,7 +344,9 @@ async function importFilesFromMenu(): Promise<void> {
  *  conventional "Settings…" item (⌘,) sits in its standard place; the rest mirrors the default roles. */
 export function buildAppMenu(): void {
   const isMac = process.platform === 'darwin'
-  const hasProject = !!focusedProject()
+  const focused = focusedProject()
+  const hasProject = !!focused
+  const hasNeuralProject = focused?.path === realpathSync(app.getAppPath())
   const recents = loadAppState().recentProjects.filter(existsSync).slice(0, 12)
   const template: Electron.MenuItemConstructorOptions[] = [
     ...(isMac
@@ -351,6 +400,10 @@ export function buildAppMenu(): void {
             ),
         },
         { type: 'separator' },
+        // Sends the command to the focused window; the visible doc surface answers. Docs only —
+        // "export what I'm reading" — so with no doc on the Stage it's a quiet no-op.
+        { label: 'Export as PDF…', enabled: hasProject, click: () => sendFileCommand('exportPdf') },
+        { type: 'separator' },
         {
           label: 'Reveal Project in Finder',
           enabled: hasProject,
@@ -379,15 +432,71 @@ export function buildAppMenu(): void {
     },
     { role: 'editMenu' as const },
     { role: 'viewMenu' as const },
+    ...(isDev
+      ? [
+          {
+            label: 'Developer',
+            submenu: [
+              {
+                label: 'Open Neural View',
+                enabled: hasNeuralProject,
+                click: () => {
+                  const project = focusedProject()
+                  if (project)
+                    void openNeuralView(project.path).catch((err) =>
+                      log.error('neural-view', 'open failed', err instanceof Error ? err.message : err),
+                    )
+                },
+              },
+              {
+                label: 'Run Overnight Dream Now',
+                click: () => runDreamNow(),
+              },
+            ],
+          },
+        ]
+      : []),
     { role: 'windowMenu' as const },
   ]
   Menu.setApplicationMenu(Menu.buildFromTemplate(template))
+
+  // Right-clicking the Dock icon lists recent projects — the Dock twin of File → Open Recent.
+  // Rebuilt here so both stay in sync with the same recents list.
+  if (isMac)
+    app.dock?.setMenu(
+      Menu.buildFromTemplate([
+        ...recents.map((path) => ({ label: basename(path), click: () => openRecentProject(path) })),
+        ...(recents.length ? [{ type: 'separator' as const }] : []),
+        { label: 'New Project…', click: () => createProjectHomeWindow(true) },
+      ]),
+    )
+}
+
+// One Koda per userData dir. Two instances silently share app-lifetime state — worst known cost: both
+// auto-refresh the same single-use cloud token, Supabase's reuse detection revokes the whole family,
+// and phone access dies for the day (2026-08-02). The second launch just fronts the one already running.
+// Dev and packaged builds have different userData dirs, so they still coexist.
+const isPrimaryInstance = app.requestSingleInstanceLock()
+if (!isPrimaryInstance) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    const win = BrowserWindow.getAllWindows()[0]
+    if (win) {
+      if (win.isMinimized()) win.restore()
+      win.show()
+      win.focus()
+    }
+  })
 }
 
 app.whenReady().then(async () => {
+  if (!isPrimaryInstance) return // quitting — don't boot services underneath the running instance
   initLogger() // open the run's log file + crash traps before anything can fail
+  startSuspensionWatchdog() // so a socket-drop diagnosis can say "the process was stopped", not guess
   migrateV1IfPresent() // one-shot: split the legacy global session blob into per-project files
   pruneGhostSessions() // drop recorded sessions the engine never wrote (start failed / nothing said)
+  backfillKnownProjects() // seed the phone's full project list from the on-disk stores (past the 20-recents cap)
   applyContentSecurityPolicy()
   registerPreviewProtocol() // serve koda-preview:// (scheme was registered pre-ready, above)
   registerPreviewCaptureResponder() // renderer→main iframe-rect replies for the agent's view_preview
@@ -486,6 +595,7 @@ app.on('before-quit', (event) => {
     voiceController.killForWindow(win.id)
   }
   stopAllLanForwards()
+  closeAllNeuralViews()
   // Flush the renderers' pending saves in parallel with engine + mini-app teardown — all bounded.
   // Mini apps get SIGTERM → short-grace SIGKILL (a port held by a half-dead child would break the
   // next launch's boot-restart); their desired-running state survives, so they come back next launch.

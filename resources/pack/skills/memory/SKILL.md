@@ -36,6 +36,17 @@ The `description` is what powers orientation — keep it a tight one-liner; it's
 
 **When to write a note.** Capture what should outlast the session: how a part of the project works, a decision and *why*, a constraint, a gotcha you hit and how you got past it. Skip transient task state, and skip anything already obvious from the code or git history — memory is for what you can't re-derive by looking. Uncommitted changes on the current branch are in that bucket: git status already shows them, so "needs committing" is not a memory entry. Work the user *can't* see from where they sit — parked on a side branch or worktree, or built but not yet deployed — is what earns a line.
 
+**Write facts that stay true, phrased as facts.** An entry is a declarative statement about the project — "tests run with pytest, single-threaded" — not an instruction to yourself — "always run tests single-threaded". Imperative phrasing gets re-read as a standing order by later sessions and can override what the user is actually asking for that day. And apply the week test before writing: if a line will be stale in a week — a PR number, a commit hash, "phase N done", a file count, today's task progress — it belongs in git or the decision log, not in memory.
+
+**Some lessons must never harden into guidance.** Four kinds of "learning" rot into standing constraints that outlive their cause — don't record them as facts:
+
+- An environment-dependent failure (a missing tool, a fresh-install error). The user can fix these; they are not durable rules.
+- A negative claim about a tool ("X doesn't work", "Y is broken"). These harden into refusals the next session cites against itself long after the actual problem was fixed. Record the working alternative instead, or nothing.
+- A transient error that resolved before the session ended.
+- An approach that never actually worked, written up as if it were a reliable workflow. An unresolved failure recorded as guidance is the worst entry a memory can hold — the next session will trust it and repeat it.
+
+A still-live blocker is worth noting — but as a dated open problem in `active-context.md`, where it gets struck when it resolves, never as a timeless fact in a topic note.
+
 **Maintain it; don't let it pile up.** Before adding a note, check for one that already covers the topic and update that instead of making a second. Fix a note that's gone stale; delete one that turns out wrong. Keep each index line in sync with its note. A lean, current memory is worth far more than an exhaustive one.
 
 **A work session is not a topic.** The default memory action at the end of a session is UPDATING the note for the topic you touched — the nav note absorbs the nav iteration, the relay note absorbs the relay fix. A new note (and its index line) is earned only by a genuinely new system, decision, or lesson — never by "what I built today"; that record belongs in the project's decision log or git history. When a new approach replaces an old one, fold the old note's surviving lesson into the replacement and delete the old file. Held to this, the index grows with the number of live systems — which plateaus — instead of growing with time, which is how a memory blows past its budget in weeks.

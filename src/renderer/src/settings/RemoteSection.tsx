@@ -42,6 +42,7 @@ function CloudAccountPanel() {
   useEffect(() => {
     window.koda.getCloudRelayEnabled().then(setCloud).catch(console.error)
     window.koda.getRemoteAuth().then(setAuth).catch(console.error)
+    return window.koda.onRemoteAuthChanged?.(setAuth)
   }, [])
 
   const sendCode = async (): Promise<void> => {
@@ -105,8 +106,12 @@ function CloudAccountPanel() {
       ) : (
         <div>
           <SettingsRow
-            label="Control from anywhere"
-            description="Sign in to drive your Mac over the internet, even off your home Wi-Fi. Then pair your phone under Remote. End-to-end encrypted, so the relay never sees your messages or files."
+            label={auth?.needsReSignin ? 'Signed out' : 'Control from anywhere'}
+            description={
+              auth?.needsReSignin
+                ? 'Your saved sign-in stopped working, so your phone can’t reach this Mac. Sign in again below and everything reconnects on its own.'
+                : 'Sign in to drive your Mac over the internet, even off your home Wi-Fi. Then pair your phone under Remote. End-to-end encrypted, so the relay never sees your messages or files.'
+            }
           />
           <div className="space-y-2.5 px-4 pb-4">
             <div className="flex items-center gap-2">

@@ -1,11 +1,19 @@
 import { useEffect, useRef, useState } from 'react'
-import type { AppInfo, EngineProbe, ProviderKind, RateLimitInfo } from '@shared/ipc'
-import { AnimatePresence, Menu, motion, spring, duration, ease } from '../motion'
-import { useTheme } from '../theme'
+import { createPortal } from 'react-dom'
+import {
+  windowLabel,
+  type AppInfo,
+  type BackupKept,
+  type EngineProbe,
+  type ProviderKind,
+  type RateLimitInfo,
+} from '@shared/ipc'
+import { Menu } from '../motion'
 import { SegmentBar } from './ContextMeter'
 import { engineShort, engineOrder } from './models'
 import { useWorkspace } from './store'
 import { Button } from '../ui'
+import { liveRateLimitWindows } from '@shared/rate-limits'
 
 // ── Billing fallback banner ──────────────────────────────────────────────────────
 // 'auto' mode only: shown when the subscription plan limit is hit and we haven't yet asked whether to
@@ -31,6 +39,197 @@ export function BillingFallbackBanner() {
     </div>
   )
 }
+
+// ── Account sign-in banner ───────────────────────────────────────────────────────
+// Shown when the Mac's cloud sign-in is dead for good (revoked token family) — the state retrying can
+// never fix. Without this the failure is silent here and masquerades as a flaky connection on the phone
+// (2026-08-02: apps unreachable all day, the only witness was a log line every 60s).
+export function AccountSignInBanner() {
+  const [needsSignIn, setNeedsSignIn] = useState(false)
+  const openSettingsTo = useWorkspace((s) => s.openSettingsTo)
+  useEffect(() => {
+    window.koda.getRemoteAuth?.().then((a) => setNeedsSignIn(a.needsReSignin)).catch(console.error)
+    return window.koda.onRemoteAuthChanged?.((a) => setNeedsSignIn(a.needsReSignin))
+  }, [])
+  if (!needsSignIn) return null
+  return (
+    <div className="flex shrink-0 items-center gap-3 border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-[12.5px] text-text">
+      <span className="flex-1">
+        <span className="font-medium">Signed out of your Koda account.</span> Your phone can&rsquo;t reach
+        this Mac until you sign in again.
+      </span>
+      <Button variant="primary" size="md" onClick={() => openSettingsTo('koda-account')} className="shrink-0">
+        Sign in
+      </Button>
+    </div>
+  )
+}
+
+// ── Data integrity banner ───────────────────────────────────────────────────────
+// Something is wrong with one of this project's two session stores (the hot sessions blob, or the cold
+// archive index), or with the app-global settings file. Five very different situations share this banner
+// and must never share wording, because the difference decides what the user should do next:
+//   TOTAL failure — main refused to treat the file as "empty" (which the very next save would otherwise
+//     overwrite; see session-store.ts), so chat saving is OFF for this run.
+//   PARTIAL drop — individual drifted rows were set aside so the rest of the project survives. Saving
+//     here is still ON, which means the shortened list DOES get written back. Without a message this is
+//     the silent one: the chat is simply gone from the list and nothing says so.
+//   REFUSED WRITE — the archive index reads fine, but a write to it came back refused, so the archive /
+//     reopen / delete the user just asked for was declined instead of half-done. The only one of the
+//     three triggered by an action rather than by boot, and the only one that can clear itself: the next
+//     write that lands takes it down (store.ts `persistArchived`).
+//   UNREADABLE TRANSCRIPT — the index is fine and the write would have been fine, but the archived
+//     chat's own transcript file couldn't be read, so the reopen stopped rather than hand back an empty
+//     conversation and delete the file it failed to read. Settings closes on the click either way, so
+//     without this line the user watches their chat not come back and hears nothing. Also self-clearing:
+//     the next reopen that works takes it down.
+//   BILLING RESET — the app-global settings file was unreadable and had recorded a choice to bill through
+//     the user's own API key, so billing fell back to the subscription. CLAUDE.md makes a billing switch
+//     "user-visible, never silent", and a log line is not visible. The one line here that isn't about
+//     this project's files, and the one fed by main rather than the workspace store (settings are
+//     app-global, so there's no per-project load result to hang it on).
+// The "Koda kept a copy" line is claimed only when main confirmed the copy landed. It can fail (an
+// EACCES store whose backup re-read fails the same way, a copyFileSync that hits ENOSPC), and promising
+// a recovery file that doesn't exist is worse than admitting there isn't one.
+// Un-dismissable on purpose: it stays true for the rest of this run. Deliberately does NOT tell the
+// user to reopen the project — a reopen re-reads the same unreadable file and fails identically, so
+// that advice would send them back in to lose another session's work. Recovery needs the kept copy,
+// which is the agent's job.
+export function DataIntegrityBanner() {
+  const sessionsFailed = useWorkspace((s) => s.sessionsLoadFailed)
+  const archiveFailed = useWorkspace((s) => s.archiveLoadFailed)
+  const sessionsBackupKept = useWorkspace((s) => s.sessionsBackupKept)
+  const archiveBackupKept = useWorkspace((s) => s.archiveBackupKept)
+  const droppedSessions = useWorkspace((s) => s.droppedSessions)
+  const droppedArchives = useWorkspace((s) => s.droppedArchives)
+  const archiveWriteFailed = useWorkspace((s) => s.archiveWriteFailed)
+  const archiveRestoreFailed = useWorkspace((s) => s.archiveRestoreFailed)
+  // Not in the workspace store: settings are app-global, so this comes straight from main. Re-asked on
+  // every settings write, which is how the line clears once the user picks a billing mode themselves.
+  const [billingModeReset, setBillingModeReset] = useState(false)
+  useEffect(() => {
+    const refresh = (): void => {
+      window.koda
+        .getDataIntegrity?.()
+        .then((d) => setBillingModeReset(!!d?.billingModeReset))
+        .catch(console.error)
+    }
+    refresh()
+    return window.koda.onSettingsChanged(refresh)
+  }, [])
+
+  // One line per store, so both stores failing says both things (a single ternary used to show only the
+  // sessions one, and "ask Koda to recover it" then quietly referred to a file the user was never told
+  // about). A store can fail OR drop rows, never both: a drop only happens on a read that succeeded.
+  const lines: { key: string; headline: string; body: string }[] = []
+  if (sessionsFailed) {
+    lines.push({
+      key: 'sessions-failed',
+      headline: 'Koda couldn’t read this project’s saved chats.',
+      body: sentences(
+        'Your chats are still on disk and Koda has not changed that file.',
+        keptCopyLine(sessionsBackupKept),
+        'Chats in this window will not be saved until that file can be read again. Everything else keeps saving normally, including your files, documents, settings and saved versions.',
+        'Ask Koda to recover it before you do more work here. The usual cause is installing an older version of Koda over a newer one.',
+      ),
+    })
+  } else if (droppedSessions > 0) {
+    lines.push({
+      key: 'sessions-dropped',
+      headline: `Koda couldn’t read ${count(droppedSessions, 'chat')} in this project.`,
+      body: sentences(
+        `${droppedSessions === 1 ? 'It was' : 'They were'} set aside instead of deleted, and Koda kept a copy of the original file beside it.`,
+        'The rest of this project is working normally and everything you do here is still being saved.',
+        `Ask Koda to bring ${droppedSessions === 1 ? 'that chat' : 'those chats'} back. The usual cause is installing an older version of Koda over a newer one.`,
+      ),
+    })
+  }
+  if (archiveFailed) {
+    lines.push({
+      key: 'archive-failed',
+      headline: 'Koda couldn’t read this project’s archived chats.',
+      body: sentences(
+        'They are still on disk and Koda has not changed that file.',
+        keptCopyLine(archiveBackupKept),
+        'Archiving is turned off here until it can be read. The rest of the project works normally.',
+        'Ask Koda to recover it.',
+      ),
+    })
+  } else if (droppedArchives > 0) {
+    lines.push({
+      key: 'archive-dropped',
+      headline: `Koda couldn’t read ${count(droppedArchives, 'archived chat')} in this project.`,
+      body: sentences(
+        `${droppedArchives === 1 ? 'It was' : 'They were'} set aside instead of deleted, and Koda kept a copy of the original list beside it.`,
+        'The rest of this project is working normally, and archiving still works.',
+        `Ask Koda to bring ${droppedArchives === 1 ? 'that chat' : 'those chats'} back.`,
+      ),
+    })
+  }
+  // Its own line rather than a branch of the two above: this one is about a WRITE, it can sit alongside
+  // an archive row that drifted on boot, and it can never sit alongside the read failure (a store we
+  // couldn't read is one we refuse to write, so no move ever gets far enough to be refused).
+  if (archiveWriteFailed) {
+    lines.push({
+      key: 'archive-write-failed',
+      headline: 'Koda couldn’t update this project’s archived chats.',
+      body: sentences(
+        'Nothing moved and nothing was lost.',
+        'Koda was not able to save the list of archived chats, so archiving a chat, reopening one and deleting one will not go through until that works again.',
+        'Ask Koda to take a look.',
+      ),
+    })
+  }
+  // Separate from the refused write above, and able to sit beside it: that one is about the list, this
+  // one is about a single chat's saved conversation. The wording has to say the chat is still there,
+  // because the user just clicked Restore and watched Settings close with nothing reopened.
+  if (archiveRestoreFailed) {
+    lines.push({
+      key: 'archive-restore-failed',
+      headline: 'Koda couldn’t reopen an archived chat.',
+      body: sentences(
+        'Nothing moved and nothing was lost.',
+        'The saved conversation could not be read, so the chat is still in your archived list.',
+        'Ask Koda to take a look.',
+      ),
+    })
+  }
+  if (billingModeReset) {
+    lines.push({
+      key: 'billing-mode-reset',
+      headline: 'Koda went back to billing on your Claude subscription.',
+      body: sentences(
+        'Koda could not read its settings file, and your choice to bill through your own API key was saved in it.',
+        'Work you do now goes to your subscription.',
+        'You can choose the API key again in Settings under AI providers.',
+      ),
+    })
+  }
+  if (!lines.length) return null
+  return (
+    <div
+      role="status"
+      className="flex shrink-0 flex-col gap-1.5 border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-[12.5px] text-text"
+    >
+      {lines.map((line) => (
+        <p key={line.key}>
+          <span className="font-medium">{line.headline}</span> {line.body}
+        </p>
+      ))}
+    </div>
+  )
+}
+
+/** The copy claim, made only when main confirmed the copy exists. `null` means nobody got to say, and
+ *  an unproven promise about the user's only remaining copy is not worth making. */
+function keptCopyLine(kept: BackupKept): string {
+  if (kept === true) return 'Koda kept a copy of it beside the original.'
+  if (kept === false) return 'Koda was not able to make a copy of it this time.'
+  return ''
+}
+
+const sentences = (...parts: string[]): string => parts.filter(Boolean).join(' ')
+const count = (n: number, noun: string): string => `${n} ${noun}${n === 1 ? '' : 's'}`
 
 // ── Status bar ─────────────────────────────────────────────────────────────────
 export function StatusBar() {
@@ -64,12 +263,17 @@ export function StatusBar() {
   const engineKey = Array.from(
     new Set([activeEngine, ...rlKeys.split(',').filter(Boolean), ...pdKeys.split(',').filter(Boolean)]),
   ).join(',')
+  const refreshEngineAuth = useWorkspace((s) => s.refreshEngineAuth)
   useEffect(() => {
-    const check = (): void => void window.koda.refreshProviderStatus?.(engineKey.split(','))
+    const check = (): void => {
+      void window.koda.refreshProviderStatus?.(engineKey.split(','))
+      // Same "on arrival + on sitting back down" cadence: catch a sign-in that lapsed while you were away.
+      void refreshEngineAuth()
+    }
     check()
     window.addEventListener('focus', check)
     return () => window.removeEventListener('focus', check)
-  }, [engineKey])
+  }, [engineKey, refreshEngineAuth])
 
   return (
     <footer className="relative flex items-center border-t border-border bg-bg px-2 py-1 text-[11px] text-text-muted">
@@ -128,79 +332,8 @@ function FooterActions() {
           <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
         </svg>
       </FooterButton>
-      <ThemeSwitch />
       <MemoryTidyPill />
     </div>
-  )
-}
-
-// ── Theme switch ──────────────────────────────────────────────────────────────────
-// The light/dark quick-flip, moved out of the title bar (which stays calm: the face flip + Remote)
-// to sit with the bar's other controls. Twin-icon track with a sliding ink disc carrying the active
-// icon; scaled to the status bar's height. Full appearance control lives in Settings → Appearance.
-function ThemeSwitch() {
-  const { theme, toggle } = useTheme()
-  const isDark = theme === 'dark'
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={isDark}
-      aria-label="Toggle light or dark theme"
-      title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
-      onClick={toggle}
-      className="relative ml-1 h-[19px] w-[37px] rounded-full bg-border transition-colors"
-    >
-      <span className="pointer-events-none absolute inset-y-0 left-[4px] flex items-center text-text-muted/70">
-        <SunIcon />
-      </span>
-      <span className="pointer-events-none absolute inset-y-0 right-[4px] flex items-center text-text-muted/70">
-        <MoonIcon />
-      </span>
-      <motion.span
-        animate={{ x: isDark ? 18 : 0 }}
-        transition={spring.snappy}
-        className="absolute left-[1.5px] top-[1.5px] z-[1] flex h-4 w-4 items-center justify-center rounded-full bg-surface text-accent shadow-sm"
-      >
-        <AnimatePresence mode="wait" initial={false}>
-          <motion.span
-            key={isDark ? 'moon' : 'sun'}
-            initial={{ rotate: -90, opacity: 0, scale: 0.4 }}
-            animate={{ rotate: 0, opacity: 1, scale: 1 }}
-            exit={{ rotate: 90, opacity: 0, scale: 0.4 }}
-            transition={{ duration: duration.fast, ease: ease.out }}
-            className="flex items-center justify-center"
-          >
-            {isDark ? <MoonIcon /> : <SunIcon />}
-          </motion.span>
-        </AnimatePresence>
-      </motion.span>
-    </button>
-  )
-}
-
-function SunIcon() {
-  return (
-    <svg
-      width="9"
-      height="9"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={2.2}
-      strokeLinecap="round"
-    >
-      <circle cx="12" cy="12" r="4.2" />
-      <path d="M12 2.5v2.2M12 19.3v2.2M4.6 4.6l1.6 1.6M17.8 17.8l1.6 1.6M2.5 12h2.2M19.3 12h2.2M4.6 19.4l1.6-1.6M17.8 6.2l1.6-1.6" />
-    </svg>
-  )
-}
-
-function MoonIcon() {
-  return (
-    <svg width="9" height="9" viewBox="0 0 24 24" fill="currentColor">
-      <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" />
-    </svg>
   )
 }
 
@@ -229,17 +362,31 @@ function ProviderOutagePill() {
   return (
     <>
       {engines.map((id) => (
-        <span
+        <button
           key={id}
-          className="flex cursor-default select-none items-center gap-1.5 text-amber-500"
+          onClick={() => openStatusPage(id)}
+          className="flex select-none items-center gap-1.5 text-amber-500 transition-colors hover:text-amber-400"
           title={healthTooltip(providerDown[id])}
         >
           <span className="h-1.5 w-1.5 rounded-full bg-amber-500" aria-hidden />
           {engineShort(id)} · {kindWord(providerDown[id]?.kind)}
-        </span>
+        </button>
       ))}
     </>
   )
+}
+
+// The human status pages behind the feeds status-watch.ts polls — where to send someone who wants the
+// provider's own word on an incident. window.open routes through main's window-open handler →
+// shell.openExternal, so it lands in the user's browser.
+const STATUS_PAGES: Record<string, string> = {
+  claude: 'https://status.claude.com',
+  codex: 'https://status.openai.com',
+}
+
+function openStatusPage(engineId: string): void {
+  const url = STATUS_PAGES[engineId]
+  if (url) window.open(url)
 }
 
 /** Plain word for a reported severity — kept honest so the chip never overstates. A missing/unknown kind
@@ -261,7 +408,7 @@ function kindWord(kind?: ProviderKind): string {
 
 function healthTooltip(health?: { note?: string; kind?: ProviderKind }): string {
   const head = `${kindWord(health?.kind)}${health?.note ? ` — ${health.note}` : ''}`
-  return `${head}. Your work is fine; you'll get a ping when it's back.`
+  return `${head}. Your work is fine; you'll get a ping when it's back. Click for the status page.`
 }
 
 // ── Memory tidy pill ──────────────────────────────────────────────────────────────
@@ -340,13 +487,13 @@ function RateLimitStatus() {
   }, [])
   // An engine in an incident always earns a chip (even before it has window data) so its health shows.
   const engineIds = Array.from(new Set([activeEngine, ...Object.keys(rateLimits), ...Object.keys(providerDown)]))
-    .filter((id) => id === activeEngine || providerDown[id] || hasWindowData(liveWindows(rateLimits[id], nowSec)))
+    .filter((id) => id === activeEngine || providerDown[id] || hasWindowData(liveRateLimitWindows(rateLimits[id], nowSec)))
     .sort((a, b) => engineOrder(a) - engineOrder(b))
   const labelEngines = engineIds.length > 1
   return (
     <div className="flex items-center gap-4">
       {engineIds.map((id) => (
-        <EngineWindows key={id} engineId={id} windows={liveWindows(rateLimits[id], nowSec)} showLabel={labelEngines} />
+        <EngineWindows key={id} engineId={id} windows={liveRateLimitWindows(rateLimits[id], nowSec)} showLabel={labelEngines} />
       ))}
     </div>
   )
@@ -360,13 +507,6 @@ function hasWindowData(windows?: Record<string, RateLimitInfo>): boolean {
  *  seed drops expired windows for exactly this reason, usage-history.ts), so an elapsed window is treated
  *  as absent — the gauge falls back to the em-dash until the next turn re-emits it, rather than showing a
  *  stale "31%" / color long after the window should have reset. */
-function liveWindows(windows: Record<string, RateLimitInfo> | undefined, nowSec: number): Record<string, RateLimitInfo> {
-  if (!windows) return {}
-  const out: Record<string, RateLimitInfo> = {}
-  for (const [k, w] of Object.entries(windows)) if (w && w.resetsAt > nowSec) out[k] = w
-  return out
-}
-
 // One engine's 5-hour gauge — the only window shown inline (it's the cap you actually hit). A small
 // accent dot + brand name when more than one engine is on screen (the single-engine case stays clean
 // with just "5-hour"). Reset times and the weekly window live in a click popout (the same pattern as
@@ -382,11 +522,27 @@ function EngineWindows({
 }) {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
-  // Dismiss on outside click / Escape — same inline idiom as ContextReadout. Only listens while open.
+  const panelRef = useRef<HTMLDivElement>(null)
+  // The popout is PORTALED to the body and positioned in viewport coords (the RemoteMenu pattern). It
+  // used to sit `absolute bottom-full` inside the footer, which fit while the plan reported one window
+  // but got cut off at the top once the usage poll started reporting three — the footer's z-10 panel
+  // competes in the root stacking context with the positioned children of the surfaces above it.
+  // Portaled + fixed, the panel is out of that contest entirely and can't be clipped by any ancestor.
+  const [pos, setPos] = useState<{ left: number; bottom: number } | null>(null)
   useEffect(() => {
     if (!open) return
+    const place = (): void => {
+      const r = ref.current?.getBoundingClientRect()
+      if (r) setPos({ left: r.left + r.width / 2, bottom: window.innerHeight - r.top + 6 })
+    }
+    place()
+    window.addEventListener('scroll', place, true)
+    window.addEventListener('resize', place)
+    // Dismiss on outside click / Escape — same inline idiom as ContextReadout. The panel is no longer a
+    // DOM descendant of the trigger, so a click inside it has to be excused explicitly.
     const onDown = (e: PointerEvent): void => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+      const t = e.target as Node
+      if (!ref.current?.contains(t) && !panelRef.current?.contains(t)) setOpen(false)
     }
     const onKey = (e: KeyboardEvent): void => {
       if (e.key === 'Escape') setOpen(false)
@@ -394,6 +550,8 @@ function EngineWindows({
     document.addEventListener('pointerdown', onDown)
     document.addEventListener('keydown', onKey)
     return () => {
+      window.removeEventListener('scroll', place, true)
+      window.removeEventListener('resize', place)
       document.removeEventListener('pointerdown', onDown)
       document.removeEventListener('keydown', onKey)
     }
@@ -402,16 +560,54 @@ function EngineWindows({
   // fine, amber the moment the provider reports trouble) and the honest severity word appears inline.
   const health = useWorkspace((s) => s.providerDown[engineId])
   const trouble = !!health
-  const five = windows['five_hour']
-  const pct = five?.usedPercent != null ? `${Math.round(five.usedPercent)}%` : null
+  // Signed-out sign-in prompt — but ONLY for the engine the active session actually runs on. A Codex-only
+  // user's active engine is Codex, so Claude never gets a chip here, let alone a "sign in" nag; the prompt
+  // rides the engine you're about to send a turn on. No active session → no proactive nag (the reactive
+  // composer banner still catches a failed turn).
+  const openSettingsTo = useWorkspace((s) => s.openSettingsTo)
+  const isActiveEngine = useWorkspace(
+    (s) => !!s.activeId && ((s.activeId ? s.sessions[s.activeId]?.engineId : undefined) ?? 'claude') === engineId,
+  )
+  const signedOut = useWorkspace((s) => s.engineSignedOut[engineId] ?? false)
+  if (signedOut && isActiveEngine)
+    return (
+      <button
+        onClick={() => openSettingsTo('providers')}
+        title={`You're signed out of ${engineShort(engineId)}. Click to sign in.`}
+        aria-label={`Sign in to ${engineShort(engineId)}`}
+        className="flex select-none items-center gap-1.5 text-amber-500 transition-colors hover:text-amber-400"
+      >
+        <span className="h-1.5 w-1.5 rounded-full bg-amber-500" aria-hidden />
+        {engineShort(engineId)} · sign in
+      </button>
+    )
+  // The window shown inline is the one that BINDS soonest: five_hour when the plan reports it (Claude),
+  // else the weekly window (a Codex plan may report ONLY a weekly window; the Claude server since
+  // ~2026-07 may report ONLY the seven_day window when it's the one running hot), else whatever
+  // non-overage window exists. Anchoring on five_hour alone would leave the plan's real gauge hidden.
+  const primaryType = windows['five_hour']
+    ? 'five_hour'
+    : windows['weekly']
+      ? 'weekly'
+      : windows['seven_day']
+        ? 'seven_day'
+        : Object.keys(windows).find((t) => !t.includes('overage')) ?? Object.keys(windows)[0]
+  const primary = primaryType ? windows[primaryType] : undefined
+  const pct = primary?.usedPercent != null ? `${Math.round(primary.usedPercent)}%` : null
   // Inline value: precise % when the engine reports one (Codex), else nothing (Claude's band is carried
   // by the bar's color), else an em dash before any turn has landed.
-  const value = !five ? '—' : pct
+  const value = !primary ? '—' : pct
+  // Present windows for the popout rows, five_hour first then the longer caps. Overage variants are
+  // dropped — they're the same window with the overage flag, already surfaced by WindowRow's "using
+  // overage" note, so listing them separately would just double a row.
+  const presentTypes = Object.keys(windows)
+    .filter((t) => !t.includes('overage'))
+    .sort((a, b) => (a === 'five_hour' ? 0 : 1) - (b === 'five_hour' ? 0 : 1))
   return (
     <div ref={ref} className="relative">
       <button
         onClick={() => setOpen((v) => !v)}
-        className={`flex select-none items-center gap-1.5 transition-colors hover:text-text ${five || trouble ? '' : 'opacity-60'}`}
+        className={`flex select-none items-center gap-1.5 transition-colors hover:text-text ${primary || trouble ? '' : 'opacity-60'}`}
         title={trouble ? healthTooltip(health) : 'Plan usage, click for details'}
         aria-label={`${engineShort(engineId)} plan usage`}
       >
@@ -422,36 +618,71 @@ function EngineWindows({
             className={`h-1.5 w-1.5 rounded-full ${trouble ? 'bg-amber-500' : 'bg-emerald-500'}`}
             aria-hidden
           />
-          {showLabel || trouble ? engineShort(engineId) : '5-hour'}
+          {showLabel || trouble ? engineShort(engineId) : windowLabel(primaryType ?? 'five_hour')}
           {trouble && <span>· {kindWord(health?.kind)}</span>}
         </span>
         {/* Same 3-state band language as the context meter (allowed/warning/rejected → green/amber/red). */}
-        <SegmentBar filled={five ? fillOf(five.status) : 0} segments={3} />
+        <SegmentBar
+          filled={primary?.usedPercent != null ? Math.ceil((Math.max(0, primary.usedPercent) / 100) * 3) : primary ? fillOf(primary.status) : 0}
+          segments={3}
+        />
         {value && <span>{value}</span>}
       </button>
       {/* Positioning lives on a plain wrapper: Menu animates `scale`, and motion's inline transform
           would override a class-based -translate-x-1/2 (the panel would hang off to the right). */}
-      <div className="absolute bottom-full left-1/2 z-10 mb-1.5 -translate-x-1/2">
-        <Menu
-          open={open}
-          origin="origin-bottom"
-          className="w-max whitespace-nowrap rounded-xl border border-border bg-surface px-3 py-2 text-left font-mono text-[11px] text-text-muted shadow-pop"
-        >
-          {/* Same label-left / value-right row as the window rows below, for consistency: engine name on
-              the left, provider health right-aligned, the incident note dropping right-aligned beneath. */}
-          <div className="mb-1 flex justify-between gap-6">
-            <span className="text-text">{engineShort(engineId)}</span>
-            <span className={health ? 'text-amber-500' : 'text-emerald-500'}>
-              {health ? kindWord(health.kind) : 'operational'}
-              {health?.note ? (
-                <span className="block text-right text-text-muted">{health.note}</span>
-              ) : null}
-            </span>
-          </div>
-          <WindowRow type="five_hour" info={five} />
-          <WindowRow type="weekly" info={windows['weekly']} />
-        </Menu>
-      </div>
+      {pos &&
+        createPortal(
+          <div
+            ref={panelRef}
+            className="fixed z-50 -translate-x-1/2"
+            style={{ left: pos.left, bottom: pos.bottom }}
+          >
+            <Menu
+              open={open}
+              origin="origin-bottom"
+              className="w-max whitespace-nowrap rounded-xl border border-border bg-surface px-3 py-2 text-left font-mono text-[11px] text-text-muted shadow-pop"
+            >
+              {/* Same label-left / value-right row as the window rows below, for consistency: engine name
+                  on the left, provider health right-aligned, the incident note beneath. During an incident
+                  the whole health read links out to the provider's status page — the note is their one-liner;
+                  the page has the rest. */}
+              <div className="mb-1 flex justify-between gap-6">
+                <span className="text-text">{engineShort(engineId)}</span>
+                {health ? (
+                  <button
+                    onClick={() => openStatusPage(engineId)}
+                    title="Open the provider's status page"
+                    className="text-right text-amber-500 transition-colors hover:text-amber-400"
+                  >
+                    {kindWord(health.kind)} ↗
+                    {health.note ? (
+                      <span className="block text-right text-text-muted">{health.note}</span>
+                    ) : null}
+                  </button>
+                ) : (
+                  <span className="text-emerald-500">operational</span>
+                )}
+              </div>
+              {presentTypes.length > 0 ? (
+                <>
+                  {presentTypes.map((t) => <WindowRow key={t} type={t} info={windows[t]} />)}
+                  {/* Claude's server (since ~2026-07) omits windows it deems quiet — surface the 5-hour
+                      line anyway so it reads as "nothing to report", not as the limit vanishing. */}
+                  {engineId === 'claude' && !windows['five_hour'] && (
+                    <div className="flex justify-between gap-6">
+                      <span>5-hour</span>
+                      <span className="text-text">nothing to report, likely low</span>
+                    </div>
+                  )}
+                </>
+              ) : (
+                // No window yet (pre-first-turn): the anchored placeholder so the popout isn't empty.
+                <WindowRow type="five_hour" info={undefined} />
+              )}
+            </Menu>
+          </div>,
+          document.body,
+        )}
     </div>
   )
 }
@@ -482,12 +713,6 @@ function WindowRow({ type, info }: { type: string; info?: RateLimitInfo }) {
       </span>
     </div>
   )
-}
-
-function windowLabel(type: string): string {
-  if (type === 'five_hour') return '5-hour'
-  if (type === 'weekly') return 'weekly'
-  return type.replace(/_/g, ' ')
 }
 
 /** Translate the band into a plain "how close am I" read for the popout, with a rough % anchor so

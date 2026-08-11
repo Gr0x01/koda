@@ -11,7 +11,16 @@ import { useWorkspace } from '../workspace/store'
  * Notion's linking/database web, which Koda doesn't have. The `.koda/docmeta/` sidecar still carries
  * table column widths — it just no longer carries icon/cover.
  */
-export function DocPageChrome({ path, readOnly }: { path: string; readOnly: boolean }): React.JSX.Element {
+export function DocPageChrome({
+  path,
+  readOnly,
+  fullWidth = false,
+}: {
+  path: string
+  readOnly: boolean
+  /** Mirrors the doc body's per-doc full-width mode so the title tracks the same column. */
+  fullWidth?: boolean
+}): React.JSX.Element {
   const renameEntry = useWorkspace((s) => s.renameEntry)
 
   // File name parts: title = stem, the extension is preserved verbatim on rename.
@@ -37,7 +46,7 @@ export function DocPageChrome({ path, readOnly }: { path: string; readOnly: bool
   }
 
   return (
-    <div className="mx-auto max-w-[46rem] px-[3.25rem] pt-9">
+    <div className={`mx-auto px-[3.25rem] pt-9 ${fullWidth ? 'max-w-none' : 'max-w-[46rem]'}`}>
       {/* Title = file name. A textarea so a long name wraps; Enter commits (no newlines in a name). */}
       <textarea
         ref={titleRef}

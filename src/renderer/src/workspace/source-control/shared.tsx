@@ -1,8 +1,9 @@
 // Shared primitives used both by SourceControl.tsx and the sub-components it imports.
 // Extracted here to break the import cycle: sub-components can't import from SourceControl.tsx
 // because SourceControl.tsx imports them.
-import { useState, type ReactNode } from 'react'
+import { useState, useLayoutEffect, useRef, type ReactNode } from 'react'
 import type { GitStatusFile } from '@shared/ipc'
+import { motion, cardVariants } from '../../motion'
 
 // ── Section chrome ────────────────────────────────────────────────────────────────────
 export function Section({
@@ -36,6 +37,8 @@ export function FileButton({
   onClick,
   title,
   trailing,
+  onOpen,
+  onReveal,
   onDiscard,
 }: {
   file: GitStatusFile
@@ -44,13 +47,31 @@ export function FileButton({
   title: string
   /** Optional right-aligned cue (e.g. "shown above ↑" tying the row to the staged diff). */
   trailing?: ReactNode
+  /** Open the actual file in the editor (read/edit) — surfaces a hover button + a menu item. */
+  onOpen?: () => void
+  /** Reveal the file in Finder — menu item only (a Mac table-stakes, not a hot action). */
+  onReveal?: () => void
   /** When set, a hover-revealed discard control appears; returns error copy, or null on success. */
   onDiscard?: () => Promise<string | null>
 }) {
-  // Row is a container (not one big button) so the discard control can be its own click target next to
-  // the name — a button can't nest inside a button. The name area keeps the whole diff-opening click.
+  // A right-click menu carries the full action set (see / open / reveal / undo) so nothing is buried
+  // behind hover-only affordances — the hover buttons are the fast path, the menu is the discoverable one.
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
+  const hasActions = !!(onOpen || onReveal || onDiscard)
+  const name = basename(file.path)
+
+  // Row is a container (not one big button) so each action can be its own click target next to the
+  // name — a button can't nest inside a button. The name area keeps the whole diff-opening click.
   return (
     <div
+      onContextMenu={
+        hasActions
+          ? (e) => {
+              e.preventDefault()
+              setMenu({ x: e.clientX, y: e.clientY })
+            }
+          : undefined
+      }
       className={`group flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-[13px] transition-colors ${
         active ? 'bg-surface text-text' : 'text-text-muted hover:bg-surface'
       }`}
@@ -63,11 +84,136 @@ export function FileButton({
         }`}
       >
         <StatusGlyph status={file.status} />
-        <span className="min-w-0 flex-1 truncate">{basename(file.path)}</span>
+        <span className="min-w-0 flex-1 truncate">{name}</span>
       </button>
       {trailing}
-      {onDiscard && <DiscardControl label={basename(file.path)} onDiscard={onDiscard} />}
+      {/* Hover-revealed fast path: an explicit "see what changed" eye (the row click, made legible),
+          then "open the file", then discard. All share the right edge and fade in on row hover. */}
+      {hasActions && !trailing && (
+        <RowIconButton onClick={onClick} title={`See what changed in ${name}`} label="See what changed">
+          <EyeIcon />
+        </RowIconButton>
+      )}
+      {onOpen && (
+        <RowIconButton onClick={onOpen} title={`Open ${name}`} label={`Open ${name}`}>
+          <FileOpenIcon />
+        </RowIconButton>
+      )}
+      {onDiscard && <DiscardControl label={name} onDiscard={onDiscard} />}
+      {menu && (
+        <RowMenu
+          x={menu.x}
+          y={menu.y}
+          onClose={() => setMenu(null)}
+          items={[
+            { label: 'See what changed', onClick },
+            ...(onOpen ? [{ label: 'Open the file', onClick: onOpen }] : []),
+            ...(onReveal ? [{ label: 'Reveal in Finder', onClick: onReveal }] : []),
+            ...(onDiscard
+              ? [{ label: 'Undo this change', danger: true, onClick: () => void onDiscard() }]
+              : []),
+          ]}
+        />
+      )}
     </div>
+  )
+}
+
+// A quiet hover-revealed icon button on a file row — shares the ✕ discard's fade-in-on-row-hover feel
+// so the whole action cluster reads as one thing. Focusable independently for keyboard reach.
+function RowIconButton({
+  onClick,
+  title,
+  label,
+  children,
+}: {
+  onClick: () => void
+  title: string
+  label: string
+  children: ReactNode
+}) {
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      aria-label={label}
+      className="shrink-0 rounded p-0.5 text-text-muted/60 opacity-0 transition-all hover:text-accent focus:opacity-100 group-hover:opacity-100"
+    >
+      {children}
+    </button>
+  )
+}
+
+// A right-click menu for a file row, positioned at the cursor and clamped inside the viewport. A
+// full-screen transparent layer behind it closes on any outside click. Mirrors FileTree's ContextMenu
+// styling so the two menus read as the same object.
+function RowMenu({
+  x,
+  y,
+  onClose,
+  items,
+}: {
+  x: number
+  y: number
+  onClose: () => void
+  items: { label: string; danger?: boolean; onClick: () => void }[]
+}) {
+  const ref = useRef<HTMLDivElement>(null)
+  const [pos, setPos] = useState({ x, y })
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const pad = 8
+    setPos({
+      x: Math.max(pad, Math.min(x, window.innerWidth - el.offsetWidth - pad)),
+      y: Math.max(pad, Math.min(y, window.innerHeight - el.offsetHeight - pad)),
+    })
+  }, [x, y])
+  return (
+    <div className="fixed inset-0 z-50" onClick={onClose} onContextMenu={(e) => e.preventDefault()}>
+      <motion.div
+        ref={ref}
+        variants={cardVariants}
+        initial="hidden"
+        animate="visible"
+        style={{ top: pos.y, left: pos.x, transformOrigin: 'top left' }}
+        onClick={(e) => e.stopPropagation()}
+        className="absolute min-w-[160px] overflow-hidden rounded-lg border border-border bg-bg py-1 text-xs shadow-pop"
+      >
+        {items.map((it) => (
+          <button
+            key={it.label}
+            onClick={() => {
+              onClose()
+              it.onClick()
+            }}
+            className={`block w-full px-3 py-1.5 text-left transition-colors hover:bg-surface ${
+              it.danger ? 'text-red-400' : 'text-text'
+            }`}
+          >
+            {it.label}
+          </button>
+        ))}
+      </motion.div>
+    </div>
+  )
+}
+
+function EyeIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7Z" />
+      <circle cx="12" cy="12" r="2.6" />
+    </svg>
+  )
+}
+
+function FileOpenIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M14 3v4a1 1 0 0 0 1 1h4" />
+      <path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2Z" />
+    </svg>
   )
 }
 

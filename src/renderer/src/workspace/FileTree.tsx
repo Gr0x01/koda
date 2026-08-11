@@ -1,12 +1,34 @@
-import { createContext, useContext, useEffect, useRef, useState } from 'react'
+import { createContext, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { FsEntry } from '@shared/ipc'
 import { Overlay, cardVariants, motion } from '../motion'
 import { Caret } from '../Caret'
 import { useWorkspace, activeEditor } from './store'
 
-/** Drag-and-drop carries the source path on a private MIME type so unrelated drops are ignored.
- *  Shared with the Documents surface so a drag reads the same across both file views. */
-export const DRAG_MIME = 'application/x-koda-path'
+/**
+ * Hand a row's drag gesture to the OS as a native file drag (shared with the Documents surface).
+ * One gesture covers both worlds: our own folder rows still see it as a drop (move), and outside
+ * the window it lands in Finder/Mail/a browser as the real file. The source path travels as view
+ * state (draggingPath), not dataTransfer — a native drag only carries the file.
+ *
+ * `onDone` clears that state. Its listeners attach only after main confirms the drag is underway:
+ * mousemove is suppressed for a drag's whole lifetime, so the first one after that means the
+ * gesture ended without hitting one of our drop targets (e.g. dropped in Finder); blur covers the
+ * user switching apps. Both may fire after a normal internal drop too — clearing twice is harmless.
+ */
+export function beginNativeDrag(e: React.DragEvent, path: string, onDone: () => void): void {
+  e.preventDefault()
+  window.koda.startDrag?.({ path })
+    .then(() => {
+      const done = (): void => {
+        window.removeEventListener('mousemove', done)
+        window.removeEventListener('blur', done)
+        onDone()
+      }
+      window.addEventListener('mousemove', done)
+      window.addEventListener('blur', done)
+    })
+    .catch(onDone)
+}
 
 export interface TreeCtx {
   renamingPath: string | null
@@ -51,6 +73,7 @@ export function DirNode({
   // Re-read open dirs when the tree's contents change (new file/folder, rename, move, delete).
   const filesRev = useWorkspace((s) => s.filesRev)
   const [entries, setEntries] = useState<FsEntry[] | null>(null)
+  const [readError, setReadError] = useState(false)
 
   // Seed the root open once — its expansion is the default; collapsible like any other afterward.
   useEffect(() => {
@@ -58,14 +81,22 @@ export function DirNode({
   }, [defaultOpen, path, setDirOpen])
 
   useEffect(() => {
-    // (Re)load when this dir is open — on first expand, and again when filesRev bumps. A read failure
-    // (e.g. permissions) settles to an empty list so the row shows no children rather than wedging.
+    // (Re)load when this dir is open — on first expand, and again when filesRev bumps. Keep a read
+    // failure distinct from an empty folder: hiding files behind a blank row is an unsafe lie.
     if (!open) return
     let alive = true
     window.koda
       .readDir({ path })
-      .then((r) => alive && setEntries(r.entries))
-      .catch(() => alive && setEntries([]))
+      .then((r) => {
+        if (!alive) return
+        setEntries(r.entries)
+        setReadError(false)
+      })
+      .catch(() => {
+        if (!alive) return
+        setEntries(null)
+        setReadError(true)
+      })
     return () => {
       alive = false
     }
@@ -80,26 +111,30 @@ export function DirNode({
   return (
     <div
       onDragOver={(e) => {
-        const external = e.dataTransfer.types.includes('Files')
-        if (!external && !dropValid) return
+        // Our own drag (draggingPath set) is a move — gate on validity. Anything else with files is
+        // a Finder drag — always a valid import target.
+        if (tree.draggingPath ? !dropValid : !e.dataTransfer.types.includes('Files')) return
         e.preventDefault()
         e.stopPropagation()
         if (tree.dropTarget !== path) tree.setDropTarget(path)
       }}
       onDrop={(e) => {
+        const src = tree.draggingPath
+        if (src) {
+          if (!dropValid) return
+          e.preventDefault()
+          e.stopPropagation()
+          tree.setDropTarget(null)
+          tree.setDraggingPath(null)
+          void moveEntry(src, path)
+          return
+        }
         if (e.dataTransfer.files.length) {
           e.preventDefault()
           e.stopPropagation()
           tree.setDropTarget(null)
           void importFiles(path, e.dataTransfer.files)
-          return
         }
-        if (!dropValid) return
-        e.preventDefault()
-        e.stopPropagation()
-        const src = e.dataTransfer.getData(DRAG_MIME)
-        tree.setDropTarget(null)
-        if (src) void moveEntry(src, path)
       }}
     >
       {tree.renamingPath === path ? (
@@ -113,13 +148,11 @@ export function DirNode({
           onContextMenu={(e) => tree.openMenu(e, path, 'dir', isRoot)}
           draggable={!isRoot}
           onDragStart={(e) => {
-            e.dataTransfer.setData(DRAG_MIME, path)
-            e.dataTransfer.effectAllowed = 'move'
             tree.setDraggingPath(path)
-          }}
-          onDragEnd={() => {
-            tree.setDraggingPath(null)
-            tree.setDropTarget(null)
+            beginNativeDrag(e, path, () => {
+              tree.setDraggingPath(null)
+              tree.setDropTarget(null)
+            })
           }}
         >
           <Caret dir={open ? 'down' : 'right'} size={12} className="text-text-muted" />
@@ -134,6 +167,11 @@ export function DirNode({
             <FileNode key={e.name} path={`${path}/${e.name}`} name={e.name} depth={depth + 1} />
           ),
         )}
+      {open && readError && (
+        <p className="py-1 pr-2 text-[11px] leading-snug text-red-400" style={{ paddingLeft: 22 + depth * 14 }}>
+          Couldn't read this folder. Close and reopen it to try again.
+        </p>
+      )}
     </div>
   )
 }
@@ -155,13 +193,11 @@ function FileNode({ path, name, depth }: { path: string; name: string; depth: nu
       onContextMenu={(e) => tree.openMenu(e, path, 'file', false)}
       draggable
       onDragStart={(e) => {
-        e.dataTransfer.setData(DRAG_MIME, path)
-        e.dataTransfer.effectAllowed = 'move'
         tree.setDraggingPath(path)
-      }}
-      onDragEnd={() => {
-        tree.setDraggingPath(null)
-        tree.setDropTarget(null)
+        beginNativeDrag(e, path, () => {
+          tree.setDraggingPath(null)
+          tree.setDropTarget(null)
+        })
       }}
     >
       <span className="w-3 shrink-0" />
@@ -224,7 +260,6 @@ function Row({
   onContextMenu,
   draggable,
   onDragStart,
-  onDragEnd,
   children,
 }: {
   depth: number
@@ -235,7 +270,6 @@ function Row({
   onContextMenu?: (e: React.MouseEvent) => void
   draggable?: boolean
   onDragStart?: (e: React.DragEvent) => void
-  onDragEnd?: () => void
   children: React.ReactNode
 }) {
   return (
@@ -245,7 +279,6 @@ function Row({
       onContextMenu={onContextMenu}
       draggable={draggable}
       onDragStart={onDragStart}
-      onDragEnd={onDragEnd}
       style={{ paddingLeft: depth * 12 + 8 }}
       className={`flex w-full items-center gap-1.5 rounded-md py-1 pr-2 text-left transition-colors ${
         highlight
@@ -272,6 +305,8 @@ export function ContextMenu({
   onNewFolder,
   onDuplicate,
   onDelete,
+  pinLabel,
+  onPin,
 }: {
   menu: Menu
   onClose: () => void
@@ -282,21 +317,45 @@ export function ContextMenu({
   onNewFolder: () => void
   onDuplicate: () => void
   onDelete: () => void
+  /** When set (the Docs panel's doc rows), Pin/Unpin leads the menu — see DocsBrowser's pinning. */
+  pinLabel?: string
+  onPin?: () => void
 }) {
   // A file gets "Open" (default app); folders lean on "Reveal in Finder" instead. Both, plus
   // "Copy path", are the Mac table-stakes that work everywhere — including the project root.
   const hasManageRow = menu.kind === 'dir' || !menu.isRoot
+  // Clamp inside the viewport: a click near the bottom/right edge would otherwise open the menu
+  // half off-screen. Measured after mount (item count varies), applied before paint — no flicker.
+  const cardRef = useRef<HTMLDivElement>(null)
+  const [pos, setPos] = useState({ x: menu.x, y: menu.y })
+  useLayoutEffect(() => {
+    const el = cardRef.current
+    if (!el) return
+    // offsetWidth/Height are layout size — immune to the enter animation's scale transform.
+    const pad = 8
+    setPos({
+      x: Math.max(pad, Math.min(menu.x, window.innerWidth - el.offsetWidth - pad)),
+      y: Math.max(pad, Math.min(menu.y, window.innerHeight - el.offsetHeight - pad)),
+    })
+  }, [menu.x, menu.y])
   return (
     <div className="fixed inset-0 z-50" onClick={onClose} onContextMenu={(e) => e.preventDefault()}>
       {/* Enter-only scale-fade from the cursor corner; menus dismiss instantly (no exit anim needed). */}
       <motion.div
+        ref={cardRef}
         variants={cardVariants}
         initial="hidden"
         animate="visible"
-        style={{ top: menu.y, left: menu.x, transformOrigin: 'top left' }}
+        style={{ top: pos.y, left: pos.x, transformOrigin: 'top left' }}
         onClick={(e) => e.stopPropagation()}
         className="absolute min-w-[160px] overflow-hidden rounded-lg border border-border bg-bg py-1 text-xs shadow-pop"
       >
+        {pinLabel && onPin && menu.kind === 'file' && (
+          <>
+            <MenuItem label={pinLabel} onClick={onPin} />
+            <div className="my-1 border-t border-border" />
+          </>
+        )}
         {menu.kind === 'file' && <MenuItem label="Open" onClick={onOpen} />}
         <MenuItem label="Reveal in Finder" onClick={onReveal} />
         <MenuItem label="Copy path" onClick={onCopyPath} />

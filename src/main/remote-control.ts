@@ -7,6 +7,7 @@
  * (`available: false` hides those surfaces), and wires nothing.
  */
 import { ipcMain } from 'electron'
+import type { SupabaseClient } from '@supabase/supabase-js'
 import { IpcChannels } from '@shared/channels'
 import type { EngineSessionManager } from './engine/sessions'
 
@@ -57,3 +58,18 @@ export function registerRemoteIpcHandlers(_broadcastSettings: () => void): void 
 }
 
 export async function disposeRemoteControl(): Promise<void> {}
+
+/** backup/ (not itself pruned — it's not part of the phone-control stack) reaches Supabase and the
+ *  auth-recovery signal through this seam, same as the real remote-control.ts. There's no cloud
+ *  account in this build, so backup simply has no remote here: getSupabase() always throws (every
+ *  call site already treats a failed Supabase call as "backup unavailable"), and onAuthState never
+ *  fires — nothing is ever signed in to recover into. */
+export function getSupabase(): SupabaseClient {
+  throw new Error(NOT_IN_BUILD)
+}
+
+export function onAuthState(
+  _cb: (s: 'signedOut' | 'restoring' | 'signedIn' | 'needsReSignin') => void,
+): () => void {
+  return () => {}
+}

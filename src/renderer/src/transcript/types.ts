@@ -8,7 +8,7 @@ import type { WorkflowItemData } from './WorkflowCard'
  * components (Transcript → QuestionCard/UserMessage → workspace/store → window.koda). The Transcript
  * component re-exports these for back-compat with existing `from './Transcript'` import sites.
  */
-export type TurnItem =
+export type TurnItem = (
   | {
       kind: 'user'
       text: string
@@ -19,18 +19,20 @@ export type TurnItem =
       files?: string[]
     }
   | { kind: 'assistant'; markdown: string }
-  | { kind: 'tool'; toolUseId: string; name: string; input: unknown; result?: string; isError?: boolean }
+  | { kind: 'tool'; toolUseId: string; name: string; input: unknown; liveOutput?: string; result?: string; isError?: boolean }
   | { kind: 'notice'; text: string }
   | { kind: 'canvas'; docTitle: string; instruction: string }
   | { kind: 'thinking'; estimatedTokens?: number; active: boolean }
   | { kind: 'tasklist'; tasks: TaskRow[] }
   | ({ kind: 'workflow' } & WorkflowItemData)
   | SubagentItem
+) & { replaySeq?: number }
 
 /** A subagent's own inner work, rendered nested inside its card. */
-export type SubagentChildData =
+export type SubagentChildData = (
   | { kind: 'assistant'; markdown: string }
-  | { kind: 'tool'; toolUseId: string; name: string; input: unknown; result?: string; isError?: boolean }
+  | { kind: 'tool'; toolUseId: string; name: string; input: unknown; liveOutput?: string; result?: string; isError?: boolean }
+) & { replaySeq?: number }
 
 /** Same, with a stable React identity. */
 export type SubagentChild = SubagentChildData & { id: number }
@@ -39,13 +41,19 @@ export type SubagentItem = {
   kind: 'subagent'
   /** The Agent launch tool_use id — the join key for lifecycle + inner events. */
   toolUseId: string
+  /** Claude background-task identity. Present once task_started lands; powers targeted Stop. */
+  taskId?: string
   subagentType: string
   /** Stable task identity (from launch) — the card's resting label, never overwritten. */
   description: string
   /** Live progress one-liner ("Writing sub.txt"), updated as the subagent works. */
   liveStatus?: string
   prompt?: string
-  status: 'running' | 'completed'
+  status: 'running' | 'completed' | 'interrupted' | 'unknown'
+  /** A targeted stop was sent, but the engine has not confirmed the child's terminal outcome yet. */
+  stopRequested?: boolean
+  /** Last child lifecycle/progress event. A quiet 10-minute child is labeled stalled, never auto-killed. */
+  lastActivityAt?: number
   isError?: boolean
   lastToolName?: string
   usage?: SubagentUsage

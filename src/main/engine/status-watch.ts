@@ -17,19 +17,42 @@
  * While watching: the renderer shows a quiet pill (broadcast hook) once confirmed, the Mac polls the feed every
  * minute, and — when a phone is paired on the cloud-relay tier — a server-side watch is registered so
  * the "back up" push arrives even if the Mac lid closes (the Mac can't poll while asleep; see
- * supabase/functions/status-watch). Recovery fires exactly one macOS notification (+ phone push only
- * when no server watch took the job), then the whole thing forgets itself. A successful turn while
- * watching also clears it silently — the user is plainly back at work.
+ * supabase/functions/status-watch). Recovery fires exactly one macOS notification; the phone ping only
+ * goes out when you're AWAY from the Mac. If input has been idle-free recently — you're sitting there
+ * working — the desktop notification is all you get and any server-side watch is dropped so it can't
+ * push either. (Recovery only reaches this local poll while the Mac is awake, so idle time is an honest
+ * "am I at my desk" signal.) Then the whole thing forgets itself. A successful turn while watching also
+ * clears it silently — the user is plainly back at work.
  *
  * Feeds are the providers' public Statuspage-format JSON; we filter to the components that can break
  * the ENGINE (Claude API / Claude Code, Codex API) so a claude.ai-web or FedRAMP incident never flags.
  */
-import { Notification } from 'electron'
+import { Notification, powerMonitor } from 'electron'
 import type { ProviderKind, ProviderStatusEvent } from '@shared/ipc'
 import { loadProviderStatusNotify } from '../settings'
 import { log } from '../logger'
 
 export type { ProviderStatusEvent }
+
+// You're "sitting there working" if the Mac has seen input this recently. The phone ping is meant for
+// when you've stepped away during the outage — at your desk, the desktop notification is enough.
+const AT_DESK_IDLE_MS = 90_000
+
+function defaultIdleSeconds(): number {
+  try {
+    return powerMonitor.getSystemIdleTime()
+  } catch {
+    return Number.POSITIVE_INFINITY // no powerMonitor (e.g. tests) → treat as away, ping as before
+  }
+}
+// Test seam so the recovery-while-working path can be exercised without a real powerMonitor.
+let idleSeconds: () => number = defaultIdleSeconds
+export function __setIdleProbe(fn: (() => number) | null): void {
+  idleSeconds = fn ?? defaultIdleSeconds
+}
+function userAtDesk(): boolean {
+  return idleSeconds() * 1000 < AT_DESK_IDLE_MS
+}
 
 interface FeedSpec {
   url: string
@@ -55,12 +78,10 @@ const FEEDS: Record<string, FeedSpec> = {
   },
 }
 
-/** Provider-side failure shapes, shared by both drivers' EngineError classification. */
-export function looksLikeProviderDown(message: string): boolean {
-  return /\b(500|502|503|504|529)\b|overloaded|temporarily unavailable|service unavailable|upstream unavailable|bad gateway|gateway timeout|internal server error/i.test(
-    message,
-  )
-}
+/** Re-exported so the drivers keep importing outage classification from the watch that consumes it, while
+ *  the pattern itself lives once beside the banner copy it has to agree with (see @shared/engine-error).
+ *  Two copies had drifted: the pill said "provider down" where the banner said something else. */
+export { looksLikeProviderDown } from '@shared/engine-error'
 
 // ── Hooks (injected by the IPC layer, like setUsageResetPush) ────────────────────
 interface StatusWatchHooks {
@@ -271,10 +292,16 @@ function recovered(engine: string, s: WatchState): void {
   } catch (err) {
     log.warn('status', 'recovery notification failed', err instanceof Error ? err.message : err)
   }
-  // The phone ping: when a server watch is registered, LEAVE its row — the edge function pushes and
-  // deletes on its next tick (cancelling here would race it: whoever polls the feed first would eat
-  // the other's push, and the Mac seeing green first would mean no phone ping at all). Only push
-  // directly when the server watch never registered.
+  // Sitting at the Mac working? The desktop notification above is all you need — skip the phone, and
+  // drop any server-side watch so it doesn't push on its next tick either. (Here "Mac saw green first"
+  // is the outcome we WANT — no phone ping at all — so cancelling the row is correct, not a race to fear.)
+  if (userAtDesk()) {
+    if (s.remoteRegistered) void hooks?.cancelRemoteWatch(engine).catch(() => {})
+    return
+  }
+  // Away from the desk. When a server watch is registered, LEAVE its row — the edge function pushes and
+  // deletes on its next tick (cancelling here would race it: whoever polls the feed first would eat the
+  // other's push). Only push directly when the server watch never registered.
   if (!s.remoteRegistered) hooks?.phonePush(title, body)
 }
 

@@ -131,6 +131,7 @@ type ClaudePhase =
 
 type CodexPhase =
   | { kind: 'checking' }
+  | { kind: 'check-failed'; message: string }
   | { kind: 'signed-in' }
   | { kind: 'idle' }
   | { kind: 'in-flight'; url: string | null } // browser open (or about to); no code to paste
@@ -160,8 +161,8 @@ function SignInStep({ onSignedInChange }: { onSignedInChange: (v: boolean) => vo
 
     window.koda
       .getCodexAuthStatus()
-      .then((s) => alive && setCodex(s.signedIn ? { kind: 'signed-in' } : { kind: 'idle' }))
-      .catch(() => alive && setCodex({ kind: 'idle' }))
+      .then((s) => alive && setCodex(s.probeFailed ? { kind: 'check-failed', message: 'Could not check ChatGPT sign-in.' } : s.signedIn ? { kind: 'signed-in' } : { kind: 'idle' }))
+      .catch(() => alive && setCodex({ kind: 'check-failed', message: 'Could not check ChatGPT sign-in.' }))
 
     const offClaude = window.koda.onAuthProgress((e) => {
       if (!alive) return
@@ -195,7 +196,10 @@ function SignInStep({ onSignedInChange }: { onSignedInChange: (v: boolean) => vo
       if (e.state === 'awaiting-browser') setCodex({ kind: 'in-flight', url: e.url })
       else if (e.state === 'verifying')
         setCodex((p) => (p.kind === 'in-flight' ? p : { kind: 'in-flight', url: null }))
-      else if (e.state === 'completed') setCodex({ kind: 'signed-in' })
+      else if (e.state === 'completed') {
+        if (!e.status || e.status.probeFailed) setCodex({ kind: 'check-failed', message: 'Could not verify ChatGPT sign-in.' })
+        else setCodex(e.status.signedIn ? { kind: 'signed-in' } : { kind: 'idle' })
+      }
       else if (e.state === 'failed') setCodex({ kind: 'error', message: e.message })
       else setCodex({ kind: 'idle' }) // cancelled / timeout
     })
@@ -238,6 +242,21 @@ function SignInStep({ onSignedInChange }: { onSignedInChange: (v: boolean) => vo
       })
       .catch(() => setCodex({ kind: 'error', message: 'Could not start sign-in.' }))
   }
+  const retryCodexCheck = (): void => {
+    setCodex({ kind: 'checking' })
+    window.koda
+      .getCodexAuthStatus()
+      .then((s) =>
+        setCodex(
+          s.probeFailed
+            ? { kind: 'check-failed', message: 'Could not check ChatGPT sign-in.' }
+            : s.signedIn
+              ? { kind: 'signed-in' }
+              : { kind: 'idle' },
+        ),
+      )
+      .catch(() => setCodex({ kind: 'check-failed', message: 'Could not check ChatGPT sign-in.' }))
+  }
 
   const claudeSub =
     claude.kind === 'checking'
@@ -264,7 +283,7 @@ function SignInStep({ onSignedInChange }: { onSignedInChange: (v: boolean) => vo
         ? 'Signed in with your ChatGPT plan'
         : codex.kind === 'in-flight'
           ? 'Approve in your browser'
-          : codex.kind === 'error'
+          : codex.kind === 'error' || codex.kind === 'check-failed'
             ? codex.message
             : 'Uses your ChatGPT plan'
 
@@ -318,9 +337,9 @@ function SignInStep({ onSignedInChange }: { onSignedInChange: (v: boolean) => vo
           ready={codex.kind === 'signed-in'}
           installing={codex.kind === 'in-flight' || codex.kind === 'checking'}
           action={
-            codex.kind === 'idle' || codex.kind === 'error' ? (
-              <CapabilityButton onClick={startCodex}>
-                {codex.kind === 'error' ? 'Try again' : 'Sign in'}
+            codex.kind === 'idle' || codex.kind === 'error' || codex.kind === 'check-failed' ? (
+              <CapabilityButton onClick={codex.kind === 'check-failed' ? retryCodexCheck : startCodex}>
+                {codex.kind === 'check-failed' ? 'Check again' : codex.kind === 'error' ? 'Try again' : 'Sign in'}
               </CapabilityButton>
             ) : null
           }

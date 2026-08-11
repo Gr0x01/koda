@@ -10,10 +10,13 @@ export default tseslint.config(
     ignores: [
       'out/**',
       'release/**',
+      'storybook-static/**',
       'node_modules/**',
       'ios/**',
       'resources/**',
       'spike/**',
+      'experiments/**',
+      '.koda/**',
       'temp/**',
       '.worktrees/**',
       'supabase/**',

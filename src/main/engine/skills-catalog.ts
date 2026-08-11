@@ -141,11 +141,16 @@ function seedStatePath(userData: string): string {
   return join(userData, 'skills', 'seed-state.json')
 }
 function readSeedState(userData: string): Set<string> {
+  const file = seedStatePath(userData)
+  if (!existsSync(file)) return new Set()
   try {
-    const raw = JSON.parse(readFileSync(seedStatePath(userData), 'utf8'))
-    return new Set(Array.isArray(raw?.everSeeded) ? raw.everSeeded.filter((x: unknown) => typeof x === 'string') : [])
+    const raw = JSON.parse(readFileSync(file, 'utf8'))
+    if (!raw || !Array.isArray(raw.everSeeded) || raw.everSeeded.some((x: unknown) => typeof x !== 'string')) {
+      throw new Error('invalid shape')
+    }
+    return new Set(raw.everSeeded)
   } catch {
-    return new Set()
+    throw new Error('Skill seed state is unreadable; refusing to reinstall defaults.')
   }
 }
 function writeSeedState(userData: string, seeded: Set<string>): void {

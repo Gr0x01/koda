@@ -1,9 +1,9 @@
-import { createContext, useContext, useEffect, useRef, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import type { ProjectDoc } from '@shared/ipc'
 import { AnimatePresence } from '../motion'
 import { Caret } from '../Caret'
 import { useWorkspace, activeEditor } from './store'
-import { ContextMenu, DeleteConfirm, DRAG_MIME, type Menu } from './FileTree'
+import { beginNativeDrag, ContextMenu, DeleteConfirm, type Menu } from './FileTree'
 
 /**
  * The doc-first sidebar's **Documents** list — the everyday-user default (ui-workspace.md; the
@@ -23,6 +23,10 @@ import { ContextMenu, DeleteConfirm, DRAG_MIME, type Menu } from './FileTree'
  * the renderer only opens paths main already vetted. Re-reads when `filesRev` bumps (a new/renamed/
  * deleted doc), so the list stays live with the tree's mutations and the "New document" button.
  *
+ * Folders open closed and remember what the user opened (per project, in localStorage). A doc pane
+ * that hangs every folder open on launch reads as clutter rather than structure — and since the agent
+ * writes here too, "expanded by default" means each new folder silently makes the list longer.
+ *
  * Beyond browsing, this is also where a non-engineer ORGANIZES their writing without dropping into a
  * file tree: right-click a doc to rename, reveal, copy its path, or delete it, and drag a doc onto a
  * folder to file it there. Every mutation is the same path-contained, safety-git-checkpointed main
@@ -33,6 +37,37 @@ const DOC_EXT = /\.(md|markdown|mdx|txt|rst|org)$/i
 
 /** Koda's home folder for the user's deliverable documents — where "New document" lands. */
 const HOME = 'Documents/'
+
+/** Pinned docs, per project, as rel paths in pin order — panel state, not content, so it lives beside
+ *  the other per-project UI keys (localStorage), never in the user's files. Rename/move rewrites the
+ *  entry; a pin whose doc is gone simply doesn't render (and is pruned on the next pin change). */
+function pinsKey(root: string): string {
+  return `koda:doc-pins:${root}`
+}
+function readPins(root: string): string[] {
+  try {
+    const v = JSON.parse(localStorage.getItem(pinsKey(root)) ?? '[]')
+    return Array.isArray(v) ? v.filter((p): p is string => typeof p === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+/** Which folders the user has opened, per project — so reopening Koda restores the shape they left,
+ *  instead of every folder in the project hanging open at once. We store the OPEN set (not the closed
+ *  one) so the default is closed: a folder the agent just created appears as one quiet row rather than
+ *  spilling its contents into the list. */
+function openKey(root: string): string {
+  return `koda:doc-folders-open:${root}`
+}
+function readOpen(root: string): Set<string> {
+  try {
+    const v = JSON.parse(localStorage.getItem(openKey(root)) ?? '[]')
+    return new Set(Array.isArray(v) ? v.filter((k): k is string => typeof k === 'string') : [])
+  } catch {
+    return new Set()
+  }
+}
 
 /** A clean, Notion-style title: extension stripped, dashes/underscores read as spaces so a slug
  *  filename doesn't look like `ls` output. Case stays the author's ("Ui Ux" title-casing reads
@@ -69,6 +104,13 @@ interface FolderNode {
  *  FileTree's TreeContext, but this surface renames inline and only moves docs *into* folders. */
 interface DocsCtx {
   openMenu: (e: React.MouseEvent, path: string, kind?: 'file' | 'dir') => void
+  pins: Set<string>
+  togglePin: (rel: string) => void
+  /** The dragged doc's rel (null for external/file drags) — pinned rows use it to accept reorders. */
+  draggingRel: string | null
+  pinDrop: { rel: string; edge: 'above' | 'below' } | null
+  setPinDrop: (v: { rel: string; edge: 'above' | 'below' } | null) => void
+  reorderPin: (fromRel: string, toRel: string, edge: 'above' | 'below') => void
   renamingPath: string | null
   startRename: (path: string) => void
   commitRename: (path: string, name: string) => void
@@ -81,7 +123,8 @@ interface DocsCtx {
   importDocs: (destDir: string, files: Iterable<File>) => void
   setSelected: (path: string, kind: 'file' | 'dir') => void
   selectedPath: string | null
-  collapsed: Set<string>
+  /** Folder keys the user has expanded — absence means closed, which is the default. */
+  openFolders: Set<string>
   toggle: (key: string) => void
 }
 const DocsContext = createContext<DocsCtx | null>(null)
@@ -91,16 +134,18 @@ const useDocs = (): DocsCtx => {
   return ctx
 }
 
-export function DocsBrowser(): React.JSX.Element {
+export function DocsBrowser({ view = 'tree' }: { view?: 'tree' | 'recent' }): React.JSX.Element {
   const [docs, setDocs] = useState<ProjectDoc[] | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set())
+  const [openFolders, setOpenFolders] = useState<Set<string>>(() => new Set())
+  const [pins, setPins] = useState<string[]>([])
   const [reloadNonce, setReloadNonce] = useState(0)
   const [menu, setMenu] = useState<Menu | null>(null)
   const [confirmDel, setConfirmDel] = useState<{ path: string; name: string } | null>(null)
   const [renamingPath, setRenamingPath] = useState<string | null>(null)
   const [draggingPath, setDraggingPath] = useState<string | null>(null)
   const [dropTarget, setDropTarget] = useState<string | null>(null)
+  const [pinDrop, setPinDrop] = useState<{ rel: string; edge: 'above' | 'below' } | null>(null)
   const [root, setRoot] = useState<string | null>(null)
   const [subdirs, setSubdirs] = useState<string[]>([])
   const [dropActive, setDropActive] = useState(false)
@@ -133,9 +178,12 @@ export function DocsBrowser(): React.JSX.Element {
     }
   }, [filesRev, reloadNonce])
 
-  // The project root (absolute), so a drop onto a folder can name its destination, and the immediate
-  // Documents/ sub-folders — so a folder the user just made shows up (and is droppable) even before it
-  // holds any docs. Re-read with the doc list. A missing Documents/ (new project) settles to none.
+  // The project root (absolute), so a drop onto a folder can name its destination, plus the EMPTY
+  // Documents/ sub-folders — a folder the user just made has to show up (and be droppable) before it
+  // holds any doc. Only the empty ones: folders that hold docs already arrive with the doc list, and a
+  // folder holding nothing BUT non-docs (fonts, screenshots, email templates) is a Files-tree folder
+  // that would render here as a row opening onto nothing. Re-read with the doc list. A missing
+  // Documents/ (new project) settles to none.
   useEffect(() => {
     let alive = true
     window.koda.readDir({}).then(async (r) => {
@@ -144,14 +192,23 @@ export function DocsBrowser(): React.JSX.Element {
       const base = `${r.path}/${HOME.slice(0, -1)}`
       const pending: Array<{ path: string; rel: string }> = [{ path: base, rel: '' }]
       const found: string[] = []
-      while (pending.length && found.length < 200) {
+      let walked = 0
+      while (pending.length && walked < 200) {
         const current = pending.shift()!
+        walked++
         try {
           const listed = await window.koda.readDir({ path: current.path })
-          for (const entry of listed.entries) {
+          // Dotfiles don't count as contents — Finder drops a `.DS_Store` into a folder the moment
+          // it's opened, and that shouldn't make the empty folder the user just made disappear.
+          const visible = listed.entries.filter((e) => !e.name.startsWith('.'))
+          // Holding a doc keeps a folder too, even though the doc list normally carries it: that list
+          // is capped (fs-browse DOCS.maxDocs) and drops some names, and a folder falling off the tail
+          // should go quiet in the list, not vanish as a drop target.
+          const holdsDoc = visible.some((e) => e.kind === 'file' && DOC_EXT.test(e.name))
+          if (current.rel && (holdsDoc || visible.length === 0)) found.push(current.rel)
+          for (const entry of visible) {
             if (entry.kind !== 'dir') continue
             const rel = current.rel ? `${current.rel}/${entry.name}` : entry.name
-            found.push(rel)
             pending.push({ path: `${current.path}/${entry.name}`, rel })
           }
         } catch {
@@ -164,6 +221,65 @@ export function DocsBrowser(): React.JSX.Element {
       alive = false
     }
   }, [filesRev, reloadNonce])
+
+  useEffect(() => {
+    if (!root) return
+    setPins(readPins(root))
+    setOpenFolders(readOpen(root))
+  }, [root])
+
+  // All pin-list changes funnel here so state and storage never drift. `docs` prunes entries whose doc
+  // no longer exists (deleted outside the panel, or a stale rename) — quietly, at the next change.
+  const updatePins = (mutate: (prev: string[]) => string[]): void => {
+    setPins((prev) => {
+      const existing = new Set((docs ?? []).map((d) => d.rel))
+      const next = mutate(prev).filter((rel, i, arr) => existing.has(rel) && arr.indexOf(rel) === i)
+      if (root) localStorage.setItem(pinsKey(root), JSON.stringify(next))
+      return next
+    })
+  }
+
+  /** Rewrite a pinned doc's entry when its rel path changes (rename / move), preserving pin order. */
+  const repinAt = (fromRel: string, toRel: string): void => {
+    setPins((prev) => {
+      if (!prev.includes(fromRel)) return prev
+      const next = prev.map((rel) => (rel === fromRel ? toRel : rel))
+      if (root) localStorage.setItem(pinsKey(root), JSON.stringify(next))
+      return next
+    })
+  }
+
+  const relOf = (path: string): string | null =>
+    root && path.startsWith(`${root}/`) ? path.slice(root.length + 1) : null
+
+  // Every open/close funnels here so state and storage never drift (same shape as updatePins).
+  const setOpen = useCallback(
+    (mutate: (next: Set<string>) => void): void =>
+      setOpenFolders((prev) => {
+        const next = new Set(prev)
+        mutate(next)
+        if (root) localStorage.setItem(openKey(root), JSON.stringify([...next]))
+        return next
+      }),
+    [root],
+  )
+
+  /** Open a folder and all its ancestors. Folders rest CLOSED, so anything created inside one has to
+   *  reveal it or the new row never mounts — and for a new folder that also means its inline rename
+   *  editor never mounts, stranding `renamingPath` (which gates the panel's whole keyboard). */
+  const openFolderPath = useCallback(
+    (dirPath: string): void => {
+      const rel = root && dirPath.startsWith(`${root}/`) ? dirPath.slice(root.length + 1) : null
+      if (!rel?.startsWith(HOME)) return
+      const inner = rel.slice(HOME.length)
+      if (!inner) return // a top-level Documents/ folder needs nothing opened above it
+      const parts = inner.split('/')
+      setOpen((next) => {
+        for (let i = 1; i <= parts.length; i++) next.add(parts.slice(0, i).join('/'))
+      })
+    },
+    [root, setOpen],
+  )
 
   // Watch the Documents/ folder so agent/external adds+removes show up live, not just UI-made changes.
   useEffect(() => {
@@ -178,17 +294,28 @@ export function DocsBrowser(): React.JSX.Element {
   useEffect(() => {
     const onRename = (e: Event): void => {
       const path = (e as CustomEvent<string>).detail
+      openFolderPath(parentDir(path))
       setSelected({ path, kind: 'dir' })
       window.dispatchEvent(new CustomEvent('koda:docs-folder-selected', { detail: path }))
       setRenamingPath(path)
     }
+    // The panel header's "New document" targets the selected folder, which may be closed — it says so
+    // here rather than reaching into this panel's state.
+    const onReveal = (e: Event): void => openFolderPath((e as CustomEvent<string>).detail)
     window.addEventListener('koda:rename-doc-folder', onRename)
-    return () => window.removeEventListener('koda:rename-doc-folder', onRename)
-  }, [])
+    window.addEventListener('koda:reveal-doc-folder', onReveal)
+    return () => {
+      window.removeEventListener('koda:rename-doc-folder', onRename)
+      window.removeEventListener('koda:reveal-doc-folder', onReveal)
+    }
+  }, [openFolderPath])
 
   if (error)
     return <p className="px-4 py-3 text-xs leading-relaxed text-red-400">Couldn't list documents: {error}</p>
-  if (!docs) return <p className="px-4 py-3 text-xs text-text-muted">Loading…</p>
+  // Wait for `root` too, not just the docs: folder rows are droppable/renamable only once it lands,
+  // and a toggle made before it does would be dropped from storage and then reverted by the effect
+  // above. Both IPCs reject together on a project-less window, which the `error` branch already covers.
+  if (!docs || !root) return <p className="px-4 py-3 text-xs text-text-muted">Loading…</p>
 
   // The user's writing (Documents/ + loose root) is the list; everything else is repo markdown that
   // only earns a footer pointer to Files. Group home docs by their sub-folder (a full rel path within
@@ -210,8 +337,8 @@ export function DocsBrowser(): React.JSX.Element {
       docsByFolder.set(sub, bucket)
     }
   }
-  // Every folder we show: those holding docs, plus every walked sub-dir (so a just-made / empty folder
-  // still appears), plus every ANCESTOR of those — a nested folder can't render without its parent node.
+  // Every folder we show: those holding docs, plus the empty ones (so a just-made folder still
+  // appears), plus every ANCESTOR of those — a nested folder can't render without its parent node.
   const folderKeys = new Set<string>([...docsByFolder.keys(), ...subdirs])
   for (const key of [...folderKeys]) {
     const parts = key.split('/')
@@ -248,6 +375,12 @@ export function DocsBrowser(): React.JSX.Element {
 
   const homeEmpty = loose.length === 0 && rootFolders.length === 0
 
+  // Pinned docs render in pin order; an entry whose doc is gone just doesn't show.
+  const homeDocs = docs.filter((d) => isHomeDoc(d.rel))
+  const pinnedDocs = pins
+    .map((rel) => homeDocs.find((d) => d.rel === rel))
+    .filter((d): d is ProjectDoc => !!d)
+
   // The flattened, in-render-order list (honoring collapse) that arrow-key nav walks — docs first, then
   // each folder followed by its docs and expanded descendants, matching what's painted below.
   const visibleItems: Array<{ path: string; kind: 'file' | 'dir'; folderKey?: string }> = [
@@ -256,7 +389,7 @@ export function DocsBrowser(): React.JSX.Element {
   const walkVisible = (nodes: FolderNode[]): void => {
     for (const node of nodes) {
       if (node.path) visibleItems.push({ path: node.path, kind: 'dir', folderKey: node.key })
-      if (!collapsed.has(node.key)) {
+      if (openFolders.has(node.key)) {
         for (const d of node.docs) visibleItems.push({ path: d.path, kind: 'file' })
         walkVisible(node.children)
       }
@@ -265,11 +398,9 @@ export function DocsBrowser(): React.JSX.Element {
   walkVisible(rootFolders)
 
   const toggle = (key: string): void =>
-    setCollapsed((prev) => {
-      const next = new Set(prev)
+    setOpen((next) => {
       if (next.has(key)) next.delete(key)
       else next.add(key)
-      return next
     })
 
   const ctx: DocsCtx = {
@@ -278,12 +409,28 @@ export function DocsBrowser(): React.JSX.Element {
       setSelected({ path, kind })
       setMenu({ path, kind, isRoot: false, x: e.clientX, y: e.clientY })
     },
+    pins: new Set(pins),
+    togglePin: (rel) =>
+      updatePins((prev) => (prev.includes(rel) ? prev.filter((p) => p !== rel) : [...prev, rel])),
+    draggingRel: draggingPath ? relOf(draggingPath) : null,
+    pinDrop,
+    setPinDrop,
+    reorderPin: (fromRel, toRel, edge) =>
+      updatePins((prev) => {
+        const without = prev.filter((p) => p !== fromRel)
+        const at = without.indexOf(toRel)
+        if (at === -1) return prev
+        without.splice(at + (edge === 'below' ? 1 : 0), 0, fromRel)
+        return without
+      }),
     renamingPath,
     startRename: (path) => setRenamingPath(path),
     commitRename: (path, name) => {
       setRenamingPath(null)
       setSelected(null)
       window.dispatchEvent(new CustomEvent('koda:docs-folder-selected', { detail: null }))
+      const oldRel = relOf(path)
+      if (oldRel) repinAt(oldRel, oldRel.slice(0, oldRel.lastIndexOf('/') + 1) + name)
       void renameEntry(path, name)
     },
     cancelRename: () => setRenamingPath(null),
@@ -291,27 +438,34 @@ export function DocsBrowser(): React.JSX.Element {
     setDraggingPath,
     dropTarget,
     setDropTarget,
-    moveDoc: (from, toDir) => void moveEntry(from, toDir),
+    moveDoc: (from, toDir) => {
+      const oldRel = relOf(from)
+      const newRel = relOf(`${toDir}/${basename(from)}`)
+      if (oldRel && newRel) repinAt(oldRel, newRel)
+      void moveEntry(from, toDir)
+    },
     importDocs: (destDir, files) => void importFiles(destDir, files),
     setSelected: (path, kind) => {
       setSelected({ path, kind })
       window.dispatchEvent(new CustomEvent('koda:docs-folder-selected', { detail: kind === 'dir' ? path : null }))
     },
     selectedPath: selected?.path ?? null,
-    collapsed,
+    openFolders,
     toggle,
   }
 
   // Finder-drag import onto the panel background lands in Documents/ (a drop onto a folder row is
   // handled by that row → into that folder). Count depth: dragenter/leave fire per child.
-  const isFileDrag = (e: React.DragEvent): boolean => e.dataTransfer.types.includes('Files')
+  // External Finder drags only — our own native drags also carry Files, but the whole-panel import
+  // highlight would misread a doc being moved between folders; draggingPath tells them apart.
+  const isFileDrag = (e: React.DragEvent): boolean => e.dataTransfer.types.includes('Files') && !draggingPath
 
   return (
     <DocsContext.Provider value={ctx}>
       <div
         tabIndex={0}
         onKeyDown={(e) => {
-          if (renamingPath) return
+          if (renamingPath || view === 'recent') return
           const selectedIndex = selected ? visibleItems.findIndex((item) => item.path === selected.path) : -1
           if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
             e.preventDefault()
@@ -326,15 +480,14 @@ export function DocsBrowser(): React.JSX.Element {
           if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && selected.kind === 'dir') {
             e.preventDefault()
             const item = visibleItems[selectedIndex]
-            if (item?.folderKey) setCollapsed((prev) => {
-              const next = new Set(prev)
-              if (e.key === 'ArrowLeft') next.add(item.folderKey!)
-              else next.delete(item.folderKey!)
-              return next
+            if (item?.folderKey) setOpen((next) => {
+              if (e.key === 'ArrowLeft') next.delete(item.folderKey!)
+              else next.add(item.folderKey!)
             })
           } else
           if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'n' && selected.kind === 'dir') {
             e.preventDefault()
+            openFolderPath(selected.path)
             void newDocument(selected.path)
           } else if (e.key === 'Enter' || e.key === 'F2') {
             e.preventDefault()
@@ -390,8 +543,23 @@ export function DocsBrowser(): React.JSX.Element {
           <p className="px-2.5 py-1.5 text-xs leading-relaxed text-text-muted">
             No documents yet. Hit <span className="text-text">New document</span> to start writing.
           </p>
+        ) : view === 'recent' ? (
+          <RecentList docs={homeDocs} />
         ) : (
           <>
+            {pinnedDocs.length > 0 && (
+              <div className="mb-1.5 border-b border-border/60 pb-1.5">
+                <p className="px-2 pb-0.5 pt-1 text-[10px] font-semibold uppercase tracking-wider text-text-muted/70">
+                  Pinned
+                </p>
+                <ul className="flex flex-col">
+                  {pinnedDocs.map((d) => (
+                    <DocRow key={d.path} doc={d} depth={0} inPinnedSection />
+                  ))}
+                </ul>
+              </div>
+            )}
+
             <ul className="flex flex-col">
               {loose.map((d) => (
                 <DocRow key={d.path} doc={d} depth={0} />
@@ -427,6 +595,18 @@ export function DocsBrowser(): React.JSX.Element {
       {menu && (
         <ContextMenu
           menu={menu}
+          pinLabel={
+            menu.kind === 'file' && relOf(menu.path)
+              ? ctx.pins.has(relOf(menu.path)!)
+                ? 'Unpin'
+                : 'Pin'
+              : undefined
+          }
+          onPin={() => {
+            setMenu(null)
+            const rel = relOf(menu.path)
+            if (rel) ctx.togglePin(rel)
+          }}
           onClose={() => setMenu(null)}
           onOpen={() => {
             setMenu(null)
@@ -446,7 +626,11 @@ export function DocsBrowser(): React.JSX.Element {
           }}
           onNewFolder={() => {
             setMenu(null)
-            void newFolder(menu.path).then((path) => path && setRenamingPath(path))
+            void newFolder(menu.path).then((path) => {
+              if (!path) return
+              openFolderPath(parentDir(path)) // it may have landed inside a closed folder
+              setRenamingPath(path)
+            })
           }}
           onDuplicate={() => {
             setMenu(null)
@@ -481,7 +665,7 @@ export function DocsBrowser(): React.JSX.Element {
  *  (each one level deeper). Recursion is what turns the flat rel-keys into a real indented tree. */
 function FolderTree({ node, depth }: { node: FolderNode; depth: number }): React.JSX.Element {
   const docs = useDocs()
-  const open = !docs.collapsed.has(node.key)
+  const open = docs.openFolders.has(node.key)
   const destDir = node.path
   return (
     <div className={depth === 0 ? 'mt-1' : undefined}>
@@ -583,26 +767,30 @@ function FolderHeader({
       onContextMenu={onMenu}
       onDragOver={(e) => {
         if (!destDir) return
-        if (!e.dataTransfer.types.includes('Files') && !internalValid) return
+        // Our own drag is a move (gate on validity); anything else with files is a Finder import.
+        if (docs.draggingPath ? !internalValid : !e.dataTransfer.types.includes('Files')) return
         e.preventDefault()
         if (docs.dropTarget !== destDir) docs.setDropTarget(destDir)
       }}
       onDrop={(e) => {
         if (!destDir) return
+        const src = docs.draggingPath
+        if (src) {
+          if (!internalValid) return
+          e.preventDefault()
+          e.stopPropagation()
+          docs.setDropTarget(null)
+          docs.setDraggingPath(null)
+          docs.moveDoc(src, destDir)
+          return
+        }
         if (e.dataTransfer.files.length) {
           // stop the panel's background handler from also importing (it lands in Documents/).
           e.preventDefault()
           e.stopPropagation()
           docs.setDropTarget(null)
           docs.importDocs(destDir, e.dataTransfer.files)
-          return
         }
-        if (!internalValid) return
-        e.preventDefault()
-        e.stopPropagation()
-        const src = e.dataTransfer.getData(DRAG_MIME)
-        docs.setDropTarget(null)
-        if (src) docs.moveDoc(src, destDir)
       }}
       style={{ paddingLeft: depth * 12 + 8 }}
       className={`group flex w-full items-center gap-1.5 rounded-md py-1.5 pr-2 text-left transition-colors ${
@@ -669,18 +857,35 @@ function FolderRenameRow({ name, depth, onCommit, onCancel }: { name: string; de
 }
 
 /** One document row — a muted page glyph + title. Opens (markdown ⇒ Doc view) on click; right-click
- *  for the manage menu, drag onto a folder to file it, and becomes an inline editor while renaming. */
-function DocRow({ doc, depth }: { doc: ProjectDoc; depth: number }): React.JSX.Element {
+ *  for the manage menu, drag onto a folder to file it, and becomes an inline editor while renaming.
+ *  A pinned doc gets a small accent dot in the tree (the Pinned section itself says it up top, so
+ *  section rows skip the dot — and leave inline rename to their tree twin, avoiding two editors). */
+function DocRow({
+  doc,
+  depth,
+  inPinnedSection = false,
+}: {
+  doc: ProjectDoc
+  depth: number
+  inPinnedSection?: boolean
+}): React.JSX.Element {
   const openFile = useWorkspace((s) => s.openFile)
   const active = useWorkspace((s) => activeEditor(s).activeSurfaceId === doc.path)
   const docs = useDocs()
 
-  if (docs.renamingPath === doc.path)
+  if (docs.renamingPath === doc.path && !inPinnedSection)
     return (
       <li>
         <RenameRow doc={doc} depth={depth} onCommit={docs.commitRename} onCancel={docs.cancelRename} />
       </li>
     )
+
+  // A pinned-section row accepts another pinned doc's drag as a reorder — the pointer half picks
+  // above/below, shown as an accent insertion line (filing into folders is untouched).
+  const reorderFrom =
+    inPinnedSection && docs.draggingRel && docs.pins.has(docs.draggingRel) && docs.draggingRel !== doc.rel
+      ? docs.draggingRel
+      : null
 
   return (
     <li>
@@ -692,23 +897,51 @@ function DocRow({ doc, depth }: { doc: ProjectDoc; depth: number }): React.JSX.E
         onContextMenu={(e) => docs.openMenu(e, doc.path)}
         draggable
         onDragStart={(e) => {
-          e.dataTransfer.setData(DRAG_MIME, doc.path)
-          e.dataTransfer.effectAllowed = 'move'
           docs.setDraggingPath(doc.path)
+          beginNativeDrag(e, doc.path, () => {
+            docs.setDraggingPath(null)
+            docs.setDropTarget(null)
+            docs.setPinDrop(null)
+          })
         }}
-        onDragEnd={() => {
+        onDragOver={(e) => {
+          if (!reorderFrom) return
+          e.preventDefault()
+          const box = e.currentTarget.getBoundingClientRect()
+          const edge = e.clientY < box.top + box.height / 2 ? 'above' : 'below'
+          if (docs.pinDrop?.rel !== doc.rel || docs.pinDrop.edge !== edge) docs.setPinDrop({ rel: doc.rel, edge })
+        }}
+        onDragLeave={() => {
+          if (docs.pinDrop?.rel === doc.rel) docs.setPinDrop(null)
+        }}
+        onDrop={(e) => {
+          if (!reorderFrom || !docs.pinDrop) return
+          e.preventDefault()
+          e.stopPropagation()
+          docs.reorderPin(reorderFrom, doc.rel, docs.pinDrop.edge)
+          docs.setPinDrop(null)
           docs.setDraggingPath(null)
-          docs.setDropTarget(null)
         }}
         title={doc.rel}
         style={{ paddingLeft: depth * 12 + 8 }}
-        className={`group flex w-full items-center gap-2 rounded-md py-1.5 pr-2 text-left transition-colors ${
+        className={`group relative flex w-full items-center gap-2 rounded-md py-1.5 pr-2 text-left transition-colors ${
           active ? 'bg-surface text-text' : 'text-text-muted hover:bg-surface hover:text-text'
         }`}
       >
+        {docs.pinDrop?.rel === doc.rel && (
+          <span
+            aria-hidden
+            className={`pointer-events-none absolute inset-x-1 h-0.5 rounded-full bg-accent ${
+              docs.pinDrop.edge === 'above' ? '-top-px' : '-bottom-px'
+            }`}
+          />
+        )}
         <span className="flex h-4 w-4 shrink-0 items-center justify-center leading-none">
           <DefaultDocGlyph />
         </span>
+        {!inPinnedSection && docs.pins.has(doc.rel) && (
+          <span aria-hidden className="-ml-0.5 h-1 w-1 shrink-0 rounded-[1px] bg-accent/80" />
+        )}
         <span className="truncate text-[13px] leading-tight">{titleOf(doc.name)}</span>
         <span
           role="button"
@@ -725,6 +958,83 @@ function DocRow({ doc, depth }: { doc: ProjectDoc; depth: number }): React.JSX.E
       </button>
     </li>
   )
+}
+
+/** The Recent lens over the same docs — a flat list by last-edited, grouped by day, each row naming
+ *  its folder. mtime is the signal (no open-tracking): in Koda "recently edited" includes what the
+ *  AGENT just wrote, so a fresh build plan surfaces here without the user ever touching it. The tree
+ *  is organization; this is attention — see the panel-header clock toggle (Sidebar). */
+function RecentList({ docs }: { docs: ProjectDoc[] }): React.JSX.Element {
+  const openFile = useWorkspace((s) => s.openFile)
+  const activeId = useWorkspace((s) => activeEditor(s).activeSurfaceId)
+  const ctx = useDocs()
+  const sorted = [...docs].sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, 30)
+  let lastBucket: string | null = null
+  return (
+    <div className="flex flex-col">
+      {sorted.map((d) => {
+        const bucket = bucketOf(d.mtimeMs)
+        const header = bucket === lastBucket ? null : bucket
+        lastBucket = bucket
+        const sub = homeSubfolder(d.rel)
+        return (
+          <div key={d.path}>
+            {header && (
+              <p className="px-2 pb-0.5 pt-2 text-[10px] font-semibold uppercase tracking-wider text-text-muted/70 first:pt-1">
+                {header}
+              </p>
+            )}
+            <button
+              onClick={() => openFile(d.path)}
+              onContextMenu={(e) => ctx.openMenu(e, d.path)}
+              title={d.rel}
+              className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors ${
+                activeId === d.path ? 'bg-surface text-text' : 'text-text-muted hover:bg-surface hover:text-text'
+              }`}
+            >
+              <span className="flex h-4 w-4 shrink-0 items-center justify-center leading-none">
+                <DefaultDocGlyph />
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-[13px] leading-tight">{titleOf(d.name)}</span>
+                {sub && (
+                  <span className="block truncate text-[10.5px] leading-tight text-text-muted/60">
+                    {sub.replaceAll('/', ' / ')}
+                  </span>
+                )}
+              </span>
+              <span className="shrink-0 text-[10.5px] tabular-nums text-text-muted/60">
+                {timeLabel(d.mtimeMs)}
+              </span>
+            </button>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function startOfToday(): number {
+  const d = new Date()
+  d.setHours(0, 0, 0, 0)
+  return d.getTime()
+}
+
+function bucketOf(ms: number): string {
+  const today = startOfToday()
+  if (ms >= today) return 'Today'
+  if (ms >= today - 86400000) return 'Yesterday'
+  return 'Earlier'
+}
+
+/** Compact "when": clock time today, then weekday within the week, then a short date. */
+function timeLabel(ms: number): string {
+  const today = startOfToday()
+  const d = new Date(ms)
+  if (ms >= today) return d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+  if (ms >= today - 86400000) return 'Yesterday'
+  if (ms >= today - 6 * 86400000) return d.toLocaleDateString(undefined, { weekday: 'short' })
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
 
 /** Inline rename editor — replaces a doc row while editing. Seeds the raw filename (not the prettied

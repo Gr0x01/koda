@@ -22,6 +22,7 @@ import { log } from '../logger'
 
 /** An OpenAI auth mode (codex `AuthMode`). 'chatgpt' = an active ChatGPT subscription. */
 type CodexAuthMethod = 'apikey' | 'chatgpt' | 'chatgptAuthTokens' | 'agentIdentity' | 'personalAccessToken' | 'bedrockApiKey'
+type CodexAuthProbe = { authMethod: CodexAuthMethod | null; requiresOpenaiAuth: boolean | null }
 
 const PROBE_TIMEOUT_MS = 20_000
 
@@ -124,19 +125,25 @@ async function probe<T>(
 
 /**
  * Is the user signed in to Codex, and how? The `claude auth status` analog. 'chatgpt' = subscription.
- * Never throws — a signed-out / unreachable state returns `{ signedIn: false, authMethod: null }`.
+ * Never throws. A failed probe is explicitly unknown so no caller can present it as confirmed sign-out.
  */
 export async function getCodexAuthStatus(opts: { resourcesPath?: string } = {}): Promise<CodexAuthStatus> {
-  const res = await probe<{ authMethod: CodexAuthMethod | null; requiresOpenaiAuth: boolean | null }>(
+  const res = await probe<CodexAuthProbe>(
     opts,
     'getAuthStatus',
     {},
   )
-  if (!res) return { signedIn: false, authMethod: null, requiresOpenaiAuth: null }
+  return codexAuthStatusFromProbe(res)
+}
+
+/** Keep a transport failure distinct from the signed-out answer returned by a healthy app-server. */
+export function codexAuthStatusFromProbe(res: CodexAuthProbe | null): CodexAuthStatus {
+  if (!res) return { signedIn: false, authMethod: null, requiresOpenaiAuth: null, probeFailed: true }
   return {
     signedIn: res.authMethod != null,
     authMethod: res.authMethod,
     requiresOpenaiAuth: res.requiresOpenaiAuth,
+    probeFailed: false,
   }
 }
 

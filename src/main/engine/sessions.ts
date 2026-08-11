@@ -11,9 +11,9 @@
  * push) are injected, and where the broker's lifecycle is tied to a session's.
  */
 import { randomUUID } from 'node:crypto'
-import { existsSync, realpathSync } from 'node:fs'
+import { realpathSync } from 'node:fs'
 import { basename, relative } from 'node:path'
-import { app } from 'electron'
+import { app, BrowserWindow } from 'electron'
 import { IpcChannels } from '@shared/channels'
 import {
   EngineEventSchema,
@@ -43,7 +43,7 @@ import { assembleGuardrailText, resolveStagingPack } from './pack'
 import { getCodexAuthStatus, listCodexModels } from './codex-auth'
 import { askCodexSideQuestion, askSideQuestion, type SideQuestionHandle } from './side-question'
 import { WorkflowWatcher } from './workflow-watch'
-import { loadRateLimits, loadUsageHistory, recordRateLimit, recordTurnUsage } from './usage-history'
+import { loadRateLimits, loadUsageHistory, recordTurnUsage, replaceRateLimits } from './usage-history'
 import {
   commitPaths,
   detectRepo,
@@ -56,14 +56,25 @@ import {
   UserGitError,
 } from '../user-git'
 import { browseDir, containedReal, docExcerpt, listProjectDocs, readProjectFile, readProjectImage, writeProjectFile } from '../fs-browse'
-import { installApp, startApp, stopApp, appStatus } from '../mini-apps'
+import { installApp, startApp, stopApp, appStatus, projectHasMiniApp } from '../mini-apps'
 import { encodeWebp } from '../backup/webp'
 import { noteRateLimit } from './usage-reset-notifier'
+import { authoritativeUsageTypes, pollAccountUsage } from './usage-poll'
 import { noteProviderError, noteTurnOk } from './status-watch'
 import { friendlyEngineError } from '@shared/engine-error'
+import {
+  isTopLevelTurnActivity,
+  mergeReplayIntoTranscript,
+  normalizeReplaySequence,
+  settleRestoredDelegationReplay,
+  settleRestoredTranscriptItems,
+  transcriptFromReplay,
+} from '@shared/delegation'
+import { reconcileRateLimitWindows } from '@shared/rate-limits'
 import { track } from '../telemetry'
 import { resolveGlobalSkillsPlugin } from './skills-catalog'
 import { noteMomentCheckpoint } from '../backup'
+import { publishNeuralEvent } from '../neural-view'
 import { ensureRepo } from '../safety-git/repo'
 import { checkpoint, checkpointKind, headSha, listCheckpoints, type Checkpoint } from '../safety-git/checkpoint'
 import { restore } from '../safety-git/restore'
@@ -81,6 +92,7 @@ import {
   loadRecentModels,
   loadLastPosture,
   saveLastPosture,
+  loadCritiquePass,
   loadMiniAppsEnabled,
   loadScratchRetentionDays,
 } from '../settings'
@@ -96,17 +108,19 @@ import { startDevServer, captureWindowPreview, showStaticPreview, getSessionPrev
 import { showTerminal } from '../terminal'
 import { stopLanForward, stopAllLanForwards } from '../lan-forward'
 import {
+  archiveSession,
   claudeConversationExists,
   claudeConversationMtime,
-  ingestFullArchives,
   readClaudeConversationReplay,
   loadProjectSessions,
   readPersistedSession,
   saveProjectSessions,
-  loadAppState,
+  knownProjectPaths,
+  type StoreReadReport,
 } from '../session-store'
 import { addSessionToWindow, contextForSession, projectPathForWindow, removeSessionFromWindow, windowForProject } from '../window-registry'
 import { log } from '../logger'
+import { appendRemoteReplay, loadRemoteReplay, replaceRemoteReplay } from '../remote-replay-store'
 
 /** The engine's structured error prefix when our in-process MCP server is unreachable, e.g.
  *  `MCP server "koda_broker" is not connected` or `… transport dropped mid-call; response for tool
@@ -127,6 +141,18 @@ const BROKER_RECOVERY_COOLDOWN_MS = 30_000
  *  broker that flaps this hard is a persistent fault, not a transient idle drop, so looping won't help. */
 const BROKER_RECOVERY_MAX = 3
 const BROKER_RECOVERY_WINDOW_MS = 5 * 60_000
+/** Account usage poll (usage-poll.ts): a first read once the app has settled, then a heartbeat. A turn
+ *  ending also triggers one, no more often than the min gap — the poll spawns a short-lived process, so
+ *  it's cheap but not free. */
+const USAGE_POLL_STARTUP_MS = 3_000
+const USAGE_POLL_INTERVAL_MS = 5 * 60_000
+const USAGE_POLL_MIN_GAP_MS = 60_000
+/** Stand-in session id on a poll-derived RateLimitUpdate. The windows are an ACCOUNT fact with no
+ *  owning session; receivers key them by `rateLimitType` + the stamped engine, never by this id. */
+const ACCOUNT_USAGE_SESSION_ID = 'account-usage'
+/** A remote caller may NAME the session it's starting (startNewRemote's idempotency key). The engine
+ *  takes --session-id as a UUID, so anything else is discarded in favour of a minted one. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 /** Sent automatically as the user's next turn after a broker reconnect, so an interrupted turn just
  *  continues — the user didn't pause it, Koda's tool connection blipped and recovered. Framed so the
  *  agent treats the "not connected" errors above as the transient glitch they were, not real failures.
@@ -194,15 +220,25 @@ export class EngineSessionManager {
    *  "session outlives the window". Sticky for Phase 0 (attach once → survives until app quit or the
    *  remote tier is disabled); refcounting/auto-teardown-on-disconnect is a later refinement. */
   private readonly remoteAttached = new Set<string>()
-  /** Live event log per remote-attached session — the transcript source when the Mac desktop ADOPTS a
-   *  session that was started/run headless from the phone (a windowless session is invisible to the
-   *  desktop otherwise). Main sees every event via `forward()`, and the app is always alive while a
-   *  phone session runs (its child dies with the app), so this in-memory log is the complete, race-free
-   *  history to replay into a desktop window — no engine-JSONL parsing, no adapter changes. High-churn
-   *  streaming deltas are skipped (the finalized AssistantBlock re-carries the text). Kept for the
-   *  session's whole life (so re-adopt after a window close/reopen still has full history); cleared on
-   *  dispose. Only remote-attached sessions are logged, so a purely-local session costs nothing. */
+  /** In-flight startNewRemote calls, keyed by the caller's chosen session id. A re-send that arrives
+   *  while the first start is still spawning rides the same promise instead of racing it — the id isn't
+   *  remote-attached yet at that point, so the ownership check alone would let it start a second one. */
+  private readonly remoteStarts = new Map<string, Promise<{ sessionId: string }>>()
+  /** Replayable event log: the full non-streaming transcript for remote-attached sessions, and the
+   *  delegated-task sidechain for ordinary desktop sessions. The latter is deliberately durable too:
+   *  a renderer reload must be able to rejoin a live child, and an app crash must preserve the child's
+   *  last observable result. Cleared only when the live engine session is truly disposed. */
   private readonly remoteEventLog = new Map<string, ReplayEntry[]>()
+  /** Last stable replay identity issued per live session. Loaded from the durable sidecar on attach so
+   *  a window close/reopen never reuses an id that is already stamped into a persisted transcript. */
+  private readonly remoteReplaySeq = new Map<string, number>()
+  /** Live delegated leaves owned by each engine process. This is main-process authority for the one
+   *  operation that can destroy them: replacing that process. Keyed by launch id, with task id added
+   *  once Claude reports it so targeted Stop can reject stale/non-running cards. */
+  private readonly activeSubagents = new Map<
+    string,
+    Map<string, Extract<EngineEvent, { type: 'SubagentStarted' }>>
+  >()
   /** new (live) session id → the original past-session id it was resumed from, so the phone can load
    *  that original's persisted transcript by the id it now holds (`remoteTranscript`). */
   private readonly resumedFrom = new Map<string, string>()
@@ -216,6 +252,13 @@ export class EngineSessionManager {
   /** Headless (phone-started) sessions we've already run first-turn auto-titling for, so a session is
    *  titled once and later turns don't reconsider it. Cleared on dispose. See `titleRemoteSession`. */
   private readonly remoteTitled = new Set<string>()
+  /** First prompt (+ project dir) and latest reply for a headless session awaiting its one-shot
+   *  substance retitle at first TurnComplete (mirrors the renderer's). Both cleared when it fires. */
+  private readonly remoteFirstPrompt = new Map<string, { prompt: string; cwd: string }>()
+  private readonly remoteLastReply = new Map<string, string>()
+  /** Titling epoch per headless session — a newer titling call invalidates any still-in-flight
+   *  predecessor, so a slow birth-title can't resolve late and overwrite the settled substance name. */
+  private readonly remoteTitleGen = new Map<string, number>()
   /** A session's INTENDED model/effort — the pair the next turn should run on. The renderer is
    *  authoritative for a windowed session; a headless remote head has no live renderer, so the manager
    *  remembers the pair to (a) show it on the phone and (b) re-apply BOTH on a remote model-OR-effort
@@ -247,6 +290,16 @@ export class EngineSessionManager {
    *  what a live session is doing ("Wiring the date picker…") without an event stream at browse level.
    *  In-memory, live sessions only — decoration, never persisted. */
   private readonly lastLines = new Map<string, string>()
+  /** sessionId → epoch ms of the last ENGINE event (deltas, blocks, tool calls) — engine liveness, as
+   *  opposed to lastActivityAt's human liveness. Lets an unattended supervisor (the dream) tell a
+   *  stalled turn (working but silent) from a busy one, so it interrupts on real inactivity instead
+   *  of burning its whole wall-clock cap on a hang (the Hermes-cron lesson: idle-based, not elapsed). */
+  private readonly engineEventAt = new Map<string, number>()
+  /** sessionId → the current turn's top-level reply, ACCUMULATED across blocks (same reason the loop
+   *  driver accumulates: a final message can arrive as several AssistantBlocks, and last-write-wins
+   *  would let a "did work" + quiet-token pair read as a quiet night). Reset on each turn's send,
+   *  capped, read by the dream's digest after the turn ends. In-memory, live sessions only. */
+  private readonly turnReplies = new Map<string, string>()
   /** Broker auto-recovery: sessions with a reconnect respawn in flight — so a burst of "koda_broker is
    *  not connected" tool errors (the engine keeps trying every queued tool) triggers ONE respawn, not
    *  one per failed tool. Added when recovery starts, removed when the respawn settles. */
@@ -257,6 +310,16 @@ export class EngineSessionManager {
   /** Sessions awaiting an auto-resume turn after a broker reconnect. The nudge is sent when the fresh
    *  session's SessionStarted lands (engine initialized), so the interrupted turn continues on its own. */
   private readonly resumeAfterReconnect = new Set<string>()
+  /** sessionId → resolver for `awaitTurnEnd`, the overnight dream's event-driven "did the turn really
+   *  end" signal (W3). Fired only by a genuine TurnComplete or a truly fatal EngineError — NOT by
+   *  `working` flipping false, which a benign broker-recovery respawn does too (see `forward`). Must
+   *  survive a respawn's `dispose()` for the same reason `resumeAfterReconnect`/`pendingWorkflowResults`
+   *  do (dispose() is also the respawn teardown path); cleared on a true end by `forgetSession`. */
+  private readonly turnEndWaiters = new Map<string, () => void>()
+  /** Heartbeat for the account usage poll (see `pollUsage`), and the last poll's start time — the
+   *  turn-end trigger debounces against it so a burst of short turns can't spawn a poll per turn. */
+  private usageTimer: ReturnType<typeof setInterval> | null = null
+  private lastUsagePoll = 0
 
   constructor(resourcesPath?: string) {
     this.resourcesPath = resourcesPath
@@ -294,7 +357,11 @@ export class EngineSessionManager {
         },
         start: async (sessionId, path) => {
           const { dir, projectPath } = this.appTarget(sessionId, path)
-          return { started: true, ...(await startApp(dir, projectPath)) }
+          // Deliberately NOT returning the port: a number in the transcript is a copy of the port the
+          // agent can never invalidate, and a later restart moves it silently. The url is valid now;
+          // app_status re-reads it.
+          const { url } = await startApp(dir, projectPath)
+          return { started: true, url }
         },
         stop: async (sessionId, path) => {
           const { dir } = this.appTarget(sessionId, path)
@@ -310,6 +377,12 @@ export class EngineSessionManager {
     this.gate.setPreviewAutoStart(loadPreviewAutoStart())
     // projectDirs are repopulated lazily per window when it loads its project's sessions
     // (loadProjectSessions) — there's no global blob to read at construction time anymore (v2).
+
+    // Plan gauge: seed it shortly after boot (the disk-restored windows show meanwhile), then keep it
+    // fresh on a heartbeat. Independent of whether any session is running — the windows are an account
+    // fact, and the gauge should read true the moment a window opens.
+    setTimeout(() => void this.pollUsage(), USAGE_POLL_STARTUP_MS)
+    this.usageTimer = setInterval(() => void this.pollUsage(), USAGE_POLL_INTERVAL_MS)
   }
 
   /**
@@ -327,7 +400,11 @@ export class EngineSessionManager {
       effort?: string
       engineId?: EngineId
       engineNativeId?: string
+      replaySeq?: number
       ownerWindowId?: number
+      /** An infrastructure recovery has no live engine it can preserve. Mark its children unknown before
+       *  replacing it; ordinary posture/model respawns omit this and are refused while children run. */
+      abandonActiveSubagents?: boolean
     } = {},
   ): Promise<{ sessionId: string; cwd: string }> {
     const requestedSessionId = opts.resumeSessionId ?? opts.sessionId
@@ -347,6 +424,11 @@ export class EngineSessionManager {
     // resumeSessionId → reattach (--resume); sessionId → fresh spawn with a caller-chosen id
     // (--session-id); neither → a fresh minted id. resume is keyed off resumeSessionId only.
     const sessionId = requestedSessionId ?? randomUUID()
+    if (this.sessions.has(sessionId) && this.hasActiveSubagents(sessionId)) {
+      if (!opts.abandonActiveSubagents)
+        throw new Error('Delegated work is still running. Let it finish or stop it before changing this session.')
+      this.markActiveSubagentsUnknown(sessionId)
+    }
     // A respawn tears down the old process before starting the replacement. Preserve the native
     // conversation id first: Codex resumes by its own thread id, not Koda's session id, and dispose()
     // clears the cache as part of normal teardown.
@@ -356,6 +438,11 @@ export class EngineSessionManager {
     // Otherwise the old child's late 'close' would unregister the NEW child's broker route — two
     // children, one id, one broken /mcp/<id>. dispose() awaits the old child's exit, so register() is clean.
     if (this.sessions.has(sessionId)) await this.dispose(sessionId)
+    if (opts.replaySeq !== undefined)
+      this.remoteReplaySeq.set(
+        sessionId,
+        Math.max(this.remoteReplaySeq.get(sessionId) ?? 0, opts.replaySeq),
+      )
     // Remember what this session runs with, so a later remote model/effort change can re-apply both
     // (dispose above cleared any prior entry; set the current intent now).
     this.sessionModelEffort.set(sessionId, { model: opts.model, effort: opts.effort })
@@ -406,12 +493,18 @@ export class EngineSessionManager {
           // The SAME guardrail rules Claude gets (memory discipline, hygiene, docs, recovery, code
           // style) as additive developerInstructions. brokerWired: true — the Codex path always
           // attaches the broker (brokerUrl below), so the broker-gated preview/ensure-tool rules apply.
-          // '' (no pack) ⇒ undefined so the driver omits the field. See assembleGuardrailText.
+          // '' (nothing to say at all) ⇒ undefined so the driver omits the field. See assembleGuardrailText.
           developerInstructions:
             assembleGuardrailText({
               cwd,
               resourcesPath: this.resourcesPath,
               brokerWired: true,
+              miniAppProject: projectHasMiniApp(cwd),
+              // Same condition ensureCodexHome used to materialize the staging skills into the
+              // Codex plugin, so the app-ask routing rule never names a skill that isn't installed.
+              miniAppsWired:
+                loadMiniAppsEnabled() && !!resolveStagingPack({ resourcesPath: this.resourcesPath }),
+              critiqueOff: !loadCritiquePass(),
               engine: 'codex',
             }) || undefined,
           model: opts.model,
@@ -454,6 +547,13 @@ export class EngineSessionManager {
       // applies to the next session/reattach without a restart.
       const apiKey = this.effectiveApiKey()
       const inject = token ? { [BROKER_TOKEN_ENV]: token } : undefined
+      // The staging pack (built-but-unshipped skills like create-mini-app) rides only when the
+      // mini-apps dogfood flag is on — that's how a normal release ships without the half-built
+      // skill. Resolved once: the same answer wires the --plugin-dir AND the pack's app-ask routing
+      // rule, so the rule can never name a skill that didn't load.
+      const stagingPackDir = loadMiniAppsEnabled()
+        ? (resolveStagingPack({ resourcesPath: this.resourcesPath })?.dir ?? null)
+        : null
       const sessionOpts: SessionOpts = {
         sessionId,
         cwd,
@@ -464,13 +564,16 @@ export class EngineSessionManager {
         mcpConfigJson: applyPlaywrightToMcpConfig(this.broker.mcpConfig(sessionId)),
         // Deny the browser-verify skill unless Playwright is wired (no guidance for absent tools).
         extraDisallowedTools: playwrightDisallowedTools(),
+        // Faced project → the pack's summon-pill rule assembles (the agent learns Koda's "Ask or fix
+        // this app" pill is claimable over the face bridge instead of designing around it blind).
+        miniAppProject: projectHasMiniApp(cwd),
+        miniAppsWired: stagingPackDir !== null,
+        critiqueOff: !loadCritiquePass(),
         // Koda-managed global skills the user turned on in the gallery (null when none active), plus
-        // the staging pack (built-but-unshipped skills like create-mini-app) only when the mini-apps
-        // dogfood flag is on — that's how a normal release ships without the half-built skill.
-        extraPluginDirs: [
-          resolveGlobalSkillsPlugin(app.getPath('userData')),
-          loadMiniAppsEnabled() ? resolveStagingPack({ resourcesPath: this.resourcesPath })?.dir ?? null : null,
-        ].filter((d): d is string => d !== null),
+        // the staging pack when the dogfood flag is on (stagingPackDir above).
+        extraPluginDirs: [resolveGlobalSkillsPlugin(app.getPath('userData')), stagingPackDir].filter(
+          (d): d is string => d !== null,
+        ),
         planMode: opts.planMode,
         model: opts.model,
         effort: opts.effort,
@@ -575,35 +678,34 @@ export class EngineSessionManager {
     const session = this.require(sessionId)
     this.lastActivityAt.set(sessionId, Date.now()) // float this session to the top of the launcher
     this.working.add(sessionId) // live "working" glyph the instant the turn is sent, before the first delta
+    this.turnReplies.delete(sessionId) // fresh turn, fresh reply accumulator (lastAssistantReply)
+    this.noteEngineActivity(sessionId) // feeds the dream scheduler's quiet clock (dream turns excluded)
     // Capture the human's turn into the replay log (engine events never echo the user's own prompt, so
     // an adopted phone transcript would otherwise be missing this half). Recorded before the response
     // events that follow, keeping the conversation order intact. Remote-attached sessions only.
     if (this.remoteAttached.has(sessionId)) {
-      const entry: ReplayEntry = { type: 'RemoteUserTurn', sessionId, text: text || '(image)' }
-      const logArr = this.remoteEventLog.get(sessionId)
-      if (logArr) logArr.push(entry)
-      else this.remoteEventLog.set(sessionId, [entry])
-      // Only a REMOTE-origin turn needs echoing here. A local turn was sent from the owning desktop
-      // window, which already pushed its own optimistic bubble via dispatchTurn — forwarding it back
-      // would render the message twice (on the Mac, and on the phone, which reads the Mac's persisted
-      // transcript). The log entry above is still recorded for both, keeping replay/adopt complete.
-      if (origin === 'remote') {
-        const owner = contextForSession(sessionId)
-        if (owner) {
-          // A window already OWNS this phone session — it was open on the project when the phone started
-          // the session, so it adopted it EMPTY (before this first turn). The engine stream never echoes
-          // the human's prompt, so without this the Mac transcript would miss the user bubble and the tab
-          // would keep its "From your phone" default (main-side titleRemoteSession is skipped once owned,
-          // to avoid racing the renderer's store writes). Forward the turn to that window ONLY — not the
-          // remote sinks, since the sending phone already shows its own optimistic bubble — and let the
-          // renderer append it and run first-turn titling through its own persist path.
-          const win = owner.win
-          if (win && !win.isDestroyed()) win.webContents.send(IpcChannels.sessionRemoteUserTurn, { sessionId, text })
-        } else if (cwd) {
-          // Still windowless — no renderer to name it. Title on the engine turn path (instant first-words
-          // title, then the on-device refinement), persisted into the store the phone reads from.
-          this.titleRemoteSession(sessionId, cwd, text)
-        }
+      const replayTurn = this.recordRemoteEntry({
+        type: 'RemoteUserTurn',
+        sessionId,
+        text: text || '(image)',
+      })
+      const owner = contextForSession(sessionId)
+      if (owner) {
+        // A remote turn needs its missing user bubble appended. A local turn already has an optimistic
+        // bubble, but it still needs the replay identity stamped so a later adoption recognizes it as
+        // the same turn. The renderer distinguishes those two cases with `append`.
+        const win = owner.win
+        if (win && !win.isDestroyed())
+          win.webContents.send(IpcChannels.sessionRemoteUserTurn, {
+            sessionId,
+            text,
+            replaySeq: replayTurn.replaySeq,
+            append: origin === 'remote',
+          })
+      } else if (origin === 'remote' && cwd) {
+        // Still windowless — no renderer to name it. Title on the engine turn path (instant first-words
+        // title, then the on-device refinement), persisted into the store the phone reads from.
+        this.titleRemoteSession(sessionId, cwd, text)
       }
     }
     // Label the checkpoint with the prompt text; fall back when it's an image-only turn.
@@ -628,6 +730,23 @@ export class EngineSessionManager {
       )
       const paths = saved.filter((p): p is string => p !== null)
       if (paths.length) engineText = `${engineText}\n\n${attachedFilesNote(paths)}`
+    }
+    // Phone turns only: mirror what the desktop composer already did renderer-side (store.send) — write
+    // each real image to `.koda/scratch/` so a phone-dropped screenshot survives the turn and shows up in
+    // the Recent images strip (which only scans that folder). It still goes inline to the engine below — a
+    // path note is doc-only. Guarded to 'remote' so a desktop image (saved by the renderer) isn't written
+    // twice. Best-effort; once a file lands, nudge the owning window to refresh the strip (this save races
+    // the sync user-turn forward above, so the notify comes after the write, not on turn receipt).
+    if (origin === 'remote' && inline?.length && cwd) {
+      void Promise.all(
+        inline.map((i) =>
+          saveScratchImage(cwd, i.mediaType, i.dataBase64, loadScratchRetentionDays(), i.name).catch(() => null),
+        ),
+      ).then((saved) => {
+        if (!saved.some((p) => p)) return
+        const win = contextForSession(sessionId)?.win
+        if (win && !win.isDestroyed()) win.webContents.send(IpcChannels.scratchChanged)
+      })
     }
     // Ride any finished background-workflow results in ahead of the human's words, framed as context so
     // the agent picks up where it left off. Only what the ENGINE sees is augmented — the user's visible
@@ -762,6 +881,9 @@ export class EngineSessionManager {
    *  (renderer applies → re-pushes here → unchanged → no second event). */
   setSessionApprovalMode(sessionId: string, mode: ApprovalMode): void {
     const prev = this.gate.getSessionMode(sessionId)
+    const crossesPlan = (mode === 'plan') !== (prev === 'plan')
+    if (crossesPlan && this.hasActiveSubagents(sessionId))
+      throw new Error('Delegated work is still running. Let it finish or stop it before switching Plan first.')
     // Always pin the explicit per-session entry (a same-value push still matters: the post-restart
     // re-push pins the session against later default-mode changes) — but only a real change broadcasts.
     this.gate.setSessionMode(sessionId, mode)
@@ -771,7 +893,6 @@ export class EngineSessionManager {
     // session's renderer does that itself when the event lands; a WINDOWLESS one (phone-started, or its
     // window closed) has no renderer — respawn here, the same eager --resume the remote model change
     // uses. The phone blocks this while a turn runs (same client-side guard as model/effort).
-    const crossesPlan = (mode === 'plan') !== (prev === 'plan')
     // Before the first turn there's no conversation to --resume; the eager reattach would race the fresh
     // child's init and fatal. The gate mode is already pinned above, and sendTurn applies plan on the
     // first turn's spawn — so skip the respawn until a conversation exists.
@@ -794,6 +915,37 @@ export class EngineSessionManager {
    *  window has (remote-control-security.md §4 — remote inherits local policy exactly). */
   getSessionApprovalMode(sessionId: string): ApprovalMode {
     return this.gate.getSessionMode(sessionId)
+  }
+
+  /** The session ITSELF is over (not just its engine process) — forget its approval posture +
+   *  unattended flag, since the only way `unattended` reactivates is a human resuming this exact
+   *  conversation (session ids are randomUUID()s; a later, different session never reuses one). Call
+   *  from true end sites only; never from a respawn path (ApprovalGate.forgetSession). Also drops any
+   *  stray `awaitTurnEnd` waiter — a true end means no future TurnComplete will ever come for this id. */
+  forgetSession(sessionId: string): void {
+    this.gate.forgetSession(sessionId)
+    this.turnEndWaiters.delete(sessionId)
+    this.remoteEventLog.delete(sessionId)
+    this.remoteReplaySeq.delete(sessionId)
+    this.activeSubagents.delete(sessionId)
+  }
+
+  /** Resolves the instant this session's turn genuinely ends — a real TurnComplete or a truly fatal
+   *  EngineError, set by `forward` (W3). Used by the overnight dream to clear its unattended flag right
+   *  away instead of waiting out the next `isWorking` poll tick; a benign broker-recovery blip never
+   *  resolves it, so it can't be fooled into firing mid-turn (see the note above `waitForTurnEnd`). */
+  awaitTurnEnd(sessionId: string): Promise<void> {
+    return new Promise((resolve) => this.turnEndWaiters.set(sessionId, resolve))
+  }
+
+  /** Clear a session's unattended (overnight-dream) flag. Called by DreamScheduler once the dream's
+   *  own turn has ended — every LATER turn on this session is a human's, so forced asks (AskUserQuestion,
+   *  exit-plan-mode, checkpoint restore, tool install, protected-target writes) must go back to asking
+   *  instead of auto-denying. Not startDreamSession's job: `notifyDesktopOfHeadless` can adopt the tab
+   *  into an open window WHILE the dream is still running, and clearing there would reopen the hole the
+   *  flag exists to close. */
+  clearUnattended(sessionId: string): void {
+    this.gate.setUnattended(sessionId, false)
   }
 
   /** The model/effort a session currently runs with (for the remote head's pickers). */
@@ -828,10 +980,64 @@ export class EngineSessionManager {
     return this.gate.pendingRequests(sessionId)
   }
 
+  /** Pending prompts owned by one project window. The renderer needs this catch-up read after a
+   *  reload; project scoping keeps tool inputs from another window out of this renderer. */
+  pendingRequestsForProject(projectPath: string): ApprovalRequest[] {
+    const root = realpathOrSelf(projectPath)
+    return Object.keys(this.gate.pendingBySession()).flatMap((sessionId) =>
+      realpathOrSelf(this.projectDirs.get(sessionId) ?? '') === root ? this.gate.pendingRequests(sessionId) : [],
+    )
+  }
+
   /** Latest account rate-limit windows per engine — the phone sheet's usage readout at browse level
    *  (the same snapshot that seeds a joining chat's meters, without needing a session). */
   remoteRateLimits(): Record<string, Record<string, RateLimitInfo>> {
     return Object.fromEntries(this.lastRateLimits)
+  }
+
+  /**
+   * Ask the engine for the account's plan windows and publish them (see usage-poll.ts for why we poll
+   * rather than wait for the stream). Fail-soft in every direction: a poll that errors, times out, or
+   * reports nothing leaves the last known windows standing — an empty read means "the engine had
+   * nothing to say", never "your limits are clear".
+   *
+   * Skipped under API billing: an API key has no plan windows, and the poll would report none every
+   * time, wrongly pruning the subscription windows the user will see again when they switch back.
+   */
+  private async pollUsage(): Promise<void> {
+    if (this.apiActive('claude')) return
+    this.lastUsagePoll = Date.now()
+    let result: Awaited<ReturnType<typeof pollAccountUsage>>
+    try {
+      result = await pollAccountUsage({ resourcesPath: this.resourcesPath })
+    } catch (err) {
+      log.warn('usage', 'account usage poll failed', err instanceof Error ? err.message : err)
+      return
+    }
+    if (!result.windows.length) return
+    // Ground-truth breadcrumb (same reason codex-driver logs its snapshot): the gauge can't show whether
+    // a number came from the poll or a stale stream event, so one line per poll makes it diagnosable.
+    log.info('usage', 'account usage poll', result)
+    // The poll is an authoritative snapshot: it lists every window the plan currently has, so receivers
+    // prune anything else (a stale window the plan stopped reporting) rather than pinning the gauge.
+    const authoritativeTypes = authoritativeUsageTypes(
+      result,
+      this.lastRateLimits.get('claude') ?? {},
+    )
+    for (const info of result.windows) {
+      const event: EngineEvent = {
+        type: 'RateLimitUpdate',
+        sessionId: ACCOUNT_USAGE_SESSION_ID,
+        engine: 'claude',
+        info,
+        authoritativeTypes,
+      }
+      const reconciled = this.forward(event) // bookkeeping: notifier, reconciler, and on-disk mirror
+      // …and the delivery forward() can't do: it routes to the window OWNING the session, and this
+      // event belongs to no session. The plan windows are an account fact — every open window shows them.
+      for (const win of BrowserWindow.getAllWindows())
+        if (!win.isDestroyed() && reconciled) win.webContents.send(IpcChannels.engineEvent, reconciled)
+    }
   }
 
   /** Record a session's model/effort intent — the chokepoint both surfaces' picks route through
@@ -845,6 +1051,10 @@ export class EngineSessionManager {
     const prev = this.sessionModelEffort.get(sessionId) ?? {}
     const prevEngine = this.sessionEngines.get(sessionId)
     const engineId = opts.engineId ?? prevEngine
+    const changed =
+      prev.model !== model || prev.effort !== effort || (prevEngine ?? 'claude') !== (engineId ?? 'claude')
+    if (changed && this.hasActiveSubagents(sessionId))
+      throw new Error('Delegated work is still running. Let it finish or stop it before changing the model or effort.')
     this.sessionModelEffort.set(sessionId, { model, effort })
     if (opts.engineId) this.sessionEngines.set(sessionId, opts.engineId)
     // Crossing engines invalidates the reported model — the new engine's default is unknown until it
@@ -853,7 +1063,7 @@ export class EngineSessionManager {
     // Remember this pick as the app-wide last-used posture so the next NEW session (notably the phone's
     // headless start, which has no renderer copy) opens on it instead of the engine default.
     saveLastPosture({ model, effort, engineId: engineId ?? 'claude' })
-    if (prev.model === model && prev.effort === effort && (prevEngine ?? 'claude') === (engineId ?? 'claude')) return
+    if (!changed) return
     // Intent now diverges from the live child's `spawnedWith`; sendTurn reconciles it before the next turn
     // (no flag to set — the comparison sees the difference on its own).
     // A WINDOWLESS session has no renderer to persist the new pair, so a Mac restart would resurrect
@@ -861,9 +1071,11 @@ export class EngineSessionManager {
     // resumed-id resolution as persistRemoteTitle; a windowed session's renderer owns the blob, and
     // writing would race it). The Codex thread id rides along so a post-restart resume finds its thread.
     const cwd = this.projectDirs.get(sessionId)
-    if (cwd && !contextForSession(sessionId)) {
+    // A null store = present but unreadable: skip the write (never rewrite it from a fresh empty one)
+    // while the broadcast below still goes out.
+    const store = cwd && !contextForSession(sessionId) ? this.projectStore(cwd) : null
+    if (cwd && store) {
       const storeId = this.resumedFrom.get(sessionId) ?? sessionId
-      const store = loadProjectSessions(cwd) ?? { version: 2 as const, activeId: null, sessions: [] }
       let stored = store.sessions.find((s) => s.id === storeId)
       if (!stored) {
         stored = { id: storeId, label: this.sessionLabel(sessionId, cwd), cwd, userNamed: false, items: [] }
@@ -919,7 +1131,7 @@ export class EngineSessionManager {
     // Codex session to Codex before the user typed anything. Real content is a sent turn, a replayed phone
     // turn, persisted renderer items, or Claude's on-disk conversation.
     const storeId = this.resumedFrom.get(sessionId) ?? sessionId
-    const stored = loadProjectSessions(cwd)?.sessions.find((s) => s.id === storeId)
+    const stored = this.projectStore(cwd)?.sessions.find((s) => s.id === storeId)
     const conversationStarted =
       this.working.has(sessionId) ||
       this.remoteEventLog.get(sessionId)?.some((e) => e.type === 'RemoteUserTurn') === true ||
@@ -970,12 +1182,102 @@ export class EngineSessionManager {
   /** A remote client attached to this session → keep it alive headless past its window's close. */
   attachRemote(sessionId: string): void {
     this.remoteAttached.add(sessionId)
+    if (this.remoteEventLog.has(sessionId)) {
+      this.seedActiveSubagentsIntoRemoteReplay(sessionId)
+      return
+    }
+    const cwd = this.projectDirs.get(sessionId)
+    if (!cwd) return
+    const storedId = this.resumedFrom.get(sessionId) ?? sessionId
+    const persistedSeq =
+      this.projectStore(cwd)?.sessions.find((session) => session.id === storedId)?.replaySeq ?? 0
+    const durable = normalizeReplaySequence(
+      settleRestoredDelegationReplay(loadRemoteReplay(cwd, storedId, sessionId)),
+    )
+    this.remoteReplaySeq.set(
+      sessionId,
+      Math.max(this.remoteReplaySeq.get(sessionId) ?? 0, persistedSeq, durable.at(-1)?.replaySeq ?? 0),
+    )
+    if (durable.length) {
+      this.remoteEventLog.set(sessionId, durable)
+      replaceRemoteReplay(cwd, storedId, durable.map((entry) => ({ ...entry, sessionId: storedId })))
+    }
+    // A local child may already be running when the phone first attaches. Its original Start was sent
+    // only to the renderer, so make it durable now before the window is allowed to close headlessly.
+    this.seedActiveSubagentsIntoRemoteReplay(sessionId)
+  }
+
+  /** The dream scheduler's ear: called on every send and turn-end with the project dir (dream.ts).
+   *  Dream sessions themselves are excluded — otherwise the dream's own turn re-arms the quiet clock
+   *  and counts as "new material," and every project would re-dream every night forever. */
+  private engineActivityListener: ((cwd: string) => void) | null = null
+  private readonly dreamSessions = new Set<string>()
+  /** REM's disposable snapshot session is digest-only: never adopt it or list it on the phone. */
+  private readonly hiddenDreamSessions = new Set<string>()
+  setEngineActivityListener(fn: ((cwd: string) => void) | null): void {
+    this.engineActivityListener = fn
+  }
+  private noteEngineActivity(sessionId: string): void {
+    if (this.dreamSessions.has(sessionId)) return
+    const cwd = this.projectDirs.get(sessionId)
+    if (cwd) this.engineActivityListener?.(cwd)
+  }
+
+  /** Reap last night's dream sessions that nobody adopted: idle, windowless, safe to end. Their
+   *  persisted titles stay in the project's session list; a claude transcript can still rebuild
+   *  from the engine JSONL on resume. Called by the scheduler at the start of each new dream. */
+  async reapDreamSessions(): Promise<void> {
+    for (const id of [...this.dreamSessions]) {
+      if (!this.working.has(id) && !contextForSession(id)) {
+        this.dreamSessions.delete(id)
+        await this.dispose(id).catch(() => {})
+        this.forgetSession(id) // reaped = a true end, not a respawn
+      }
+    }
+  }
+
+  /** Start a windowless session for the overnight dream (dream.ts) — the phone-session machinery
+   *  reused: headless start on the last posture, name-locked so nothing can rename it, and gate-marked
+   *  unattended so anything needing a human is DENIED instead of hanging on a prompt no window shows.
+   *  Tidy sessions are remotely attached for live adoption; REM stays hidden until it is disposed,
+   *  because its whole-project rollback must finish before any human can continue that conversation.
+   *
+   *  The lock is `userNamed` (the same flag a manual rename sets) — main's own titlers and BOTH renderer
+   *  retitle paths already honor it. `remoteTitled` alone wasn't enough: a window open on the project
+   *  adopts the dream live, and the renderer then re-derived a name from the prompt at the first turn
+   *  (08-06's dreams landed as "Memory Edits" / "Memory Consolidation" instead of their dated names,
+   *  which made a night's dreams unfindable). */
+  async startDreamSession(
+    projectPath: string,
+    label: string,
+    options: { visible?: boolean; readOnly?: boolean } = {},
+  ): Promise<{ sessionId: string }> {
+    const last = loadLastPosture()
+    let started: { sessionId: string }
+    try {
+      started = await this.start({ cwd: projectPath, model: last.model, effort: last.effort, engineId: last.engineId })
+    } catch (err) {
+      log.warn('sessions', 'dream start with last posture failed; retrying bare', err instanceof Error ? err.message : err)
+      started = await this.start({ cwd: projectPath })
+    }
+    const { sessionId } = started
+    this.dreamSessions.add(sessionId)
+    if (options.visible === false) this.hiddenDreamSessions.add(sessionId)
+    if (options.visible !== false) this.attachRemote(sessionId)
+    this.remoteTitled.add(sessionId) // never auto-retitle a dream session
+    this.persistRemoteTitle(projectPath, sessionId, label, true)
+    this.gate.setUnattended(sessionId, true)
+    if (options.readOnly) this.gate.setReadOnly(sessionId, true)
+    if (options.visible !== false)
+      this.notifyDesktopOfHeadless(projectPath) // a window open on this project can adopt it live
+    return { sessionId }
   }
 
   /** Live sessions a remote client can pick: id + project dir + the session's human title.
    *  `lastActivityAt` (epoch ms, 0 = no turn yet) rides along so the phone can show ages + day-group. */
   remoteSessionList(): { id: string; cwd: string; label: string; engineId: EngineId; lastActivityAt: number; lastLine?: string }[] {
     return [...this.sessions.keys()]
+      .filter((id) => !this.hiddenDreamSessions.has(id))
       .sort((a, b) => (this.lastActivityAt.get(b) ?? 0) - (this.lastActivityAt.get(a) ?? 0))
       .map((id) => {
         const cwd = this.projectDirs.get(id) ?? ''
@@ -995,13 +1297,25 @@ export class EngineSessionManager {
     return this.working.has(sessionId)
   }
 
+  /** Epoch ms of this session's last engine event (0 = none yet) — engine liveness for unattended
+   *  supervisors: `working && old lastEngineEventAt` = a stalled turn worth interrupting early. */
+  lastEngineEventAt(sessionId: string): number {
+    return this.engineEventAt.get(sessionId) ?? 0
+  }
+
+  /** The current turn's accumulated top-level reply (capped at 4000 chars) — the dream digest reads
+   *  a turn's closing message here after the turn ends. Undefined until a block lands; reset per turn. */
+  lastAssistantReply(sessionId: string): string | undefined {
+    return this.turnReplies.get(sessionId)
+  }
+
   /** A live session's human title — the on-device auto-title or the user's rename, from the persisted
    *  store (the same source `remoteHistory` trusts). Falls back to the project folder only when there's
    *  no title yet (a session before its first turn). A remote-resumed session's live id differs from the
    *  stored one, so fall back through `resumedFrom`. */
   private sessionLabel(id: string, cwd: string): string {
     const storedId = this.resumedFrom.get(id) ?? id
-    const label = loadProjectSessions(cwd)?.sessions.find((s) => s.id === storedId)?.label?.trim()
+    const label = this.projectStore(cwd)?.sessions.find((s) => s.id === storedId)?.label?.trim()
     return label || basename(cwd) || 'Session'
   }
 
@@ -1017,57 +1331,77 @@ export class EngineSessionManager {
     const clean = text.trim()
     if (!clean) return // image-only turn — let the next text turn name it
     const storedId = this.resumedFrom.get(sessionId) ?? sessionId
-    const stored = loadProjectSessions(cwd)?.sessions.find((s) => s.id === storedId)
+    const stored = this.projectStore(cwd)?.sessions.find((s) => s.id === storedId)
     // Already named (a resumed past session, or a restart-resume) — never re-title.
     if (stored?.label?.trim() || stored?.userNamed) {
       this.remoteTitled.add(sessionId)
       return
     }
     this.remoteTitled.add(sessionId)
+    this.remoteFirstPrompt.set(sessionId, { prompt: clean, cwd }) // feeds the substance retitle at first TurnComplete
     this.persistRemoteTitle(cwd, storedId, titleFromPrompt(clean))
     // Fire-and-forget on-device upgrade; never blocks the turn, never throws. Skip once a window has
     // adopted the session (its renderer owns the label then) so the write can't race the renderer.
-    void assistTitle(clean)
+    const gen = (this.remoteTitleGen.get(sessionId) ?? 0) + 1
+    this.remoteTitleGen.set(sessionId, gen)
+    void assistTitle(clean, this.takenRemoteTitles(cwd, storedId))
       .then((title) => {
+        if (this.remoteTitleGen.get(sessionId) !== gen) return // superseded by the substance retitle
         if (title.trim() && !contextForSession(sessionId)) this.persistRemoteTitle(cwd, storedId, title.trim())
       })
       .catch(() => {})
   }
 
+  /** Sibling-session names in this project the auto-titler must avoid — same list the renderer builds
+   *  from its store; here it comes from the persisted per-project store (the phone reads from there). */
+  private takenRemoteTitles(cwd: string, excludeId: string): string[] {
+    return (this.projectStore(cwd)?.sessions ?? [])
+      .filter((s) => s.id !== excludeId)
+      .map((s) => s.label?.trim())
+      .filter((l): l is string => !!l && l !== 'New session')
+      .slice(-12)
+  }
+
   /** Write a headless session's auto-title into its project store — the source the phone's session list
    *  and history read labels from. Upserts a minimal entry when the renderer hasn't persisted this
-   *  (windowless) session, updates the label in place otherwise. Never clobbers a user rename. */
-  private persistRemoteTitle(cwd: string, storedId: string, label: string): void {
-    const store = loadProjectSessions(cwd) ?? { version: 2 as const, activeId: null, sessions: [] }
+   *  (windowless) session, updates the label in place otherwise. Never clobbers a user rename.
+   *  `lock` marks the label userNamed — for a name Koda itself chose deliberately (the dream's dated
+   *  title) that no auto-titler on either side of the IPC boundary may overwrite. */
+  private persistRemoteTitle(cwd: string, storedId: string, label: string, lock = false): void {
+    const store = this.projectStore(cwd)
+    if (!store) return // unreadable store — a title isn't worth rewriting it from an empty one
     const existing = store.sessions.find((s) => s.id === storedId)
     if (existing?.userNamed) return
-    if (existing) existing.label = label
-    else store.sessions.push({ id: storedId, label, cwd, userNamed: false, items: [] })
+    if (existing) {
+      existing.label = label
+      if (lock) existing.userNamed = true
+    } else store.sessions.push({ id: storedId, label, cwd, userNamed: lock, items: [] })
     saveProjectSessions(cwd, store)
   }
 
   // ── Remote launcher: start-new / resume-old from the phone (no desktop window) ────────────────────
   // The phone is a full control head, not an attach-only viewer (otherwise it's strictly worse than
   // Anthropic's /remote-control). These wrap the SAME windowless `start()` path the desktop uses; the
-  // only new trust rule is that a phone-supplied path/id must match a known recent project — the phone
-  // can never name an arbitrary directory to spawn an agent in.
+  // only new trust rule is that a phone-supplied path/id must match a project already known on this Mac —
+  // the phone can never name an arbitrary directory to spawn an agent in.
 
-  /** Recent projects the phone may start a new session in (most-recent-first, existing dirs only). */
-  recentProjectsForRemote(): { path: string; name: string }[] {
-    return loadAppState()
-      .recentProjects.filter((p) => existsSync(p))
-      .map((p) => ({ path: p, name: basename(p) || p }))
+  /** Every project the phone may act in (start / resume / browse) — the full known-projects registry,
+   *  most-recent-first, existing dirs only. NOT just recents: the phone Home lists all of them, so all of
+   *  them are reachable (the user chose full access over a view-only tail). */
+  remoteProjectList(): { path: string; name: string }[] {
+    return knownProjectPaths().map((p) => ({ path: p, name: basename(p) || p }))
   }
 
-  /** Resumable past sessions across recent projects — id + human label + which project. Excludes any
-   *  session that's already live (those appear in the running list, not as a resume target) and any
-   *  whose engine-side conversation is gone — Koda's store outlives the engine's (cleanup, sessions
-   *  that died before their first turn), and offering one produces `--resume` → "No conversation
-   *  found" → a fatal engine error on the phone. */
+  /** Resumable past sessions across ALL known projects — id + human label + which project. Spans the
+   *  full registry (not just recents) so every project the phone Home now lists shows its real chats and
+   *  is resumable. Excludes any session that's already live (those appear in the running list, not as a
+   *  resume target) and any whose engine-side conversation is gone — Koda's store outlives the engine's
+   *  (cleanup, sessions that died before their first turn), and offering one produces `--resume` → "No
+   *  conversation found" → a fatal engine error on the phone. */
   remoteHistory(): { id: string; label: string; projectPath: string; projectName: string; updatedAt: number }[] {
     const out: { id: string; label: string; projectPath: string; projectName: string; updatedAt: number }[] = []
-    for (const p of loadAppState().recentProjects) {
-      const stored = loadProjectSessions(p)
+    for (const p of knownProjectPaths()) {
+      const stored = this.projectStore(p)
       if (!stored) continue
       for (const s of stored.sessions) {
         if (this.sessions.has(s.id)) continue // already running → shown under "running", not "resume"
@@ -1081,9 +1415,33 @@ export class EngineSessionManager {
   }
 
   /** Start a NEW headless session in a recent project and attach the remote head. Refuses any path
-   *  that isn't a known recent project (the phone can't spawn an agent in an arbitrary directory). */
-  async startNewRemote(projectPath: string): Promise<{ sessionId: string }> {
-    if (!this.recentProjectsForRemote().some((r) => r.path === projectPath)) throw new Error('unknown project')
+   *  that isn't a known recent project (the phone can't spawn an agent in an arbitrary directory).
+   *
+   *  IDEMPOTENT on the phone's chosen `sessionId`. A start is a WRITE whose reply can be lost in transit
+   *  (a recycled relay socket, a cold WG tunnel) — the phone then reports "could not start" for a session
+   *  that IS running, and a blind retry would spawn a second engine. So the phone names the id up front
+   *  and re-sends the same one: an id that's already live under the remote head in this same project is
+   *  simply handed back. A live id we DON'T own (a desktop session the phone named) is never touched —
+   *  it falls through to a fresh id, because start() would otherwise dispose and respawn it. */
+  async startNewRemote(projectPath: string, sessionId?: string): Promise<{ sessionId: string }> {
+    if (!this.remoteProjectList().some((r) => r.path === projectPath)) throw new Error('unknown project')
+    // The engine takes --session-id as a UUID; anything else is ignored rather than failing the start.
+    const chosen = sessionId && UUID_RE.test(sessionId) ? sessionId : undefined
+    if (chosen) {
+      const inflight = this.remoteStarts.get(chosen)
+      if (inflight) return inflight
+      if (this.sessions.has(chosen))
+        return this.remoteAttached.has(chosen) && this.projectDirs.get(chosen) === projectPath
+          ? { sessionId: chosen } // the re-send of a start that already landed
+          : this.startNewRemote(projectPath) // live but not ours — mint a fresh id instead
+      const p = this.spawnNewRemote(projectPath, chosen).finally(() => this.remoteStarts.delete(chosen))
+      this.remoteStarts.set(chosen, p)
+      return p
+    }
+    return this.spawnNewRemote(projectPath, undefined)
+  }
+
+  private async spawnNewRemote(projectPath: string, chosen: string | undefined): Promise<{ sessionId: string }> {
     // Open on the last-used model/effort/engine (the phone has no renderer to seed this the way the
     // desktop does), so a new session isn't stuck on the engine default. A fresh spawn — not a --resume —
     // so it carries the pair with no conversation to reattach to. Fail-soft: a stale posture (e.g. a
@@ -1092,15 +1450,21 @@ export class EngineSessionManager {
     const last = loadLastPosture()
     let started: { sessionId: string }
     try {
-      started = await this.start({ cwd: projectPath, model: last.model, effort: last.effort, engineId: last.engineId })
+      started = await this.start({
+        cwd: projectPath,
+        sessionId: chosen,
+        model: last.model,
+        effort: last.effort,
+        engineId: last.engineId,
+      })
     } catch (err) {
       log.warn('sessions', 'seeded new-session start failed; retrying bare', err instanceof Error ? err.message : err)
-      started = await this.start({ cwd: projectPath })
+      started = await this.start({ cwd: projectPath, sessionId: chosen })
     }
-    const { sessionId } = started
-    this.attachRemote(sessionId)
+    const id = started.sessionId
+    this.attachRemote(id)
     this.notifyDesktopOfHeadless(projectPath) // if this project is open on the Mac, let it adopt this live
-    return { sessionId }
+    return { sessionId: id }
   }
 
   /** Resume a PAST session (--resume) headless and attach the remote head. Both id and project must
@@ -1111,7 +1475,7 @@ export class EngineSessionManager {
       throw new Error('unknown session')
     // Resume with the pair the session was last running (persisted by the desktop) — without it the
     // respawn silently falls back to the account default model and clobbers the intent map.
-    const stored = loadProjectSessions(projectPath)?.sessions.find((s) => s.id === sessionId)
+    const stored = this.projectStore(projectPath)?.sessions.find((s) => s.id === sessionId)
     const { sessionId: id } = await this.start({
       resumeSessionId: sessionId,
       cwd: projectPath,
@@ -1119,16 +1483,34 @@ export class EngineSessionManager {
       effort: stored?.effort,
       engineId: stored?.engineId,
       engineNativeId: stored?.engineNativeId,
+      // A phone attachment is sticky, while a true session end clears the in-memory counter. Seed
+      // the respawn before SessionStarted is buffered so restored rows cannot restart at 1 and be
+      // mistaken for already-rendered history.
+      replaySeq: stored?.replaySeq,
     })
-    this.attachRemote(id)
     if (id !== sessionId) this.resumedFrom.set(id, sessionId) // so the phone can load the prior transcript
+    this.attachRemote(id)
     // Seed the replay buffer with the prior history when the store holds no transcript (a headless
     // session's items are never persisted). Without this, the first turn after a resume makes the
     // buffer non-empty, so remoteTranscript's file fallback stops firing and a reopen would show ONLY
     // the new turn. Seeding happens before the resumed engine emits anything, so nothing can double.
-    if (!stored?.items?.length && (stored?.engineId ?? 'claude') === 'claude') {
-      const seed = readClaudeConversationReplay(stored?.cwd || projectPath, sessionId, id)
-      if (seed.length) this.remoteEventLog.set(id, seed)
+    if (
+      !stored?.items?.length &&
+      !this.remoteEventLog.get(id)?.length &&
+      (stored?.engineId ?? 'claude') === 'claude'
+    ) {
+      const seed = normalizeReplaySequence(
+        readClaudeConversationReplay(stored?.cwd || projectPath, sessionId, id),
+      )
+      if (seed.length) {
+        this.remoteEventLog.set(id, seed)
+        this.remoteReplaySeq.set(id, seed.at(-1)?.replaySeq ?? 0)
+        replaceRemoteReplay(
+          stored?.cwd || projectPath,
+          sessionId,
+          seed.map((entry) => ({ ...entry, sessionId })),
+        )
+      }
     }
     this.notifyDesktopOfHeadless(projectPath) // if this project is open on the Mac, let it adopt this live
     return { sessionId: id }
@@ -1156,17 +1538,48 @@ export class EngineSessionManager {
       }
       const storedId = this.resumedFrom.get(sessionId) ?? sessionId
       const label = this.sessionLabel(sessionId, cwd) // read before dispose (it needs the live maps)
-      await this.dispose(sessionId)
-      const store = loadProjectSessions(cwd) ?? { version: 2 as const, activeId: null, sessions: [] }
+      // Read the store BEFORE disposing: a throw here must still find the session live and untouched
+      // (W4) — disposing first and discovering the store unreadable afterward made "nothing was
+      // changed" a lie (the session was already ended).
+      const store = this.projectStore(cwd)
+      if (!store) throw new Error('the session store for this project could not be read — nothing was changed')
       // A headless session may have no persisted entry yet (its transcript lives in the replay log) —
       // archive a minimal one so it still lands in Settings → Archived sessions.
       const session = store.sessions.find((s) => s.id === storedId) ?? { id: storedId, label, cwd, userNamed: false, items: [] }
-      saveProjectSessions(cwd, {
-        ...store,
-        activeId: store.activeId === storedId ? null : store.activeId,
-        sessions: store.sessions.filter((s) => s.id !== storedId),
-      })
-      ingestFullArchives(cwd, [{ ...session, archivedAt: Date.now() }])
+      try {
+        await this.dispose(sessionId)
+      } finally {
+        // A renderer-less archive has no transcript body of its own. The replay log survives dispose
+        // specifically so the final unknown/completed child state can be folded into the cold body
+        // before true-end cleanup clears the live maps.
+        const replay =
+          this.remoteEventLog.get(sessionId) ??
+          normalizeReplaySequence(
+            settleRestoredDelegationReplay(loadRemoteReplay(cwd, storedId, storedId)),
+          )
+        if (replay.length) {
+          const tail = session.items.length
+            ? replay.filter(
+                (entry) => entry.replaySeq === undefined || entry.replaySeq > (session.replaySeq ?? 0),
+              )
+            : replay
+          session.items = session.items.length
+            ? mergeReplayIntoTranscript(session.items, tail)
+            : transcriptFromReplay(replay)
+          session.replaySeq = Math.max(
+            session.replaySeq ?? 0,
+            ...replay.map((entry) => entry.replaySeq ?? 0),
+          )
+        }
+        // a true end — forget its approval posture too (dispose alone doesn't); in a finally so a
+        // throwing dispose can't skip it (W5).
+        this.forgetSession(sessionId)
+      }
+      // archiveSession writes the cold archive FIRST and only removes the hot-store row once that
+      // write is durably confirmed (C2) — a throwing/failed archive must never delete the session from
+      // both places.
+      if (!archiveSession(cwd, store, session, storedId))
+        throw new Error("could not archive the session — it was ended, but it's still in your session list")
       return
     }
     if (!this.remoteHistory().some((h) => h.id === sessionId && h.projectPath === projectPath))
@@ -1176,17 +1589,14 @@ export class EngineSessionManager {
       win.webContents.send(IpcChannels.sessionArchiveRequested, { sessionId })
       return
     }
-    const store = loadProjectSessions(projectPath)
+    const store = this.projectStore(projectPath)
     const session = store?.sessions.find((s) => s.id === sessionId)
     if (!store || !session) throw new Error('unknown session')
-    saveProjectSessions(projectPath, {
-      ...store,
-      activeId: store.activeId === sessionId ? null : store.activeId,
-      sessions: store.sessions.filter((s) => s.id !== sessionId),
-    })
     // Archives live in their own cold store now (metadata index + split-out body) — never in the hot
-    // store above.
-    ingestFullArchives(projectPath, [{ ...session, archivedAt: Date.now() }])
+    // store above. archiveSession archives first, removing the hot-store row only once that write is
+    // durably confirmed (C2).
+    if (!archiveSession(projectPath, store, session, sessionId))
+      throw new Error('could not archive the session — nothing was changed')
   }
 
   /** Rename a live session from the phone — the desktop right-click's same move. Two write paths (the
@@ -1204,7 +1614,8 @@ export class EngineSessionManager {
       return
     }
     const storedId = this.resumedFrom.get(sessionId) ?? sessionId
-    const store = loadProjectSessions(cwd) ?? { version: 2 as const, activeId: null, sessions: [] }
+    const store = this.projectStore(cwd)
+    if (!store) throw new Error('the session store for this project could not be read — nothing was changed')
     const existing = store.sessions.find((s) => s.id === storedId)
     if (existing) {
       existing.label = label
@@ -1219,15 +1630,110 @@ export class EngineSessionManager {
   // sessions and pulls one into a window — routing its future events there AND replaying its buffered
   // history so the conversation appears exactly as a local one would.
 
-  /** Append to a remote-attached session's replay log. Called for every forwarded event; a no-op for
-   *  any session no phone has attached to (the common local case), so it costs nothing there. Streaming
-   *  deltas are dropped — they're ephemeral and the finalized AssistantBlock re-carries the full text. */
-  private bufferRemoteEvent(event: EngineEvent): void {
-    if (!this.remoteAttached.has(event.sessionId)) return
-    if (event.type === 'AssistantDelta' || event.type === 'ThinkingDelta') return
-    const logArr = this.remoteEventLog.get(event.sessionId)
-    if (logArr) logArr.push(event)
-    else this.remoteEventLog.set(event.sessionId, [event])
+  /** Append full replay for remote-attached sessions and delegated-task replay for local sessions.
+   *  Streaming deltas are ephemeral; finalized blocks re-carry any text worth restoring. */
+  private bufferRemoteEvent(event: EngineEvent): EngineEvent {
+    if (event.type === 'AssistantDelta' || event.type === 'ThinkingDelta') return event
+    const delegated =
+      event.type === 'SubagentStarted' ||
+      event.type === 'SubagentProgress' ||
+      event.type === 'SubagentCompleted' ||
+      ((event.type === 'AssistantBlock' || event.type === 'ToolRequested' || event.type === 'ToolResult') &&
+        !!event.parentToolUseId)
+    if (!this.remoteAttached.has(event.sessionId) && !delegated) return event
+    return this.recordRemoteEntry(event) as EngineEvent
+  }
+
+  /** Keep the in-memory adoption log and its durable sidecar in the same order, returning the stamped
+   *  row so a live renderer can persist the same identity it will later see during adoption. */
+  private recordRemoteEntry(entry: ReplayEntry): ReplayEntry {
+    const last = this.remoteReplaySeq.get(entry.sessionId) ?? 0
+    const replaySeq = entry.replaySeq && entry.replaySeq > last ? entry.replaySeq : last + 1
+    const recorded = { ...entry, replaySeq } as ReplayEntry
+    this.remoteReplaySeq.set(entry.sessionId, replaySeq)
+    const logArr = this.remoteEventLog.get(entry.sessionId)
+    if (logArr) logArr.push(recorded)
+    else this.remoteEventLog.set(entry.sessionId, [recorded])
+    const cwd = this.projectDirs.get(entry.sessionId)
+    if (!cwd) return recorded
+    const storedId = this.resumedFrom.get(entry.sessionId) ?? entry.sessionId
+    appendRemoteReplay(cwd, storedId, { ...recorded, sessionId: storedId })
+    return recorded
+  }
+
+  /** Track delegated leaves independently from the parent turn. Replacing the engine process while
+   *  this map is non-empty would silently orphan work, so all posture/model respawn paths consult it. */
+  private trackSubagentLifecycle(event: EngineEvent): void {
+    if (event.type === 'SubagentStarted') {
+      const active =
+        this.activeSubagents.get(event.sessionId) ??
+        new Map<string, Extract<EngineEvent, { type: 'SubagentStarted' }>>()
+      const current = active.get(event.toolUseId)
+      active.set(event.toolUseId, {
+        ...event,
+        taskId: event.taskId ?? current?.taskId,
+        subagentType: event.subagentType === 'subagent' && current ? current.subagentType : event.subagentType,
+        description: event.description || current?.description || '',
+        prompt: event.prompt ?? current?.prompt,
+      })
+      this.activeSubagents.set(event.sessionId, active)
+      return
+    }
+    if (event.type === 'SubagentProgress') {
+      const active =
+        this.activeSubagents.get(event.sessionId) ??
+        new Map<string, Extract<EngineEvent, { type: 'SubagentStarted' }>>()
+      const current = active.get(event.toolUseId)
+      active.set(event.toolUseId, {
+        ...(current ?? {
+          type: 'SubagentStarted' as const,
+          sessionId: event.sessionId,
+          toolUseId: event.toolUseId,
+          subagentType: 'subagent',
+          description: '',
+        }),
+        taskId: event.taskId ?? current?.taskId,
+      })
+      this.activeSubagents.set(event.sessionId, active)
+      return
+    }
+    if (event.type === 'SubagentCompleted') {
+      const active = this.activeSubagents.get(event.sessionId)
+      if (!active) return
+      active.delete(event.toolUseId)
+      if (!active.size) this.activeSubagents.delete(event.sessionId)
+    }
+  }
+
+  /** First phone attach can happen after a local child started. Backfill any live Starts missing from
+   *  the replay log so later Progress/Completed rows always have a card to join after the window closes. */
+  private seedActiveSubagentsIntoRemoteReplay(sessionId: string): void {
+    const logEntries = this.remoteEventLog.get(sessionId) ?? []
+    const started = new Set(
+      logEntries.filter((entry) => entry.type === 'SubagentStarted').map((entry) => entry.toolUseId),
+    )
+    for (const event of this.activeSubagents.get(sessionId)?.values() ?? []) {
+      if (!started.has(event.toolUseId)) this.recordRemoteEntry({ ...event, replaySeq: undefined })
+    }
+  }
+
+  private hasActiveSubagents(sessionId: string): boolean {
+    return (this.activeSubagents.get(sessionId)?.size ?? 0) > 0
+  }
+
+  /** The owning process vanished, so success vs failure is unknowable. Emit the same terminal event
+   *  live and into durable replay; callers can then replace the process without leaving a false Running. */
+  private markActiveSubagentsUnknown(sessionId: string): void {
+    const active = [...(this.activeSubagents.get(sessionId)?.entries() ?? [])]
+    for (const [toolUseId, task] of active) {
+      this.forward({
+        type: 'SubagentCompleted',
+        sessionId,
+        toolUseId,
+        ...(task.taskId ? { taskId: task.taskId } : {}),
+        outcome: 'unknown',
+      })
+    }
   }
 
   /** Nudge the desktop window already open for `projectPath` (if any) to adopt this project's live
@@ -1238,26 +1744,44 @@ export class EngineSessionManager {
     if (win && !win.isDestroyed()) win.webContents.send(IpcChannels.headlessAppeared, { projectPath })
   }
 
-  /** Live headless (phone-started, windowless) sessions in `projectPath` that no window owns yet, and
-   *  claim them for `windowId` so their future events route there. Returns each session's identity plus
-   *  its full replayable event history — the renderer builds the transcript by feeding the events
-   *  through its normal reducer. Registering ownership and snapshotting the log happen together in this
-   *  one synchronous pass, so no event can slip into the gap: anything forwarded after this returns is
-   *  sent to the window (now the owner) AFTER the renderer has the snapshot. Already-owned sessions are
-   *  skipped (idempotent — safe to call on every boot + every `headlessAppeared`). */
+  /** Return live sessions this renderer can adopt. That includes remote/headless sessions with no
+   *  owner, plus sessions this SAME BrowserWindow already owns after its renderer reloaded. Ownership
+   *  and snapshotting happen in one synchronous pass, so no event can slip between them. A session
+   *  owned by another window is never exposed. */
   adoptHeadlessForWindow(windowId: number, projectPath: string): AdoptedHeadlessSession[] {
     const root = realpathOrSelf(projectPath)
     const out: AdoptedHeadlessSession[] = []
     for (const id of this.sessions.keys()) {
-      if (!this.remoteAttached.has(id)) continue
-      if (contextForSession(id)) continue // already owned by a window (this one or another)
+      const owner = contextForSession(id)
+      const ownedByRequester = owner?.win.id === windowId
+      if (owner && !ownedByRequester) continue
+      if (!owner && !this.remoteAttached.has(id)) continue
       if (realpathOrSelf(this.projectDirs.get(id) ?? '') !== root) continue
-      addSessionToWindow(windowId, id)
+      if (!owner) addSessionToWindow(windowId, id)
+      const cwd = this.projectDirs.get(id) ?? projectPath
+      // Carry the label this session already settled on (auto-title, substance retitle, or a phone
+      // rename) so the renderer adopts it verbatim instead of regenerating a name the user has seen.
+      const storedId = this.resumedFrom.get(id) ?? id
+      const stored = this.projectStore(cwd)?.sessions.find((x) => x.id === storedId)
+      // The gate's REAL posture, not the window's default — a phone (or the dream scheduler) may have
+      // set this session's mode before any window existed to display it. Pin it as an explicit entry
+      // too (setSessionApprovalMode's same-value push — no broadcast, no loop reset when unchanged):
+      // without this, adoption is the one entry path that leaves the session on the fallback default,
+      // so a LATER Settings default-mode change silently re-postures its enforcement while the tab
+      // pill it already showed on adoption stays put — display-more-restrictive-than-enforced (W4).
+      const approvalMode = this.gate.getSessionMode(id)
+      this.setSessionApprovalMode(id, approvalMode)
       out.push({
         id,
-        cwd: this.projectDirs.get(id) ?? projectPath,
+        cwd,
         engineId: this.sessionEngines.get(id) ?? 'claude',
         model: this.sessionModelEffort.get(id)?.model,
+        effort: this.sessionModelEffort.get(id)?.effort,
+        label: stored?.label?.trim() || undefined,
+        userNamed: stored?.userNamed || undefined,
+        approvalMode,
+        working: this.working.has(id),
+        activeSubagentToolUseIds: [...(this.activeSubagents.get(id)?.keys() ?? [])],
         events: [...(this.remoteEventLog.get(id) ?? [])],
       })
     }
@@ -1278,25 +1802,53 @@ export class EngineSessionManager {
     const cwd = this.remoteSessionList().find((s) => s.id === sessionId)?.cwd
     let found = cwd ? readPersistedSession(cwd, storeId) : null
     if (!found) {
-      for (const p of loadAppState().recentProjects) {
+      for (const p of knownProjectPaths()) {
         found = readPersistedSession(p, storeId)
         if (found) break
       }
     }
     const engine = this.sessionEngines.get(sessionId) ?? found?.engineId ?? 'claude'
-    const items = found?.items ?? []
+    let items = found?.items ?? []
     // A headless (phone-started, or Mac-adopted-then-window-closed) session is never persisted by a
     // renderer, so its `items` are empty even though it has a full history. Fall back to the live replay
     // buffer — the same per-session event log the Mac desktop adopts through — which the phone reduces
     // into a transcript exactly like the live stream. Keyed by the LIVE id (the log is never remapped).
-    let events = items.length ? undefined : this.remoteEventLog.get(sessionId)
+    let events = this.remoteEventLog.get(sessionId)
+    const fileCwd = this.projectDirs.get(sessionId) ?? found?.cwd ?? cwd
+    if (!events?.length && fileCwd) {
+      const durable = normalizeReplaySequence(
+        settleRestoredDelegationReplay(loadRemoteReplay(fileCwd, storeId, sessionId)),
+      )
+      if (durable.length) events = durable
+    }
+    // A desktop renderer may have persisted the beginning of a task, then closed while the attached
+    // engine kept working headless. Fold the durable tail over that snapshot before settling restart
+    // state, so a completion/result wins over the older Running row instead of being discarded.
+    if (items.length && events?.length) {
+      const tail = events.filter(
+        (entry) => entry.replaySeq === undefined || entry.replaySeq > (found?.replaySeq ?? 0),
+      )
+      items = mergeReplayIntoTranscript(items, tail)
+    }
+    items = settleRestoredTranscriptItems(
+      items,
+      new Set(this.activeSubagents.get(sessionId)?.keys() ?? []),
+    )
     // The replay buffer is in-memory, so a Mac relaunch wipes it — a phone-driven session then opened
     // to a blank "Ready" screen with its whole history sitting in the engine's own conversation file.
     // Last resort: rebuild the events from that file (claude only; Codex keeps its own store).
     if (!items.length && !events?.length && engine === 'claude') {
-      const fileCwd = this.projectDirs.get(sessionId) ?? found?.cwd ?? cwd
-      if (fileCwd) events = readClaudeConversationReplay(fileCwd, storeId, sessionId)
+      if (fileCwd) {
+        events = normalizeReplaySequence(readClaudeConversationReplay(fileCwd, storeId, sessionId))
+        if (events.length)
+          replaceRemoteReplay(fileCwd, storeId, events.map((entry) => ({ ...entry, sessionId: storeId })))
+      }
     }
+    // Normalize replay into ordinary transcript rows before it crosses the remote boundary. Relay pages
+    // `items`, while raw events are hard-capped by frame budget; a verbose child could otherwise push
+    // its Started event out of the retained suffix and make its surviving completion impossible to join.
+    if (!items.length && events?.length) items = transcriptFromReplay(events)
+    if (items.length) events = undefined
     return {
       items,
       usage: {
@@ -1424,14 +1976,14 @@ export class EngineSessionManager {
     }
   }
 
-  /** Resolve a phone-supplied browse target to a project root: a live session's cwd, or a known recent
+  /** Resolve a phone-supplied browse target to a project root: a live session's cwd, or a known
    *  project's path directly — so the project screen can browse docs/files WITHOUT a session running.
-   *  Same trust rule as startNewRemote: a phone-named path must match a known recent project; the phone
-   *  can never browse an arbitrary directory. */
+   *  Same trust rule as startNewRemote: a phone-named path must match a known project; the phone can
+   *  never browse an arbitrary directory. */
   private remoteRoot(ref: { sessionId?: string; projectPath?: string }): string {
     if (ref.sessionId) return this.remoteCwd(ref.sessionId)
     const p = ref.projectPath ?? ''
-    if (!this.recentProjectsForRemote().some((r) => r.path === p)) throw new Error('unknown project')
+    if (!this.remoteProjectList().some((r) => r.path === p)) throw new Error('unknown project')
     return p
   }
 
@@ -1524,7 +2076,13 @@ export class EngineSessionManager {
   async disposeHeadlessRemote(): Promise<void> {
     stopAllLanForwards() // no phone can be watching once the tier is off
     for (const id of [...this.remoteAttached]) {
-      if (!contextForSession(id)) await this.dispose(id)
+      if (!contextForSession(id)) {
+        try {
+          await this.dispose(id)
+        } finally {
+          this.forgetSession(id) // a true end (the remote tier is off) — not a respawn; fail-safe (W5)
+        }
+      }
     }
     this.remoteAttached.clear()
   }
@@ -1605,13 +2163,60 @@ export class EngineSessionManager {
   }
 
   // ── Per-project persistence (a project's sessions survive an app restart) ────
+  /** The project store for the WINDOWLESS (phone-driven) paths, or `null` when the file is present but
+   *  unreadable. `loadProjectSessions` throws in that case on purpose — a failed read handed back as
+   *  "no sessions" is what let the store be saved back empty — but a phone turn must not crash over it
+   *  either, so callers here degrade instead: a lookup finds nothing, and a WRITE path skips its write
+   *  rather than upserting into a fresh empty store and clobbering the file it just failed to read. An
+   *  ABSENT store is not a failure — it starts empty, which is how the first headless session lands. */
+  private projectStore(projectPath: string): PersistedSessions | null {
+    try {
+      return loadProjectSessions(projectPath) ?? { version: 2 as const, activeId: null, sessions: [] }
+    } catch (err) {
+      log.warn('sessions', 'project store unreadable — skipping this read/write', err instanceof Error ? err.message : err)
+      return null
+    }
+  }
+
   /** A project's persisted sessions for its window to rehydrate on boot (null when none). Backfills
    *  the recovery/resume dir map so a restored session's safety-git timeline resolves before its
-   *  engine reattaches (recovery is sessionId-keyed and must work post-crash). */
-  loadSessionsForProject(projectPath: string): PersistedSessions | null {
-    const persisted = loadProjectSessions(projectPath)
-    if (persisted) for (const s of persisted.sessions) this.projectDirs.set(s.id, s.cwd)
-    return persisted
+   *  engine reattaches (recovery is sessionId-keyed and must work post-crash). Deliberately does NOT
+   *  catch — a failed read must reach the renderer as a failure, not as an empty list it would save.
+   *  `report` carries back how many rows a SUCCESSFUL read had to set aside, which the caller shows the
+   *  user (that case keeps saving, so a shortened list is otherwise invisible). */
+  loadSessionsForProject(projectPath: string, report?: StoreReadReport): PersistedSessions | null {
+    const persisted = loadProjectSessions(projectPath, report)
+    if (persisted)
+      for (const s of persisted.sessions) {
+        this.projectDirs.set(s.id, s.cwd)
+        const liveReplay = this.remoteEventLog.get(s.id)
+        const replay =
+          liveReplay?.length
+            ? liveReplay
+            : normalizeReplaySequence(
+                settleRestoredDelegationReplay(loadRemoteReplay(s.cwd, s.id, s.id)),
+              )
+        if (!replay.length) continue
+        const tail = s.items.length
+          ? replay.filter(
+              (entry) => entry.replaySeq === undefined || entry.replaySeq > (s.replaySeq ?? 0),
+            )
+          : replay
+        s.items = s.items.length
+          ? mergeReplayIntoTranscript(s.items, tail)
+          : transcriptFromReplay(replay)
+        s.replaySeq = Math.max(
+          s.replaySeq ?? 0,
+          ...replay.map((entry) => entry.replaySeq ?? 0),
+        )
+      }
+    const rateLimits = this.remoteRateLimits()
+    if (persisted) return { ...persisted, rateLimits }
+    // Account usage is global, not project-owned. A project with no chat file still needs main's
+    // disk-restored snapshot so its footer is honest before the delayed live poll (or while offline).
+    return Object.keys(rateLimits).length
+      ? { version: 2, activeId: null, sessions: [], rateLimits }
+      : null
   }
 
   /** Persist a project's open sessions + transcripts (keyed by the window's root, supplied by main). */
@@ -1656,6 +2261,15 @@ export class EngineSessionManager {
 
   interrupt(sessionId: string): void {
     this.sessions.get(sessionId)?.interrupt()
+  }
+
+  /** Stop one delegated child without aborting the parent turn/session or its siblings. */
+  stopSubagent(sessionId: string, taskId: string): void {
+    const task = [...(this.activeSubagents.get(sessionId)?.values() ?? [])].find((item) => item.taskId === taskId)
+    if (!task) throw new Error('That delegated task is no longer running.')
+    const session = this.sessions.get(sessionId)
+    if (!session?.stopTask || !session.stopTask(taskId))
+      throw new Error('Koda could not send the stop request to the running task.')
   }
 
   /**
@@ -1750,7 +2364,8 @@ export class EngineSessionManager {
     // Drop the project mapping only after teardown (a crash keeps it so recovery still works;
     // handleClose, which needs the dir to cancel approvals, has already run by here).
     this.projectDirs.delete(sessionId)
-    this.remoteEventLog.delete(sessionId)
+    this.dreamSessions.delete(sessionId)
+    this.hiddenDreamSessions.delete(sessionId)
     this.diffBaselines.delete(sessionId)
     this.sessionModelEffort.delete(sessionId)
     this.spawnedWith.delete(sessionId)
@@ -1762,9 +2377,15 @@ export class EngineSessionManager {
     this.brokerRecovery.delete(sessionId)
     this.resumeAfterReconnect.delete(sessionId)
     this.remoteTitled.delete(sessionId)
+    this.remoteFirstPrompt.delete(sessionId)
+    this.remoteLastReply.delete(sessionId)
+    this.remoteTitleGen.delete(sessionId)
     this.lastActivityAt.delete(sessionId)
     this.working.delete(sessionId)
     this.lastLines.delete(sessionId)
+    this.engineEventAt.delete(sessionId)
+    this.turnReplies.delete(sessionId)
+    this.activeSubagents.delete(sessionId)
     // NB: pendingWorkflowResults is NOT cleared here — like recoveringBroker, it must SURVIVE a respawn
     // (dispose() is also the broker-recovery / model-effort teardown, and a workflow result stashed
     // before the respawn still needs to ride the next human turn). It's drained on delivery; a truly
@@ -1774,6 +2395,9 @@ export class EngineSessionManager {
     // NB: recoveringBroker is NOT cleared here — a broker recovery calls start()→dispose() on the old
     // child mid-flight, and its own finally removes the flag once the respawn settles. Clearing it here
     // would drop the guard during the respawn and let a racing error trigger a second recovery.
+    // NB: turnEndWaiters is NOT cleared here either, for the same reason — a pending awaitTurnEnd must
+    // survive the respawn's own dispose() and keep waiting for the NEW child's TurnComplete. Only a true
+    // end (forgetSession) drops it.
   }
 
   /**
@@ -1790,11 +2414,27 @@ export class EngineSessionManager {
       return
     }
     this.interrupt(sessionId) // best-effort: stop any in-flight turn before teardown
-    await this.dispose(sessionId)
+    try {
+      await this.dispose(sessionId)
+    } finally {
+      this.forgetSession(sessionId) // the owning window is gone for good — a true end, not a respawn; fail-safe (W5)
+    }
   }
 
   async disposeAll(): Promise<void> {
-    await Promise.all([...this.projectDirs.keys()].map((id) => this.dispose(id)))
+    if (this.usageTimer) {
+      clearInterval(this.usageTimer)
+      this.usageTimer = null
+    }
+    await Promise.all(
+      [...this.projectDirs.keys()].map(async (id) => {
+        try {
+          await this.dispose(id)
+        } finally {
+          this.forgetSession(id) // app quitting — every session is a true end, not a respawn; fail-safe (W5)
+        }
+      }),
+    )
     await this.broker.dispose()
   }
 
@@ -1805,6 +2445,9 @@ export class EngineSessionManager {
    * so the gate can still resolve the dir while cancelling.
    */
   private handleClose(sessionId: string): void {
+    // The process is gone and any non-terminal child may have made side effects. Surface + persist the
+    // honest state before clearing its handle; a later restart must never resurrect it as Running.
+    this.markActiveSubagentsUnknown(sessionId)
     this.sessions.delete(sessionId)
     this.working.delete(sessionId) // the child is gone → no turn is running (a broker-recovery respawn re-sets it)
     this.gate.cancelSession(sessionId)
@@ -1858,9 +2501,21 @@ export class EngineSessionManager {
     this.forward({ type: 'EngineError', sessionId, fatal: false, message: "Reconnecting Koda's safety net — one moment…" })
     try {
       const { model, effort } = this.sessionModelEffort.get(sessionId) ?? {}
+      // The gate's posture now survives this respawn (ApprovalGate.cancelSession no longer wipes it),
+      // so read it BEFORE start()'s internal dispose — a session parked in Plan must come back unable
+      // to write, not silently promoted to a fully-auto writing session (adapter.ts only passes
+      // --permission-mode plan when planMode is set).
+      const planMode = this.gate.getSessionMode(sessionId) === 'plan'
       // start() disposes the still-live child first (it sees the id in this.sessions), which unregisters
       // the stale broker route, then re-registers a fresh one before spawning with --resume.
-      await this.start({ resumeSessionId: sessionId, cwd, model, effort })
+      await this.start({
+        resumeSessionId: sessionId,
+        cwd,
+        model,
+        effort,
+        planMode,
+        abandonActiveSubagents: true,
+      })
       // Auto-resume: pick the interrupted turn back up on its own once the fresh session is initialized.
       // Added AFTER start() (its internal dispose of the old child already ran) and before the new
       // child's SessionStarted can fire (a later event-loop tick), so the flag is set in time.
@@ -1902,7 +2557,7 @@ export class EngineSessionManager {
    * the boundary — but contain a bad shape (safeParse), never throw out of the
    * stdout-drain callback chain that calls this.
    */
-  private forward(event: EngineEvent): void {
+  private forward(event: EngineEvent): EngineEvent | undefined {
     // A --resume whose conversation the engine no longer holds exits "No conversation found with
     // session ID: …" (a ghost store entry, a cleared/partial transcript, or an auto-recovery respawn of
     // a session that never completed its first turn). The filesystem can't reliably predict this — the
@@ -1923,29 +2578,72 @@ export class EngineSessionManager {
       track('engine_error', { tone: friendlyEngineError(event.message, event.fatal).tone, fatal: event.fatal })
 
     this.logEvent(event)
-    this.bufferRemoteEvent(event)
+    this.trackSubagentLifecycle(event)
 
     // Per-session turn-activity → the launcher's live working/idle glyph (remote heads poll the launcher;
     // they have no event stream at browse level). Driven off the SAME live events the client's `busy`
     // reducer uses, so ANY active session shows working regardless of how its turn started — a desktop IPC
     // turn, a phone turn, a resume, a broker-recovery nudge — not only turns routed through sendTurn (which
     // sets it too, for the instant before the first delta lands). Ends on TurnComplete / fatal error.
-    if (
-      event.type === 'ThinkingDelta' ||
-      event.type === 'AssistantDelta' ||
-      event.type === 'AssistantBlock' ||
-      event.type === 'ToolRequested' ||
-      event.type === 'SubagentStarted' ||
-      event.type === 'SubagentProgress'
-    )
+    if (isTopLevelTurnActivity(event)) {
       this.working.add(event.sessionId)
-    else if (event.type === 'TurnComplete' || (event.type === 'EngineError' && event.fatal))
+      this.engineEventAt.set(event.sessionId, Date.now())
+    }
+    // ToolResult refreshes the liveness clock WITHOUT joining working.add: a finished tool proves the
+    // engine is alive (a long-legitimate tool would otherwise read as a stall — review catch), but
+    // working-state transitions stay owned by the branch above.
+    else if (event.type === 'ToolResult') this.engineEventAt.set(event.sessionId, Date.now())
+    else if (event.type === 'TurnComplete' || (event.type === 'EngineError' && event.fatal)) {
       this.working.delete(event.sessionId)
+      // The genuine end-of-turn signal `awaitTurnEnd` waits for (W3) — resolved here, not off
+      // `working`, so a benign respawn's transient false (fatal: false) never fires it.
+      const waiter = this.turnEndWaiters.get(event.sessionId)
+      if (waiter) {
+        this.turnEndWaiters.delete(event.sessionId)
+        waiter()
+      }
+    }
+
+    event = this.bufferRemoteEvent(event)
 
     // The launcher's "what is it doing" line — the first non-empty line of the latest finalized reply.
     if (event.type === 'AssistantBlock') {
-      const line = event.markdown.split('\n').find((l) => l.trim())
-      if (line) this.lastLines.set(event.sessionId, line.trim().slice(0, 140))
+      // Top-level blocks only — a subagent's text isn't the agent's reply.
+      if (!event.parentToolUseId) {
+        const sofar = this.turnReplies.get(event.sessionId)
+        this.turnReplies.set(
+          event.sessionId,
+          (sofar ? `${sofar}\n\n${event.markdown}` : event.markdown).slice(0, 4000),
+        )
+        const line = event.markdown.split('\n').find((l) => l.trim())
+        if (line) this.lastLines.set(event.sessionId, line.trim().slice(0, 140))
+        // Keep the latest full reply for a headless session still awaiting its substance retitle.
+        if (this.remoteFirstPrompt.has(event.sessionId))
+          this.remoteLastReply.set(event.sessionId, event.markdown.slice(0, 2000))
+      }
+    }
+
+    // One-shot substance retitle for a headless (phone-started) session — mirrors the renderer's
+    // TurnComplete retitle: once the FIRST turn finishes cleanly, rename from prompt + final reply so
+    // repeat sessions on the same topic come apart. The maps only ever hold a session between its
+    // first prompt and first TurnComplete, so this can't re-fire. persistRemoteTitle guards userNamed.
+    if (event.type === 'TurnComplete' && this.remoteFirstPrompt.has(event.sessionId)) {
+      const sid = event.sessionId
+      const { prompt, cwd } = this.remoteFirstPrompt.get(sid)!
+      const reply = this.remoteLastReply.get(sid)
+      this.remoteFirstPrompt.delete(sid)
+      this.remoteLastReply.delete(sid)
+      if (event.stopReason === 'success' && reply && !contextForSession(sid)) {
+        const storedId = this.resumedFrom.get(sid) ?? sid
+        const gen = (this.remoteTitleGen.get(sid) ?? 0) + 1
+        this.remoteTitleGen.set(sid, gen) // invalidates a still-in-flight birth-title call
+        void assistTitle(`${prompt.slice(0, 1500)}\n\nWhat was done:\n${reply}`, this.takenRemoteTitles(cwd, storedId))
+          .then((title) => {
+            if (this.remoteTitleGen.get(sid) !== gen) return
+            if (title.trim() && !contextForSession(sid)) this.persistRemoteTitle(cwd, storedId, title.trim())
+          })
+          .catch(() => {})
+      }
     }
 
     // Broker self-heal: the engine's MCP client dropped our in-process permission/capability server
@@ -1983,14 +2681,34 @@ export class EngineSessionManager {
     if (event.type === 'TurnComplete')
       recordTurnUsage(event.models, event.costEstimate, this.sessionEngines.get(event.sessionId) ?? 'claude')
 
+    // Turn-end is engine activity too — the dream scheduler's quiet clock re-arms from the LAST
+    // event of the day, not the last send (a long final turn shouldn't shorten the quiet window).
+    if (event.type === 'TurnComplete') this.noteEngineActivity(event.sessionId)
+
+    // A turn just moved the needle — refresh the plan gauge instead of leaving it up to a minute stale.
+    // Debounced, so a run of short turns doesn't spawn a poll each time.
+    if (event.type === 'TurnComplete' && Date.now() - this.lastUsagePoll >= USAGE_POLL_MIN_GAP_MS)
+      void this.pollUsage()
+
     // Watch the account-level 5-hour window so we can ping once when a MAXED window resets (not every window).
     if (event.type === 'RateLimitUpdate') {
-      const engine = this.sessionEngines.get(event.sessionId) ?? 'claude'
-      noteRateLimit(engine, event.info)
-      const windows = this.lastRateLimits.get(engine) ?? {}
-      windows[event.info.rateLimitType] = event.info
-      this.lastRateLimits.set(engine, windows)
-      recordRateLimit(engine, event.info)
+      const engine = event.engine ?? this.sessionEngines.get(event.sessionId) ?? 'claude'
+      const merged = reconcileRateLimitWindows(
+        this.lastRateLimits.get(engine) ?? {},
+        event.info,
+        event.authoritativeTypes,
+      )
+      if (merged.accepted) {
+        this.lastRateLimits.set(engine, merged.windows)
+        replaceRateLimits(engine, merged.windows)
+        noteRateLimit(engine, merged.windows[event.info.rateLimitType])
+      }
+      event = {
+        ...event,
+        engine,
+        info: merged.windows[event.info.rateLimitType] ?? event.info,
+        reconciledWindows: merged.windows,
+      }
     }
 
     // Provider-outage watch: a provider-shaped turn failure triggers one status-feed check (only a
@@ -2021,9 +2739,15 @@ export class EngineSessionManager {
     const parsed = EngineEventSchema.safeParse(event)
     if (!parsed.success) {
       log.error('engine', 'dropped malformed event', { issues: parsed.error.issues, event })
-      return
+      return undefined
     }
+    publishNeuralEvent(
+      this.projectDirs.get(parsed.data.sessionId),
+      parsed.data,
+      this.sessionEngines.get(parsed.data.sessionId),
+    )
     this.send(IpcChannels.engineEvent, parsed.data.sessionId, parsed.data)
+    return parsed.data
   }
 
   private pushApprovalRequest(req: unknown): void {
