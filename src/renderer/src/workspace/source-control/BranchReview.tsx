@@ -118,7 +118,7 @@ export function BranchReview({
           ) : (
             // The one user-confirmed destructive git op in user-git. Amber box keeps its custom color
             // (not danger Button) so it reads visually distinct from the red danger variant.
-            <div className="rounded-lg border border-[#b5862f]/40 bg-[#b5862f]/10 p-2.5">
+            <div className="rounded-lg bg-[#b5862f]/12 p-2.5">
               <p className="text-[11px] leading-relaxed text-[#7a5b14] dark:text-[#d8b765]">
                 This deletes "{branch}" and its unmerged work. Unlike Koda's normal undo, this{' '}
                 <b>can't be easily brought back</b>.

@@ -1,26 +1,28 @@
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { codexCleanFinishHooksJson } from './codex-clean-finish'
 import {
   assembleGuardrailText,
   assemblePackRules,
   CODEX_PACK_SKILLS,
   codexPackMarker,
+  deepReviewPluginVersion,
+  DEEP_REVIEW_PLUGIN_NAME,
   GATED_PACK_SKILLS,
+  kodaPlaybooksExpected,
   loadPackRules,
   loadPresentation,
   MEMORY_HEAVY_CHARS,
+  PROJECT_CARD_MAX_CHARS,
   projectMemoryWeight,
+  readProjectCard,
+  resolveDeepReviewPlugin,
   resolvePack,
   resolveStagingPack,
 } from './pack'
 
-// A project dir with no `.koda/guardrails.json` ⇒ nothing disabled, so we read the shipped pack as-is.
-// assembleGuardrailText resolves the in-repo resources/pack via process.cwd() (dev path).
-const cwd = tmpdir()
 const bundledClaude = join(
   process.cwd(),
   'resources',
@@ -29,222 +31,148 @@ const bundledClaude = join(
   'claude',
 )
 
-describe('assembleGuardrailText (shared by both engine drivers)', () => {
-  it('carries the project-memory rule to any engine (Codex parity — the rule, not the skill)', () => {
-    const text = assembleGuardrailText({ cwd, brokerWired: true })
-    expect(text).toContain('.koda/memory/')
-    expect(text).toContain('MEMORY.md')
-  })
+function project(prefix = 'koda-context-'): string {
+  return mkdtempSync(join(tmpdir(), prefix))
+}
 
-  it('includes broker-gated rules only when the broker is wired', () => {
-    const wired = assembleGuardrailText({ cwd, brokerWired: true })
-    const bare = assembleGuardrailText({ cwd, brokerWired: false })
-    // The preview rule names the broker tool — present with the broker, dropped without it.
-    expect(wired).toContain('mcp__koda_broker__preview')
-    expect(bare).not.toContain('mcp__koda_broker__preview')
-    // Engine-neutral rules (the memory discipline) survive either way.
-    expect(bare).toContain('.koda/memory/')
-  })
+describe('ambient context assembly', () => {
+  it('carries only the constitution, compact routes, and bounded project card', () => {
+    const cwd = project()
+    mkdirSync(join(cwd, '.koda', 'memory'), { recursive: true })
+    mkdirSync(join(cwd, 'Documents', 'plans'), { recursive: true })
+    writeFileSync(join(cwd, '.koda', 'memory', 'MEMORY.md'), 'MEMORY_SENTINEL')
+    writeFileSync(join(cwd, '.koda', 'memory', 'active-context.md'), 'ACTIVE_SENTINEL')
+    writeFileSync(join(cwd, 'Documents', 'plans', 'secret.md'), 'DOCUMENT_SENTINEL')
+    writeFileSync(
+      join(cwd, '.koda', 'memory', 'project-card.md'),
+      'What: A small test project.\nNow: Proving routed context.\nCritical: Read the repo map before Git.',
+    )
 
-  it('includes the app-ask routing rule only when the mini-apps staging skill is wired', () => {
-    const wired = assembleGuardrailText({ cwd, brokerWired: true, miniAppsWired: true })
-    const bare = assembleGuardrailText({ cwd, brokerWired: true })
-    // The routing rule names the staging skill — present only when that skill actually loads.
-    expect(wired).toContain('create-mini-app')
-    expect(bare).not.toContain('create-mini-app')
-  })
-
-  it('carries the pre-task skill check always (a skill nobody checks for might as well not ship)', () => {
-    // Generalizes the critic lesson: rules that hope a skill triggers by description lose to defaults.
-    const text = assembleGuardrailText({ cwd, brokerWired: false })
-    expect(text).toContain('A skill that covers the task drives the task')
-  })
-
-  it('fits work to its topic before either engine edits', () => {
     for (const engine of ['claude', 'codex'] as const) {
-      const text = assembleGuardrailText({ cwd, brokerWired: false, engine })
-      expect(text).toContain('Fit the branch to the work before editing')
-      expect(text).toContain('Talking or investigating makes no Git changes')
-      expect(text).toContain('only when it belongs to this workstream')
-      expect(text).toContain('materially different coding task')
-      expect(text).toContain("human-named topic branch from the repository's main branch")
-      expect(text).toContain('use a separate worktree when the current checkout belongs to another topic')
-      expect(text).toContain('leave it untouched')
-      expect(text).toContain('ask once before editing')
+      const text = assembleGuardrailText({ cwd, brokerWired: true, engine })
+      expect(text).toContain('# How to work in Koda')
+      expect(text).toContain('# Project card')
+      expect(text).toContain('What: A small test project.')
+      expect(text).toContain('load `finish-work`')
+      expect(text).not.toContain('MEMORY_SENTINEL')
+      expect(text).not.toContain('ACTIVE_SENTINEL')
+      expect(text).not.toContain('DOCUMENT_SENTINEL')
+      expect(text.length).toBeLessThan(5_000)
     }
+  })
 
-    const pack = resolvePack()
-    const presentation = loadPresentation(pack!.dir)
-    expect(presentation?.find((principle) => principle.id === 'code')?.members).toContain(
-      'finish-the-merge',
+  it('routes Koda-specific goals through the live broker directory only when it exists', () => {
+    const cwd = project()
+    const wired = assembleGuardrailText({ cwd, brokerWired: true })
+    const standalone = assembleGuardrailText({ cwd, brokerWired: false })
+    expect(wired).toContain('mcp__koda_broker__capabilities')
+    expect(standalone).not.toContain('mcp__koda_broker__capabilities')
+    expect(wired.length).toBeLessThan(5_000)
+  })
+
+  it('bounds and sanitizes the card, and fails soft to the folder name', () => {
+    const cwd = project('project card ')
+    mkdirSync(join(cwd, '.koda', 'memory'), { recursive: true })
+    writeFileSync(
+      join(cwd, '.koda', 'memory', 'project-card.md'),
+      `What: ${'w'.repeat(600)}\nNow: now\u0000 forged\nCritical: critical`,
     )
+    const card = readProjectCard(cwd)
+    expect(card.length).toBeLessThanOrEqual(PROJECT_CARD_MAX_CHARS)
+    expect(card).not.toContain('\u0000')
+    expect(card).toContain('Before changing files, read an existing `CLAUDE.md` or `AGENTS.md`')
+
+    const fallback = readProjectCard(project('plain project '))
+    expect(fallback).toContain('Project folder `plain project ')
   })
 
-  it('carries the check-before-done pass always, and stands it down only when the user turned it off', () => {
-    const on = assembleGuardrailText({ cwd, brokerWired: true })
-    const off = assembleGuardrailText({ cwd, brokerWired: true, critiqueOff: true })
-    // General behavior, not a mini-apps one: present with no capability wired at all. Both halves of
-    // the step ship together — the critic on what the user looks at, the reviewer on a finished change.
-    expect(on).toContain('Critique it before you call it good')
-    expect(on).toContain('Something other than you looks at it before it')
-    expect(on).not.toContain('pass is off right now')
-    // Off contradicts the always-on rules rather than removing them (rules.json is static per id), and
-    // the one toggle stands down BOTH halves — a reviewer that survived it would make the switch a lie.
-    expect(off).toContain('Critique it before you call it good')
-    expect(off).toContain('Something other than you looks at it before it')
-    expect(off).toContain('pass is off right now')
-    expect(off).toContain('no reviewer pass on a finished change')
-    expect(off).toContain('neither `code-reviewer` nor `review-architecture`')
-  })
-
-  it('arms the critique pass on presenting-for-a-decision, and checks a self-authored bar against the project', () => {
-    const text = assembleGuardrailText({ cwd, brokerWired: true })
-    // The failure this widening fixes: rounds of work each read as "still in progress", so "before done"
-    // never arms — while the user has already formed a view on what they were shown.
-    expect(text).toContain("Presenting work for the user's opinion counts as finishing")
-    // A bar the agent wrote itself can contradict a standard the project already set.
-    expect(text).toContain("check it against the project's own written standards")
-  })
-
-  it('names the `critic` subagent in BOTH halves of the pass (an unnamed tool never gets reached for)', () => {
-    const text = assembleGuardrailText({ cwd, brokerWired: true })
-    // critique-before-done — the half that used to describe an anonymous "fresh critic".
-    expect(text).toContain('hand it to the `critic` subagent before they see it')
-    // outside-eyes-before-done — named `code-reviewer` but not its counterpart; that asymmetry was the bug.
-    expect(text).toContain('gets the `critic` subagent instead')
-    expect(text).toContain('hand the diff to the `code-reviewer` subagent')
-    // Feature-sized work gets the wider-but-bounded integration check by name; the normal reviewer
-    // remains diff-scoped and does not turn back into a repository bug hunt.
-    expect(text).toContain('gets the `review-architecture` skill')
-  })
-
-  it('ships the critic subagent the rules name, with the tools to open a real artifact', () => {
-    const pack = resolvePack()
-    expect(pack).not.toBeNull()
-    const agent = readFileSync(join(pack!.dir, 'agents', 'critic.md'), 'utf8')
-    expect(agent).toContain('name: critic')
-    // It must be able to load the running page — a critic that can only read source is the failure itself.
-    expect(agent).toContain('mcp__playwright__browser_navigate')
-    expect(agent).toContain('background: false')
-    expect(agent).toContain('disallowedTools: Write, Edit, NotebookEdit, Bash, Agent, Task')
-  })
-
-  it('ships a bounded architecture review skill to both engines', () => {
-    const pack = resolvePack()
-    expect(pack).not.toBeNull()
-    const dir = join(pack!.dir, 'skills', 'review-architecture')
-    const skill = readFileSync(join(dir, 'SKILL.md'), 'utf8')
-    const metadata = readFileSync(join(dir, 'agents', 'openai.yaml'), 'utf8')
-    expect(skill).toContain('name: review-architecture')
-    expect(skill).toContain('This inventory is the audit queue')
-    expect(skill).toContain('both with file and line references')
-    expect(skill).toContain('Stop when every item in the audit queue is accounted for')
-    expect(metadata).toContain('$review-architecture')
-    expect(CODEX_PACK_SKILLS).toContain('review-architecture')
-  })
-
-  it.skipIf(!existsSync(bundledClaude))('passes the bundled engine\'s strict plugin validator', () => {
-    expect(() =>
-      execFileSync(bundledClaude, ['plugin', 'validate', 'resources/pack', '--strict'], {
-        cwd: process.cwd(),
-        stdio: 'pipe',
-      }),
-    ).not.toThrow()
-  })
-
-  it('uses the command-hook shape the engine accepts', () => {
-    const pack = resolvePack()
-    expect(pack).not.toBeNull()
-    const config = JSON.parse(readFileSync(join(pack!.dir, 'hooks', 'hooks.json'), 'utf8')) as {
-      hooks: { PreToolUse: Array<{ hooks: Array<Record<string, unknown>> }> }
-    }
-    const hook = config.hooks.PreToolUse[0].hooks[0]
-    expect(hook).not.toHaveProperty('args')
-    expect(hook.command).toBe(
-      '/usr/bin/osascript -l JavaScript "${CLAUDE_PLUGIN_ROOT}/hooks/constrain-delegation.js"',
+  it('preserves a valid long Critical route inside the assembled budget', () => {
+    const cwd = project()
+    mkdirSync(join(cwd, '.koda', 'memory'), { recursive: true })
+    const critical =
+      'The private internal repo is canonical; public code moves only through the publish script. Model calls and billing stay engine-owned. Read repo-topology before Git or release work.'
+    writeFileSync(
+      join(cwd, '.koda', 'memory', 'project-card.md'),
+      `What: Koda is a conversation-first Mac app with an iPhone control head.\nNow: Mini-app make-and-run is the product focus.\nCritical: ${critical}`,
     )
+
+    const card = readProjectCard(cwd)
+    expect(card).toContain(`Critical: ${critical}`)
+    expect(card).toContain('Read repo-topology before Git or release work.')
+    expect(card.length).toBeLessThanOrEqual(PROJECT_CARD_MAX_CHARS)
   })
 
-  it.skipIf(process.platform !== 'darwin')('keeps legacy agents foreground without changing Koda leaves', () => {
-    const pack = resolvePack()
-    expect(pack).not.toBeNull()
-    const script = join(pack!.dir, 'hooks', 'constrain-delegation.js')
-    const legacy = execFileSync('/usr/bin/osascript', ['-l', 'JavaScript', script], {
-      input: JSON.stringify({
-        tool_name: 'Agent',
-        tool_input: {
-          description: 'Inspect',
-          prompt: 'Read the fixture.',
-          subagent_type: 'legacy-reader',
-          run_in_background: true,
-          future_field: { preserved: true },
-        },
-      }),
-      encoding: 'utf8',
-    })
-    expect(JSON.parse(legacy)).toMatchObject({
-      hookSpecificOutput: {
-        permissionDecision: 'allow',
-        updatedInput: {
-          subagent_type: 'legacy-reader',
-          run_in_background: false,
-          future_field: { preserved: true },
-        },
-      },
-    })
-
-    const scout = execFileSync('/usr/bin/osascript', ['-l', 'JavaScript', script], {
-      input: JSON.stringify({
-        tool_name: 'Agent',
-        tool_input: { subagent_type: 'koda:scout', run_in_background: true },
-      }),
-      encoding: 'utf8',
-    })
-    expect(scout.trim()).toBe('')
+  it('removes the review route when the preference is off instead of adding a contradiction', () => {
+    const cwd = project()
+    const on = assembleGuardrailText({ cwd, brokerWired: true, critiqueOn: true })
+    const off = assembleGuardrailText({ cwd, brokerWired: true })
+    expect(on).toContain('load `review-work`')
+    expect(on).toContain('One matching pass total is the default')
+    expect(on).toContain('Deep Review is explicit-only')
+    expect(off).not.toContain('load `review-work`')
+    expect(off.toLowerCase()).not.toContain('stand down')
   })
 
-  it.skipIf(process.platform !== 'darwin')('blocks one dirty Git stop, then permits the continuation', () => {
-    const pack = resolvePack()
-    expect(pack).not.toBeNull()
-    const hookDir = join(pack!.dir, 'codex-hooks')
-    const config = JSON.parse(codexCleanFinishHooksJson()) as {
-      hooks: { Stop: Array<{ hooks: Array<{ command: string }> }> }
-    }
-    expect(config.hooks.Stop[0].hooks[0].command).toContain('${PLUGIN_ROOT}/hooks/clean-finish.js')
-
-    const repo = mkdtempSync(join(tmpdir(), 'koda-clean-finish-'))
-    const script = join(hookDir, 'clean-finish.js')
-    const runHook = (stopHookActive = false): Record<string, unknown> => {
-      const output = execFileSync('/usr/bin/osascript', ['-l', 'JavaScript', script], {
-        cwd: repo,
-        input: JSON.stringify({ cwd: repo, stop_hook_active: stopHookActive }),
-        encoding: 'utf8',
+  it('adds the compact parent-orchestrator route only for opted-in sessions on both engines', () => {
+    const cwd = project()
+    for (const engine of ['claude', 'codex'] as const) {
+      const adaptive = assembleGuardrailText({ cwd, brokerWired: true, engine })
+      const orchestrator = assembleGuardrailText({
+        cwd,
+        brokerWired: true,
+        engine,
+        orchestratorSession: true,
       })
-      return JSON.parse(output || '{}') as Record<string, unknown>
-    }
-
-    try {
-      execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: repo })
-      execFileSync('git', ['config', 'user.email', 'test@koda.local'], { cwd: repo })
-      execFileSync('git', ['config', 'user.name', 'Koda Test'], { cwd: repo })
-      execFileSync('git', ['config', 'commit.gpgsign', 'false'], { cwd: repo })
-      writeFileSync(join(repo, 'tracked.txt'), 'saved\n')
-      execFileSync('git', ['add', '-A'], { cwd: repo })
-      execFileSync('git', ['commit', '-qm', 'start'], { cwd: repo })
-
-      expect(runHook()).toEqual({})
-
-      writeFileSync(join(repo, 'tracked.txt'), 'dirty in this worktree\n')
-      const blocked = runHook()
-      expect(blocked).toMatchObject({ decision: 'block' })
-      expect(blocked.reason).toContain('Do not commit pre-existing or unrelated changes')
-      expect(runHook(true)).toEqual({})
-    } finally {
-      rmSync(repo, { recursive: true, force: true })
+      expect(adaptive).not.toContain('Load `fan-out-work`')
+      expect(orchestrator).toContain('Lead through delegation')
+      expect(orchestrator).toContain('Load `fan-out-work`')
+      expect(orchestrator).toContain('do short or dependent work directly')
+      expect(orchestrator).not.toContain('fresh-judgment lane')
+      expect(orchestrator.length).toBeLessThan(5_000)
     }
   })
 
-  it('drops a rule whose gate this code does not know (a gate that fails open is not a gate)', () => {
+  it('removes a route when the native playbook it names is disabled', () => {
+    const rules = loadPackRules(resolvePack()!.dir)!
+    const text = assemblePackRules(
+      rules,
+      new Set(['skill:fan-out-work', 'skill:finish-work', 'skill:review-work', 'skill:create-mini-app']),
+      { miniAppsWired: true, orchestratorSession: true, critiqueOn: true },
+    )
+    expect(text).not.toContain('load `fan-out-work`')
+    expect(text).not.toContain('load `finish-work`')
+    expect(text).not.toContain('load `review-work`')
+    expect(text).not.toContain('load `create-mini-app`')
+  })
+
+  it('distinguishes an intentionally disabled playbook catalog from a load failure', () => {
+    const cwd = project()
+    mkdirSync(join(cwd, '.koda'), { recursive: true })
+    writeFileSync(
+      join(cwd, '.koda', 'guardrails.json'),
+      JSON.stringify({ disabled: CODEX_PACK_SKILLS.map((name) => `skill:${name}`), overrides: {} }),
+    )
+    expect(kodaPlaybooksExpected(cwd)).toBe(false)
+    expect(kodaPlaybooksExpected(cwd, { includeBrowser: true })).toBe(true)
+    expect(kodaPlaybooksExpected(cwd, { includeGated: true })).toBe(true)
+  })
+
+  it('removes a route when two project folders ambiguously claim its playbook identity', () => {
+    const cwd = project()
+    for (const directory of ['first-review', 'second-review']) {
+      const skillDir = join(cwd, '.claude', 'skills', directory)
+      mkdirSync(skillDir, { recursive: true })
+      writeFileSync(
+        join(skillDir, 'SKILL.md'),
+        '---\nname: review-work\ndescription: Ambiguous review playbook\n---\n',
+      )
+    }
+
+    const text = assembleGuardrailText({ cwd, brokerWired: true, critiqueOn: true })
+    expect(text).not.toContain('load `review-work`')
+  })
+
+  it('drops a rule whose delivery gate this code does not know', () => {
     const rules = {
       title: 'T',
       preamble: 'P',
@@ -269,184 +197,183 @@ describe('assembleGuardrailText (shared by both engine drivers)', () => {
     expect(text).not.toContain('gated on something newer')
   })
 
-  it('includes the summon-pill rule only for a project with a registered mini app', () => {
-    const faced = assembleGuardrailText({ cwd, brokerWired: true, miniAppProject: true })
-    const plain = assembleGuardrailText({ cwd, brokerWired: true })
-    // The faced-project rule names the claim-the-line handshake — present only with a registered app.
-    expect(faced).toContain('koda:claim-agent-line')
-    expect(plain).not.toContain('koda:claim-agent-line')
+  it('keeps presentation toggles mapped only to live rule ids', () => {
+    const pack = resolvePack()!
+    const rules = loadPackRules(pack.dir)!
+    const presentation = loadPresentation(pack.dir)!
+    const ids = new Set(rules.groups.flatMap((group) => group.rules.map((rule) => rule.id)))
+    expect(rules.groups.find((group) => group.id === 'constitution')?.rules).toHaveLength(11)
+    expect(rules.groups.find((group) => group.id === 'routes')?.rules).toHaveLength(5)
+    expect(presentation.map((principle) => principle.id)).toEqual([
+      'work-like-this',
+      'thinks-it-through',
+      'keep-it-clean',
+      'careful-where-it-counts',
+      'code',
+      'working-in-koda',
+    ])
+    // `critique-before-done` belonged to this stable principle before the routed-context migration.
+    // Keeping it here preserves existing disabled/customized project settings across the upgrade.
+    expect(presentation.find((principle) => principle.id === 'work-like-this')?.members).toContain(
+      'critique-before-done',
+    )
+    expect(presentation.find((principle) => principle.id === 'code')?.members).not.toContain(
+      'critique-before-done',
+    )
+    for (const principle of presentation)
+      for (const member of principle.members) expect(ids.has(member), `${principle.id}:${member}`).toBe(true)
+  })
+})
+
+describe('routed playbooks', () => {
+  it('ships every shared Codex playbook with native interface metadata', () => {
+    const pack = resolvePack()!
+    for (const name of CODEX_PACK_SKILLS) {
+      const dir = join(pack.dir, 'skills', name)
+      expect(readFileSync(join(dir, 'SKILL.md'), 'utf8')).toContain(`name: ${name}`)
+      expect(readFileSync(join(dir, 'agents', 'openai.yaml'), 'utf8')).toContain(`$${name}`)
+    }
   })
 
-  it('uses the advertised MCP tool names for both engines', () => {
-    const claude = assembleGuardrailText({ cwd, brokerWired: true, engine: 'claude' })
-    const codex = assembleGuardrailText({ cwd, brokerWired: true, engine: 'codex' })
-    // Codex app-server advertises the same fully-qualified name as Claude.
-    expect(claude).toContain('mcp__koda_broker__preview')
-    expect(codex).toContain('mcp__koda_broker__preview')
-    expect(codex).toContain("A declined call doesn't remove these tools")
+  it('relocates task procedure into its single native owner', () => {
+    const pack = resolvePack()!
+    const skill = (name: string): string => readFileSync(join(pack.dir, 'skills', name, 'SKILL.md'), 'utf8')
+    expect(skill('documents')).toContain('Inspect the live `Documents/` folder')
+    expect(skill('documents')).toContain('Extend it before creating a parallel')
+    expect(skill('code-work')).toContain('before the first substantive write')
+    expect(skill('code-work')).toContain('invoke `git-work`')
+    expect(skill('code-work')).toContain('at least 14 full days')
+    expect(skill('finish-work')).toContain('Finish the actual task, not the entire surrounding worktree')
+    expect(skill('finish-work')).toContain('Spend at most one review pass')
+    expect(skill('finish-work')).toContain('rerun only the proof that repair invalidated')
+    expect(skill('review-work')).toContain('Do not self-activate merely because code changed')
+    expect(skill('review-work')).toContain("the task's whole fresh-review budget")
+    expect(skill('verify')).toContain('retry it once')
+    expect(skill('fan-out-work')).toContain('generic shared-tree children')
+    expect(skill('memory')).toContain('project-card.md` is the only memory content carried')
+    expect(skill('memory')).toContain('Critical: optional trigger plus one high-consequence path to read')
+    expect(skill('frontend-design')).toContain('mcp__koda_broker__preview_file')
+    expect(skill('frontend-design')).toContain('Skip this mock for bounded work in an established interface')
   })
 
-  it('teaches both engines to fan out without pretending Codex has Claude profiles', () => {
-    const claude = assembleGuardrailText({ cwd, brokerWired: true, engine: 'claude' })
-    const codex = assembleGuardrailText({ cwd, brokerWired: true, engine: 'codex' })
-    expect(claude).toContain('Fan out independent work when it materially helps')
-    expect(claude).toContain('`scout`')
-    expect(claude).toContain('`worker`')
-    expect(claude).not.toContain('roles are not limited to a fixed list')
-    expect(codex).toContain('Fan out independent work when it materially helps')
-    expect(codex).not.toContain('koda:fan-out-work')
-    expect(codex).toContain('roles are not limited to a fixed list')
-    expect(codex).toContain('Start every selected read-only child before waiting')
-    expect(codex).toContain('If a child may mutate the tree')
-    expect(codex).toContain('do not edit in the parent until it finishes')
-    expect(codex).not.toContain('`worker`')
-
-    const pack = resolvePack()
-    const presentation = loadPresentation(pack!.dir)
-    expect(presentation?.find((principle) => principle.id === 'code')?.members).toEqual(
-      expect.arrayContaining(['delegate-independent-work', 'delegate-independent-work-codex']),
-    )
-
-    // Guardrail config mirrors the established Claude key onto the new Codex-specific key for existing
-    // projects. Once expanded, either engine's assembled prompt stays free of delegation guidance.
-    const rules = loadPackRules(pack!.dir)!
-    const disabled = new Set(['rule:delegate-independent-work', 'rule:delegate-independent-work-codex'])
-    expect(assemblePackRules(rules, disabled, { engine: 'claude' })).not.toContain(
-      'Fan out independent work when it materially helps',
-    )
-    expect(assemblePackRules(rules, disabled, { engine: 'codex' })).not.toContain(
-      'Fan out independent work when it materially helps',
-    )
-
-    const codexSkill = readFileSync(
-      join(process.cwd(), 'resources', 'codex-skills', 'fan-out-work', 'SKILL.md'),
-      'utf8',
-    )
-    expect(codexSkill).toContain('Use collaboration subagents')
-    expect(codexSkill).toContain('runtime has available')
-    const codexSkillInterface = readFileSync(
-      join(process.cwd(), 'resources', 'codex-skills', 'fan-out-work', 'agents', 'openai.yaml'),
-      'utf8',
-    )
-    expect(codexSkillInterface).toContain('allow_implicit_invocation: false')
-  })
-
-  it('ships bounded scout and isolated-worker leaf profiles', () => {
-    const pack = resolvePack()
-    expect(pack).not.toBeNull()
-    const scout = readFileSync(join(pack!.dir, 'agents', 'scout.md'), 'utf8')
-    const critic = readFileSync(join(pack!.dir, 'agents', 'critic.md'), 'utf8')
-    const worker = readFileSync(join(pack!.dir, 'agents', 'worker.md'), 'utf8')
-    expect(scout).toContain('tools: Read, Grep, Glob, Skill')
-    expect(scout).toContain('disallowedTools: Write, Edit, NotebookEdit, Bash, Agent, Task')
-    expect(scout).toContain('background: true')
+  it('ships bounded critic, reviewer, scout, and isolated-worker specialists', () => {
+    const pack = resolvePack()!
+    const critic = readFileSync(join(pack.dir, 'agents', 'critic.md'), 'utf8')
+    const reviewer = readFileSync(join(pack.dir, 'agents', 'code-reviewer.md'), 'utf8')
+    const scout = readFileSync(join(pack.dir, 'agents', 'scout.md'), 'utf8')
+    const worker = readFileSync(join(pack.dir, 'agents', 'worker.md'), 'utf8')
     expect(critic).toContain('disallowedTools: Write, Edit, NotebookEdit, Bash, Agent, Task')
+    expect(reviewer).toContain('disallowedTools: Agent, Task')
+    expect(scout).toContain('background: true')
     expect(worker).toContain('isolation: worktree')
-    expect(worker).toContain('disallowedTools: Agent, Task')
-    expect(worker).toContain('background: true')
   })
 
-  it('folds the project memory index + active-context into the prompt (no "read on start" dependency)', () => {
-    const proj = mkdtempSync(join(tmpdir(), 'koda-mem-'))
-    mkdirSync(join(proj, '.koda', 'memory'), { recursive: true })
-    writeFileSync(join(proj, '.koda', 'memory', 'MEMORY.md'), '# Index\n- [Orientation](orientation.md) — the map')
-    writeFileSync(join(proj, '.koda', 'memory', 'active-context.md'), 'Currently: wiring memory injection.')
-    const text = assembleGuardrailText({ cwd: proj, brokerWired: true })
-    expect(text).toContain('Project memory (already loaded')
-    expect(text).toContain('- [Orientation](orientation.md) — the map')
-    expect(text).toContain('Currently: wiring memory injection.')
+  it.skipIf(!existsSync(bundledClaude))('passes the bundled engine strict plugin validator', () => {
+    expect(() =>
+      execFileSync(bundledClaude, ['plugin', 'validate', 'resources/pack', '--strict'], {
+        cwd: process.cwd(),
+        stdio: 'pipe',
+      }),
+    ).not.toThrow()
   })
 
-  it('injects nothing when the project has no memory index (fails soft)', () => {
-    // tmpdir() has no `.koda/memory/MEMORY.md`, so the memory block is absent.
-    const text = assembleGuardrailText({ cwd: tmpdir(), brokerWired: true })
-    expect(text).not.toContain('Project memory (already loaded')
-  })
-
-  it('weighs the injected memory pair: absent ⇒ not present, small ⇒ healthy, big ⇒ heavy', () => {
-    // No `.koda/memory/` at all — nothing injected, nothing to warn about.
-    expect(projectMemoryWeight(mkdtempSync(join(tmpdir(), 'koda-mem-')))).toEqual({
-      present: false,
-      chars: 0,
-      heavy: false,
+  it.skipIf(process.platform !== 'darwin')('keeps legacy agents foreground without changing approved leaves', () => {
+    const script = join(resolvePack()!.dir, 'hooks', 'constrain-delegation.js')
+    const legacy = execFileSync('/usr/bin/osascript', ['-l', 'JavaScript', script], {
+      input: JSON.stringify({
+        tool_name: 'Agent',
+        tool_input: {
+          subagent_type: 'legacy-reader',
+          run_in_background: true,
+          future_field: { preserved: true },
+        },
+      }),
+      encoding: 'utf8',
+    })
+    expect(JSON.parse(legacy)).toMatchObject({
+      hookSpecificOutput: {
+        permissionDecision: 'allow',
+        updatedInput: { run_in_background: false, future_field: { preserved: true } },
+      },
     })
 
-    const proj = mkdtempSync(join(tmpdir(), 'koda-mem-'))
-    mkdirSync(join(proj, '.koda', 'memory'), { recursive: true })
-    writeFileSync(join(proj, '.koda', 'memory', 'MEMORY.md'), '- [A note](a.md) — small index')
-    writeFileSync(join(proj, '.koda', 'memory', 'active-context.md'), 'Currently: fine.')
-    expect(projectMemoryWeight(proj)).toMatchObject({ present: true, heavy: false })
+    for (const subagentType of ['koda:scout', 'koda:worker', 'deep-review:detective', 'deep-review:finding-judge']) {
+      const leaf = execFileSync('/usr/bin/osascript', ['-l', 'JavaScript', script], {
+        input: JSON.stringify({
+          tool_name: 'Agent',
+          tool_input: { subagent_type: subagentType, run_in_background: true },
+        }),
+        encoding: 'utf8',
+      })
+      expect(leaf.trim()).toBe('')
+    }
+  })
+})
 
-    // Grow active-context past the line — the same threshold the status-bar pill warns at.
-    writeFileSync(join(proj, '.koda', 'memory', 'active-context.md'), 'x'.repeat(MEMORY_HEAVY_CHARS))
-    expect(projectMemoryWeight(proj)).toMatchObject({ present: true, heavy: true })
+describe('standalone Deep Review plugin', () => {
+  it('ships one shared review workflow to both native plugin formats', () => {
+    const plugin = resolveDeepReviewPlugin()!
+    const claudeManifest = JSON.parse(readFileSync(join(plugin.dir, '.claude-plugin', 'plugin.json'), 'utf8'))
+    const codexManifest = JSON.parse(readFileSync(join(plugin.dir, '.codex-plugin', 'plugin.json'), 'utf8'))
+    expect(plugin.dir).toContain(`/plugins/${DEEP_REVIEW_PLUGIN_NAME}`)
+    expect(deepReviewPluginVersion(plugin)).toBe('0.1.2')
+    expect(claudeManifest).toMatchObject({ name: 'deep-review', version: '0.1.2' })
+    expect(codexManifest).toMatchObject({ name: 'deep-review', version: claudeManifest.version })
+    const skill = readFileSync(join(plugin.dir, 'skills', 'deep-review', 'SKILL.md'), 'utf8')
+    expect(skill).toContain('score readiness from 1–5')
+    expect(skill).toContain('Cross-provider')
+    expect(skill).toContain('Self-review cannot earn')
+    expect(skill).toContain('up to five scored passes only when the user explicitly asks')
+    expect(skill).toContain('Treat an invocation without repair language')
+    const openAiMetadata = readFileSync(join(plugin.dir, 'skills', 'deep-review', 'agents', 'openai.yaml'), 'utf8')
+    expect(openAiMetadata).toContain('default_prompt: "Use $deep-review:deep-review')
+    expect(openAiMetadata).toContain('allow_implicit_invocation: false')
+    const guide = readFileSync(join(process.cwd(), 'Documents', 'guides', 'deep-review-workflow.md'), 'utf8')
+    expect(guide).toContain('/deep-review:deep-review')
+    expect(guide).toContain('$deep-review:deep-review')
+    expect(readFileSync(join(plugin.dir, 'agents', 'detective.md'), 'utf8')).toContain('background: true')
+    expect(readFileSync(join(plugin.dir, 'agents', 'finding-judge.md'), 'utf8')).toContain(
+      'confidence at least 80',
+    )
   })
 
-  it('shows the shape of Documents/ — folders and counts, nested, never filenames', () => {
-    const proj = mkdtempSync(join(tmpdir(), 'koda-docs-'))
-    mkdirSync(join(proj, 'Documents', 'design', 'audits'), { recursive: true })
-    mkdirSync(join(proj, 'Documents', 'fonts'), { recursive: true })
-    writeFileSync(join(proj, 'Documents', 'brief.md'), 'loose at the root')
-    writeFileSync(join(proj, 'Documents', 'design', 'DESIGN.md'), 'a doc')
-    writeFileSync(join(proj, 'Documents', 'design', 'mock.html'), 'not a doc')
-    writeFileSync(join(proj, 'Documents', 'design', 'audits', 'sidebar.md'), 'a doc')
-    writeFileSync(join(proj, 'Documents', 'fonts', 'x.woff2'), 'not a doc')
-    const text = assembleGuardrailText({ cwd: proj, brokerWired: true })
-    expect(text).toContain('- (loose at the `Documents/` root) — 1 doc')
-    // Anchored on the newline so the assertions actually pin INDENT — the depth math is the part
-    // most likely to break, and an unanchored `toContain` matches at any indent.
-    expect(text).toContain('\n- design/ — 1 doc')
-    expect(text).toContain('\n  - audits/ — 1 doc')
-    // A folder with no documents still shows (it's a real place to file one), but by count, not name.
-    expect(text).toContain('\n- fonts/ — 0 docs')
-    expect(text).not.toContain('DESIGN.md')
+  it.skipIf(!existsSync(bundledClaude))('passes the bundled Claude strict plugin validator', () => {
+    expect(() =>
+      execFileSync(bundledClaude, ['plugin', 'validate', 'resources/plugins/deep-review', '--strict'], {
+        cwd: process.cwd(),
+        stdio: 'pipe',
+      }),
+    ).not.toThrow()
   })
+})
 
-  it('keeps every top-level folder when a deep subtree overruns the cap, and says it was cut', () => {
-    const proj = mkdtempSync(join(tmpdir(), 'koda-docs-'))
-    // One fat subtree big enough to blow the nested budget, plus siblings after it alphabetically.
-    for (let i = 0; i < 80; i++) mkdirSync(join(proj, 'Documents', 'aaa', `sub${i}`), { recursive: true })
-    for (const name of ['mmm', 'zzz']) mkdirSync(join(proj, 'Documents', name), { recursive: true })
-    const text = assembleGuardrailText({ cwd: proj, brokerWired: true })
-    // The filing choice is which TOP-LEVEL folder — those must survive a greedy subtree.
-    expect(text).toContain('\n- aaa/ — 0 docs')
-    expect(text).toContain('\n- mmm/ — 0 docs')
-    expect(text).toContain('\n- zzz/ — 0 docs')
-    // And a cut list must never read as the whole shape.
-    expect(text).toContain('more folders exist below this')
-  })
+describe('memory library health', () => {
+  it('weighs the on-demand navigation pair without injecting it', () => {
+    const absent = project('koda-mem-')
+    expect(projectMemoryWeight(absent)).toEqual({ present: false, chars: 0, heavy: false })
 
-  it('cannot have a folder name forge a second list entry', () => {
-    const proj = mkdtempSync(join(tmpdir(), 'koda-docs-'))
-    mkdirSync(join(proj, 'Documents', 'plans\n- invented'), { recursive: true })
-    const text = assembleGuardrailText({ cwd: proj, brokerWired: true })
-    expect(text).toContain('- plans - invented/ — 0 docs')
-    expect(text).not.toContain('\n- invented/')
-  })
-
-  it('says nothing about Documents/ when the project has none yet (no shape to honor)', () => {
-    const proj = mkdtempSync(join(tmpdir(), 'koda-docs-'))
-    expect(assembleGuardrailText({ cwd: proj, brokerWired: true })).not.toContain('shape of this project')
+    const cwd = project('koda-mem-')
+    mkdirSync(join(cwd, '.koda', 'memory'), { recursive: true })
+    writeFileSync(join(cwd, '.koda', 'memory', 'MEMORY.md'), '- [A note](a.md) — small index')
+    writeFileSync(join(cwd, '.koda', 'memory', 'active-context.md'), 'Currently: fine.')
+    expect(projectMemoryWeight(cwd)).toMatchObject({ present: true, heavy: false })
+    writeFileSync(join(cwd, '.koda', 'memory', 'active-context.md'), 'x'.repeat(MEMORY_HEAVY_CHARS))
+    expect(projectMemoryWeight(cwd)).toMatchObject({ present: true, heavy: true })
   })
 })
 
 describe('gated mini-app recipe', () => {
-  // create-mini-app is built but not shipped: it lives in the staging pack and reaches an engine only
-  // when the mini-apps dogfood flag is on. These assertions guard that it stays OUT of the always-on
-  // path so a normal release ships clean; flip them when the feature graduates into the main pack.
-  it('keeps the create-mini-app skill in staging, not the main pack or the always-on Codex list', () => {
-    const staging = resolveStagingPack()
-    expect(staging).not.toBeNull()
-    const skill = readFileSync(join(staging!.dir, 'skills', 'create-mini-app', 'SKILL.md'), 'utf8')
-    expect(skill).toContain('name: create-mini-app')
-    expect(skill).toContain('Install, start, stop, and inspect the app only through Koda')
+  it('keeps create-mini-app in staging until the feature graduates', () => {
+    const staging = resolveStagingPack()!
+    expect(readFileSync(join(staging.dir, 'skills', 'create-mini-app', 'SKILL.md'), 'utf8')).toContain(
+      'name: create-mini-app',
+    )
     expect(GATED_PACK_SKILLS).toContain('create-mini-app')
     expect(CODEX_PACK_SKILLS).not.toContain('create-mini-app')
   })
 
-  it('invalidates same-version Codex plugin caches when pack wiring or the mini-apps flag changes', () => {
-    expect(codexPackMarker('0.1.4', false, false)).toMatch(/^0\.1\.4:pack\d+:pw0:ma0$/)
-    expect(codexPackMarker('0.1.4', true, false)).toMatch(/^0\.1\.4:pack\d+:pw1:ma0$/)
-    expect(codexPackMarker('0.1.4', false, true)).toMatch(/^0\.1\.4:pack\d+:pw0:ma1$/)
+  it('keys the immutable Codex catalog by content versions, not per-session capability flags', () => {
+    expect(codexPackMarker('0.1.10', null)).toMatch(/^0\.1\.10:pack\d+:drnone$/)
+    expect(codexPackMarker('0.1.10', '0.2.0')).not.toBe(codexPackMarker('0.1.10', '0.1.0'))
   })
 })

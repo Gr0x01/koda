@@ -16,10 +16,12 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { CallToolRequestSchema, isInitializeRequest, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http'
 import { randomUUID, timingSafeEqual } from 'node:crypto'
-import type { ToolDecision } from '@shared/ipc'
+import { DocKindSchema, type ToolDecision } from '@shared/ipc'
 import type { Checkpoint } from '../safety-git/checkpoint'
+import { REREAD_AFTER_RESTORE } from '../safety-git/restore-notice'
 import { CLIS, RUNTIMES, RUNTIME_IDS, CLI_IDS } from '../runtime/registry'
 import type { EnsureToolResult } from '../runtime/provision'
+import type { KeepDocumentArgs, KeptDocument } from '../keep-document'
 import { log } from '../logger'
 
 // The gate contract now lives in ./types (engine-neutral, so Codex can reach the same gate without
@@ -51,10 +53,16 @@ export type PreviewFileFn = (sessionId: string, relPath: string) => Promise<{ ur
  *  drives; the manager provisions via runtime/provision.ts (ensureTool) and returns the JSON result. */
 export type EnsureToolFn = (sessionId: string, toolId: string) => Promise<EnsureToolResult>
 
-/** Pop the terminal shelf for the user (open_terminal): the escape hatch for the rare command the agent
+/** Put the terminal on stage for the user (open_terminal): the escape hatch for the rare command the agent
  *  can't run itself. The broker drives; the manager pushes to the session's window (terminal.ts). A set
  *  `command` is staged at the prompt for the user to run — never executed. */
 export type OpenTerminalFn = (sessionId: string, command?: string) => Promise<void>
+
+/** "Keep this as a document" (document-workspace.md, the magic layer §1): the user asked for the
+ *  conversation to become a durable document, and the agent supplies the words. The broker drives; the
+ *  manager resolves session → project root and keep-document.ts writes it through `createProjectFile`,
+ *  which is where the frontmatter and the session's own id as provenance come from. */
+export type KeepDocumentFn = (sessionId: string, args: KeepDocumentArgs) => Promise<KeptDocument>
 
 /** Mini-app lifecycle capability (mini-apps-plan.md): install/start/stop/status for the project's mini
  *  apps. The broker drives; the manager resolves session → project → app dir (containment) and the
@@ -72,6 +80,7 @@ export interface MiniAppsFns {
 export const SERVER_NAME = 'koda_broker'
 /** Bare MCP tool names this server exposes (the engine namespaces them as `mcp__koda_broker__<name>`). */
 const TOOL_APPROVE = 'approve'
+const TOOL_CAPABILITIES = 'capabilities'
 const TOOL_LIST_CHECKPOINTS = 'list_checkpoints'
 const TOOL_RESTORE_CHECKPOINT = 'restore_checkpoint'
 const TOOL_PREVIEW = 'preview'
@@ -83,10 +92,70 @@ const TOOL_APP_INSTALL = 'app_install'
 const TOOL_APP_START = 'app_start'
 const TOOL_APP_STOP = 'app_stop'
 const TOOL_APP_STATUS = 'app_status'
+const TOOL_KEEP_DOCUMENT = 'keep_document'
 /** The mini-app lifecycle verbs — advertised only when the mini-apps flag is on (register() opts). */
 const MINI_APP_TOOLS = new Set([TOOL_APP_INSTALL, TOOL_APP_START, TOOL_APP_STOP, TOOL_APP_STATUS])
 /** The env var the engine expands for the bearer token (kept out of argv). */
 export const BROKER_TOKEN_ENV = 'KODA_BROKER_TOKEN'
+
+interface CapabilityDirectoryEntry {
+  id: string
+  label: string
+  outcome: string
+  invoke: string[]
+  note?: string
+}
+
+interface CapabilityDirectoryDefinition extends Omit<CapabilityDirectoryEntry, 'invoke'> {
+  tools: string[]
+}
+
+const brokerTool = (name: string): string => `mcp__${SERVER_NAME}__${name}`
+
+const CAPABILITY_DIRECTORY: CapabilityDirectoryDefinition[] = [
+  {
+    id: 'recovery',
+    label: 'Recovery',
+    outcome: 'Inspect Koda safety checkpoints and restore a known-good project state.',
+    tools: [TOOL_LIST_CHECKPOINTS, TOOL_RESTORE_CHECKPOINT],
+    note: 'Restoring always asks the user first.',
+  },
+  {
+    id: 'preview',
+    label: 'Preview',
+    outcome: 'Show a static HTML artifact or run, embed, and inspect a live web app.',
+    tools: [TOOL_PREVIEW_FILE, TOOL_PREVIEW, TOOL_VIEW_PREVIEW],
+  },
+  {
+    id: 'environment',
+    label: 'Tools and terminal',
+    outcome: 'Install a curated runtime or put Koda\'s built-in terminal on stage for the user.',
+    tools: [TOOL_ENSURE_TOOL, TOOL_OPEN_TERMINAL],
+    note: 'Installing software asks the user first; open_terminal stages commands but never runs them.',
+  },
+  {
+    id: 'documents',
+    label: 'Documents',
+    outcome: 'Keep a conversation as a durable Koda document when the user explicitly asks.',
+    tools: [TOOL_KEEP_DOCUMENT],
+    note: 'Never create a kept document on the agent\'s own initiative.',
+  },
+  {
+    id: 'mini-apps',
+    label: 'Mini apps',
+    outcome: 'Register and control this project\'s Koda mini-app lifecycle.',
+    tools: [TOOL_APP_INSTALL, TOOL_APP_START, TOOL_APP_STOP, TOOL_APP_STATUS],
+  },
+]
+
+/** Build the live directory from the exact descriptors registered on this MCP server. A capability
+ * disappears automatically when any required verb is gated or removed, so directory truth cannot
+ * drift from ListTools. */
+function capabilityDirectory(registeredToolNames: ReadonlySet<string>): CapabilityDirectoryEntry[] {
+  return CAPABILITY_DIRECTORY
+    .filter((entry) => entry.tools.every((tool) => registeredToolNames.has(tool)))
+    .map(({ tools, ...entry }) => ({ ...entry, invoke: tools.map(brokerTool) }))
+}
 
 interface SessionEntry {
   server: Server
@@ -134,10 +203,12 @@ export class PermissionBroker {
     private readonly previewFile: PreviewFileFn,
     /** Just-in-time tool provisioning: install a curated CLI the agent asks for, return the result. */
     private readonly ensureTool: EnsureToolFn,
-    /** Pop the terminal shelf for the user, optionally staging (never running) a command at the prompt. */
+    /** Put the terminal on stage for the user, optionally staging (never running) a command at the prompt. */
     private readonly openTerminal: OpenTerminalFn,
     /** Mini-app lifecycle verbs (install/start/stop/status) — surfaced only when register() opts in. */
     private readonly miniApps: MiniAppsFns,
+    /** "Keep this as a document": write the conversation the user asked to keep into their Documents/. */
+    private readonly keepDocument: KeepDocumentFn,
   ) {}
 
   /**
@@ -190,8 +261,7 @@ export class PermissionBroker {
     const token = randomUUID()
     const server = new Server({ name: SERVER_NAME, version: '1.0.0' }, { capabilities: { tools: {} } })
 
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: [
+    const registeredTools = [
         {
           name: TOOL_APPROVE,
           description: 'Koda permission broker — approve or deny a tool call.',
@@ -203,6 +273,21 @@ export class PermissionBroker {
               tool_use_id: { type: 'string' },
             },
             additionalProperties: true,
+          },
+        },
+        {
+          name: TOOL_CAPABILITIES,
+          description:
+            "Read Koda's live capability directory for this session. Use this once when a request could benefit from a Koda-owned surface, or when you are unsure how Koda can help. Pass a short goal to narrow the result. It returns only ready capabilities and their exact tool names — never infer a capability that is absent.",
+          inputSchema: {
+            type: 'object',
+            properties: {
+              query: {
+                type: 'string',
+                description: 'Optional short goal, e.g. "show the app", "recover files", or "keep this conversation".',
+              },
+            },
+            additionalProperties: false,
           },
         },
         {
@@ -273,7 +358,7 @@ export class PermissionBroker {
         {
           name: TOOL_OPEN_TERMINAL,
           description:
-            "Open Koda's built-in terminal (the shelf in the Stage) for the user. Use this for the rare command YOU can't run yourself — one needing a sudo/password prompt, an interactive login, or the user's own credentials typed in. Pass `command` to stage it at the prompt; Koda types it in but never runs it, so the user reviews it and presses Enter (their password step stays theirs). Prefer this over telling the user to open the macOS Terminal app. For everything you can run yourself, just use Bash — not this.",
+            "Open Koda's built-in terminal (a tab on the Stage) for the user. Use this for the rare command YOU can't run yourself — one needing a sudo/password prompt, an interactive login, or the user's own credentials typed in. Pass `command` to stage it at the prompt; Koda types it in but never runs it, so the user reviews it and presses Enter (their password step stays theirs). Prefer this over telling the user to open the macOS Terminal app. For everything you can run yourself, just use Bash — not this.",
           inputSchema: {
             type: 'object',
             properties: {
@@ -327,10 +412,50 @@ export class PermissionBroker {
             "List this project's mini apps with their live state (starting / running / stopped / crashed), URL, pid, restart count, and whether they start when Koda launches. This is the way to get a running app's CURRENT url — Koda reassigns the port on every restart, so a url from an earlier message may already be dead. 'crashed' means it exited repeatedly and the supervisor gave up — fix the app, then app_start again.",
           inputSchema: { type: 'object', properties: {}, additionalProperties: false },
         },
+        {
+          name: TOOL_KEEP_DOCUMENT,
+          // This description is the deterministic half of the rule. A playbook has to be routed to be
+          // read; a tool description is in front of the agent on every turn of every session, which is
+          // why the polarity and the editorial bar are stated HERE and only reinforced in the pack.
+          description:
+            'Turn what you and the user just worked through into a durable document in their Documents/ folder. Use it ONLY when they ask — "keep this", "save this as a document", "write that up". Never on your own initiative: Koda does not decide that a conversation was worth keeping, and a document the user did not ask for is the failure this tool is shaped around. Look at the live Documents/ tree first — when a document already owns the topic, extend that one with an ordinary edit instead of filing a parallel memo. Keep only what outlives the conversation: the decisions, the conclusions, the reasoning someone will need later, never a transcript or a play-by-play of the chat. A quiet stretch of work earns one dated line rather than a padded summary, and when nothing durable came out of it, write nothing and say so — an empty result is a valid result, and manufacturing content to fill it is the failure. Koda writes the title block, the date and where the document came from; you write the words.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              title: {
+                type: 'string',
+                description: "The document's name, e.g. \"Branch management notes\" — it becomes both the filename and the title on the page.",
+              },
+              description: {
+                type: 'string',
+                description:
+                  'One honest sentence saying what this document is for. It is the single line shown under the title when the user is looking for something, so a description that restates the title is rejected.',
+              },
+              kind: {
+                type: 'string',
+                enum: [...DocKindSchema.options],
+                description: 'What the document is for. Answer that, not where it lives — "note" is the honest catch-all.',
+              },
+              body: {
+                type: 'string',
+                description:
+                  'The document itself, in markdown: headings, lists, tables, and callouts all render. Do not include a frontmatter block — Koda writes that.',
+              },
+              folder: {
+                type: 'string',
+                description:
+                  'Optional project-relative topic folder under Documents/, e.g. "Documents/decisions". Created if it does not exist yet. Omit to file at the top of Documents/.',
+              },
+            },
+            required: ['title', 'description', 'kind', 'body'],
+            additionalProperties: false,
+          },
+        },
       ].filter(
         (t) => (includeApprove || t.name !== TOOL_APPROVE) && (includeMiniApps || !MINI_APP_TOOLS.has(t.name)),
-      ),
-    }))
+      )
+    const registeredToolNames = new Set(registeredTools.map((tool) => tool.name))
+    server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: registeredTools }))
 
     server.setRequestHandler(CallToolRequestSchema, async (req, extra) =>
       // Keep the call alive across a long wait — an `approve` for AskUserQuestion or an Ask-me prompt
@@ -338,6 +463,29 @@ export class PermissionBroker {
       // notifications reset that timer (verified vs 2.1.197). No-op for instant approvals.
       withApprovalHeartbeat(extra, req.params._meta?.progressToken, async () => {
       const args = (req.params.arguments ?? {}) as Record<string, unknown>
+
+      if (req.params.name === TOOL_CAPABILITIES) {
+        const query = typeof args.query === 'string' ? args.query.trim().toLowerCase() : ''
+        const entries = capabilityDirectory(registeredToolNames)
+        const queryTerms = query.split(/\s+/).filter((term) => term.length >= 3)
+        const capabilities = query
+          ? entries.filter((entry) =>
+              queryTerms.some((term) =>
+                [entry.id, entry.label, entry.outcome, entry.note ?? '', ...entry.invoke]
+                  .join(' ')
+                  .toLowerCase()
+                  .includes(term),
+              ),
+            )
+          : entries
+        const payload = {
+          capabilities,
+          ...(query && capabilities.length === 0
+            ? { message: "No ready Koda capability matched that goal. Use the engine's ordinary tools or tell the user plainly." }
+            : {}),
+        }
+        return { content: [{ type: 'text' as const, text: JSON.stringify(payload) }] }
+      }
 
       // Agent-driven recovery capability tools — the broker drives, safety-git executes. Errors come
       // back as an MCP tool error (isError) the engine reports to the user, never a thrown handler.
@@ -353,7 +501,14 @@ export class PermissionBroker {
         if (!checkpointId) return toolError(new Error('checkpoint_id is required'))
         try {
           const checkpoint = await this.restoreCheckpoint(sessionId, checkpointId)
-          return { content: [{ type: 'text', text: JSON.stringify({ restored: true, checkpoint }) }] }
+          // The tree just moved under this conversation. Say so in the result rather than letting the
+          // agent carry on from files it read before the rewind (dual-git.md §2; restore-notice.ts).
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify({ restored: true, checkpoint }) },
+              { type: 'text' as const, text: REREAD_AFTER_RESTORE },
+            ],
+          }
         } catch (err) {
           return toolError(err)
         }
@@ -411,6 +566,23 @@ export class PermissionBroker {
         try {
           await this.openTerminal(sessionId, command)
           return { content: [{ type: 'text', text: JSON.stringify({ opened: true, staged: !!command }) }] }
+        } catch (err) {
+          return toolError(err)
+        }
+      }
+      if (req.params.name === TOOL_KEEP_DOCUMENT) {
+        // Every field is validated in keep-document.ts, including the ones that look like plain
+        // presence checks — one place to read for what this tool will and won't write, and every
+        // refusal comes back as a sentence that says which rule it broke.
+        try {
+          const kept = await this.keepDocument(sessionId, {
+            title: String(args.title ?? ''),
+            description: String(args.description ?? ''),
+            kind: String(args.kind ?? ''),
+            body: String(args.body ?? ''),
+            folder: typeof args.folder === 'string' ? args.folder : undefined,
+          })
+          return { content: [{ type: 'text', text: JSON.stringify(kept) }] }
         } catch (err) {
           return toolError(err)
         }

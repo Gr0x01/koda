@@ -6,16 +6,19 @@ import { BrowserTestingRow, RuntimeRow } from './ApprovalsSection'
 // changes. If the user already has the runtime, we say so and offer nothing. See runtime/provision.ts.
 export function ToolsSection() {
   return (
-    <SettingsSection title="Toolkit">
+    <SettingsSection
+      title="Toolkit"
+      note="Each of these downloads once into Koda's own folder, is shared by every project, changes nothing else on your Mac, and leaves nothing to uninstall. Node is about 50 MB, Python about 25 MB, a browser about 150 MB."
+    >
       <RuntimeRow
         runtime="node"
         label="Node.js runtime"
-        description="Apps that store data or run their own server need Node.js. Koda sets it up in its own folder. About 50 MB, no changes to your Mac, nothing to uninstall later."
+        description="Set up Node.js so apps that store data or run their own server can work."
       />
       <RuntimeRow
         runtime="python"
         label="Python runtime"
-        description="Data work, automation, and many AI tools run on Python. Koda sets up a self-contained copy in its own folder. About 25 MB, no changes to your Mac, nothing to uninstall later."
+        description="Set up Python for data work, automation, and the AI tools that expect it."
       />
       <BrowserTestingRow />
     </SettingsSection>

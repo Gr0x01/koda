@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fan Out Work"
+  short_description: "Delegate independent work to bounded leaf agents"
+  default_prompt: "Use $fan-out-work to divide this task among independent leaf agents."

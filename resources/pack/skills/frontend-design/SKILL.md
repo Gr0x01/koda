@@ -1,12 +1,12 @@
 ---
 name: frontend-design
-description: Guidance for distinctive, intentional visual design when building new UI or reshaping an existing one. Helps with aesthetic direction, typography, and making choices that don't read as templated defaults.
+description: Guidance for intentional visual design. Use the full identity-and-mock process for a new product or genuinely new visual direction; for bounded UI work in an established product, inherit its existing design system and keep the process proportional.
 license: Complete terms in LICENSE.txt
 ---
 
 # Frontend Design
 
-Approach this as the design lead at a small studio known for giving every client a visual identity that could not be mistaken for anyone else's. This client has already rejected proposals that felt templated, and is paying for a distinctive point of view: make deliberate, opinionated choices about palette, typography, and layout that are specific to this brief, and take one real aesthetic risk you can justify.
+First classify the job. A new product, campaign, or explicitly requested redesign may need a distinctive visual identity. A bounded addition or repair inside an established product inherits that product's tokens, typography, components, density, and interaction grammar; do not invent a new palette, type system, signature device, or aesthetic risk just to prove design effort.
 
 ## Ground it in the subject
 
@@ -26,13 +26,19 @@ Match complexity to the vision. Maximalist directions need elaborate execution; 
 
 Consider written content carefully. Often a design brief may not contain real content, and it's up to you to come up with copy. Copy can make a design feel as templated as the design itself. See the below section on writing for more guidance.
 
-## Process: brainstorm, explore, plan, critique, build, critique again
+## Process: match the design work to the decision
+
+For established-product UI, inspect the surrounding screen and design source of truth, state the one interaction or hierarchy choice the change needs, and build it with existing primitives. Make a separate mock only when the visual direction itself is undecided and the choice would materially change the result.
+
+For a new visual identity or genuinely open redesign, use the full process below.
 
 For calibration: AI-generated design right now clusters around three looks: (1) a warm cream background (near #F4F1EA) with a high-contrast serif display and a terracotta accent; (2) a near-black background with a single bright acid-green or vermilion accent; (3) a broadsheet-style layout with hairline rules, zero border-radius, and dense newspaper-like columns. All three are legitimate for some briefs, but they are defaults rather than choices, and they appear regardless of subject. Where the brief pins down a visual direction, follow it exactly — the brief's own words always win, including when it asks for one of these looks. Where it leaves an axis free, don't spend that freedom on one of these defaults. Just like a human designer who's hired, there's often a careful balance between doing what you're good at and taking each project as a chance to experiment and learn.
 
 Work in two passes. First, brainstorm a short design plan based on the human's design brief: create a compact token system with color, type, layout, and signature. Color: describe the palette as 4–6 named hex values. Type: the typefaces for 2+ roles (a characterful display face that's used with restraint, a complementary body face, and a utility face for captions or data if needed). Layout: a layout concept, using one-sentence prose descriptions and ASCII wireframes to ideate and compare. Signature: the single unique element this page will be remembered by that embodies the brief in an appropriate way.
 
 Then review that plan against the brief before building: if any part of it reads like the generic default you would produce for any similar page (work through a similar prompt to see if you arrive somewhere similar) rather than a choice made for this specific brief — revise that part, say what you changed and why. Only after you've confirmed the relative uniqueness of your design plan should you start to write the code, following the revised plan exactly and deriving every color and type decision from it.
+
+Before writing production code for a new visual identity or an open redesign, turn the revised plan into one small, self-contained HTML mock under `.koda/scratch/`. Include enough context to show the direction, open it in Koda with `mcp__koda_broker__preview_file`, and wait for the user's go. Skip this mock for bounded work in an established interface, a non-visual change, an explicitly approved design, or when the user asks to skip it.
 
 When writing the code, be careful of structuring your CSS selector specificities. It's easy to generate CSS classes that cancel each other out (especially with a type-based selector like .section and a element-based selector like .cta). This can happen often with paddings/margins between sections.
 

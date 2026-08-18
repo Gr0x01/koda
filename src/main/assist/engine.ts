@@ -1,27 +1,31 @@
 /**
  * Local-assist engine — the backend-swappable seam for Koda's QoL micro-tasks (session titles,
- * humanized safety-git recovery labels). Tier-1 backend = Apple Foundation Models via a tiny signed
- * Swift helper (spawn-per-call; the OS keeps the on-device model warm across processes, ~300ms).
+ * saved-version subjects, humanized safety-git recovery labels). Tier-1 backend = Apple Foundation
+ * Models via a tiny signed Swift helper (spawn-per-call; the OS keeps the on-device model warm across
+ * processes, ~300ms).
  *
  * Electron-free on purpose (testable in isolation, like adapter.ts). The Electron wiring (settings
  * toggle, helper-path resolution, IPC) lives in the thin layer that constructs this.
  *
- * Contract: `assist()` NEVER throws and ALWAYS returns a usable string. Anything that isn't a clean
- * model answer — toggle off, model unavailable, helper missing, timeout, bad JSON — falls through to
- * the deterministic floor. "Apple FM if available, else first-words / raw label" (local-assist-roadmap).
+ * Contract: `assist()` NEVER throws and ALWAYS returns a usable title/label. Anything that isn't a
+ * clean model answer falls through to its deterministic floor. `generateVersion()` returns null on
+ * the same misses because the save composer already owns its richer file-count floor.
  *
  * Roadmap note: this is where the `local-gguf` backend slots in later (another branch behind the same
  * `generate()` boundary) and where non-Mac inherits it. Don't widen the public surface for that yet.
  */
 import { execFile } from 'node:child_process'
+import { cleanVersionSubject } from '@shared/version-message'
 
-export type AssistTask = 'title' | 'label'
+export type AssistTask = 'title' | 'label' | 'version'
+export type DeterministicAssistTask = Exclude<AssistTask, 'version'>
 
 export interface AssistEngineOpts {
   /** Absolute path to the compiled Swift helper, or null when there's no backend (non-mac / not built). */
   helperPath: string | null
-  /** The user's toggle (Apple-style: default-on when available, one switch to disable). */
-  enabled: () => boolean
+  /** Live per-task gate. Titles/versions are chosen by the generated-text picker; recovery labels keep
+   *  their own on-device-assist toggle. */
+  enabled: (task: AssistTask) => boolean
   /** Per-call ceiling. Generous: tasks are background, but a wedged helper must never hang a caller. */
   timeoutMs?: number
 }
@@ -60,14 +64,18 @@ export class AssistEngine {
    * model: measured on-device, the ~3B model ignores "don't use these names" on identical inputs, so
    * divergence comes from the substance-digest input plus this deterministic floor.
    */
-  async assist(task: AssistTask, input: string, avoid: string[] = []): Promise<string> {
-    const out = await this.generate(task, input)
+  async assist(task: DeterministicAssistTask, input: string, avoid: string[] = []): Promise<string> {
+    const out = (await this.generate(task, input)) ?? deterministic(task, input)
     return task === 'title' ? disambiguate(out, avoid) : out
   }
 
-  private async generate(task: AssistTask, input: string): Promise<string> {
-    const fallback = deterministic(task, input)
-    if (!this.opts.enabled() || this.availability === 'unavailable') return fallback
+  /** A locally written saved-version subject, or null so the caller keeps its already-seeded floor. */
+  async generateVersion(input: string): Promise<string | null> {
+    return this.generate('version', input)
+  }
+
+  private async generate(task: AssistTask, input: string): Promise<string | null> {
+    if (!this.opts.enabled(task) || this.availability === 'unavailable') return null
 
     const result = await this.runHelper(task, input)
     if (result?.ok) {
@@ -76,12 +84,12 @@ export class AssistEngine {
       // The model answered, but "answered" isn't "usable": the on-device model sometimes refuses or
       // echoes its own instructions on bug-report-shaped input. Rejecting → the floor keeps that
       // apology text from being stored verbatim as the session name.
-      return out.length > 0 && !looksUnusable(out) ? out : fallback
+      return out.length > 0 && (task === 'version' || !looksUnusable(out)) ? out : null
     }
     // A hard "unavailable:*" signal latches off (no AI on this machine / this run); transient
     // "error:*" or a spawn miss does NOT latch — it might be a one-off, so stay 'unknown' and retry next time.
     if (result && result.reason.startsWith('unavailable:')) this.availability = 'unavailable'
-    return fallback
+    return null
   }
 
   private runHelper(task: AssistTask, input: string): Promise<HelperOk | HelperErr | null> {
@@ -91,8 +99,9 @@ export class AssistEngine {
       execFile(
         helperPath,
         // Cap the argv arg: a huge pasted prompt would blow ARG_MAX (E2BIG → spawn fail → fallback).
-        // A title/label only needs the opening anyway. The deterministic floor still sees full input.
-        [task, input.slice(0, 4000)],
+        // A title/label only needs the opening; version evidence gets the larger cap. The
+        // deterministic floor still sees the full title/label input.
+        [task, input.slice(0, task === 'version' ? 8000 : 4000)],
         { timeout: this.timeoutMs, maxBuffer: 1 << 16 },
         (err, stdout) => {
           if (err) return resolve(null) // spawn miss / timeout / nonzero — treat as transient
@@ -114,7 +123,8 @@ export class AssistEngine {
  * whole (length is already bounded by the helper's token budget); the UI ellipsizes visually when
  * it doesn't fit, so we never chop real words out of the stored name.
  */
-function tidy(_task: AssistTask, raw: string): string {
+function tidy(task: AssistTask, raw: string): string {
+  if (task === 'version') return cleanVersionSubject(raw) ?? ''
   return recase(
     raw
       .trim()
@@ -167,7 +177,7 @@ function looksUnusable(text: string): boolean {
  * it also covers assist-off machines, where the deterministic first-words title would otherwise
  * repeat identically forever.
  */
-function disambiguate(title: string, avoid: string[]): string {
+export function disambiguate(title: string, avoid: string[]): string {
   const norm = (t: string): string => t.replace(/…$/, '').replace(/\s+/g, ' ').trim().toLowerCase()
   if (!avoid.some((a) => norm(a) === norm(title))) return title
   return `${title} · ${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`
@@ -177,7 +187,7 @@ function disambiguate(title: string, avoid: string[]): string {
  * The always-available floor. Title = first few words of the request (ellipsized); label = the
  * request itself, whitespace-collapsed (already the user's own words — what safety-git stores today).
  */
-export function deterministic(task: AssistTask, input: string): string {
+export function deterministic(task: DeterministicAssistTask, input: string): string {
   const clean = input.replace(/\s+/g, ' ').trim()
   if (task === 'label') return clean || 'checkpoint'
 

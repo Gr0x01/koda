@@ -26,6 +26,12 @@ resources/voice/
 # onto the user's machine at enable-time, not here.
 resources/playwright/
 
+# packaging).
+
+# Compiled TailscaleKit.framework (libtailscale — the phone's Connect node). Built from the pinned
+# SHA plus the fork series by native/libtailscale/build-tailscalekit.sh; never committed (~23 MB of
+# Go runtime, signed by Xcode on embed).
+native/libtailscale/Frameworks/
 
 # Koda runtime state created when dogfooding on this repo: the safety-git undo store
 # (.koda/safety.git — a nested git repo, ~150 internal files) + per-project memory. Machine-local,
@@ -57,7 +63,6 @@ playwright-report/
 !.vscode/extensions.json
 
 /temp*
-
 
 # Xcode build output
 ios/build/

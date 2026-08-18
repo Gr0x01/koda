@@ -1,0 +1,4 @@
+interface:
+  display_name: "Finish Work"
+  short_description: "Verify, review, clean, and truthfully close material work."
+  default_prompt: "Use $finish-work to verify and close this work before delivery."

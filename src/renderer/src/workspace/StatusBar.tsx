@@ -4,6 +4,7 @@ import {
   windowLabel,
   type AppInfo,
   type BackupKept,
+  type EngineId,
   type EngineProbe,
   type ProviderKind,
   type RateLimitInfo,
@@ -14,6 +15,7 @@ import { engineShort, engineOrder } from './models'
 import { useWorkspace } from './store'
 import { Button } from '../ui'
 import { liveRateLimitWindows } from '@shared/rate-limits'
+import { engineCapabilities, isEngineId } from '@shared/engine-capabilities'
 
 // ── Billing fallback banner ──────────────────────────────────────────────────────
 // 'auto' mode only: shown when the subscription plan limit is hit and we haven't yet asked whether to
@@ -102,6 +104,7 @@ export function DataIntegrityBanner() {
   const archiveBackupKept = useWorkspace((s) => s.archiveBackupKept)
   const droppedSessions = useWorkspace((s) => s.droppedSessions)
   const droppedArchives = useWorkspace((s) => s.droppedArchives)
+  const unreadableArchiveBodies = useWorkspace((s) => s.unreadableArchiveBodies)
   const archiveWriteFailed = useWorkspace((s) => s.archiveWriteFailed)
   const archiveRestoreFailed = useWorkspace((s) => s.archiveRestoreFailed)
   // Not in the workspace store: settings are app-global, so this comes straight from main. Re-asked on
@@ -163,6 +166,17 @@ export function DataIntegrityBanner() {
         `${droppedArchives === 1 ? 'It was' : 'They were'} set aside instead of deleted, and Koda kept a copy of the original list beside it.`,
         'The rest of this project is working normally, and archiving still works.',
         `Ask Koda to bring ${droppedArchives === 1 ? 'that chat' : 'those chats'} back.`,
+      ),
+    })
+  }
+  if (unreadableArchiveBodies > 0) {
+    lines.push({
+      key: 'archive-body-unreadable',
+      headline: `Koda couldn’t read the archived copy of ${count(unreadableArchiveBodies, 'chat')}.`,
+      body: sentences(
+        `${unreadableArchiveBodies === 1 ? 'Its live copy is' : 'Their live copies are'} still here and nothing was deleted.`,
+        `Koda kept the readable live ${unreadableArchiveBodies === 1 ? 'copy' : 'copies'} instead of trusting the broken archive.`,
+        'Ask Koda to repair the archive before putting that work away again.',
       ),
     })
   }
@@ -306,26 +320,52 @@ export function StatusBar() {
 }
 
 // ── Footer actions (left of the status bar) ──────────────────────────────────────
-// Versions opens the full history (graph + branch review); Settings overlays the main area. A dirty
-// dot on Versions echoes the dock's Changes cue so unsaved work — including a sibling worktree's — is
-// visible even when the dock is on another tool.
+// ONE Versions chip: it opens the timeline, carries the unsaved-change count, and shows an amber dot
+// when side lines are still waiting. It used to be two buttons sitting next to each other saying two
+// halves of the same fact ("2 changes" and "Versions"), which is what made the count read as a second
+// place work could live. Settings overlays the main area. This lives in always-visible chassis because
+// the stage comes and goes with what's on it, and an unsaved-work cue that can disappear isn't a cue.
 function FooterActions() {
   const setVersionsOpen = useWorkspace((s) => s.setVersionsOpen)
   const setSettingsOpen = useWorkspace((s) => s.setSettingsOpen)
-  const dirty = useWorkspace((s) => s.gitRepo && (s.gitFiles.length > 0 || s.gitWorktreesDirty))
+  const gitRepo = useWorkspace((s) => s.gitRepo)
+  const changeCount = useWorkspace((s) => (s.gitRepo ? s.gitFiles.length : 0))
+  const sideLinesWaiting = useWorkspace((s) => s.gitRepo && s.gitSideLinesWaiting)
+  const changeSummary =
+    changeCount > 0
+      ? `${changeCount} ${changeCount === 1 ? 'change' : 'changes'} not yet saved`
+      : null
+  const details = [changeSummary, sideLinesWaiting ? 'side-line work is waiting' : null].filter(
+    (detail): detail is string => detail !== null,
+  )
   return (
     <div className="flex items-center gap-0.5">
-      <FooterButton label="Versions" onClick={() => setVersionsOpen(true)}>
-        <span className="relative">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-            <circle cx="6" cy="6" r="2.5" />
-            <circle cx="6" cy="18" r="2.5" />
-            <circle cx="18" cy="8" r="2.5" />
-            <path d="M6 8.5v7M18 10.5c0 3-2.5 4.5-6 4.5" />
-          </svg>
-          {dirty && <span className="absolute -right-1 -top-0.5 h-1.5 w-1.5 rounded-full bg-accent ring-2 ring-bg" aria-hidden />}
-        </span>
-      </FooterButton>
+      <button
+        onClick={() => setVersionsOpen(true)}
+        title={details.length > 0 ? `Versions · ${details.join(' · ')}` : 'Versions'}
+        aria-label={details.length > 0 ? `Versions, ${details.join(', ')}` : 'Versions'}
+        className="flex items-center gap-1.5 rounded-md px-1.5 py-1 text-[11px] text-text-muted transition-colors hover:bg-surface hover:text-text"
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+          <circle cx="6" cy="6" r="2.5" />
+          <circle cx="6" cy="18" r="2.5" />
+          <circle cx="18" cy="8" r="2.5" />
+          <path d="M6 8.5v7M18 10.5c0 3-2.5 4.5-6 4.5" />
+        </svg>
+        <span>Versions</span>
+        {gitRepo && changeCount > 0 && (
+          <span className="font-medium tabular-nums text-accent" aria-hidden>
+            {changeCount}
+          </span>
+        )}
+        {sideLinesWaiting && (
+          <span
+            className="h-1.5 w-1.5 rounded-full bg-amber-500"
+            title="Side lines are still waiting"
+            aria-hidden
+          />
+        )}
+      </button>
       <FooterButton label="Settings" onClick={() => setSettingsOpen(true)}>
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
           <circle cx="12" cy="12" r="3" />
@@ -412,8 +452,8 @@ function healthTooltip(health?: { note?: string; kind?: ProviderKind }): string 
 }
 
 // ── Memory tidy pill ──────────────────────────────────────────────────────────────
-// Quiet by default: renders only when the project's always-injected memory pair (the index +
-// active-context, folded into every session's system prompt) has crossed the heaviness line. Sits
+// Quiet by default: renders only when the project's memory navigation pair (the index +
+// active-context) has crossed the heaviness line. Sits
 // right next to Settings (the surface it opens), NOT in the center usage cluster — it's a control
 // that leads somewhere, not an ambient stat. Amber like the outage pill; gone once tidied.
 function MemoryTidyPill() {
@@ -423,7 +463,7 @@ function MemoryTidyPill() {
   return (
     <button
       onClick={() => openSettingsTo('memory')}
-      title="This project's memory has grown. Part of it loads into every conversation, so tidying it keeps the agent sharp. Click for details."
+      title="This project's memory map has grown hard to navigate. Tidying it keeps retrieval sharp. Click for details."
       aria-label="Memory needs a tidy — open Settings"
       className="ml-0.5 flex select-none items-center gap-1.5 rounded-md px-1.5 py-1 text-[11px] text-amber-500 transition-colors hover:bg-surface hover:text-amber-400"
     >
@@ -487,6 +527,7 @@ function RateLimitStatus() {
   }, [])
   // An engine in an incident always earns a chip (even before it has window data) so its health shows.
   const engineIds = Array.from(new Set([activeEngine, ...Object.keys(rateLimits), ...Object.keys(providerDown)]))
+    .filter(isEngineId)
     .filter((id) => id === activeEngine || providerDown[id] || hasWindowData(liveRateLimitWindows(rateLimits[id], nowSec)))
     .sort((a, b) => engineOrder(a) - engineOrder(b))
   const labelEngines = engineIds.length > 1
@@ -516,7 +557,7 @@ function EngineWindows({
   windows,
   showLabel,
 }: {
-  engineId: string
+  engineId: EngineId
   windows: Record<string, RateLimitInfo>
   showLabel: boolean
 }) {
@@ -666,9 +707,10 @@ function EngineWindows({
               {presentTypes.length > 0 ? (
                 <>
                   {presentTypes.map((t) => <WindowRow key={t} type={t} info={windows[t]} />)}
-                  {/* Claude's server (since ~2026-07) omits windows it deems quiet — surface the 5-hour
-                      line anyway so it reads as "nothing to report", not as the limit vanishing. */}
-                  {engineId === 'claude' && !windows['five_hour'] && (
+                  {/* A server that omits windows it deems quiet (Anthropic's, since ~2026-07) still has
+                      a 5-hour limit — surface the line so it reads as "nothing to report", not as the
+                      limit vanishing. */}
+                  {engineCapabilities(engineId).anchorsFiveHourWindow && !windows['five_hour'] && (
                     <div className="flex justify-between gap-6">
                       <span>5-hour</span>
                       <span className="text-text">nothing to report, likely low</span>

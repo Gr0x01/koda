@@ -1,11 +1,22 @@
 import { create } from 'zustand'
-import { attachedFilesNote, clampLayout, DEFAULT_LAYOUT, faceTurnText, undoPointRefusal } from '@shared/ipc'
+import {
+  attachedFilesNote,
+  clampLayout,
+  DEFAULT_LAYOUT,
+  faceTurnText,
+  undoPointRefusal,
+} from '@shared/ipc'
+import { compactTranscriptToolOutput } from '@shared/tool-output'
 import {
   appendLiveToolOutput,
-  hasRunningSubagent,
+  attachTurnFailureToTranscript,
+  hasRunningDelegation,
   isTopLevelTurnActivity,
+  latestTurnFailureOf,
   settleRestoredTranscriptItem,
   settleRestoredTranscriptItems,
+  supersedeTurnFailure,
+  terminalAttentionKind,
 } from '@shared/delegation'
 import {
   appSummonThread,
@@ -27,14 +38,24 @@ import type {
   EngineId,
   GitStatusFile,
   MiniAppInfo,
+  LegacyKeptDocPathChange,
   ModelSpend,
   PreviewRestart,
+  PersistedSession,
+  PersistedSessions,
   ProviderKind,
   ProviderStatusEvent,
   RateLimitInfo,
+  ResumeCursor,
+  SessionCapabilitySnapshot,
+  SessionNameKind,
+  TaskCompletionState,
   WorkspaceLayoutSizes,
 } from '@shared/ipc'
-import { expandDocMentionLabels } from '../doc-mentions'
+import { expandDocMentionLabels, hasDocMention } from '../doc-mentions'
+import { countWords } from '../transcript/CanvasEditChip'
+import { flushFileWritersUnder } from './file-writer-registry'
+import { namingEvidence, shouldRegenerateName, userMessages } from './session-naming'
 import { isModelAlias, prettyModel } from './models'
 import type {
   Entry,
@@ -44,11 +65,20 @@ import type {
   TurnItem,
 } from '../transcript/Transcript'
 import type { TaskRow } from '../transcript/TaskList'
+import { engineCapabilities } from '@shared/engine-capabilities'
+import {
+  isProvisionalSessionTitle,
+  isSessionNamingPrompt,
+  NEW_SESSION_TITLE,
+  PHONE_SESSION_TITLE,
+  titleFromPrompt,
+} from '@shared/session-title'
 
 /** An attachment staged for the next turn (base64). Transient draft state — never persisted.
  *  Images go inline to the engine; document files (non-`image/*` mediaType, csv/pdf) carry their
  *  original `name` and reach the engine as a saved `.koda/scratch/` path instead (see send()). */
 export type ImageDraft = { mediaType: string; dataBase64: string; name?: string; scratchPath?: string }
+export type DeleteEntryResult = { ok: true } | { ok: false; error: string }
 /** The workflow turn-item, narrowed from Entry — the journal watcher patches its agents/status. */
 type WorkflowEntry = Extract<Entry, { kind: 'workflow' }>
 
@@ -62,9 +92,21 @@ type WorkflowEntry = Extract<Entry, { kind: 'workflow' }>
 export interface SessionState {
   id: string
   label: string
-  /** True once the user manually renamed this session. Locks the label: the local-assist auto-title
-   *  upgrade (fired on the first turn) won't overwrite a name the user chose. Persisted. */
+  /** One plain sentence saying what this thread is about — the sessions map's second line, generated
+   *  beside the title (see `nameSession`). Absent until a naming turn answers with one; a user rename
+   *  clears it rather than leaving a sentence about the old subject. Persisted. */
+  overview?: string
+  /** Epoch ms of this session's last OBSERVED activity: a turn sent, a turn finished, an approval
+   *  asked. The sidebar row reads its age off this stamp (`ageLabel`, session-map.ts), which is the
+   *  only thing marking a dormant thread. Never set by a user action — merely opening a session must
+   *  not make it look freshly worked in. Persisted, so a row's age survives a restart. */
+  lastActivityAt?: number
+  /** True once the user manually renamed this session. Locks the label: the generated title
+   *  won't overwrite a name the user chose. Persisted. */
   userNamed: boolean
+  /** The user-message count this thread was last re-named at — what makes the regeneration crossings
+   *  an EDGE rather than a level (see the TurnComplete reducer). Persisted. */
+  namedAtTurns?: number
   /** The project dir this session runs in — persisted so a restored session resumes in the same
    *  place (resume is cwd-scoped; spike/resume). */
   cwd: string
@@ -73,6 +115,10 @@ export interface SessionState {
   replaySeq?: number
   streaming: string
   busy: boolean
+  /** When the running turn was dispatched, for the live "Working for 1m 12s" readout. Cleared when the
+   *  turn ends, which stamps the elapsed time onto that turn's user message. Not persisted: a turn
+   *  cannot survive a restart, so a stale start would tick from a time that no longer means anything. */
+  turnStartedAt?: number
   errored: boolean
   draft: string
   /** Pasted/dragged images staged for the next turn (base64); cleared on send. Not persisted. */
@@ -98,14 +144,17 @@ export interface SessionState {
    *  last-used engine) and immutable once the conversation starts — switching engine respawns a fresh
    *  session, allowed by the UI only before the first turn. Persisted. */
   engineId: EngineId
-  /** The engine's own native session/thread id, when it differs from Koda's `id` (Codex thread id;
-   *  Claude reuses `id`). Captured from `SessionStarted` and persisted so a reattach resumes THAT
-   *  thread by id (context preserved across a restart / model change). Undefined for Claude. */
-  engineNativeId?: string
+  /** How this session's engine reattaches its own conversation — an opaque, driver-owned blob (see
+   *  `ResumeCursorSchema`). Captured from `ResumeCursorUpdated` and persisted, so a reattach hands the
+   *  engine back exactly what it needs. Never read here; passed through untouched. */
+  resumeCursor?: ResumeCursor
   /** The model the engine ACTUALLY reported running (system/init) — ground truth for display, not
    *  persisted (refreshed every reattach). Differs from `model` only briefly before a switch lands,
    *  or if the engine fell back from a retired id. */
   activeModel?: string
+  /** What this live engine actually loaded in this cwd. Ephemeral by design: a reattach must attest
+   * again instead of restoring stale capability claims from disk. */
+  capabilities?: SessionCapabilitySnapshot
   /** Context-window occupancy after the last turn — drives the meter (§7a). Undefined until the
    *  first turn completes; persisted so the gauge survives a restart, then refreshed next turn. */
   context?: ContextUsage
@@ -177,15 +226,16 @@ export type WorkspaceLayout =
  * in v0 (the engine's files on disk are the source of truth; reopening is cheap).
  */
 export interface FileSurface {
-  /** 'file' (default) = a file pane keyed by its path. 'preview' = the project-level rendered-web
-   *  surface (one slot per window; preview-surface.md). A preview has no real file path — its `path`
-   *  is the reserved PREVIEW_SURFACE_ID sentinel so the rest of the tab machinery (dedup, close,
-   *  split) works unchanged while never colliding with an absolute path. */
-  kind?: 'file' | 'preview'
-  /** Absolute path — also the stable tab identity (dedup on open). For a preview surface this is the
-   *  PREVIEW_SURFACE_ID sentinel, not a filesystem path. */
+  /** 'file' (default) = a file pane keyed by its path. Everything else is a SINGLETON surface with no
+   *  real file path — the running app ('preview'), the project shell ('terminal'), and the working-tree
+   *  review ('changes'). Each takes a reserved sentinel `path` so the whole tab machinery (dedup,
+   *  select, close, the cap) works on it unchanged while never colliding with an absolute path. One
+   *  method for everything that can take the stage: no shelf, no drawer, no sheet of its own. */
+  kind?: 'file' | 'preview' | 'terminal' | 'changes' | 'agents'
+  /** Absolute path — also the stable tab identity (dedup on open). For a singleton surface this is its
+   *  reserved sentinel id, not a filesystem path. */
   path: string
-  /** Display label (basename; 'Preview' for the preview surface). */
+  /** Display label (basename; 'Preview' / 'Terminal' / 'Changes' for the singletons). */
   title: string
   /** How the pane renders this file. 'doc' = the WYSIWYG document (default for markdown — the
    *  everyday-user surface); 'file' = the editable Monaco editor (raw markdown / all other files);
@@ -196,6 +246,11 @@ export interface FileSurface {
   /** For a preview surface: the URL the sandboxed iframe loads — `koda-preview://<token>/index.html`
    *  (Rung 1 static) or `http://localhost:<port>` (Rung 2 dev server). */
   previewUrl?: string
+  /** For a preview surface: something is actually serving that URL right now. True from the moment main
+   *  confirms the dev server responds (or for a static entry, which Koda serves itself), false once main
+   *  says it stopped. The tab's mark is green only while this is true — the iframe keeps showing its
+   *  last paint after a server dies, so "there is a preview tab" is not evidence of a running app. */
+  live?: boolean
   /** A line to reveal when the file opens in the Monaco editor (1-based) — set when a search hit
    *  opens the file. Ignored by the doc/diff views. */
   gotoLine?: number
@@ -208,6 +263,14 @@ export interface FileSurface {
 }
 
 /**
+ * How many surfaces stay co-open as tabs on one session's stage. Tabs are lightweight but not free:
+ * past a handful the strip stops being scannable, and every open diff/doc holds a live Monaco or Crepe
+ * instance. When a new surface arrives over the cap, the OLDEST-opened tab retires — never the one on
+ * stage, never the one just added, and never the preview (it fronts a running dev server).
+ */
+export const STAGE_TAB_LIMIT = 6
+
+/**
  * One session's editor workbench — the open file/preview surfaces plus which are focused/split. The
  * dock is the ACTIVE session's editor (`editors[activeId]`), so tabs follow the session in the sidebar
  * and clear when it's gone, instead of accumulating every file ever opened across every task. The
@@ -216,22 +279,51 @@ export interface FileSurface {
  * looking at. Files opened with no active session (pre-session Files browsing) live under a sentinel key.
  */
 export interface EditorState {
+  /** The co-open tabs on this session's stage, in open order (capped at STAGE_TAB_LIMIT). */
   surfaces: FileSurface[]
-  /** What's ON STAGE (the dock's single surface); null ⇒ this session's stage is empty. */
+  /** Which tab is SELECTED (showing on stage); null ⇒ this session's stage is empty. */
   activeSurfaceId: string | null
-  /** User pinned the stage: the agent's edits/preview pushes stop stealing it (they still land in
-   *  `surfaces` + bump rev). User actions (open a file, pick from the switcher) always override. */
+  /** User pinned the stage: the agent's edits/preview pushes stop SELECTING their tab (the tab still
+   *  appears in `surfaces` and its rev still bumps). User actions (open a file, click a tab) always
+   *  override. */
   pinned: boolean
+  /** The user's explicit show/hide of the stage panel for THIS session. Undefined = follow the stage's
+   *  own contents (see `stageVisible`), which is what a fresh chat starts on: nothing open, nothing to
+   *  show. Set true/false only by the session-header toggle and ⌘J. */
+  stageShown?: boolean
 }
 
 const EMPTY_EDITOR: EditorState = { surfaces: [], activeSurfaceId: null, pinned: false }
 
+/** Surfaces that are never retired to make room and are never a second copy: a live dev server, a live
+ *  shell with its scrollback, the working-tree review. Only plain file tabs are expendable. */
+function isSingleton(s: FileSurface): boolean {
+  return (s.kind ?? 'file') !== 'file'
+}
+
+/** Append a newly opened surface to a session's tab strip, retiring the oldest expendable tab once the
+ *  strip is over STAGE_TAB_LIMIT. Tab ORDER is open order (it never reshuffles under the pointer), so
+ *  the leftmost expendable tab is also the oldest one. */
+function addSurface(ed: EditorState, surface: FileSurface): FileSurface[] {
+  const next = [...ed.surfaces, surface]
+  if (next.length <= STAGE_TAB_LIMIT) return next
+  const victim = next.findIndex(
+    (s) => !isSingleton(s) && s.path !== surface.path && s.path !== ed.activeSurfaceId,
+  )
+  return victim === -1 ? next : next.filter((_, i) => i !== victim)
+}
+
 /** Whether the agent's edit pushes should stop stealing the stage. True when the user explicitly
- *  pinned it, OR — the "soft pin" — when the preview is what's currently on stage: someone iterating
- *  on a page with the agent shouldn't get yanked back to a diff every time the agent touches a file.
- *  Soft because it needs no toggle and clears itself the moment the user picks another surface. */
+ *  pinned it, OR — the "soft pin" — when a LIVE surface is what's currently on stage: someone iterating
+ *  on a page with the agent, or typing into the shell, shouldn't get yanked back to a diff every time
+ *  the agent touches a file. Soft because it needs no toggle and clears itself the moment the user
+ *  picks another surface. */
 function stageHeld(ed: EditorState): boolean {
-  return ed.pinned || ed.activeSurfaceId === PREVIEW_SURFACE_ID
+  return (
+    ed.pinned ||
+    ed.activeSurfaceId === PREVIEW_SURFACE_ID ||
+    ed.activeSurfaceId === TERMINAL_SURFACE_ID
+  )
 }
 
 /** Editor key for files opened while no session is active (the pre-session Files browser). Not a valid
@@ -248,6 +340,18 @@ function editorKey(state: { activeId: string | null }): string {
  *  object or the shared EMPTY_EDITOR), so it's safe as a zustand selector. */
 export function activeEditor(state: { activeId: string | null; editors: Record<string, EditorState> }): EditorState {
   return state.editors[editorKey(state)] ?? EMPTY_EDITOR
+}
+
+/**
+ * Whether the stage panel is showing beside the conversation. DERIVED from the active session's own
+ * stage, not a window-level flag: a chat with nothing on stage shows no panel, so a new chat opens as
+ * a full-width conversation instead of an empty picker nobody asked for. The user's explicit toggle
+ * (`stageShown`) overrides it for that session, and any deliberate open clears the override back to
+ * "follow the contents".
+ */
+export function stageVisible(state: { activeId: string | null; editors: Record<string, EditorState> }): boolean {
+  const ed = activeEditor(state)
+  return ed.stageShown ?? ed.surfaces.length > 0
 }
 
 /** Store patch that replaces one session's editor slice (leaving the rest of the map untouched). */
@@ -270,102 +374,127 @@ function mapEditors(
   return out
 }
 
-/** Dock open/closed is window UI state — persisted renderer-side (like the theme), so it survives a
- *  reload without an IPC/settings round-trip. Fails soft to open. (The dock is the STAGE now — one
- *  surface, no tool tabs — so `open` is all there is to remember; an old `{open, tool}` blob parses
- *  fine, the tool half is just ignored.) */
-const DOCK_KEY = 'koda.dock'
-function readDock(): { open: boolean } {
-  try {
-    const v = JSON.parse(localStorage.getItem(DOCK_KEY) ?? '')
-    return { open: typeof v?.open === 'boolean' ? v.open : true }
-  } catch {
-    return { open: true }
-  }
+/** Put a singleton surface (terminal, changes) on the active session's stage: add its tab if it isn't
+ *  there, select it, and release both the pin and any explicit hide — it's a deliberate user or agent
+ *  action either way. The same path the preview and file opens take, which is the point: everything on
+ *  the stage arrives as a tab, nothing gets its own shelf or drawer. */
+function stageSingleton(
+  state: { activeId: string | null; editors: Record<string, EditorState> },
+  surface: { kind: 'terminal' | 'changes' | 'agents'; path: string; title: string },
+  sessionId?: string,
+  respectHold = false,
+): { editors: Record<string, EditorState> } {
+  // Targets the REQUESTING session's editor when one is named (an agent push belongs to the session
+  // that made it, not to whichever conversation happens to be in front), else the active one.
+  const key = sessionId ?? editorKey(state)
+  const ed = state.editors[key] ?? EMPTY_EDITOR
+  const surfaces = ed.surfaces.some((s) => s.path === surface.path)
+    ? ed.surfaces
+    : addSurface(ed, { ...surface, view: 'file', rev: 0 })
+  const isActive = key === editorKey(state)
+  // Automatic surfaces obey the Stage's pin/live-surface hold, except when the user had hidden the
+  // Stage entirely: a fresh delegation is important enough to bring it back with Agents in front.
+  const takeStage = !respectHold || (isActive && ed.stageShown === false) || !stageHeld(ed)
+  return withEditor(state.editors, key, {
+    ...ed,
+    surfaces,
+    activeSurfaceId: takeStage ? surface.path : ed.activeSurfaceId,
+    pinned: takeStage ? false : ed.pinned,
+    // Same rule as openPreview: only release an explicit hide on the session in FRONT. A background
+    // session's push stages itself in its own editor without reopening a stage the user closed there.
+    ...(isActive ? { stageShown: undefined } : {}),
+  })
 }
 
-/** Reserved tab identity for the (single, per-window) preview surface. A NUL prefix can never be a
- *  real absolute path, so it slots into the path-keyed `surfaces` array without colliding. */
+/** Reserved tab identities for the singleton surfaces (the running app, the project shell, the
+ *  working-tree review). A NUL prefix can never be a real absolute path, so each slots into the
+ *  path-keyed `surfaces` array without colliding. Whether the stage is SHOWING is deliberately not
+ *  remembered across launches any more: surfaces are transient, so a remembered "open" could only ever
+ *  restore an empty panel (see `stageVisible`). */
 export const PREVIEW_SURFACE_ID = '\u0000preview'
+export const TERMINAL_SURFACE_ID = '\u0000terminal'
+export const CHANGES_SURFACE_ID = '\u0000changes'
+const AGENTS_SURFACE_ID = '\u0000agents'
 
-/** Shape persisted to disk (mirrors the renderer-facing half of @shared PersistedSessions). v2 =
- *  per-project persistence; main keys the file by the window's project root, so projectPath stays
- *  out of this payload. */
-export interface PersistedBlob {
-  version: 2
-  activeId: string | null
-  sessions: {
-    id: string
-    label: string
-    cwd: string
-    userNamed?: boolean
-    approvalMode?: ApprovalMode
-    model?: string
-    effort?: string
-    engineId?: EngineId
-    engineNativeId?: string
-    context?: ContextUsage
-    spendUsd?: number
-    byModel?: Record<string, ModelSpend>
-    lastPreview?: PreviewRestart
-    replaySeq?: number
-    items: Entry[]
-  }[]
-  /** Last-known account-level rate-limit windows (5-hour / weekly), so the footer survives a restart
-   *  instead of going blank until the next turn re-emits them. `resetsAt` is absolute, so a restored
-   *  value stays meaningful; the next turn refreshes it. */
-  rateLimits?: Record<string, Record<string, RateLimitInfo>>
-}
+/** The renderer writes the shared persisted schema minus the retired inline archive field. Main keys
+ *  it by project root, so the path stays outside the payload. Keeping this as a type projection rather
+ *  than a handwritten mirror means a new durable session field cannot silently disappear here. */
+export type PersistedBlob = Omit<PersistedSessions, 'archived'>
 
-// The engine a new session defaults to — the last one the user picked, remembered across restarts
-// (a small global preference, like the dock state). New sessions start here; the user can switch
-// engine from the model dropdown before the first turn. Fails soft to 'claude'.
-const LAST_ENGINE_KEY = 'koda.lastEngine'
-const LAST_MODEL_KEY = 'koda.lastModel'
-const NEW_SESSION_POSTURE_KEY = 'koda.newSessionPosture'
-
-type NewSessionPosture = { engineId: EngineId; model?: string }
-
-// Read/write the new-session engine + model as one posture. A SessionStarted event from an older
-// session must never update just the model half: that used to pair (for example) Claude + gpt-5.x,
-// so the next session silently fell back to whichever engine/model happened to accept the mismatch.
-function readNewSessionPosture(): NewSessionPosture {
-  try {
-    const saved = JSON.parse(localStorage.getItem(NEW_SESSION_POSTURE_KEY) ?? 'null') as unknown
-    if (saved && typeof saved === 'object') {
-      const value = saved as { engineId?: unknown; model?: unknown }
-      if (value.engineId === 'claude' || value.engineId === 'codex')
-        return { engineId: value.engineId, model: typeof value.model === 'string' ? value.model : undefined }
-    }
-  } catch {
-    /* migrate the old split-key preference below */
-  }
-
-  const legacyEngine: EngineId = localStorage.getItem(LAST_ENGINE_KEY) === 'codex' ? 'codex' : 'claude'
-  const model = localStorage.getItem(LAST_MODEL_KEY) || undefined
-  // The old split keys could be crossed by two SessionStarted events. Claude aliases and concrete IDs
-  // identify their engine unambiguously; prefer that evidence over the stale engine half.
-  const engineId: EngineId = model && (isModelAlias(model) || model.startsWith('claude-')) ? 'claude' : legacyEngine
-  const migrated = { engineId, model }
-  writeNewSessionPosture(engineId, model)
-  return migrated
-}
-function writeNewSessionPosture(engineId: EngineId, model: string | undefined): void {
-  try {
-    // One JSON value makes the pair indivisible: no event can update only the model or engine half.
-    localStorage.setItem(NEW_SESSION_POSTURE_KEY, JSON.stringify({ engineId, model }))
-    localStorage.removeItem(LAST_ENGINE_KEY)
-    localStorage.removeItem(LAST_MODEL_KEY)
-  } catch {
-    /* private mode / quota — new-session memory is a nicety, never fatal */
+/** The one SessionState → durable-session seam, reused by hot saves and archive creation. */
+function persistedSessionFromState(s: SessionState): PersistedSession & { items: Entry[] } {
+  return {
+    id: s.id,
+    label: s.label,
+    overview: s.overview,
+    lastActivityAt: s.lastActivityAt,
+    cwd: s.cwd,
+    userNamed: s.userNamed,
+    namedAtTurns: s.namedAtTurns,
+    approvalMode: s.approvalMode,
+    model: s.model,
+    effort: s.effort,
+    engineId: s.engineId,
+    resumeCursor: s.resumeCursor,
+    context: s.context,
+    spendUsd: s.spendUsd,
+    byModel: s.byModel,
+    lastPreview: s.lastPreview,
+    replaySeq: s.replaySeq,
+    items: compactTranscriptToolOutput(s.items),
   }
 }
 
-// Resolve an engine default only while that engine is still the selected new-session engine. Late
-// starts from background sessions cannot overwrite a newer pick made in another engine.
-function writeResolvedNewSessionModel(engineId: EngineId, model: string): void {
-  const current = readNewSessionPosture()
-  if (current.engineId === engineId && !current.model) writeNewSessionPosture(engineId, model)
+/** The one durable-session → SessionState seam, reused by boot hydration and archive restore. */
+function sessionStateFromPersisted(
+  s: PersistedSession,
+  defaultApprovalMode: ApprovalMode,
+  opts: { freshActivity?: boolean; replaySeq?: number } = {},
+): SessionState {
+  const items = (s.items as Entry[]).map(settleRestoredTranscriptItem)
+  const turnFailure = latestTurnFailureOf(items)
+  const firstPrompt = items.find(
+    (item): item is Extract<Entry, { kind: 'user' }> =>
+      item.kind === 'user' && isSessionNamingPrompt(item.text),
+  )
+  // Older builds persisted the phone's waiting label as though it were a finished title. Repair every
+  // readable hot/restored transcript at the hydration boundary, including an inactive session that
+  // will never pass through live headless adoption. The selected writer can still refine a live one
+  // when main hands it back below; this instant floor simply removes the stale literal now.
+  const label =
+    !s.userNamed && isProvisionalSessionTitle(s.label) && firstPrompt
+      ? titleFromPrompt(firstPrompt.text)
+      : s.label
+  return {
+    id: s.id,
+    label,
+    overview: s.overview,
+    lastActivityAt: opts.freshActivity ? Date.now() : (s.lastActivityAt ?? Date.now()),
+    userNamed: s.userNamed ?? false,
+    namedAtTurns: s.namedAtTurns,
+    cwd: s.cwd,
+    items,
+    replaySeq: opts.replaySeq ?? s.replaySeq,
+    context: s.context,
+    streaming: '',
+    busy: false,
+    errored: !!turnFailure?.error.fatal || turnFailure?.error.category === 'turnRejected',
+    draft: '',
+    attachments: [],
+    live: false,
+    attention: false,
+    ...(turnFailure
+      ? { error: { message: turnFailure.error.message, fatal: turnFailure.error.fatal } }
+      : {}),
+    approvalMode: s.approvalMode ?? defaultApprovalMode,
+    model: s.model,
+    effort: s.effort,
+    engineId: s.engineId ?? 'claude',
+    resumeCursor: s.resumeCursor,
+    spendUsd: s.spendUsd ?? 0,
+    byModel: s.byModel ?? {},
+    lastPreview: s.lastPreview,
+  }
 }
 
 // Monotonic counters + synchronous guards live module-level (as the old App.tsx refs did) — they
@@ -385,6 +514,9 @@ const bannerErrored = new Set<string>()
 // Sessions whose engine reattach is in flight — guards a double `claude --resume <sameId>` when two
 // sends fire in one tick before `busy` flushes.
 const reattaching = new Set<string>()
+// Composer sends have asynchronous document/scratch preflight before the engine turn can be claimed.
+// Guard that gap synchronously so a double click cannot launch the same snapshot twice.
+const sending = new Set<string>()
 // Sessions being ADOPTED from the phone right now — their buffered history is being replayed through
 // the normal reducer. While a session's id is here, per-event side-effects that only make sense for a
 // LIVE turn (native "finished" notifications, the working-tree git refresh) are suppressed, so
@@ -431,16 +563,16 @@ function fmtClock(unixSeconds: number): string {
   return new Date(unixSeconds * 1000).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
 }
 
-/** Restore the full relative path behind `@`-mentions before the text reaches the engine. The composer
- *  inserts the pretty name (`@ship-checklist-iphone`) for readability; the agent needs an exact location
- *  to Read. We resolve each bare-name token (no slash) against the project's live doc list. Path-shaped
- *  tokens the user typed by hand, and names that match no doc, are left untouched. Runs only when the
- *  text actually contains an `@`, so the common no-mention turn skips the listDocs round-trip. */
-async function expandDocMentions(text: string): Promise<string> {
-  if (!text.includes('@')) return text
-  // Labels are either one token or quoted; a slash means the user already supplied a path.
-  const re = /(^|\s)@(?:"(?:\\.|[^"\\])*"|[^\s/]+)/g
-  if (!re.test(text)) return text
+/** Restore the full relative path behind `@`-mentions before the text reaches the engine, and hand back
+ *  the doc list that resolution ran against. The composer inserts the pretty name
+ *  (`@ship-checklist-iphone`) for readability; the agent needs an exact location to Read. We resolve
+ *  each bare-name token (no slash) against the project's live doc list. Path-shaped tokens the user
+ *  typed by hand, and names that match no doc, are left untouched.
+ *
+ *  Runs at most one listDocs round-trip, which main caches, and only when the draft holds an
+ *  `@`-token at all. */
+async function resolveDocMentions(text: string): Promise<string> {
+  if (!hasDocMention(text)) return text
   const res = await window.koda.listDocs({}).catch(() => null)
   const docs = res?.docs ?? []
   if (!docs.length) return text
@@ -489,6 +621,7 @@ export interface StoreIntegrity {
   archiveBackupKept: BackupKept
   droppedSessions: number
   droppedArchives: number
+  unreadableArchiveBodies: number
 }
 
 interface WorkspaceStore {
@@ -499,6 +632,20 @@ interface WorkspaceStore {
    *  which is fetched on restore). Persisted to the cold archive index; surfaced in Settings → Archived
    *  sessions for restore. */
   archived: ArchivedSessionMeta[]
+  /** Archive metadata whose body was unreadable while a live fallback still existed. Hidden from the
+   *  Archived UI so it cannot tombstone that readable chat, but merged into every index rewrite until
+   *  a successful archive of the same id replaces it. */
+  protectedArchived: ArchivedSessionMeta[]
+  /** Documents the user starred in this project, independent of whichever chat is open. Persisted in
+   *  the project's hot store as relative paths only; Library metadata is always re-read from disk. */
+  starredDocs: string[]
+  /** One-way migration ledger for the retired session-scoped `keptDocs` field. A path remains here
+   *  after it is unstarred so an old archive loaded later cannot silently add it back. */
+  legacyKeptDocsImported: string[]
+  /** Koda-observed path changes to replay over legacy star sources that were not readable at the time. */
+  legacyKeptDocPathChanges: LegacyKeptDocPathChange[]
+  /** Whether every readable archived legacy shelf has reached the same acknowledged hot-store blob. */
+  legacyKeptDocsMigrationComplete: boolean
   pending: ApprovalRequest[]
   /** Account-level subscription rate-limit windows, keyed by ENGINE then window type
    *  (`claude`/`codex` → `five_hour`/`weekly`). Each engine is a separate subscription with its own
@@ -525,7 +672,7 @@ interface WorkspaceStore {
   /** 'auto' mode only: set when a plan-limit rejection lands and we haven't yet asked → renders the
    *  "continue on your API key?" banner. Carries the rejected window's resetsAt (the fallback expiry). */
   billingFallbackPrompt: { resetsAt: number } | null
-  /** How heavy this project's always-injected memory pair is (memory:weight). Null until the first
+  /** How heavy this project's memory navigation pair is (memory:weight). Null until the first
    *  fetch. Drives the status-bar tidy pill + Settings → Memory. */
   memoryWeight: MemoryWeight | null
   /** The posture new sessions start at (seeded on boot from main's persisted default). */
@@ -583,56 +730,53 @@ interface WorkspaceStore {
   /** Sessions section's share of the sidebar height (0–1); Files takes the rest. Drag the divider
    *  between them. In-memory only. */
   sessionsFrac: number
-  /** What the lower sidebar section shows: the doc-first flat **Documents** list (the everyday-user
-   *  default — find your writing by glancing, no tree-spelunking) or the full **Files** tree (the
-   *  organize/code view). In-memory only — every launch lands doc-first, deliberately. */
-  filesView: 'docs' | 'tree'
   /** Conversation column width in px when an artifact (file/preview) is open beside it. Drag the
    *  divider between the conversation and the artifact zone. In-memory only. */
   conversationWidth: number
   /** Legacy 2-up-split fraction — the split died with the Stage, but the persisted-layout schema still
    *  round-trips it, so it stays as inert state. */
   artifactSplitFrac: number
-  /** Whether the right dock (the Stage) is showing. Collapsed ⇒ the conversation takes the full
-   *  width; nothing running is torn down (the preview server keeps going). Persisted (localStorage). */
-  dockOpen: boolean
-  /** The desk (the changes strip under the stage) is expanded into its review sheet. In-memory. */
-  deskOpen: boolean
-  setDeskOpen: (open: boolean) => void
-  /** The terminal shelf under the stage is open. The xterm view stays mounted once first opened (the
-   *  pty + scrollback survive); this only animates its height. In-memory. */
-  termOpen: boolean
-  setTermOpen: (open: boolean) => void
   /** A command the agent staged for the terminal (open_terminal): the TerminalSurfaceView types it at
    *  the prompt once the shell is ready, then clears it. Never auto-run. In-memory. */
   pendingTermCommand: string | null
-  /** Pop the terminal shelf open (agent's open_terminal), optionally staging a command at the prompt. */
-  openTerminalShelf: (command?: string) => void
+  /** Put the terminal on stage (agent's open_terminal, or the picker), optionally staging a command at
+   *  the prompt. One tab like everything else — the old shelf under the stage is gone. `sessionId` is
+   *  the session that ASKED (an agent push carries one); its tab lands in that session's editor rather
+   *  than in whichever conversation the user is reading. A user pick carries none ⇒ the active session. */
+  openTerminal: (command?: string, sessionId?: string) => void
   /** Clear the staged command once the terminal view has consumed it. */
   clearPendingTermCommand: () => void
   /** Pin/unpin the ACTIVE session's stage (see EditorState.pinned). */
   setStagePinned: (pinned: boolean) => void
-  /** Preview focus mode: while the preview is on stage, hide the session workspace so the preview
-   *  can use the full main area. In-memory only; it is a transient viewing mode. */
-  previewExpanded: boolean
+  /** Stage focus mode: hide the conversation so whatever tab is on stage uses the full main area.
+   *  Any surface can expand, not just the preview. In-memory only; a transient viewing mode. */
+  stageExpanded: boolean
   /** Whether the open project is a git repo (drives the Changes surface + dirty indicators). Refreshed
    *  by refreshGitStatus (after each turn / on focus). In-memory. */
   gitRepo: boolean
   /** The user-git working-tree changes, aggregate across the whole project (one tree, all sessions).
-   *  Attributed per session by computeSessionChanges. In-memory; refreshed, not persisted. */
+   *  Attributed per session by main-owned completion evidence, with transcript edits only as an
+   *  in-flight/back-compat fallback. In-memory; refreshed, not persisted. */
   gitFiles: GitStatusFile[]
+  /** Turn-scoped completion evidence from main. It deliberately is not persisted across app restarts:
+   *  user Git survives; stale task attribution should not. */
+  completionBySession: Record<string, TaskCompletionState>
+  applyCompletionState: (state: TaskCompletionState) => void
   /** True when the changed count exceeded the status cap and gitFiles is clipped. */
   gitChangesTruncated: boolean
-  /** True when ANOTHER worktree (not this window's) needs attention — loose work, an unreadable
-   *  status, or a missing folder. Drives the Versions badge without claiming unknown state is clean. */
-  gitWorktreesDirty: boolean
+  /** True when side-line work is waiting: a clean unmerged branch, or ANOTHER worktree with loose
+   *  work, unreadable status, or a missing folder. Drives the always-visible Versions cue. */
+  gitSideLinesWaiting: boolean
   /** Re-read git repo state + working-tree status into gitRepo/gitFiles. Fire-and-forget; fails soft. */
   refreshGitStatus: () => Promise<void>
-  /** Session whose change group the desk sheet should scroll to on open (set by openChanges,
+  /** Session whose change group the Changes surface should scroll to on open (set by openChanges,
    *  cleared by the surface once consumed). In-memory. */
   changesFocus: string | null
-  /** Open the desk's review sheet, optionally scrolling to a session's change group. */
+  /** Put Changes on stage, optionally scrolling to a session's change group. */
   openChanges: (focusSessionId?: string) => void
+  /** Put the Agents roster on stage — the surface a fan-out's fleet row opens. Session-scoped like
+   *  every other tab: it shows the delegates of the session whose editor it lands in. */
+  openAgents: (sessionId?: string) => void
   /** The Find overlay (Spotlight-style centered search) — summoned over everything (⌘P / ⌘⇧F),
    *  dismissed on Esc / click-out / opening a result. Independent of sidebarView + settings. */
   searchOpen: boolean
@@ -668,6 +812,9 @@ interface WorkspaceStore {
    *  that a chat left the list, which is why it's state and not just a log line. */
   droppedSessions: number
   droppedArchives: number
+  /** Cold metadata overlapped a hot chat but its transcript body could not be read, so the live copy
+   * was deliberately kept instead of being removed by the archive tombstone. */
+  unreadableArchiveBodies: number
   /** One patch for all of the above: boot resolves them together, from one pair of loads. */
   setStoreIntegrity: (patch: Partial<StoreIntegrity>) => void
   /** The archive index could be READ this run, but a write to it came back refused — so the move the
@@ -707,16 +854,29 @@ interface WorkspaceStore {
   retryLastTurn: (sessionId: string) => void
 
   // lifecycle (IPC-driven)
-  startSession: () => Promise<void>
+  startSession: (posture?: { engineId: EngineId; model?: string; effort?: string }) => Promise<void>
   /** Pull this window's project's live headless (phone-started) sessions into the window: create a tab
    *  for each and replay its buffered history so the conversation shows up. Idempotent — skips sessions
    *  already open. Called after boot-hydrate and whenever a phone starts a session in this project. */
   adoptHeadless: () => Promise<void>
   /** Reconcile a human turn with durable replay: phone turns append their missing bubble; local turns
    *  stamp the optimistic row with the replay identity main assigned. */
-  applyRemoteUserTurn: (sessionId: string, text: string, replaySeq?: number, append?: boolean) => void
+  applyRemoteUserTurn: (
+    sessionId: string,
+    text: string,
+    replaySeq?: number,
+    append?: boolean,
+    hadImages?: boolean,
+    images?: ImageDraft[],
+    clientTurnId?: string,
+    hadAttachments?: boolean,
+    attachments?: { mediaType: string; name?: string }[],
+  ) => void
   /** Refetch the Recent images strip — a scratch image was saved outside the composer (a phone turn). */
   bumpScratch: () => void
+  /** Re-read every file-backed surface (Files tree, Library, starred documents) — the project changed on
+   *  disk without going through one of this store's own mutations, which is the agent's normal path. */
+  bumpFilesRev: () => void
   /** End a session's live agent and move it to the archive (keeps the whole conversation; restorable
    *  from Settings). Replaces the old hard close — nothing is deleted. */
   archiveSession: (id: string) => Promise<void>
@@ -746,10 +906,14 @@ interface WorkspaceStore {
    *  agent reviews it vs the trunk, merges it in, and switches back. Merging is conversational
    *  (conflicts, unfinished work) — never a button-driven git op. Returns false if no session / busy. */
   sendFinishBranch: (args: { branch: string; into: string }) => Promise<boolean>
+  /** "Tidy up" from the Versions timeline's side-line bundle: hand the whole pile over at once — the
+   *  agent reviews each one, keeps what holds real work, and clears the rest, asking before it
+   *  deletes anything. Returns false if no active session / busy. */
+  sendTidySideLines: (args: { names: string[] }) => Promise<boolean>
   /** Re-read this project's memory weight from main (status-bar poll + Settings → Memory on open). */
   refreshMemoryWeight: () => Promise<void>
   /** "Tidy memory" from Settings → Memory: composes a turn telling the agent to distill the
-   *  always-injected pair per the memory skill's tidy recipe. Returns false if no session / busy. */
+   *  navigation pair per the memory skill's tidy recipe. Returns false if no session / busy. */
   sendMemoryTidy: () => Promise<boolean>
   /** "Keep going in a fresh chat" — shown when the active session's context is nearly full. Asks the
    *  current agent for a handoff summary, then (on that turn's completion) opens a new session with the
@@ -843,7 +1007,6 @@ interface WorkspaceStore {
   /** Resize the sidebar (px) / the Sessions vs Files split (fraction); both clamped to sane bounds. */
   setSidebarWidth: (px: number) => void
   setSessionsFrac: (frac: number) => void
-  setFilesView: (view: 'docs' | 'tree') => void
   /** Resize the conversation column (px); clamped. */
   setConversationWidth: (px: number) => void
   /** Seed pane sizes from persisted global settings (boot). */
@@ -854,7 +1017,8 @@ interface WorkspaceStore {
   resetLayout: () => void
   /** Open/close the Find overlay (⌘P / ⌘⇧F to open; Esc / click-out / opening a result to close). */
   setSearchOpen: (open: boolean) => void
-  setPreviewExpanded: (expanded: boolean) => void
+  /** Expand the stage to the full window width (and back). Works for whichever tab is on stage. */
+  setStageExpanded: (expanded: boolean) => void
 
   // surfaces (artifact zone)
   /** Open a file in the artifact zone (focuses its tab if already open). `gotoLine` (from a search
@@ -872,8 +1036,8 @@ interface WorkspaceStore {
   /** Move a file/folder into another folder (drag-and-drop). Same rebasing as rename. No-op if it's
    *  already there, or if dropping a folder into itself/a descendant. */
   moveEntry: (from: string, toDir: string) => Promise<void>
-  /** Delete a file/folder (recursive). Closes any open tab under it. Checkpointed, so undoable. */
-  deleteEntry: (path: string) => Promise<void>
+  /** Delete a file/folder (recursive). Drains its live editor first, then closes tabs on success. */
+  deleteEntry: (path: string, options?: { document?: true }) => Promise<DeleteEntryResult>
   /** Duplicate a file/folder as "<name> copy" alongside it. Checkpointed, so undoable. */
   duplicateEntry: (path: string) => Promise<void>
   /** Import Finder-dragged files into `destDir` (an existing folder) or, omitted, Documents/. Reads
@@ -907,20 +1071,40 @@ interface WorkspaceStore {
   /** Remember how to bring a session's preview back (from the `preview:show` push), so the empty stage
    *  can offer a one-click "Restart preview" after the surface/dev-server is gone. Persisted. */
   rememberPreview: (sessionId: string, restart: PreviewRestart) => void
+
+  // starred documents (project-wide)
+  /** Star a document for this project. `rel` is a project-relative POSIX path and the only document
+   *  data stored; everything else is re-read from the file. Works even when no chat is open. */
+  starDoc: (rel: string) => void
+  /** Remove a document from this project's starred list. */
+  unstarDoc: (rel: string) => void
+  /** One-time move of this project's localStorage doc pins — the retired Documents pane's own idea of
+   *  "this one matters" — into the project-wide starred list. The legacy copy stays until
+   *  `completeDocPinMigration` sees an acknowledged persisted blob. */
+  migrateDocPins: () => void
+  /** Remove the retired pane's keys only after main acknowledged a project blob that contains every
+   *  adopted pin. The exact acknowledged blob is passed in so in-memory state cannot masquerade as
+   *  durable state while the IPC write is still in flight. */
+  completeDocPinMigration: (persisted: PersistedBlob) => void
   /** Close the preview surface. */
   closePreview: () => void
+  /** Main says this preview URL stopped serving — drop the live mark wherever it's shown. */
+  notePreviewStopped: (url: string) => void
   /** Bring the preview on stage (dock open + preview focused), if one exists. Used by the agent's
    *  view_preview capture — an explicit "look at it", so it overrides a pin. */
   bringPreviewToStage: () => void
-  /** Show/hide the dock. */
+  /** Show/hide the stage for the ACTIVE session (an explicit override of `stageVisible`'s default). */
   setDockOpen: (open: boolean) => void
-  /** Flip the dock open↔closed (the session-header toggle). */
+  /** Flip the stage shown↔hidden (the session-header toggle, ⌘J). */
   toggleDock: () => void
 
   // persistence
   /** Boot restore. `archived` is the cold-store metadata (bodies fetched on restore), merged in by
    *  useEngineBridge — kept off PersistedBlob because persistBlob → saveSessions must never carry it. */
-  hydrate: (blob: PersistedBlob & { archived?: ArchivedSessionMeta[] }) => void
+  hydrate: (blob: PersistedBlob & {
+    archived?: ArchivedSessionMeta[]
+    protectedArchived?: ArchivedSessionMeta[]
+  }) => void
   persistBlob: () => PersistedBlob
   noteRestored: (label: string) => void
 }
@@ -940,6 +1124,53 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     patchSession(id, (s) => ({ ...s, items: [...s.items, { ...item, id: eid }] }))
   }
 
+  /** A deliberate agent surface is a handoff to the user, so its owning session comes forward. Passive
+   *  edit auto-follow remains session-local and never calls this. Returns true only when the push moved
+   *  the user to another live session, which lets the arriving surface override that session's stale
+   *  pin/hide once. */
+  function frontAgentSurface(sessionId: string | undefined): boolean {
+    if (!sessionId || sessionId === get().activeId || !get().sessions[sessionId]) return false
+    get().selectSession(sessionId)
+    return true
+  }
+
+  /** A newly launched delegate makes the fleet visible without replaying old history into the Stage. */
+  function followDelegation(id: string): void {
+    if (replayingSessions.has(id)) return
+    const fronted = frontAgentSurface(id)
+    set((state) => {
+      const editor = state.editors[id] ?? EMPTY_EDITOR
+      // The first delegate opens the fleet. Later launches update that existing surface without
+      // repeatedly pulling the user back after they deliberately selected another tab.
+      if (editor.surfaces.some((surface) => surface.path === AGENTS_SURFACE_ID)) return {}
+      return stageSingleton(
+        state,
+        { kind: 'agents', path: AGENTS_SURFACE_ID, title: 'Agents' },
+        id,
+        !fronted,
+      )
+    })
+  }
+
+  /**
+   * A turn ended: stop the clock and stamp how long it ran onto the message that started it, which is
+   * where the transcript's fold reads it from ("Worked for 2m 14s"). Every path that clears `busy` for
+   * a real turn goes through here — completion, a user interrupt, a fatal error — so a turn that died
+   * badly still gets a truthful duration instead of a stuck timer.
+   */
+  function endTurn(s: SessionState): SessionState {
+    if (!s.turnStartedAt) return s.busy ? { ...s, busy: false } : s
+    const elapsedMs = Date.now() - s.turnStartedAt
+    let items = s.items
+    for (let i = items.length - 1; i >= 0; i--) {
+      const item = items[i]
+      if (item.kind !== 'user') continue
+      items = [...items.slice(0, i), { ...item, elapsedMs }, ...items.slice(i + 1)]
+      break
+    }
+    return { ...s, busy: false, turnStartedAt: undefined, items }
+  }
+
   function settleDeferredBillingRespawn(id: string): void {
     if (!billingRespawnPending.has(id)) return
     const state = get()
@@ -950,7 +1181,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     }
     if (
       session.busy ||
-      hasRunningSubagent(session.items) ||
+      hasRunningDelegation(session.items) ||
       state.pending.some((request) => request.sessionId === id)
     )
       return
@@ -967,33 +1198,109 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       ...st.order.filter((sid) => sid !== excludeId).map((sid) => st.sessions[sid]?.label),
       ...st.archived.filter((a) => a.id !== excludeId).map((a) => a.label),
     ]
-      .filter((l): l is string => !!l?.trim() && l !== 'New session' && l !== 'From your phone')
+      .filter((l): l is string => !isProvisionalSessionTitle(l))
       .slice(0, 12)
   }
 
-  // Per-session titling epoch: each upgradeTitle call invalidates any still-in-flight predecessor, so
-  // a slow birth-title call (model cold-load) can never resolve late and revert the settled substance
-  // retitle. Entries are a number per session ever titled — no cleanup needed.
+  // Per-session naming epoch: each nameSession call invalidates any still-in-flight predecessor, so a
+  // slow birth-naming turn can never resolve late and revert a later regeneration. Entries are a number
+  // per session ever named — no cleanup needed.
   const titleGen = new Map<string, number>()
 
-  // Fire-and-forget on-device title upgrade; never blocks a turn, never rejects. A user rename
-  // (userNamed) always wins — including against an in-flight upgrade resolving late.
-  function upgradeTitle(id: string, text: string): void {
+  // Fire-and-forget naming through the app-global generated-text choice. Main owns the
+  // initial/regenerate prompt split and every fallback, so this never blocks a turn or rejects.
+  // A user rename (userNamed) always wins — including against an in-flight naming turn resolving late.
+  function nameSession(id: string, kind: SessionNameKind, evidence: string): void {
+    if (!evidence.trim()) return
+    const session = get().sessions[id]
+    if (!session || session.userNamed) return
     const gen = (titleGen.get(id) ?? 0) + 1
     titleGen.set(id, gen)
     void window.koda
-      .assistTitle({ text, avoid: takenTitles(id) })
-      .then(({ title }) => {
-        if (titleGen.get(id) !== gen) return // superseded by a newer titling for this session
-        if (title.trim()) patchSession(id, (s) => (s.userNamed ? s : { ...s, label: title }))
+      .nameSession({
+        kind,
+        evidence,
+        currentTitle: kind === 'regenerate' ? session.label : undefined,
+        avoid: takenTitles(id),
+      })
+      .then(({ title, overview }) => {
+        if (titleGen.get(id) !== gen) return // superseded by a newer naming for this session
+        if (!title.trim()) return
+        patchSession(id, (s) =>
+          s.userNamed
+            ? s
+            : { ...s, label: title, ...(overview.trim() ? { overview: overview.trim() } : {}) },
+        )
       })
       .catch(() => {})
   }
 
-  // The substance digest: first prompt + the turn's final reply. Naming from what was DONE (not just
-  // what was asked) is what makes two sessions with the same opening prompt end up named apart.
-  function titleDigest(prompt: string, reply: string): string {
-    return `${prompt.slice(0, 1500)}\n\nWhat was done:\n${reply.slice(0, 2000)}`
+  /** Reconcile the title when main hands a phone-started session to this renderer. Main's settled
+   *  label wins, then a replayed/persisted first prompt repairs the old phone placeholder. This is
+   *  shared by both adoption arms: on window reopen the session already exists because hydration
+   *  necessarily runs before main transfers its live engine. */
+  function repairAdoptedTitle(
+    id: string,
+    incomingLabel: string | undefined,
+    incomingUserNamed: boolean | undefined,
+  ): void {
+    const current = get().sessions[id]
+    if (!current || current.userNamed) return
+    const settledIncoming = incomingLabel?.trim()
+    if (incomingUserNamed) {
+      patchSession(id, (session) => ({
+        ...session,
+        ...(settledIncoming ? { label: settledIncoming } : {}),
+        userNamed: true,
+      }))
+      return
+    }
+    if (settledIncoming && !isProvisionalSessionTitle(settledIncoming)) {
+      patchSession(id, (session) => ({ ...session, label: settledIncoming }))
+      return
+    }
+
+    const first = current.items.find(
+      (item): item is Extract<Entry, { kind: 'user' }> =>
+        item.kind === 'user' && isSessionNamingPrompt(item.text),
+    )
+    if (!first) return
+    const instant = titleFromPrompt(first.text)
+    // Hydration may already have replaced the literal with this exact deterministic floor. It still
+    // deserves the configured writer once the live session is adopted; any other settled renderer
+    // title is left alone.
+    if (!isProvisionalSessionTitle(current.label) && current.label !== instant) return
+    if (isProvisionalSessionTitle(current.label))
+      patchSession(id, (session) => ({ ...session, label: instant }))
+    const reply = current.items
+      .slice()
+      .reverse()
+      .find((item) => item.kind === 'assistant') as Extract<Entry, { kind: 'assistant' }> | undefined
+    nameSession(
+      id,
+      reply ? 'regenerate' : 'initial',
+      reply ? namingEvidence(get().sessions[id]?.items ?? []) : first.text,
+    )
+  }
+
+  /** Older renderer builds could persist the phone fallback onto a desktop-origin session during a
+   *  reload. Main's explicit false is authoritative enough to repair that row even before it has a
+   *  text prompt; `undefined` preserves mixed-version behavior and a human rename always wins. */
+  function originSafeAdoptedLabel(
+    label: string | undefined,
+    fromRemote: boolean | undefined,
+    userNamed: boolean | undefined,
+  ): string | undefined {
+    return fromRemote === false && !userNamed && label?.trim() === PHONE_SESSION_TITLE
+      ? NEW_SESSION_TITLE
+      : label
+  }
+
+  // Every observed sign of life in a session: a turn sent, a turn finished, an approval asked. This is
+  // the ONLY writer of `lastActivityAt`, which is what every sidebar row's age reads — so a thread
+  // looks recent because it was worked in, never because it was marked.
+  function markActivity(id: string): void {
+    patchSession(id, (s) => ({ ...s, lastActivityAt: Date.now() }))
   }
 
   // Shared turn dispatch for every path that drives the engine (the composer + Canvas edits). Pushes an
@@ -1004,14 +1311,14 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
   async function dispatchTurn(
     id: string,
     opts: { sentText: string; images?: ImageDraft[]; displayItem: TurnItem; nameFromText?: string },
-  ): Promise<void> {
+  ): Promise<boolean> {
     const active = get().sessions[id]
-    if (!active || active.busy) return
+    if (!active || active.busy) return false
     const needsReattach = !active.live
     const cwd = active.cwd
     // Synchronous guard: two dispatches in one tick (before `busy` flushes) could both spawn a second
     // `claude --resume` and orphan the first child.
-    if (needsReattach && reattaching.has(id)) return
+    if (needsReattach && reattaching.has(id)) return false
     // "First turn" = no engine turn has ever been dispatched (drives spawn-vs-resume + first-prompt
     // naming). A Canvas edit dispatches a turn too (pushes a `canvas` item, not `user`), so it must
     // count here — otherwise a canvas-only session that later drops its engine would spawn fresh and
@@ -1022,6 +1329,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     patchSession(id, (s) => ({
       ...s,
       busy: true,
+      turnStartedAt: Date.now(),
       errored: false,
       error: undefined, // a fresh turn clears any prior error banner
       attachNotice: undefined, // …and any leftover "couldn't attach that" row
@@ -1035,7 +1343,10 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         ? {}
         : { order: [id, ...state.order.filter((sid) => sid !== id)] },
     )
-    if (firstTurn && name && !get().sessions[id]?.userNamed) upgradeTitle(id, name)
+    // A sent turn is the plainest activity there is — stamp it before anything can await (the map
+    // un-settles this thread on the spot, even if the engine takes a while to answer).
+    markActivity(id)
+    if (firstTurn && name && !get().sessions[id]?.userNamed) nameSession(id, 'initial', name)
     if (needsReattach) {
       reattaching.add(id)
       suppressStartNotice.add(id)
@@ -1048,33 +1359,20 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         const model = active.model
         const effort = active.effort
         const engineId = active.engineId
-        const engineNativeId = active.engineNativeId
         const replaySeq = active.replaySeq
-        if (!firstTurn && engineId === 'codex' && !engineNativeId) {
-          suppressStartNotice.delete(id)
-          patchSession(id, (s) => ({ ...s, busy: false }))
-          pushItem(id, {
-            kind: 'notice',
-            text:
-              "Couldn't reattach this Codex session: Koda is missing the Codex thread id for it. Start a new chat to keep going.",
-          })
-          reattaching.delete(id)
-          return
-        }
-        await window.koda.startSession(
-          firstTurn
-            ? { cwd, sessionId: id, planMode, model, effort, engineId, replaySeq }
-            : {
-                cwd,
-                resumeSessionId: id,
-                planMode,
-                model,
-                effort,
-                engineId,
-                engineNativeId,
-                replaySeq,
-              },
-        )
+        // Hand the driver its own resume blob back and let it decide: it reattaches when the blob is
+        // still good, starts clean when it isn't, and main recovers a session whose engine lost the
+        // conversation outright. Nothing here has to reason about what a resumable conversation is.
+        await window.koda.startSession({
+          cwd,
+          sessionId: id,
+          planMode,
+          model,
+          effort,
+          engineId,
+          resumeCursor: firstTurn ? undefined : active.resumeCursor,
+          replaySeq,
+        })
         patchSession(id, (s) => ({ ...s, live: true }))
         // The gate's per-session posture map is empty after a restart — re-push this session's mode.
         window.koda
@@ -1085,7 +1383,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         patchSession(id, (s) => ({ ...s, busy: false }))
         pushItem(id, { kind: 'notice', text: `⚠ couldn't reattach this session: ${String(err)}` })
         reattaching.delete(id)
-        return
+        return true // the optimistic transcript item already owns this composer snapshot
       } finally {
         reattaching.delete(id)
       }
@@ -1095,6 +1393,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       text: opts.sentText,
       images: opts.images?.length ? opts.images : undefined,
     })
+    return true
   }
 
   // If no card matches a subagent event, drop it (never leak to the main flow) — but warn so a
@@ -1246,6 +1545,9 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     const { sessions, activeId } = get()
     const s = sessions[sid]
     if (!s) return
+    // Reaching a notable state is activity, whoever is watching: a thread that asked for an approval
+    // last night is live work, and its row should not read a day old.
+    if (!replayingSessions.has(sid)) markActivity(sid)
     // "Watching this" = its view is active AND the window is focused — the only case needing no
     // signal (the user is literally looking at it finish).
     const watchingThis = activeId === sid && document.hasFocus()
@@ -1292,12 +1594,20 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
    *  only, and refusing is the safe side of it. */
   const persistArchived = async (next: ArchivedSessionMeta[]): Promise<boolean> => {
     if (get().archiveLoadFailed) return false
+    // Rows whose bodies could not be read stay hidden from the archive UI, but they are still recovery
+    // metadata and must survive unrelated archive/restore/delete writes. A new readable archive for the
+    // same live fallback deliberately replaces its protected row.
+    const nextIds = new Set(next.map((meta) => meta.id))
+    const protectedArchived = get().protectedArchived.filter((meta) => !nextIds.has(meta.id))
+    const durable = [...next, ...protectedArchived]
     let ok = false
     try {
-      ok = (await window.koda.saveArchived?.(next)) === true
+      ok = (await window.koda.saveArchived?.(durable)) === true
     } catch (err) {
       console.error('archive index save failed', err)
     }
+    if (ok && protectedArchived.length !== get().protectedArchived.length)
+      set({ protectedArchived })
     // Cleared by the first write that lands, so a genuinely one-off failure stops warning on its own.
     if (get().archiveWriteFailed !== !ok) set({ archiveWriteFailed: !ok })
     return ok
@@ -1325,13 +1635,16 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     return run
   }
 
-  const initialDock = readDock() // seed dock open/tool from the last session (localStorage)
-
   return {
     sessions: {},
     order: [],
     activeId: null,
     archived: [],
+    protectedArchived: [],
+    starredDocs: [],
+    legacyKeptDocsImported: [],
+    legacyKeptDocPathChanges: [],
+    legacyKeptDocsMigrationComplete: false,
     pending: [],
     rateLimits: {},
     providerDown: {},
@@ -1379,19 +1692,16 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     versionsOpen: false,
     sidebarWidth: DEFAULT_LAYOUT.sidebarWidth, // hydrated from persisted settings at boot
     sessionsFrac: DEFAULT_LAYOUT.sessionsFrac,
-    filesView: 'docs', // doc-first by default; the tree is a deliberate toggle
 
     conversationWidth: DEFAULT_LAYOUT.conversationWidth,
     artifactSplitFrac: DEFAULT_LAYOUT.artifactSplitFrac,
-    dockOpen: initialDock.open,
-    deskOpen: false,
-    termOpen: false,
     pendingTermCommand: null,
-    previewExpanded: false,
+    stageExpanded: false,
     gitRepo: false,
     gitFiles: [],
+    completionBySession: {},
     gitChangesTruncated: false,
-    gitWorktreesDirty: false,
+    gitSideLinesWaiting: false,
     changesFocus: null,
     searchOpen: false,
     lightbox: null,
@@ -1405,8 +1715,18 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     archiveBackupKept: null,
     droppedSessions: 0,
     droppedArchives: 0,
+    unreadableArchiveBodies: 0,
     archiveWriteFailed: false,
     archiveRestoreFailed: false,
+
+    applyCompletionState: (completion) => {
+      set((state) => ({
+        completionBySession: { ...state.completionBySession, [completion.sessionId]: completion },
+      }))
+      // Reconcile the independent evidence streams together: completion names task-owned paths;
+      // user Git decides which of them are still actually loose.
+      void get().refreshGitStatus()
+    },
 
     applyAsideEvent: (e) => {
       patchSession(e.sessionId, (s) => {
@@ -1434,7 +1754,6 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           // Record the model the engine actually reports running — ground truth for the model pill
           // (confirms a switch landed, or shows the engine default when the user picked nothing).
           // Capture the engine's native id (Codex thread id) so a later reattach can resume THAT thread.
-          const hadModel = !!get().sessions[sid]?.model
           patchSession(sid, (s) => ({
             ...s,
             activeModel: e.model || undefined,
@@ -1444,13 +1763,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
             // later respawn with no model is an explicit "Default" pick, which must stay unpinned.
             // Local sessions never inherit (undefined ⇒ "Default", which auto-upgrades).
             model: s.fromRemote && !s.model && !s.activeModel && e.model ? e.model : s.model,
-            engineNativeId: e.engineNativeId ?? s.engineNativeId,
           }))
-          // Seed the next new session's pill. An explicit pick was already remembered at pick time (keep
-          // its alias for auto-upgrade); a "Default" session had no name to show, so remember the concrete
-          // model the engine just resolved to — after any first turn, new sessions name a real model.
-          if (!hadModel && e.model)
-            writeResolvedNewSessionModel(get().sessions[sid]?.engineId ?? 'claude', e.model)
           // A reattach (--resume) re-fires this; swallow its banner so restored history stays clean.
           if (suppressStartNotice.has(sid)) suppressStartNotice.delete(sid)
           // No banner in a fresh session — the composer's model pill owns model truth, and a spawn-time
@@ -1463,6 +1776,39 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
             })
           break
         }
+        case 'SessionCapabilitiesUpdated': {
+          const degraded = e.snapshot.capabilities.filter((capability) => capability.status === 'degraded')
+          const degradedKey = degraded.map((capability) => capability.id).sort().join('|')
+          const warningPrefix = "Some Koda abilities didn't load:"
+          const warningText = degradedKey
+            ? `${warningPrefix} ${degraded.map((capability) => capability.label).join(', ')}. You can keep chatting; start a new session to retry them.`
+            : undefined
+          // Runtime truth can recover on a later Claude init. Keep at most the warning matching the
+          // CURRENT degraded shape, and remove it entirely once everything is ready; a persisted old
+          // warning after renderer reload must not instruct the user to restart a healthy session.
+          patchSession(sid, (s) => ({
+            ...s,
+            capabilities: e.snapshot,
+            items: s.items.filter(
+              (item) =>
+                item.kind !== 'notice' ||
+                !item.text.startsWith(warningPrefix) ||
+                item.text === warningText,
+            ),
+          }))
+          if (
+            !replayingSessions.has(sid) &&
+            warningText &&
+            !get().sessions[sid]?.items.some((item) => item.kind === 'notice' && item.text === warningText)
+          )
+            pushItem(sid, { kind: 'notice', text: warningText, replaySeq: e.replaySeq })
+          break
+        }
+        case 'ResumeCursorUpdated':
+          // The driver's own reattach state. Stored and persisted verbatim so the next start can hand it
+          // straight back; the renderer never looks inside it.
+          patchSession(sid, (s) => ({ ...s, resumeCursor: e.cursor }))
+          break
         case 'ApprovalModeChanged':
           // A change made on another surface (the phone) — route through the full action so the pill
           // updates, persistence saves it, and a plan crossing respawns. The echo of this window's own
@@ -1471,16 +1817,17 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           break
         case 'ModelEffortChanged':
           // A change made on another surface (the phone) — adopt the new pair so the pill follows and
-          // the next reattach doesn't revert it. Patch directly (NOT setSessionModel): main already
-          // respawned the engine with this pair, so the session stays live — and no re-push, so this
-          // window's own echo can't loop. An engine flip also drops the old engine's ground-truth
-          // fields (activeModel, Codex thread id), exactly as setSessionEngine does locally.
+          // the next reattach doesn't revert it. Main already owns the app-wide next-chat posture. Patch
+          // directly (NOT setSessionModel): main already respawned the engine with this pair, so the
+          // session stays live — and no re-push, so this window's own echo can't loop. An engine flip drops the old
+          // engine's ground-truth fields (activeModel, Codex thread id), exactly as setSessionEngine does
+          // locally.
           patchSession(sid, (s) => ({
             ...s,
             model: e.model,
             effort: e.effort,
             ...(e.engineId && e.engineId !== s.engineId
-              ? { engineId: e.engineId, activeModel: undefined, engineNativeId: undefined }
+              ? { engineId: e.engineId, activeModel: undefined, resumeCursor: undefined }
               : {}),
           }))
           break
@@ -1618,6 +1965,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
             replaySeq: e.replaySeq,
             children: [],
           })
+          followDelegation(sid)
           break
         case 'WorkflowStarted':
           finalizeThinking(sid)
@@ -1629,6 +1977,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
             agents: [],
             replaySeq: e.replaySeq,
           })
+          followDelegation(sid)
           break
         case 'WorkflowAgent':
           mutateWorkflow(sid, e.runId, (w) => {
@@ -1640,8 +1989,27 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           })
           break
         case 'WorkflowCompleted':
-          mutateWorkflow(sid, e.runId, (w) => ({ ...w, status: 'completed' }))
-          raiseAttention(sid, 'done') // a backgrounded workflow finishing pings the user
+          {
+            const attentionKind = terminalAttentionKind(e)
+            const workflow = get().sessions[sid]?.items.find(
+              (item) => item.kind === 'workflow' && item.runId === e.runId,
+            )
+            const stillRunning = workflow?.kind === 'workflow' && workflow.agents.some((agent) => agent.status === 'running')
+            mutateWorkflow(sid, e.runId, (w) => ({ ...w, status: 'completed' }))
+            if (!stillRunning && attentionKind) raiseAttention(sid, attentionKind)
+          }
+          break
+        case 'WorkflowObservationEnded':
+          mutateWorkflow(sid, e.runId, (w) => {
+            const unresolved = new Set(e.unresolvedAgentIds)
+            return {
+              ...w,
+              status: 'unknown',
+              agents: w.agents.map((agent) =>
+                unresolved.has(agent.agentId) ? { ...agent, status: 'unknown' as const } : agent,
+              ),
+            }
+          })
           break
         case 'SubagentProgress': {
           const patch: Partial<SubagentItem> = { lastActivityAt: Date.now() }
@@ -1674,11 +2042,16 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           settleDeferredBillingRespawn(sid)
           break
         case 'TurnComplete': {
+          // Codex pairs a pre-start rejection with a compatibility completion so pre-category clients
+          // release busy. The remote handshake has no version gate (those builds may still false-haptic),
+          // so this renderer must read the reason: the EngineError owns attention and one-shot success
+          // workflows must survive for Retry.
+          const attentionKind = terminalAttentionKind(e)
+          const rejectedBeforeStart = attentionKind === null
           finalizeThinking(sid) // covers a thinking-only turn that produced no text
           patchSession(sid, (s) => ({
-            ...s,
+            ...endTurn(s),
             streaming: '',
-            busy: false,
             context: e.context ?? s.context,
             // Accumulate spend regardless of whether a notice shows — feeds the Usage view.
             spendUsd: s.spendUsd + (e.costEstimate ?? 0),
@@ -1690,25 +2063,27 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           // with no cancel event) — clear it, else statusOf latches the session on "Needs your approval".
           get().cancelPending(sid)
           settleDeferredBillingRespawn(sid)
-          // One-shot substance retitle: the FIRST turn just finished cleanly, so rename from what was
-          // actually done (prompt + final reply) — two sessions that open with the same prompt diverge
-          // in the work, so this is where their names come apart. Fires only while the session has a
-          // single turn; after this the name never moves again unless the user renames it (userNamed).
+          // A finished turn is activity: it re-dates the session in the map (and un-settles it if the
+          // work was picked back up after a quiet week). Replay is history, not activity.
+          if (!replayingSessions.has(sid)) markActivity(sid)
+          // Re-name the thread at the sparse regeneration crossings (session-naming.ts). The old
+          // one-shot retitle named a thread from its opening turn and never looked again, so a thread
+          // that moved research → build → review kept the name of whatever it opened with. The
+          // regenerate prompt keeps the umbrella subject instead of chasing the latest stage.
+          //
+          // `namedAtTurns` is what makes a crossing an EDGE. `shouldRegenerateName` answers "is the
+          // count AT a crossing", and plenty of turns finish without adding a user message — a doc
+          // edit (a `canvas` item), the handoff prompt (a `notice` item), an image-only turn (whose
+          // text `userMessages` drops). Without the stamp, every one of those re-fires naming for as
+          // long as the thread sits on 2, 5, or a multiple of 10, and each re-fire is another chance
+          // for the title to come back worded differently. Stamped BEFORE the call, so a second turn
+          // completing while this naming is still in flight doesn't fire a duplicate either.
           if (!replayingSessions.has(sid) && e.stopReason === 'success') {
             const sess = get().sessions[sid]
-            // Count only turns that could have named the session: canvas + text prompts. An image-only
-            // opener never named it, so the first TEXT turn's completion is this session's one shot.
-            const turns =
-              sess?.items.filter(
-                (it) => it.kind === 'canvas' || (it.kind === 'user' && it.text.trim() && it.text !== '(image)'),
-              ) ?? []
-            const opener = turns.length === 1 && turns[0].kind === 'user' ? turns[0].text : ''
-            if (sess && !sess.userNamed && opener) {
-              const reply = sess.items
-                .slice()
-                .reverse()
-                .find((it) => it.kind === 'assistant') as Extract<Entry, { kind: 'assistant' }> | undefined
-              if (reply) upgradeTitle(sid, titleDigest(opener, reply.markdown))
+            const turns = sess ? userMessages(sess.items).length : 0
+            if (sess && !sess.userNamed && sess.namedAtTurns !== turns && shouldRegenerateName(turns)) {
+              patchSession(sid, (s) => ({ ...s, namedAtTurns: turns }))
+              nameSession(sid, 'regenerate', namingEvidence(sess.items))
             }
           }
           // A clean turn (subtype 'success') needs no footer — the next composer marks the boundary.
@@ -1733,7 +2108,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           // Keep-going-in-a-fresh-chat: this session requested a handoff summary — now that the turn is
           // done, carry it into a new session. A stopped or empty turn yields no usable summary → say so
           // and stay put rather than opening a blank chat.
-          if (handoffPending.delete(sid)) {
+          if (!rejectedBeforeStart && handoffPending.delete(sid)) {
             const items = get().sessions[sid]?.items ?? []
             const summary = [...items]
               .reverse()
@@ -1745,14 +2120,14 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
               })
             } else {
               // The fresh chat should continue on the SAME engine/model as the one being handed off
-              // (matters when it's Codex, not the global last-used). startSession reads these, so seed
-              // them from the old session first.
+              // (matters when it's Codex, not the global last-used), as a one-start override.
               const prev = get().sessions[sid]
-              if (prev) {
-                writeNewSessionPosture(prev.engineId, prev.model)
-              }
               void (async () => {
-                await get().startSession() // creates + activates the fresh session
+                await get().startSession(
+                  prev
+                    ? { engineId: prev.engineId, model: prev.model, effort: prev.effort }
+                    : undefined,
+                ) // creates + activates the fresh session
                 const newId = get().activeId
                 if (!newId) return
                 const note = `Continuing from a previous chat that was getting long. Here's the handoff:\n\n${summary}`
@@ -1762,7 +2137,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
               })()
             }
           }
-          raiseAttention(sid, 'done')
+          if (attentionKind) raiseAttention(sid, attentionKind)
           break
         }
         case 'RateLimitUpdate': {
@@ -1790,7 +2165,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           const resetsAt = e.info.resetsAt
           if (
             !replayingSessions.has(sid) && // a replayed historical 'rejected' isn't live news — don't pop the banner
-            rlEngine === 'claude' && // the API-key fallback bills an Anthropic key; a Codex window can't trigger it
+            engineCapabilities(rlEngine).apiKeyFallback && // only an engine with a Koda-held key to switch forward onto
             get().billingMode === 'auto' &&
             e.info.status === 'rejected' &&
             !get().billingFallbackPrompt &&
@@ -1816,22 +2191,29 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           // A turn-level API failure (apiError) or a fatal engine stop becomes the composer error banner —
           // a calm, retryable surface. A recoverable non-fatal notice (broker/gate/preview hiccup, a stdin
           // blip, a reconnect message) stays a quiet transcript footer and leaves the live turn running.
-          const banner = e.category === 'apiError' || e.fatal
-          // Only a FATAL error ends the turn (an apiError is followed by its own turn-ending `result`);
-          // clearing busy on a mid-turn non-fatal notice would flip the sidebar to idle under a live turn.
-          patchSession(sid, (s) => ({
-            ...s,
-            busy: e.fatal ? false : s.busy,
-            errored: e.fatal ? true : s.errored,
-            ...(banner ? { error: { message: e.message, fatal: e.fatal } } : {}),
-          }))
-          // A fatal error ends the turn too (see the TurnComplete invariant): drop any now-stale prompt so
-          // the session doesn't die stuck on "Needs your approval". Non-fatal notices leave the turn live.
-          if (e.fatal) get().cancelPending(sid)
-          if (banner) {
+          const turnRejected = e.category === 'turnRejected'
+          const attentionKind = terminalAttentionKind(e)
+          const banner = attentionKind === 'error'
+          // Fatal process loss and an explicit pre-start rejection end the turn. An apiError is followed
+          // by its own turn-ending `result`; other non-fatal notices can arrive while work is still live.
+          patchSession(sid, (s) => {
+            const terminal = e.fatal || turnRejected ? endTurn(s) : s
+            return {
+              ...terminal,
+              // Persist the canonical error AND exact user payload before replaySeq advances past it.
+              // Otherwise a renderer reload has neither the transient banner nor an eligible replay tail.
+              items: banner ? attachTurnFailureToTranscript(terminal.items, e) : terminal.items,
+              errored: e.fatal || turnRejected ? true : s.errored,
+              ...(banner ? { error: { message: e.message, fatal: e.fatal } } : {}),
+            }
+          })
+          // A terminal error drops any now-stale prompt so the session cannot die stuck on "Needs your
+          // approval". Recoverable mid-turn notices leave the turn live.
+          if (e.fatal || turnRejected) get().cancelPending(sid)
+          if (attentionKind) {
             // The banner is the report; suppress the abnormal-stop footer from the `result` that follows.
             bannerErrored.add(sid)
-            raiseAttention(sid, 'error')
+            raiseAttention(sid, attentionKind)
           } else {
             pushItem(sid, {
               kind: 'notice',
@@ -1919,7 +2301,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       window.koda.interruptSession({ sessionId }).catch(console.error)
       // The graceful interrupt aborts the turn but keeps the process alive; clear busy now so the user
       // can immediately type a correction. A late `result`/TurnComplete is idempotent (busy already false).
-      patchSession(sessionId, (x) => ({ ...x, busy: false, error: undefined }))
+      patchSession(sessionId, (x) => ({ ...endTurn(x), error: undefined }))
     },
 
     stopSubagent: (sessionId, taskId) => {
@@ -1936,31 +2318,84 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     retryLastTurn: (sessionId) => {
       const s = get().sessions[sessionId]
       if (!s || s.busy) return
-      // Re-send the last user prompt (image turns re-send text-only — the common failure is a text turn).
-      const lastUser = [...s.items].reverse().find((it) => it.kind === 'user') as
-        | { kind: 'user'; text: string }
-        | undefined
-      const text = lastUser?.text?.trim()
-      if (!text || text === '(image)') {
+      const target = latestTurnFailureOf(s.items)?.target
+      if (!target) {
         // Nothing sensible to re-send — just clear the banner so the composer is usable again.
         patchSession(sessionId, (x) => ({ ...x, error: undefined }))
         return
       }
-      void dispatchTurn(sessionId, { sentText: text, displayItem: { kind: 'user', text } })
+      if (target.hadImages && !target.images?.length) {
+        // The transcript remembers that photos existed but not their bytes. Re-sending a caption (or
+        // the legacy `(image)` sentinel) would silently ask the engine to do different work.
+        patchSession(sessionId, (x) => ({
+          ...x,
+          error: {
+            message: "Those images aren't available anymore. Add them again, then resend the turn.",
+            fatal: false,
+          },
+        }))
+        return
+      }
+      const exactAttachmentsComplete =
+        !!target.images?.length &&
+        (!target.attachments?.length ||
+          (target.images.length === target.attachments.length &&
+            target.attachments.every((attachment, index) => {
+              const exact = target.images?.[index]
+              return (
+                exact?.mediaType === attachment.mediaType &&
+                (attachment.name === undefined || exact.name === attachment.name)
+              )
+            })))
+      if (target.hadAttachments && !exactAttachmentsComplete) {
+        // Provenance without the complete ordered payload is display-only. A mixed image/document turn
+        // must not retry whichever subset happened to survive and silently change the user's request.
+        patchSession(sessionId, (x) => ({
+          ...x,
+          error: {
+            message: "Those attachments aren't available anymore. Add them again, then resend the turn.",
+            fatal: false,
+          },
+        }))
+        return
+      }
+      const images = target.images as ImageDraft[] | undefined
+      if (!target.text.trim() && !images?.length) {
+        patchSession(sessionId, (x) => ({ ...x, error: undefined }))
+        return
+      }
+      void dispatchTurn(sessionId, {
+        sentText: target.text,
+        images,
+        displayItem: {
+          kind: 'user',
+          text: target.text,
+          ...(target.hadImages ? { hadImages: true } : {}),
+          ...(target.hadAttachments ? { hadAttachments: true } : {}),
+          ...(target.attachments?.length ? { attachments: target.attachments } : {}),
+          ...(target.attachments?.some((attachment) => attachment.name)
+            ? {
+                files: target.attachments.flatMap((attachment) =>
+                  attachment.name ? [attachment.name] : [],
+                ),
+              }
+            : {}),
+          ...(images?.length ? { images } : {}),
+        },
+      })
     },
 
-    startSession: async () => {
+    startSession: async (posture) => {
       // New sessions start in the default posture (never plan) — picking Plan in the composer
       // reattaches the session in plan mode on its next turn (see setSessionApprovalMode). The engine
-      // defaults to the last one the user picked; they can switch it from the model dropdown until the
-      // first turn (after that the conversation is bound to its engine).
-      const { engineId, model } = readNewSessionPosture()
-      // Spawn the warm-up engine ON that model. Omitting it booted the engine on its own default while the
-      // pill named `model`, so a first turn sent without re-picking silently ran the wrong model (the pill
-      // was display-only). Main also reconciles intent-vs-actual before every turn now, but that backstop
-      // only works if main is TOLD the intended model here — the renderer is its source of truth.
-      const { sessionId, cwd } = await window.koda.startSession({ engineId, model })
-      const label = 'New session' // placeholder until the first turn names it (titleFromPrompt → assistTitle)
+      // defaults to the last one the user picked; main owns that durable posture for desktop and phone.
+      // A handoff can supply a one-start override so it stays on its source conversation's engine.
+      const started = await window.koda.startSession(posture ? { ...posture } : {})
+      const { sessionId, cwd } = started
+      const engineId = started.engineId ?? posture?.engineId ?? 'claude'
+      const model = started.model ?? posture?.model
+      const effort = started.effort ?? posture?.effort
+      const label = NEW_SESSION_TITLE // placeholder until the first turn names it (titleFromPrompt → nameSession)
       const approvalMode = get().defaultApprovalMode
       set((state) => ({
         sessions: {
@@ -1969,6 +2404,9 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
             id: sessionId,
             label,
             userNamed: false,
+            // Starting a session is activity: it enters the map as live work, and only goes quiet if
+            // it is genuinely left alone for days.
+            lastActivityAt: Date.now(),
             cwd,
             items: [],
             streaming: '',
@@ -1981,6 +2419,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
             approvalMode,
             engineId,
             model,
+            effort,
             spendUsd: 0,
             byModel: {},
           },
@@ -1999,22 +2438,30 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       for (const s of adopted) {
         any = true
         const existing = get().sessions[s.id]
+        const incomingLabel = originSafeAdoptedLabel(s.label, s.fromRemote, s.userNamed)
         if (existing) {
           // A reopened window hydrates this same id as a cold transcript before main transfers the
           // still-running engine back to it. The persisted replay cursor lets the normal reducer apply
           // only the exact headless tail—no text-based guessing when the user says "continue" twice.
           patchSession(s.id, (current) => ({
             ...current,
+            label:
+              originSafeAdoptedLabel(
+                current.label,
+                s.fromRemote,
+                current.userNamed || s.userNamed,
+              ) ?? current.label,
             cwd: s.cwd,
             streaming: '',
             busy: s.working ?? current.busy,
-            errored: false,
-            error: undefined,
             live: true,
             approvalMode: s.approvalMode,
             engineId: s.engineId,
             model: s.model,
             effort: s.effort,
+            // Main now reports origin explicitly. `undefined` keeps a phone flag across a mixed-version
+            // development reload; an authoritative false clears any stale renderer-only inference.
+            fromRemote: s.fromRemote === undefined ? current.fromRemote : s.fromRemote || undefined,
           }))
           const tail = s.events.filter(
             (entry) => entry.replaySeq === undefined || entry.replaySeq > (existing.replaySeq ?? 0),
@@ -2024,7 +2471,17 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           try {
             for (const entry of tail) {
               if (entry.type === 'RemoteUserTurn')
-                pushItem(s.id, { kind: 'user', text: entry.text, replaySeq: entry.replaySeq })
+                get().applyRemoteUserTurn(
+                  s.id,
+                  entry.text,
+                  entry.replaySeq,
+                  true,
+                  entry.hadImages,
+                  entry.images,
+                  entry.clientTurnId,
+                  entry.hadAttachments,
+                  entry.attachments,
+                )
               else get().applyEngineEvent(entry)
             }
           } finally {
@@ -2032,30 +2489,58 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
             suppressStartNotice.delete(s.id)
           }
           const activeChildren = new Set(s.activeSubagentToolUseIds ?? [])
-          patchSession(s.id, (current) => ({
-            ...current,
-            items: settleRestoredTranscriptItems(current.items, activeChildren) as Entry[],
-            busy: s.working ?? current.busy,
-            replaySeq: Math.max(
-              current.replaySeq ?? 0,
-              ...s.events.map((entry) => entry.replaySeq ?? 0),
-            ),
-          }))
+          const activeWorkflows = new Map(
+            (s.activeWorkflows ?? []).map((workflow) => [workflow.runId, new Set(workflow.runningAgentIds)]),
+          )
+          patchSession(s.id, (current) => {
+            const items = settleRestoredTranscriptItems(
+              current.items,
+              activeChildren,
+              activeWorkflows,
+            ) as Entry[]
+            const turnFailure = latestTurnFailureOf(items)
+            return {
+              ...current,
+              items,
+              busy: s.working ?? current.busy,
+              replaySeq: Math.max(
+                current.replaySeq ?? 0,
+                ...s.events.map((entry) => entry.replaySeq ?? 0),
+              ),
+              errored: !!turnFailure?.error.fatal || turnFailure?.error.category === 'turnRejected',
+              ...(turnFailure
+                ? { error: { message: turnFailure.error.message, fatal: turnFailure.error.fatal } }
+                : { error: undefined }),
+            }
+          })
+          if (s.capabilities)
+            get().applyEngineEvent({
+              type: 'SessionCapabilitiesUpdated',
+              sessionId: s.id,
+              snapshot: s.capabilities,
+            })
+          repairAdoptedTitle(s.id, incomingLabel, s.userNamed)
           continue
         }
         // Create the tab first so the replay + subsequent live events have a session to land in. It's
         // `live: true` — the engine is already running on main; a Mac turn sends straight through (no
-        // reattach). approvalMode mirrors the gate's ACTUAL posture for this session (main reads it
-        // live, not a guessed window default) — a phone session's mode may have been changed before
-        // any window existed to display it, and showing a looser posture than the gate enforces would
-        // be the dangerous direction to get wrong.
+        // reattach). This path also reconstructs a desktop-owned session after a renderer reload, so
+        // main's explicit origin bit—not the fact that this adoption API returned it—owns the fallback
+        // label and phone marker. approvalMode mirrors the gate's ACTUAL posture for this session.
         set((state) => ({
           sessions: {
             ...state.sessions,
             [s.id]: {
               id: s.id,
-              label: s.label || 'From your phone',
+              // `fromRemote` was added after adoption shipped. An older/mixed-version main omits it,
+              // so only an explicit desktop-origin `false` may select the desktop fallback.
+              label:
+                incomingLabel ||
+                (s.fromRemote === false ? NEW_SESSION_TITLE : PHONE_SESSION_TITLE),
               userNamed: s.userNamed ?? false,
+              // Adoption is the moment this renderer starts observing the live session, so it enters
+              // the map as active work instead of sitting outside the settling rule indefinitely.
+              lastActivityAt: Date.now(),
               cwd: s.cwd,
               items: [],
               streaming: '',
@@ -2071,7 +2556,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
               effort: s.effort,
               spendUsd: 0,
               byModel: {},
-              fromRemote: true,
+              fromRemote: s.fromRemote || undefined,
             },
           },
           order: [s.id, ...state.order],
@@ -2084,7 +2569,17 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         try {
           for (const entry of s.events) {
             if (entry.type === 'RemoteUserTurn')
-              pushItem(s.id, { kind: 'user', text: entry.text, replaySeq: entry.replaySeq })
+              get().applyRemoteUserTurn(
+                s.id,
+                entry.text,
+                entry.replaySeq,
+                true,
+                entry.hadImages,
+                entry.images,
+                entry.clientTurnId,
+                entry.hadAttachments,
+                entry.attachments,
+              )
             else get().applyEngineEvent(entry)
           }
         } finally {
@@ -2094,30 +2589,27 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         // Replaying describes the history; main's ownership snapshot is authoritative for what remains
         // live at the handoff boundary (including a child whose Start event predates this window).
         const activeChildren = new Set(s.activeSubagentToolUseIds ?? [])
+        const activeWorkflows = new Map(
+          (s.activeWorkflows ?? []).map((workflow) => [workflow.runId, new Set(workflow.runningAgentIds)]),
+        )
         patchSession(s.id, (current) => ({
           ...current,
-          items: settleRestoredTranscriptItems(current.items, activeChildren) as Entry[],
+          items: settleRestoredTranscriptItems(current.items, activeChildren, activeWorkflows) as Entry[],
           busy: s.working ?? current.busy,
           replaySeq: Math.max(
             current.replaySeq ?? 0,
             ...s.events.map((entry) => entry.replaySeq ?? 0),
           ),
         }))
-        // A session main already named keeps that name verbatim (s.label above) — a settled title must
-        // not change on open. Only a still-unnamed adoption derives one here (mirrors first-turn
-        // naming: instant prompt-word title, then the digest upgrade when the replay holds a reply).
-        // If its first turn is still running, the TurnComplete retitle in the reducer finishes the job.
-        const first = get().sessions[s.id]?.items.find((it) => it.kind === 'user') as
-          | { kind: 'user'; text: string }
-          | undefined
-        if (!s.label && first?.text.trim()) {
-          patchSession(s.id, (ss) => ({ ...ss, label: titleFromPrompt(first.text) }))
-          const reply = get()
-            .sessions[s.id]?.items.slice()
-            .reverse()
-            .find((it) => it.kind === 'assistant') as Extract<Entry, { kind: 'assistant' }> | undefined
-          upgradeTitle(s.id, reply ? titleDigest(first.text, reply.markdown) : first.text)
-        }
+        if (s.capabilities)
+          get().applyEngineEvent({
+            type: 'SessionCapabilitiesUpdated',
+            sessionId: s.id,
+            snapshot: s.capabilities,
+          })
+        // A settled label from main wins verbatim. Otherwise a first replayed prompt replaces the
+        // phone placeholder immediately and the configured writer refines it in the background.
+        repairAdoptedTitle(s.id, incomingLabel, s.userNamed)
       }
       // One git refresh after replay settles (the per-turn refreshes were suppressed during replay).
       if (any) void get().refreshGitStatus()
@@ -2128,41 +2620,154 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
 
     bumpScratch: () => set((s) => ({ scratchTick: s.scratchTick + 1 })),
 
-    applyRemoteUserTurn: (sessionId, text, replaySeq, append = true) => {
+    bumpFilesRev: () => set((s) => ({ filesRev: s.filesRev + 1 })),
+
+    applyRemoteUserTurn: (
+      sessionId,
+      text,
+      replaySeq,
+      append = true,
+      hadImages,
+      images,
+      clientTurnId,
+      hadAttachments,
+      attachments,
+    ) => {
       const s = get().sessions[sessionId]
       if (!s) return // not owned by this window — nothing to append or stamp
+      // Every live turn is activity, including an optimistic desktop row receiving its replay identity
+      // and a durable phone retry reconciling into the same logical bubble. Replay is history, not work.
+      if (!replayingSessions.has(sessionId)) markActivity(sessionId)
+      const matchingLogicalIndex = clientTurnId
+        ? s.items.findIndex((item) => item.kind === 'user' && item.clientTurnId === clientTurnId)
+        : -1
       if (!append) {
         // The desktop already rendered this turn optimistically. Main assigns the replay identity before
         // the engine receives it, so stamp the newest unstamped turn row rather than appending a copy.
         patchSession(sessionId, (current) => {
-          const index = current.items.findLastIndex(
-            (item) => (item.kind === 'user' || item.kind === 'canvas') && item.replaySeq === undefined,
+          const unstampedIndex = current.items.findLastIndex(
+            (item) =>
+              (item.kind === 'user' || item.kind === 'canvas') && item.replaySeq === undefined,
           )
+          const replayIndex = replaySeq === undefined
+            ? -1
+            : current.items.findIndex(
+                (item) => item.kind === 'user' && item.replaySeq === replaySeq,
+              )
+          const index = clientTurnId
+            ? current.items.findIndex(
+                (item) => item.kind === 'user' && item.clientTurnId === clientTurnId,
+              )
+            : replayIndex >= 0
+              ? replayIndex
+              : unstampedIndex
           if (index === -1) return current
           const items = current.items.slice()
-          items[index] = { ...items[index], replaySeq }
+          const optimistic = items[index]
+          if (optimistic.kind === 'user') {
+            const superseded = clientTurnId ? supersedeTurnFailure(optimistic) : optimistic
+            const {
+              images: _oldImages,
+              attachments: _oldAttachments,
+              files: _oldFiles,
+              ...stable
+            } = superseded
+            items[index] = {
+              ...(clientTurnId ? stable : optimistic),
+              replaySeq,
+              ...(clientTurnId ? { clientTurnId } : {}),
+              ...(hadImages !== undefined ? { hadImages } : {}),
+              ...(hadAttachments !== undefined ? { hadAttachments } : {}),
+              ...(attachments?.length ? { attachments } : {}),
+              ...(attachments?.some((attachment) => attachment.name)
+                ? {
+                    files: attachments.flatMap((attachment) =>
+                      attachment.name ? [attachment.name] : [],
+                    ),
+                  }
+                : {}),
+              ...(images?.length ? { images } : {}),
+            }
+            // Keep legacy optimistic payload fields when this is merely the first replay stamp. A stable
+            // logical retry replaces them with the latest attempt's exact/provenance material above.
+          } else items[index] = { ...optimistic, replaySeq }
           return {
             ...current,
+            ...(clientTurnId ? { error: undefined, errored: false } : {}),
             items,
             replaySeq: replaySeq === undefined ? current.replaySeq : Math.max(current.replaySeq ?? 0, replaySeq),
           }
         })
         return
       }
+      if (matchingLogicalIndex >= 0) {
+        // A fresh engine attempt for a durable failure emits a new replay boundary but belongs to the
+        // same phone bubble. Reconcile metadata in place; never append a second owner-window row.
+        patchSession(sessionId, (current) => ({
+          ...current,
+          error: undefined,
+          errored: false,
+          replaySeq:
+            replaySeq === undefined
+              ? current.replaySeq
+              : Math.max(current.replaySeq ?? 0, replaySeq),
+          items: current.items.map((item, index) => {
+            if (index !== matchingLogicalIndex || item.kind !== 'user') return item
+            const superseded = supersedeTurnFailure(item)
+            const {
+              images: _oldImages,
+              attachments: _oldAttachments,
+              files: _oldFiles,
+              ...stable
+            } = superseded
+            return {
+              ...stable,
+              text: text || (hadImages || images?.length ? '(image)' : ''),
+              ...(replaySeq !== undefined ? { replaySeq } : {}),
+              ...(hadImages !== undefined ? { hadImages } : {}),
+              ...(hadAttachments !== undefined ? { hadAttachments } : {}),
+              ...(attachments?.length ? { attachments } : {}),
+              ...(attachments?.some((attachment) => attachment.name)
+                ? { files: attachments.flatMap((attachment) => attachment.name ? [attachment.name] : []) }
+                : {}),
+              ...(images?.length ? { images } : {}),
+            }
+          }),
+        }))
+        return
+      }
       // This is the session's first real prompt if nothing before it was one (an image-only turn shows
       // as "(image)" and never names the tab). Decide BEFORE appending so the new turn isn't counted.
-      const hadPrompt = s.items.some((it) => it.kind === 'user' && it.text.trim() && it.text !== '(image)')
-      pushItem(sessionId, { kind: 'user', text: text || '(image)', replaySeq })
+      const hadPrompt = s.items.some(
+        (it) => it.kind === 'user' && isSessionNamingPrompt(it.text),
+      )
+      pushItem(sessionId, {
+        kind: 'user',
+        text: text || (hadImages || images?.length ? '(image)' : ''),
+        ...(clientTurnId ? { clientTurnId } : {}),
+        ...(hadImages !== undefined ? { hadImages } : {}),
+        ...(hadAttachments !== undefined ? { hadAttachments } : {}),
+        ...(attachments?.length ? { attachments } : {}),
+        ...(attachments?.some((attachment) => attachment.name)
+          ? { files: attachments.flatMap((attachment) => attachment.name ? [attachment.name] : []) }
+          : {}),
+        ...(images?.length ? { images } : {}),
+        replaySeq,
+      })
       if (replaySeq !== undefined)
         patchSession(sessionId, (current) => ({
           ...current,
           replaySeq: Math.max(current.replaySeq ?? 0, replaySeq),
         }))
       // Mirror adoptHeadless's first-turn naming: the session was adopted empty (before any turn), so it
-      // never got titled. Instant first-words label, then the fire-and-forget assistTitle upgrade.
-      if (!s.userNamed && !hadPrompt && text.trim()) {
-        patchSession(sessionId, (ss) => ({ ...ss, label: titleFromPrompt(text) }))
-        upgradeTitle(sessionId, text)
+      // never got titled. Instant first-words label, then the fire-and-forget engine naming turn.
+      // Replay has its own settled-label/substance naming pass after the full history is reduced, and
+      // adoption already stamps activity at the handoff. Keep this live-only side effect out of catch-up.
+      if (!replayingSessions.has(sessionId)) {
+        if (!s.userNamed && !hadPrompt && isSessionNamingPrompt(text)) {
+          patchSession(sessionId, (ss) => ({ ...ss, label: titleFromPrompt(text) }))
+          nameSession(sessionId, 'initial', text)
+        }
       }
     },
 
@@ -2184,31 +2789,27 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         }
         // The transcript body goes to its own cold file; the metadata index stays light. Baked preview +
         // maxItemId let the list render and boot advance the id counter WITHOUT re-loading bodies.
-        const items = s.items
-        // Await so the body is durably written before the session leaves the store (also orders it ahead of
-        // any later loadArchivedBody, which rides a different channel). Fail-soft: on error the archive is
-        // still recorded (visible in the list) — only its restore would come back empty.
+        const persisted = persistedSessionFromState(s)
+        const items = persisted.items
+        // Await and require an acknowledgement before recording metadata or removing the hot session.
+        // A metadata row with no body is not an archive; it is a conversation whose only transcript was
+        // just thrown away.
         try {
-          await window.koda.writeArchivedBody?.(id, items)
+          if ((await window.koda.writeArchivedBody?.(id, items)) !== true) {
+            console.error(`archive aborted for session ${id} — its conversation body refused the write`)
+            if (!get().archiveWriteFailed) set({ archiveWriteFailed: true })
+            return
+          }
         } catch (err) {
           console.error(err)
+          if (!get().archiveWriteFailed) set({ archiveWriteFailed: true })
+          return
         }
         // Snapshot the durable metadata (same fields the persist blob keeps, minus `items`) + an archive
         // stamp, so it restores byte-identical and reattaches via --resume like a boot-restored session.
+        const { items: _items, ...durable } = persisted
         const meta: ArchivedSessionMeta = {
-          id: s.id,
-          label: s.label,
-          cwd: s.cwd,
-          userNamed: s.userNamed,
-          approvalMode: s.approvalMode,
-          model: s.model,
-          effort: s.effort,
-          engineId: s.engineId,
-          engineNativeId: s.engineNativeId,
-          context: s.context,
-          spendUsd: s.spendUsd,
-          byModel: s.byModel,
-          replaySeq: s.replaySeq,
+          ...durable,
           archivedAt: Date.now(),
           preview: buildArchivePreview(items),
           maxItemId: maxArchivedItemId(items),
@@ -2219,7 +2820,9 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         // The committed list below is this exact array, so memory and disk can't disagree about the move.
         // It still composes with a second move asked for at the same time: `queueArchiveMove` holds that
         // one until this one has committed, so the base read here already carries whatever landed first.
-        const nextArchived = [meta, ...get().archived]
+        // A stale hot-store row may legitimately retry after an interrupted save/reload. Replace its
+        // earlier metadata instead of accumulating several rows for the same conversation.
+        const nextArchived = [meta, ...get().archived.filter((row) => row.id !== id)]
         if (!(await persistArchived(nextArchived))) {
           console.error(`archive aborted for session ${id} — the archive index refused the write`)
           return
@@ -2230,7 +2833,11 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         set((state) => {
           // The session went away across the awaits (a phone close). The index on disk already holds
           // `nextArchived`, so commit that half regardless — same rule restoreArchived's setter follows.
-          if (!state.sessions[id]) return { archived: nextArchived }
+          if (!state.sessions[id]) {
+            const completionBySession = { ...state.completionBySession }
+            delete completionBySession[id]
+            return { archived: nextArchived, completionBySession }
+          }
           const rest = { ...state.sessions }
           delete rest[id]
           const order = state.order.filter((sid) => sid !== id)
@@ -2239,6 +2846,8 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           // Drop the session's editor workbench too — its tabs die with it.
           const editors = { ...state.editors }
           delete editors[id]
+          const completionBySession = { ...state.completionBySession }
+          delete completionBySession[id]
           return {
             sessions: rest,
             order,
@@ -2246,6 +2855,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
             editors,
             pending: state.pending.filter((r) => r.sessionId !== id),
             archived: nextArchived,
+            completionBySession,
           }
         })
       }),
@@ -2294,6 +2904,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         const nextArchived = get().archived.filter((x) => x.id !== id)
         if (!(await persistArchived(nextArchived))) {
           console.error(`reopen aborted for archived session ${id} — the archive index refused the write`)
+          if (!get().archiveRestoreFailed) set({ archiveRestoreFailed: true })
           return
         }
         set((state) => {
@@ -2309,29 +2920,14 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
             if (it.kind === 'subagent')
               for (const c of it.children) if (c.id > entryId) entryId = c.id
           }
-          const session: SessionState = {
-            id: a.id,
-            label: a.label,
-            userNamed: a.userNamed ?? false,
-            cwd: a.cwd,
-            items,
-            context: a.context,
-            streaming: '',
-            busy: false,
-            errored: false,
-            draft: '',
-            attachments: [],
-            live: false, // engine not spawned — reattaches via --resume on its next turn
-            attention: false,
-            approvalMode: a.approvalMode ?? state.defaultApprovalMode,
-            model: a.model,
-            effort: a.effort,
-            engineId: a.engineId ?? 'claude',
-            engineNativeId: a.engineNativeId,
-            spendUsd: a.spendUsd ?? 0,
-            byModel: a.byModel ?? {},
-            replaySeq: restoredReplaySeq,
-          }
+          // Reopening is fresh activity, but every other durable field follows the same conversion as
+          // boot hydration. Combining the cold metadata with its body here prevents archive and hot
+          // persistence from growing competing field lists again.
+          const session = sessionStateFromPersisted(
+            { ...a, items },
+            state.defaultApprovalMode,
+            { freshActivity: true, replaySeq: restoredReplaySeq },
+          )
           return {
             sessions: { ...state.sessions, [id]: session },
             order: [id, ...state.order],
@@ -2373,30 +2969,38 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       const id = active.id
       // Same synchronous double-send guard dispatchTurn applies, re-checked here so we don't consume
       // (clear) the composer for a dispatch that would early-return on a racing reattach.
-      if (!active.live && reattaching.has(id)) return
-      // Ambient open-file context: tell the agent which file the user is looking at — a doc OR a code
-      // file (a diff counts; a preview doesn't) — so "shorten the intro" / "fix this" work without an
-      // explicit selection. The transcript shows the raw text; only the engine sees the hint, and only
-      // when the user actually typed something. The composer shows the same file as a visible cue.
-      const ed = activeEditor(get())
-      const activeFile = ed.surfaces.find((s) => s.path === ed.activeSurfaceId && s.kind !== 'preview')
-      const noun = activeFile && isMarkdown(activeFile.path) ? 'document' : 'file'
+      if ((!active.live && reattaching.has(id)) || sending.has(id)) return
+      // Document mention resolution and scratch persistence both await IPC before dispatchTurn can set
+      // `busy`. Claim this exact composer snapshot now so a second click cannot send it twice. The
+      // composer itself remains editable; only the captured text/attachments are consumed below, so
+      // typing the next message during preflight is never erased by this continuation.
+      sending.add(id)
+      try {
+        // Ambient open-file context: tell the agent which file the user is looking at — a doc OR a code
+        // file (a diff counts; a preview doesn't) — so "shorten the intro" / "fix this" work without an
+        // explicit selection. The transcript shows the raw text; only the engine sees the hint, and only
+        // when the user actually typed something. The composer shows the same file as a visible cue.
+        const ed = activeEditor(get())
+      // Test for what qualifies, not for the one kind that doesn't: `kind` is optional (undefined means
+      // a file), so excluding only 'preview' let the `terminal` and `changes` stage tabs through and
+      // told the engine it was looking at a file called ` terminal`.
+        const activeFile = ed.surfaces.find(
+        (s) => s.path === ed.activeSurfaceId && (s.kind ?? 'file') === 'file',
+      )
+        const noun = activeFile && isMarkdown(activeFile.path) ? 'document' : 'file'
       // Engine-facing text restores the full path behind any pretty `@`-mention; the transcript keeps
       // the clean name (displayItem uses `text` below).
-      const engineText = await expandDocMentions(text)
-      const docText =
+        const engineText = await resolveDocMentions(text)
+        const docText =
         activeFile && text.trim()
           ? `${engineText}\n\n(I'm currently looking at the ${noun} \`${activeFile.path}\` in Koda — if this is about it, work with that file.)`
           : engineText
-      // Clear the composer optimistically; dispatchTurn pushes the transcript item + drives the send.
-      // Naming from the first prompt happens inside dispatchTurn (nameFromText).
-      patchSession(id, (s) => ({ ...s, draft: '', attachments: [], replyStaged: false }))
       // Persist the attached images to the project's scratch folder so they outlive the conversation and
       // the agent can re-read them by path later (they're ALSO sent inline below for the immediate turn).
       // Best-effort: a save failure (no project open, fs error) just means no durable copy — never blocks
       // the turn. The saved paths are appended to the ENGINE text only (the transcript shows raw text).
-      let sentText = docText
-      if (images.length) {
+        let sentText = docText
+        if (images.length) {
         const saved = await Promise.all(
           images.map(async (img) => {
             // A Recent images attachment already has a durable scratch copy. Reuse it instead of
@@ -2417,11 +3021,11 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         }
         // Durable copies just landed — nudge the Recent images strip to refetch the folder.
         set((s) => ({ scratchTick: s.scratchTick + 1 }))
-      }
+        }
       // Document attachments: the scratch path IS the delivery (no inline copy), so unlike images a
       // failed save is surfaced to the agent by omission from the list below. Staged in scratch, the
       // agent is told to promote anything load-bearing out of it (scratch prunes by age).
-      if (files.length) {
+        if (files.length) {
         const saved = await Promise.all(
           files.map(async (f) => {
             try {
@@ -2438,8 +3042,12 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         )
         const paths = saved.filter((p): p is string => p !== null)
         if (paths.length) sentText = `${sentText}\n\n${attachedFilesNote(paths)}`
-      }
-      await dispatchTurn(id, {
+        }
+      // Re-check after every preflight await. A phone turn or another surface may have claimed the engine
+      // meanwhile; in that case the original composer snapshot stays untouched for a later send.
+        const ready = get().sessions[id]
+        if (!ready || ready.busy) return
+        const dispatch = dispatchTurn(id, {
         sentText,
         images,
         displayItem: {
@@ -2449,7 +3057,21 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           files: files.length ? files.map((f) => f.name ?? 'file') : undefined,
         },
         nameFromText: text,
-      })
+        })
+      // `dispatchTurn` executes synchronously through its optimistic busy/transcript claim before its
+      // first await. Consume only the snapshot this call sent: a new draft or attachment added while
+      // mention/scratch IPC was pending belongs to the next message and stays in the composer.
+        const sentAttachments = new Set(active.attachments)
+        patchSession(id, (s) => ({
+        ...s,
+        draft: s.draft === text ? '' : s.draft,
+        attachments: s.attachments.filter((attachment) => !sentAttachments.has(attachment)),
+        replyStaged: s.draft === text ? false : s.replyStaged,
+        }))
+        await dispatch
+      } finally {
+        sending.delete(id)
+      }
     },
 
     sendCanvasEdit: async ({ path, selection, instruction }) => {
@@ -2468,7 +3090,15 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         : `I'm editing the document \`${path}\` in Koda's doc view. Instruction: ${instr}\n\nEdit the document to apply this.`
       await dispatchTurn(id, {
         sentText,
-        displayItem: { kind: 'canvas', docTitle: basename(path), instruction: instr },
+        displayItem: {
+          kind: 'canvas',
+          docTitle: basename(path),
+          instruction: instr,
+          // This is the one send path that puts real document words in a turn (the passage is quoted
+          // verbatim above), so the chip says how many went. Only the count is kept: the passage
+          // itself never enters the transcript, which is written to disk and sent to the phone.
+          selectedWords: sel ? countWords(sel) : undefined,
+        },
       })
     },
 
@@ -2538,9 +3168,10 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
             ? 'a new `.claude/skills/<name>/SKILL.md` (YAML frontmatter with name + description, then the body)'
             : 'a new `.claude/agents/<name>.md` (YAML frontmatter with name + description, then the body)'
       const sentText = `Add a new ${kind} for this project: ${desc}\n\nCreate it as ${dest}. Keep it focused and in the standard format. When done, tell me in one line what you created and where.`
+      const visibleKind = kind === 'rule' ? 'core guidance' : kind === 'skill' ? 'playbook' : 'specialist'
       await dispatchTurn(id, {
         sentText,
-        displayItem: { kind: 'user', text: `New ${kind}: ${desc}` },
+        displayItem: { kind: 'user', text: `New ${visibleKind}: ${desc}` },
       })
       return true
     },
@@ -2602,6 +3233,24 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       return true
     },
 
+    sendTidySideLines: async ({ names }) => {
+      const { activeId, sessions } = get()
+      const id = activeId
+      if (!id || !sessions[id] || sessions[id].busy || names.length === 0) return false
+      const sentText =
+        `My project has a pile of side lines left over from earlier work (Git branches and leftover ` +
+        `checkouts): ${names.map((n) => `"${n}"`).join(', ')}. Deal with the whole pile for me: for each ` +
+        `one, look at what it holds, tell me in plain language whether it's finished work worth keeping, ` +
+        `unfinished work I should come back to, or a dead end. Clean up the dead ends and the leftover ` +
+        `checkouts, and leave the ones worth keeping alone. Ask me before deleting anything that isn't ` +
+        `already saved somewhere else, and finish with a short summary of what you kept and what you cleared.`
+      await dispatchTurn(id, {
+        sentText,
+        displayItem: { kind: 'user', text: `Tidy up ${names.length} leftover side lines` },
+      })
+      return true
+    },
+
     refreshMemoryWeight: async () => {
       try {
         set({ memoryWeight: await window.koda.getMemoryWeight() })
@@ -2619,8 +3268,8 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       // The recipe itself lives in the memory skill (the pack's content, versioned with the app);
       // this turn just points the agent at the job in the user's terms.
       const sentText =
-        `This project's memory in .koda/memory/ has grown heavy. The two files that load into every ` +
-        `conversation (the MEMORY.md index and active-context.md) are now big enough to weigh every turn down. ` +
+        `This project's memory in .koda/memory/ has grown heavy. Its navigation notes (MEMORY.md and ` +
+        `active-context.md) are now big enough to make relevant context harder to retrieve reliably. ` +
         `Tidy the memory following the memory skill's tidy recipe: distill active-context.md back to a short ` +
         `current-state page, move narrative detail into the right topic notes, archive the old tail of any ` +
         `log-style notes, fold notes about replaced approaches into the note that superseded them (keep the ` +
@@ -2668,7 +3317,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       }
       patchSession(sessionId, (s) => ({ ...s, draft: '', aside: { id: asideId, question: q, answer: '', status: 'streaming' } }))
       // Overlay shows the pretty `q`; the engine gets `@`-mentions expanded to full paths.
-      expandDocMentions(q)
+      resolveDocMentions(q)
         .then((eq) => window.koda.askAside({ sessionId, asideId, question: eq }))
         .catch((err) => {
           console.error(err)
@@ -2748,7 +3397,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       for (const id of get().order) {
         const s = get().sessions[id]
         if (!s?.live) continue
-        if (!s.busy && !hasRunningSubagent(s.items) && !pendingIds.has(id))
+        if (!s.busy && !hasRunningDelegation(s.items) && !pendingIds.has(id))
           patchSession(id, (x) => ({ ...x, live: false }))
         else billingRespawnPending.add(id)
       }
@@ -2769,14 +3418,19 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     setSessionApprovalMode: (id, mode) => {
       const s = get().sessions[id]
       if (!s || mode === s.approvalMode) return
-      // `plan` is the engine's real --permission-mode (read-only); the other three are pure gate
-      // tiers. Crossing the plan boundary needs a respawn — the engine can't switch --permission-mode
-      // live on a -p process. A respawn would kill an in-flight turn or strand a pending approval, so
-      // the control blocks the cross while either is outstanding.
+      // `plan` is a real mode, not a gate tier like the other three. On an engine with a native plan
+      // mode it is a spawn-time flag (`--permission-mode plan`), so crossing the boundary needs a
+      // respawn — and a respawn would kill an in-flight turn or strand a pending approval, hence the
+      // guard below.
       const crossesPlan = (mode === 'plan') !== (s.approvalMode === 'plan')
+      // Only an engine whose plan mode is a spawn-time flag has to respawn. An engine that carries the
+      // mode in each turn's text (Codex) keeps its process, so the cross costs nothing and can happen
+      // mid-turn — it lands on the next message. Delegated children still block it on both, matching
+      // main's own guard.
+      const needsRespawn = crossesPlan && engineCapabilities(s.engineId).planMode === 'native'
       if (
-        crossesPlan &&
-        (s.busy || hasRunningSubagent(s.items) || get().pending.some((r) => r.sessionId === id))
+        (needsRespawn && (s.busy || get().pending.some((r) => r.sessionId === id))) ||
+        (crossesPlan && hasRunningDelegation(s.items))
       )
         return
       patchSession(id, (x) => ({ ...x, approvalMode: mode }))
@@ -2795,7 +3449,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         )
       })
 
-      if (!crossesPlan) return
+      if (!needsRespawn) return
       // Cross the plan boundary: mark the session not-live so the next turn reattaches in the new
       // --permission-mode (send() reads approvalMode for planMode). We do NOT dispose here — the old
       // idle child is torn down by main's start() right before the respawn (atomic, no two-children
@@ -2808,7 +3462,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       if (!s || model === s.model) return
       // A respawn would kill an in-flight turn or strand a pending approval — block the switch while
       // either is outstanding (same guard as crossing the plan boundary; --model is also spawn-time).
-      if (s.busy || hasRunningSubagent(s.items) || get().pending.some((r) => r.sessionId === id)) return
+      if (s.busy || hasRunningDelegation(s.items) || get().pending.some((r) => r.sessionId === id)) return
       patchSession(id, (x) => ({ ...x, model }))
       // Tell main at pick time (fire-and-forget, like setApprovalMode) so a real change broadcasts
       // ModelEffortChanged to the phone and main's map reads fresh — not stale until the next reattach.
@@ -2817,9 +3471,8 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         .then(() => {
           const current = get().sessions[id]
           if (!current || current.engineId !== s.engineId || current.model !== model) return
-          writeNewSessionPosture(s.engineId, model)
           // Remember an explicit full id so it's a quick-pick next time (aliases are always offered).
-          if (s.engineId === 'claude' && model && !isModelAlias(model))
+          if (engineCapabilities(s.engineId).customModelIds && model && !isModelAlias(model))
             window.koda.addRecentModel({ model }).catch(console.error)
         })
         .catch((err) => {
@@ -2843,22 +3496,21 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       // auto "session started" notice, so `items.length > 0` would lock the switch prematurely and the
       // dropdown pick would silently no-op (same signal ModelControl uses for `conversationStarted`).
       if (s.items.some((it) => it.kind === 'user' || it.kind === 'canvas')) return
-      if (s.busy || hasRunningSubagent(s.items) || get().pending.some((r) => r.sessionId === id)) return
+      if (s.busy || hasRunningDelegation(s.items) || get().pending.some((r) => r.sessionId === id)) return
       if (engineId === s.engineId && model === s.model) return
       // Drop the old engine's ground-truth fields: `activeModel` (what the pill falls back to when no
-      // model is picked) and `engineNativeId` (the Codex thread id) both describe the abandoned engine.
-      // Leaving `activeModel` makes a "Default" pick on the new engine still show the old engine's model
-      // in the pill (e.g. switch to Claude Default → pill keeps reading Codex's stale "gpt-5.5"). The
-      // new engine re-reports both on its next SessionStarted.
-      patchSession(id, (x) => ({ ...x, engineId, model, activeModel: undefined, engineNativeId: undefined }))
+      // model is picked) and the resume cursor (the abandoned engine's own reattach state) both describe
+      // the engine being left. Leaving `activeModel` makes a "Default" pick on the new engine still show
+      // the old engine's model in the pill (e.g. switch to Claude Default → pill keeps reading Codex's
+      // stale "gpt-5.5"). The new engine re-reports both as it starts.
+      patchSession(id, (x) => ({ ...x, engineId, model, activeModel: undefined, resumeCursor: undefined }))
       // Pick-time push (see setSessionModel) — carries engineId so the phone's sheet switches groups too.
       window.koda
         .setModelEffort({ sessionId: id, model, effort: s.effort, engineId })
         .then(() => {
           const current = get().sessions[id]
           if (!current || current.engineId !== engineId || current.model !== model) return
-          writeNewSessionPosture(engineId, model)
-          if (engineId === 'claude' && model && !isModelAlias(model))
+          if (engineCapabilities(engineId).customModelIds && model && !isModelAlias(model))
             window.koda.addRecentModel({ model }).catch(console.error)
         })
         .catch((err) => {
@@ -2870,7 +3522,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
                   engineId: s.engineId,
                   model: s.model,
                   activeModel: s.activeModel,
-                  engineNativeId: s.engineNativeId,
+                  resumeCursor: s.resumeCursor,
                   live: s.live,
                 }
               : current,
@@ -2886,15 +3538,17 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       if (!s || effort === s.effort) return
       // Spawn-time like --model: a respawn would kill an in-flight turn or strand a pending approval,
       // so block the switch while either is outstanding.
-      if (s.busy || hasRunningSubagent(s.items) || get().pending.some((r) => r.sessionId === id)) return
+      if (s.busy || hasRunningDelegation(s.items) || get().pending.some((r) => r.sessionId === id)) return
       patchSession(id, (x) => ({ ...x, effort }))
       // Pick-time push (see setSessionModel) — always the full pair so model doesn't reset to default.
-      window.koda.setModelEffort({ sessionId: id, model: s.model, effort }).catch((err) => {
-        console.error(err)
-        patchSession(id, (current) =>
-          current.effort === effort ? { ...current, effort: s.effort, live: s.live } : current,
-        )
-      })
+      window.koda
+        .setModelEffort({ sessionId: id, model: s.model, effort })
+        .catch((err) => {
+          console.error(err)
+          patchSession(id, (current) =>
+            current.effort === effort ? { ...current, effort: s.effort, live: s.live } : current,
+          )
+        })
       // Drop the live engine so the next turn reattaches with the new --effort (send() reads `effort`).
       if (s.live) patchSession(id, (x) => ({ ...x, live: false }))
     },
@@ -2902,7 +3556,9 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     renameSession: (id, name) => {
       const trimmed = name.trim()
       if (!trimmed) return
-      patchSession(id, (s) => ({ ...s, label: trimmed, userNamed: true }))
+      // The overview was generated to sit under the GENERATED title. Once the user names the thread
+      // themselves, a leftover sentence about Koda's reading of it is just noise under their name.
+      patchSession(id, (s) => ({ ...s, label: trimmed, userNamed: true, overview: undefined }))
     },
 
     setProjectPath: (projectPath) => set({ projectPath }),
@@ -2971,11 +3627,12 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       const extra = notes.trim() ? `\n\nThings to keep in mind: ${notes.trim()}` : ''
       // Visible-user-turn pattern (like sendGuardrailAuthoring): the composed prompt goes through the
       // session as the user's own turn (shows in the worklog) — the agent's gated Write closes the loop.
-      // Engine-neutral: "take a look at what's already here" handles existing folders too; the agent
-      // writes its own native guidance file (CLAUDE.md for Claude, AGENTS.md for Codex) — we don't dictate.
-      // Three jobs woven in: (1) the project guide [Layer-3 state], (2) a .koda/memory brief [the
-      // "what-this-is" half], (3) a just-in-time tool top-up via ensure_tool when the project implies one.
-      const sentText = `I'm setting up this project in Koda. Here's what it's about:\n\n"""\n${desc}${extra}\n"""\n\nHelp me get this project set up. First take a quick look at what's already here (there may be nothing yet). Then ask me the two or three questions whose answers would change what you build or how you set it up, and suggest anything I haven't thought of — you've built things like this before; I may not have. Once we've shaped it:\n\n1. Write a short, friendly project guide as your guidance file at the project root — what we're building, who it's for, what success looks like, and any constraints — as concise guidance for you to follow on later turns. Keep it human and in plain language (this is for a non-engineer).\n2. Jot a brief note in .koda/memory/ capturing what this project is, so you can orient quickly in future sessions.\n3. If this project clearly needs a language runtime or tool that isn't set up yet (for example Python for a data project), set it up with your ensure_tool capability — I'll confirm.\n\nWhen you're done, tell me in one line what you set up.`
+      // Engine-neutral: "take a look at what's already here" handles existing folders too. The guide is
+      // ONE canonical AGENTS.md with CLAUDE.md symlinked to it — both engines read the same file, so it
+      // can never drift per engine (main's healGuidelinesPair backstops the link on later opens).
+      // Three jobs woven in: (1) the project guide [Layer-3 state], (2) the shared bounded project card,
+      // (3) a just-in-time tool top-up via ensure_tool when the project implies one.
+      const sentText = `I'm setting up this project in Koda. Here's what it's about:\n\n"""\n${desc}${extra}\n"""\n\nHelp me get this project set up. First take a quick look at what's already here (there may be nothing yet). Then ask me the two or three questions whose answers would change what you build or how you set it up, and suggest anything I haven't thought of — you've built things like this before; I may not have. Once we've shaped it:\n\n1. Write a short, friendly project guide to \`AGENTS.md\` at the project root — what we're building, who it's for, what success looks like, and any constraints — as concise guidance for you to follow on later turns. Keep it human and in plain language (this is for a non-engineer). Then run \`ln -s AGENTS.md CLAUDE.md\` so every engine reads this same guide.\n2. Load the \`memory\` playbook and create .koda/memory/project-card.md using its project-card contract.\n3. If this project clearly needs a language runtime or tool that isn't set up yet (for example Python for a data project), set it up with your ensure_tool capability — I'll confirm.\n\nWhen you're done, tell me in one line what you set up.`
       await dispatchTurn(id, {
         sentText,
         displayItem: { kind: 'user', text: desc },
@@ -2992,7 +3649,6 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     clearSettingsSection: () => set({ settingsSection: null }),
     setSidebarWidth: (px) => set({ sidebarWidth: clampLayout({ sidebarWidth: px }).sidebarWidth }),
     setSessionsFrac: (frac) => set({ sessionsFrac: clampLayout({ sessionsFrac: frac }).sessionsFrac }),
-    setFilesView: (view) => set({ filesView: view }),
     setConversationWidth: (px) =>
       set({ conversationWidth: clampLayout({ conversationWidth: px }).conversationWidth }),
     hydrateLayout: (layout) => set(clampLayout(layout)),
@@ -3007,12 +3663,14 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       get().persistLayout()
     },
     setSearchOpen: (open) => set({ searchOpen: open }),
-    setPreviewExpanded: (expanded) => {
-      // Expanding is a user act on the preview — make sure it's the thing on stage first.
-      get().bringPreviewToStage()
-      set({ previewExpanded: expanded, dockOpen: true })
-    },
+    setStageExpanded: (expanded) =>
+      set((state) => {
+        const key = editorKey(state)
+        const ed = state.editors[key] ?? EMPTY_EDITOR
+        return { stageExpanded: expanded, ...withEditor(state.editors, key, { ...ed, stageShown: true }) }
+      }),
     setLightbox: (img) => set({ lightbox: img }),
+
     toggleRecentImagesExpanded: () =>
       set((s) => ({ recentImagesExpanded: !s.recentImagesExpanded })),
     setStoreIntegrity: (patch) => set(patch),
@@ -3038,19 +3696,24 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
                   }
                 : s,
             )
-          : [...ed.surfaces, { path, title: basename(path), view, rev: 0, gotoLine, gotoNonce: 0 }]
+          : addSurface(ed, { path, title: basename(path), view, rev: 0, gotoLine, gotoNonce: 0 })
         return {
           // A user open is explicit intent — it takes the stage and releases a pin (the pin guards
           // against the AGENT yanking the stage, never against the user's own hand).
+          // stageShown deliberately dropped: an explicit open releases any hide the user had set, and
+          // the default (follow the tabs) then keeps the stage up for as long as something is on it.
           ...withEditor(state.editors, key, { surfaces, activeSurfaceId: path, pinned: false }),
           // MRU for the Find overlay's quick-open: this path to the front, deduped, capped.
           recentFiles: [path, ...state.recentFiles.filter((p) => p !== path)].slice(0, 12),
-          dockOpen: true,
         }
       }),
 
     newDocument: async (parent) => {
-      const { path } = await window.koda.createFile(parent ? { parent } : {})
+      // Provenance: the session in front of the user when they made this doc, written once into the
+      // file's own frontmatter (`source:`) so it survives a rename or a move. Undefined when no chat
+      // is open, which is honest — an absent source beats a guessed one.
+      const source = get().activeId ?? undefined
+      const { path } = await window.koda.createFile({ ...(parent ? { parent } : {}), ...(source ? { source } : {}) })
       // Nudge the Files tree to re-read so the new doc appears, then open it (markdown ⇒ Doc view).
       set((state) => ({ filesRev: state.filesRev + 1 }))
       get().openFile(path)
@@ -3095,13 +3758,34 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       }
     },
 
-    deleteEntry: async (path) => {
+    deleteEntry: async (path, options) => {
+      let affectedSurfacePaths: string[]
       try {
-        await window.koda.deletePath({ path })
-        get().notePathDeleted(path)
+        // The mounted editor is the only owner of text inside its debounce window. Main must not make
+        // the delete checkpoint until that buffer (and any older in-flight write) has settled.
+        affectedSurfacePaths = await flushFileWritersUnder(path)
+      } catch {
+        const error = "Couldn't save the latest edits, so nothing was deleted."
+        set({ treeError: error })
+        return { ok: false, error }
+      }
+
+      try {
+        // Keep the renderer compatible while the main-side document-delete contract evolves: a named
+        // variable is structurally valid for the older `{ path }` bridge and carries the new hint.
+        const request = { path, ...options }
+        await window.koda.deletePath(request)
+        // Main's resolved file identity can differ from the lexical path that keys a Stage tab (an
+        // in-project symlink or case alias). Close both only after main confirms the delete.
+        for (const deletedPath of new Set([path, ...affectedSurfacePaths])) {
+          get().notePathDeleted(deletedPath)
+        }
         set({ treeError: null })
+        return { ok: true }
       } catch (e) {
-        set({ treeError: humanFsError(e) })
+        const error = humanFsError(e)
+        set({ treeError: error })
+        return { ok: false, error }
       }
     },
 
@@ -3134,7 +3818,12 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     // Rebase open tabs + the tree's expansion when a path is renamed/moved. A folder move carries its
     // descendants (anything under `from/` → under `to/`). A rename is project-wide, so EVERY session's
     // editor gets its matching surfaces re-keyed + retitled; the focused/split panes and openDirs follow.
-    notePathMoved: (from, to) =>
+    notePathMoved: (from, to) => {
+      const root = get().projectPath
+      const legacyPathChange = root ? pathChangeFromAbsolute(root, from, to) : null
+      // Retired local pins remain the durable copy until the hot-store save is acknowledged. Repair
+      // that copy synchronously too, so a quit inside the debounce window cannot revive the old path.
+      if (root && legacyPathChange) repairLegacyDocPins(root, [legacyPathChange])
       set((state) => {
         const reb = (p: string): string => rebasePath(p, from, to) ?? p
         const editors = mapEditors(state.editors, (ed) => ({
@@ -3145,13 +3834,30 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           }),
           activeSurfaceId: ed.activeSurfaceId ? reb(ed.activeSurfaceId) : ed.activeSurfaceId,
         }))
-        return { editors, openDirs: state.openDirs.map(reb), filesRev: state.filesRev + 1 }
-      }),
+        return {
+          editors,
+          openDirs: state.openDirs.map(reb),
+          filesRev: state.filesRev + 1,
+          ...remapStarredDocs(state, (abs) => rebasePath(abs, from, to) ?? abs),
+          ...(legacyPathChange
+            ? {
+                legacyKeptDocPathChanges: appendLegacyPathChange(
+                  state.legacyKeptDocPathChanges,
+                  legacyPathChange,
+                ),
+              }
+            : {}),
+        }
+      })
+    },
 
     // Close any tab under a deleted path (across every session's editor) and drop its tree expansion.
-    notePathDeleted: (path) =>
+    notePathDeleted: (path) => {
+      const under = (p: string): boolean => p === path || p.startsWith(path + '/')
+      const root = get().projectPath
+      const legacyPathChange = root ? pathChangeFromAbsolute(root, path, null) : null
+      if (root && legacyPathChange) repairLegacyDocPins(root, [legacyPathChange])
       set((state) => {
-        const under = (p: string): boolean => p === path || p.startsWith(path + '/')
         const editors = mapEditors(state.editors, (ed) => {
           const surfaces = ed.surfaces.filter((s) => !under(s.path))
           const activeSurfaceId =
@@ -3160,8 +3866,22 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
               : ed.activeSurfaceId
           return { ...ed, surfaces, activeSurfaceId }
         })
-        return { editors, openDirs: state.openDirs.filter((p) => !under(p)), filesRev: state.filesRev + 1 }
-      }),
+        return {
+          editors,
+          openDirs: state.openDirs.filter((p) => !under(p)),
+          filesRev: state.filesRev + 1,
+          ...remapStarredDocs(state, (abs) => (under(abs) ? null : abs)),
+          ...(legacyPathChange
+            ? {
+                legacyKeptDocPathChanges: appendLegacyPathChange(
+                  state.legacyKeptDocPathChanges,
+                  legacyPathChange,
+                ),
+              }
+            : {}),
+        }
+      })
+    },
 
     showEditDiff: (path, sessionId) =>
       // Re-stamps `sessionId` each edit (last-writer-wins) → the diff is "cumulative since the most
@@ -3177,14 +3897,17 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           ? ed.surfaces.map((s) =>
               s.path === path ? { ...s, view: 'diff' as const, rev: s.rev + 1, sessionId } : s,
             )
-          : [...ed.surfaces, { path, title: basename(path), view: 'diff' as const, rev: 0, sessionId }]
+          : addSurface(ed, { path, title: basename(path), view: 'diff' as const, rev: 0, sessionId })
         return withEditor(state.editors, sessionId, {
           ...ed,
           surfaces,
-          // Pop the just-edited file onto the stage so the user watches the change land — unless the
-          // stage is HELD (pinned, or the preview is on stage: soft pin). The edit still lands in
-          // `surfaces` + bumps rev; only focus is withheld.
-          // Deliberately NOT touching dockOpen: agent edits fire constantly; a collapsed dock stays put.
+          // Auto-follow: the just-edited file joins the strip as a tab and gets SELECTED, so the user
+          // watches the change land while everything they already had open stays open — unless the
+          // stage is HELD (pinned, or a live surface is on stage: soft pin). Held, the tab still appears
+          // and its rev still bumps; only the selection is withheld.
+          // `...ed` keeps any explicit hide: agent edits fire constantly, so a stage the user closed by
+          // hand stays closed. A stage the user never touched follows its tabs, so the first edit of a
+          // fresh chat does bring it up.
           activeSurfaceId: stageHeld(ed) ? ed.activeSurfaceId : path,
         })
       }),
@@ -3201,7 +3924,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           ? ed.surfaces.map((s) =>
               s.path === path ? { ...s, view: 'doc' as const, rev: s.rev + 1, sessionId } : s,
             )
-          : [...ed.surfaces, { path, title: basename(path), view: 'doc' as const, rev: 0, sessionId }]
+          : addSurface(ed, { path, title: basename(path), view: 'doc' as const, rev: 0, sessionId })
         return withEditor(state.editors, sessionId, {
           ...ed,
           surfaces,
@@ -3233,20 +3956,27 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       set((state) => {
         const key = editorKey(state)
         const ed = state.editors[key] ?? EMPTY_EDITOR
+        const idx = ed.surfaces.findIndex((s) => s.path === path)
         const surfaces = ed.surfaces.filter((s) => s.path !== path)
-        // Closing the staged surface falls back to the neighbour; closing the last empties the stage.
+        // Closing the SELECTED tab falls to the tab that slid into its place (or the new last one, when
+        // it was the rightmost) — the browser-tab behaviour; closing the last tab empties the stage.
         const activeSurfaceId =
           ed.activeSurfaceId === path
-            ? (surfaces[surfaces.length - 1]?.path ?? null)
+            ? (surfaces[Math.min(idx, surfaces.length - 1)]?.path ?? null)
             : ed.activeSurfaceId
-        return withEditor(state.editors, key, { ...ed, surfaces, activeSurfaceId })
+        return {
+          ...withEditor(state.editors, key, { ...ed, surfaces, activeSurfaceId }),
+          // Emptying the stage takes the panel away (stageVisible), so full-width mode has to end with
+          // it — otherwise the next file opened would land in an expanded stage nobody asked for.
+          ...(surfaces.length === 0 ? { stageExpanded: false } : {}),
+        }
       }),
 
     selectSurface: (path) =>
       set((state) => {
         const key = editorKey(state)
         const ed = state.editors[key] ?? EMPTY_EDITOR
-        // Picking from the stage switcher is explicit user intent — it releases a pin (like openFile).
+        // Clicking a tab is explicit user intent — it releases a pin (like openFile).
         return withEditor(state.editors, key, { ...ed, activeSurfaceId: path, pinned: false })
       }),
 
@@ -3257,7 +3987,8 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         return withEditor(state.editors, key, { ...ed, pinned })
       }),
 
-    openPreview: (url, opts) =>
+    openPreview: (url, opts) => {
+      const fronted = frontAgentSurface(opts?.sessionId)
       set((state) => {
         // The preview belongs to the session that TRIGGERED it (opts.sessionId on an agent push), not
         // whichever tab is focused when the push lands — a window can host several sessions. A user
@@ -3269,43 +4000,159 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         const surfaces = existing
           ? // Already open — re-point its URL (e.g. static → dev server) and bump rev to force reload.
             ed.surfaces.map((s) =>
-              s.kind === 'preview' ? { ...s, previewUrl: url, rev: s.rev + 1 } : s,
+              s.kind === 'preview' ? { ...s, previewUrl: url, rev: s.rev + 1, live: true } : s,
             )
-          : [
-              ...ed.surfaces,
-              { kind: 'preview' as const, path: PREVIEW_SURFACE_ID, title: 'Preview', view: 'file' as const, rev: 0, previewUrl: url },
-            ]
-        // Agent-pushed previews respect a pinned stage (the URL still updates behind it); user opens
-        // take the stage.
-        const takeStage = !(opts?.respectPin && ed.pinned)
-        // The dock is window-global and renders the ACTIVE session's editor — so only pop it open when
-        // the preview lands on the session in front. A background session's push stages itself in its
-        // own editor (seen when the user switches to it) without yanking the dock over another session.
+          : addSurface(ed, {
+              kind: 'preview' as const,
+              path: PREVIEW_SURFACE_ID,
+              title: 'Preview',
+              view: 'file' as const,
+              rev: 0,
+              previewUrl: url,
+              // Main only pushes a preview once it has confirmed something answers on that URL.
+              live: true,
+            })
+        // A preview pushed by the session already in front respects its pin. A background push is an
+        // explicit handoff: front that session and show the preview once, even if its old Stage state
+        // was pinned or hidden. User opens always take the Stage.
+        const takeStage = fronted || !(opts?.respectPin && ed.pinned)
         const isActive = key === editorKey(state)
-        return {
-          ...withEditor(state.editors, key, {
-            ...ed,
-            surfaces,
-            activeSurfaceId: takeStage ? PREVIEW_SURFACE_ID : ed.activeSurfaceId,
-          }),
-          ...(isActive ? { dockOpen: true } : {}),
-        }
-      }),
+        return withEditor(state.editors, key, {
+          ...ed,
+          surfaces,
+          activeSurfaceId: takeStage ? PREVIEW_SURFACE_ID : ed.activeSurfaceId,
+          pinned: fronted ? false : ed.pinned,
+          ...(isActive ? { stageShown: undefined } : {}),
+        })
+      })
+    },
 
     bringPreviewToStage: () =>
       set((state) => {
         const key = editorKey(state)
         const ed = state.editors[key] ?? EMPTY_EDITOR
         if (!ed.surfaces.some((s) => s.kind === 'preview')) return {}
-        return {
-          ...withEditor(state.editors, key, { ...ed, activeSurfaceId: PREVIEW_SURFACE_ID }),
-          dockOpen: true,
-        }
+        return withEditor(state.editors, key, {
+          ...ed,
+          activeSurfaceId: PREVIEW_SURFACE_ID,
+          stageShown: undefined,
+        })
       }),
 
     rememberPreview: (sessionId, restart) => patchSession(sessionId, (s) => ({ ...s, lastPreview: restart })),
 
+    starDoc: (rel) => {
+      const { starredDocs, legacyKeptDocsImported } = get()
+      // Guard before setting: an existing star must not schedule another debounced rewrite of the
+      // whole project store.
+      if (!rel || starredDocs.includes(rel)) return
+      set({
+        starredDocs: [...starredDocs, rel],
+        // A manually touched path is settled migration state too. If an old archive with the same
+        // path becomes readable later, it must not get a second vote after the user unstars it.
+        legacyKeptDocsImported: mergeUniquePaths(legacyKeptDocsImported, [rel]),
+      })
+    },
+
+    unstarDoc: (rel) => {
+      const { starredDocs, legacyKeptDocsImported, projectPath } = get()
+      if (!starredDocs.includes(rel)) return
+      // Removing an adopted legacy pin must consume it from that source too. Otherwise the next mount
+      // sees the old key and silently puts the star back before the first hot-save acknowledgement.
+      if (projectPath) {
+        const pinsKey = `koda:doc-pins:${projectPath}`
+        try {
+          const raw: unknown = JSON.parse(localStorage.getItem(pinsKey) ?? '[]')
+          const pins = Array.isArray(raw) ? raw.filter((p): p is string => typeof p === 'string') : []
+          if (pins.includes(rel)) {
+            const remaining = pins.filter((pin) => pin !== rel)
+            if (remaining.length) localStorage.setItem(pinsKey, JSON.stringify(remaining))
+            else localStorage.removeItem(pinsKey)
+          }
+        } catch {
+          // Storage is fail-soft. The in-memory unstar still stands for this run; an unreadable legacy
+          // source is not rewritten because doing so could erase pins we could not inspect.
+        }
+      }
+      set({
+        starredDocs: starredDocs.filter((path) => path !== rel),
+        legacyKeptDocsImported: mergeUniquePaths(legacyKeptDocsImported, [rel]),
+      })
+    },
+
+    // Adoption and deletion are deliberately separate. The legacy key is the only durable copy until
+    // main acknowledges a project-store write containing the merged stars, so this action only adopts.
+    // `completeDocPinMigration` owns deletion after that acknowledgement.
+    migrateDocPins: () => {
+      const {
+        projectPath,
+        starredDocs,
+        legacyKeptDocsImported,
+        legacyKeptDocPathChanges,
+      } = get()
+      if (!projectPath) return
+      const pinsKey = `koda:doc-pins:${projectPath}`
+      const pins = repairLegacyDocPins(
+        projectPath,
+        legacyKeptDocPathChanges,
+        (path) => starredDocs.includes(path) || !legacyKeptDocsImported.includes(path),
+      )
+      if (!pins) return // storage unreadable: change nothing, and try again on the next mount
+      const merged = mergeUniquePaths(starredDocs, pins)
+      if (merged.length !== starredDocs.length) set({ starredDocs: merged })
+      // No choices to protect: clear the retired pane's empty residue immediately.
+      if (pins.length) return
+      try {
+        localStorage.removeItem(pinsKey)
+        localStorage.removeItem(`koda:doc-folders-open:${projectPath}`) // the retired pane's other key
+      } catch {
+        // Storage refused the delete: harmless. The merge above skips anything already starred, so the
+        // next mount re-runs it without duplicating a row.
+      }
+    },
+
+    completeDocPinMigration: (persisted) => {
+      const {
+        projectPath,
+        starredDocs,
+        legacyKeptDocsImported,
+        legacyKeptDocPathChanges,
+      } = get()
+      if (!projectPath) return
+      const pinsKey = `koda:doc-pins:${projectPath}`
+      const pins = repairLegacyDocPins(
+        projectPath,
+        legacyKeptDocPathChanges,
+        (path) => starredDocs.includes(path) || !legacyKeptDocsImported.includes(path),
+      )
+      if (!pins) return
+      // The acknowledgement is for THIS blob. Only it can prove every legacy choice has reached disk;
+      // current Zustand state may already have changed while the IPC round-trip was in flight.
+      if (pins.length && !pins.every((path) => persisted.starredDocs?.includes(path))) return
+      try {
+        localStorage.removeItem(pinsKey)
+        localStorage.removeItem(`koda:doc-folders-open:${projectPath}`)
+      } catch {
+        // Harmless and retryable: adoption de-duplicates the next time the old key is seen.
+      }
+    },
+
     closePreview: () => get().closeSurface(PREVIEW_SURFACE_ID),
+
+    // Across EVERY session's editor, not just the active one: the dev server is window-wide, so a
+    // background session's preview tab is pointed at the same dead URL and would keep claiming green.
+    notePreviewStopped: (url) =>
+      set((state) => ({
+        editors: mapEditors(state.editors, (ed) => {
+          if (!ed.surfaces.some((s) => s.kind === 'preview' && s.previewUrl === url && s.live)) return ed
+          return {
+            ...ed,
+            surfaces: ed.surfaces.map((s) =>
+              s.kind === 'preview' && s.previewUrl === url ? { ...s, live: false } : s,
+            ),
+          }
+        }),
+      })),
 
     refreshGitStatus: async () => {
       // Core path first: repo state + working-tree status. This must NOT depend on anything newer,
@@ -3313,7 +4160,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       try {
         const info = await window.koda.gitDetect()
         if (!info.isRepo) {
-          set({ gitRepo: false, gitFiles: [], gitChangesTruncated: false, gitWorktreesDirty: false })
+          set({ gitRepo: false, gitFiles: [], gitChangesTruncated: false, gitSideLinesWaiting: false })
           return
         }
         const status = await window.koda.gitStatus()
@@ -3323,40 +4170,104 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         console.error('refreshGitStatus failed', err)
         return
       }
-      // The worktree badge is strictly additive + best-effort. Optional-call (`?.()`) so a preload
-      // that predates gitWorktrees short-circuits to undefined instead of throwing synchronously, and
-      // catch any IPC rejection — either way it degrades to "no worktree info", never breaking above.
-      try {
-        const worktrees = (await window.koda.gitWorktrees?.()) ?? []
-        set({
-          gitWorktreesDirty: worktrees.some(
-            (w) => !w.isCurrent && (!w.statusKnown || w.dirtyCount > 0 || w.prunable),
-          ),
-        })
-      } catch (err) {
-        console.error('refreshGitStatus: worktrees skipped', err)
+      // The side-line cue is additive + best-effort. A clean committed branch and a dirty sibling
+      // checkout are both waiting work, so read both existing sources. Keep a previous true cue if
+      // either source is temporarily unavailable; a later complete refresh can clear it honestly.
+      const [worktreesResult, graphResult] = await Promise.allSettled([
+        window.koda.gitWorktrees?.() ?? Promise.resolve([]),
+        window.koda.gitGraph?.({ limit: 1 }) ?? Promise.resolve(null),
+      ])
+      if (worktreesResult.status === 'rejected') {
+        console.error('refreshGitStatus: worktrees skipped', worktreesResult.reason)
+      }
+      if (graphResult.status === 'rejected') {
+        console.error('refreshGitStatus: branch check skipped', graphResult.reason)
+      }
+      const dirtySibling =
+        worktreesResult.status === 'fulfilled' &&
+        worktreesResult.value.some(
+          (w) => !w.isCurrent && (!w.statusKnown || w.dirtyCount > 0 || w.prunable),
+        )
+      const unmergedBranch =
+        graphResult.status === 'fulfilled' &&
+        graphResult.value !== null &&
+        graphResult.value.unmergedBranches.length > 0
+      const bothKnown =
+        worktreesResult.status === 'fulfilled' &&
+        graphResult.status === 'fulfilled' &&
+        graphResult.value !== null
+      if (dirtySibling || unmergedBranch || bothKnown) {
+        set({ gitSideLinesWaiting: dirtySibling || unmergedBranch })
       }
     },
 
     openChanges: (focusSessionId) => {
-      set({ deskOpen: true, dockOpen: true, changesFocus: focusSessionId ?? null })
+      set((state) => ({
+        ...stageSingleton(state, { kind: 'changes', path: CHANGES_SURFACE_ID, title: 'Changes' }),
+        changesFocus: focusSessionId ?? null,
+      }))
       void get().refreshGitStatus()
     },
 
-    setDockOpen: (open) => set({ dockOpen: open, previewExpanded: open ? get().previewExpanded : false }),
-    toggleDock: () =>
+    openAgents: (sessionId) =>
+      set((state) =>
+        stageSingleton(state, { kind: 'agents', path: AGENTS_SURFACE_ID, title: 'Agents' }, sessionId),
+      ),
+
+    setDockOpen: (open) =>
       set((state) => {
-        const dockOpen = !state.dockOpen
-        return { dockOpen, previewExpanded: dockOpen ? state.previewExpanded : false }
+        const key = editorKey(state)
+        const ed = state.editors[key] ?? EMPTY_EDITOR
+        return {
+          ...withEditor(state.editors, key, { ...ed, stageShown: open }),
+          stageExpanded: open ? state.stageExpanded : false,
+        }
       }),
-    setDeskOpen: (open) => set({ deskOpen: open }),
-    setTermOpen: (open) => set({ termOpen: open, dockOpen: open ? true : get().dockOpen }),
-    openTerminalShelf: (command) =>
-      set({ termOpen: true, dockOpen: true, pendingTermCommand: command && command.trim() ? command : null }),
+    toggleDock: () => get().setDockOpen(!stageVisible(get())),
+    openTerminal: (command, sessionId) =>
+      set((state) => ({
+        ...stageSingleton(state, { kind: 'terminal', path: TERMINAL_SURFACE_ID, title: 'Terminal' }, sessionId),
+        // The staged command stays window-scoped because the pty is: one shell per window, so whichever
+        // session asked, the command belongs at that one prompt (the Stage follows the same rule).
+        pendingTermCommand: command && command.trim() ? command : null,
+      })),
     clearPendingTermCommand: () => set({ pendingTermCommand: null }),
 
     hydrate: (blob) => {
-      const archived = blob.archived ?? []
+      // An acknowledged archive row is the durable user intent. If an oversized/stalled hot-store save
+      // left the old live row behind, do not resurrect it on reload. Older affected builds could also
+      // append the same archive id repeatedly, so collapse those redundant rows at the same boundary.
+      const archived: ArchivedSessionMeta[] = []
+      const archivedIds = new Set<string>()
+      for (const row of blob.archived ?? []) {
+        if (archivedIds.has(row.id)) continue
+        archivedIds.add(row.id)
+        archived.push(row)
+      }
+      const protectedArchived: ArchivedSessionMeta[] = []
+      const protectedIds = new Set<string>()
+      for (const row of blob.protectedArchived ?? []) {
+        if (archivedIds.has(row.id) || protectedIds.has(row.id)) continue
+        protectedIds.add(row.id)
+        protectedArchived.push(row)
+      }
+      const liveSessions = blob.sessions.filter((session) => !archivedIds.has(session.id))
+      const legacyKeptDocPathChanges = blob.legacyKeptDocPathChanges ?? []
+      // Session-scoped shelves were the old storage model. Import every legacy path once, with the
+      // active chat first so the order the user was looking at remains the head of the new project
+      // shelf. The append-only ledger is the tombstone too: an unstarred path stays "seen", so an
+      // archive that was unavailable on the first upgraded launch cannot resurrect it later.
+      const legacyPaths = legacyKeptDocsInOrder(liveSessions, blob.activeId, archived)
+      const importedBefore = blob.legacyKeptDocsImported ?? []
+      const legacyKeptDocsImported = mergeUniquePaths(importedBefore, legacyPaths)
+      const unseenLegacyPaths = legacyPaths
+        .filter((path) => !importedBefore.includes(path))
+        .map((path) => applyLegacyPathChanges(path, legacyKeptDocPathChanges))
+        .filter(
+          (path): path is string =>
+            !!path && !importedBefore.includes(path),
+        )
+      const starredDocs = mergeUniquePaths(blob.starredDocs ?? [], unseenLegacyPaths)
       // Advance the entry-id counter past BOTH live AND archived sessions, so a later restore (or a new
       // entry) can never reissue an entry id that a not-yet-restored archive still holds.
       let maxEntryId = 0
@@ -3367,78 +4278,66 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
             for (const c of it.children) if (c.id > maxEntryId) maxEntryId = c.id
         }
       }
-      for (const s of blob.sessions) scanItems(s.items)
+      for (const s of liveSessions) scanItems(s.items as Entry[])
       // Archived metadata carries only its baked maxItemId (bodies aren't loaded on boot) — advance past
       // it so a new entry can't reuse an id a not-yet-restored archive still holds.
       for (const a of archived) if ((a.maxItemId ?? 0) > maxEntryId) maxEntryId = a.maxItemId ?? 0
       entryId = maxEntryId
-      if (!blob.sessions.length) {
-        set({ archived, hydrated: true, rateLimits: blob.rateLimits ?? {} })
+      if (!liveSessions.length) {
+        set({
+          archived,
+          protectedArchived,
+          starredDocs,
+          legacyKeptDocsImported,
+          legacyKeptDocPathChanges,
+          legacyKeptDocsMigrationComplete: blob.legacyKeptDocsMigrationComplete ?? false,
+          hydrated: true,
+          rateLimits: blob.rateLimits ?? {},
+        })
         return
       }
       const sessions: Record<string, SessionState> = {}
-      for (const s of blob.sessions)
-        sessions[s.id] = {
-          id: s.id,
-          label: s.label,
-          userNamed: s.userNamed ?? false,
-          cwd: s.cwd,
-          // Settle live-only item states: no engine is attached yet, so a thinking burst or workflow
-          // that was in flight when we last saved must not restore as a forever-spinning indicator.
-          items: s.items.map(settleRestoredTranscriptItem),
-          replaySeq: s.replaySeq,
-          context: s.context, // restore the fuel gauge; refreshed on the next completed turn
-          streaming: '',
-          busy: false,
-          errored: false,
-          draft: '',
-          attachments: [],
-          live: false, // engine not spawned yet — reattaches on the next turn
-          attention: false,
-          approvalMode: s.approvalMode ?? get().defaultApprovalMode,
-          model: s.model, // activeModel refreshes when the engine reattaches next turn
-          effort: s.effort,
-          engineId: s.engineId ?? 'claude',
-          engineNativeId: s.engineNativeId,
-          spendUsd: s.spendUsd ?? 0,
-          byModel: s.byModel ?? {},
-          lastPreview: s.lastPreview, // one-click "Restart preview" survives the restart
-        }
+      for (const s of liveSessions)
+        sessions[s.id] = sessionStateFromPersisted(s, get().defaultApprovalMode)
       set({
         sessions,
-        order: blob.sessions.map((s) => s.id),
-        activeId: blob.activeId ?? blob.sessions[0]?.id ?? null,
+        order: liveSessions.map((s) => s.id),
+        activeId:
+          blob.activeId && sessions[blob.activeId]
+            ? blob.activeId
+            : (liveSessions[0]?.id ?? null),
         archived,
+        protectedArchived,
+        starredDocs,
+        legacyKeptDocsImported,
+        legacyKeptDocPathChanges,
+        legacyKeptDocsMigrationComplete: blob.legacyKeptDocsMigrationComplete ?? false,
         hydrated: true,
         rateLimits: blob.rateLimits ?? {},
       })
     },
 
     persistBlob: () => {
-      const { order, sessions, activeId } = get()
-      return {
-        version: 2,
+      const {
+        order,
+        sessions,
         activeId,
+        starredDocs,
+        legacyKeptDocsImported,
+        legacyKeptDocPathChanges,
+        legacyKeptDocsMigrationComplete,
+      } = get()
+      return {
+        version: 3,
+        activeId,
+        starredDocs,
+        legacyKeptDocsImported,
+        legacyKeptDocPathChanges,
+        legacyKeptDocsMigrationComplete,
         sessions: order
           .map((id) => sessions[id])
           .filter(Boolean)
-          .map((s) => ({
-            id: s.id,
-            label: s.label,
-            cwd: s.cwd,
-            userNamed: s.userNamed,
-            approvalMode: s.approvalMode,
-            model: s.model,
-            effort: s.effort,
-            engineId: s.engineId,
-            engineNativeId: s.engineNativeId,
-            context: s.context,
-            spendUsd: s.spendUsd,
-            byModel: s.byModel,
-            lastPreview: s.lastPreview,
-            replaySeq: s.replaySeq,
-            items: s.items,
-          })),
+          .map(persistedSessionFromState),
         // `archived` deliberately absent: it lives in its own cold file, written by the three actions
         // that move a session in or out of it (archiveSession / restoreArchived / deleteArchived, via
         // `persistArchived`), never in this constantly-rewritten hot blob.
@@ -3456,36 +4355,22 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
   }
 })
 
-/** Persist the dock's open flag whenever it changes (any action can change it — the explicit toggles,
- *  or opening a file/preview). Cheap: a compare gates the localStorage write to real changes. */
-let lastDock: boolean | null = null
-useWorkspace.subscribe((s) => {
-  if (s.dockOpen === lastDock) return
-  lastDock = s.dockOpen
-  try {
-    localStorage.setItem(DOCK_KEY, JSON.stringify({ open: s.dockOpen }))
-  } catch {
-    /* private mode / quota — dock just won't persist, no-op */
-  }
-})
-
 // Keep the dirty state fresh without a file watcher: on window focus (the user may have edited in
 // another tool or a sibling session's turn landed while away) + once at boot. Per-turn refresh lives
 // in TurnComplete. Fires against whatever project the window holds; fails soft to not-a-repo.
+//
+// Focus also clears the unseen mark on the session in FRONT, which is the only way it can be cleared
+// there. `raiseAttention` skips the mark for a session the user is watching, and watching means active
+// AND focused — so a turn that finished while the user was in another app marked the session they were
+// already on. Selecting it is what clears the mark, and it is already selected, so nothing could: it
+// sat under "Needs you" for the rest of the window's life. Coming back to the window IS looking at it.
 if (typeof window !== 'undefined') {
-  window.addEventListener('focus', () => void useWorkspace.getState().refreshGitStatus())
+  window.addEventListener('focus', () => {
+    const { activeId, sessions } = useWorkspace.getState()
+    if (activeId && sessions[activeId]?.attention) useWorkspace.getState().selectSession(activeId)
+    void useWorkspace.getState().refreshGitStatus()
+  })
   void useWorkspace.getState().refreshGitStatus()
-}
-
-/**
- * The INSTANT provisional title shown the moment the first turn is sent — first words of the prompt.
- * The local-assist seam (`assist:title`) upgrades this to a clean on-device-model title ~300ms later
- * (or leaves a deterministic name when the model's unavailable). User rename (`renameSession`) wins
- * over both.
- */
-function titleFromPrompt(text: string): string {
-  const clean = text.trim().replace(/\s+/g, ' ')
-  return clean.length <= 40 ? clean : `${clean.slice(0, 40).trimEnd()}…`
 }
 
 /** Per-project key remembering that the user dismissed the intake offer (so reopening doesn't re-nag). */
@@ -3510,6 +4395,150 @@ function rebasePath(p: string, from: string, to: string): string | null {
   if (p === from) return to
   if (p.startsWith(from + '/')) return to + p.slice(from.length)
   return null
+}
+
+/** Convert one successful Koda filesystem operation into the project-relative prefix rule used only
+ *  for legacy star sources. A destination outside the project is a deletion from this project's point
+ *  of view. */
+function pathChangeFromAbsolute(
+  root: string,
+  from: string,
+  to: string | null,
+): LegacyKeptDocPathChange | null {
+  if (!from.startsWith(`${root}/`)) return null
+  const fromRel = from.slice(root.length + 1)
+  const toRel = to?.startsWith(`${root}/`) ? to.slice(root.length + 1) : null
+  if (!fromRel || fromRel === toRel) return null
+  return { from: fromRel, to: toRel }
+}
+
+/** Replay Koda-observed prefix moves/deletions over a legacy project-relative path. Rules are ordered:
+ *  A→B followed by B→C lands at C, while a matching deletion ends the path permanently. */
+function applyLegacyPathChanges(
+  rel: string,
+  changes: readonly LegacyKeptDocPathChange[],
+): string | null {
+  let current: string | null = rel
+  for (const change of changes) {
+    if (!current) return null
+    if (current !== change.from && !current.startsWith(change.from + '/')) continue
+    if (change.to === null) return null
+    current = change.to + current.slice(change.from.length)
+  }
+  return current
+}
+
+/** Keep the ordered change log compact under duplicate filesystem notifications. */
+function appendLegacyPathChange(
+  changes: readonly LegacyKeptDocPathChange[],
+  next: LegacyKeptDocPathChange,
+): LegacyKeptDocPathChange[] {
+  const last = changes[changes.length - 1]
+  return last?.from === next.from && last.to === next.to ? [...changes] : [...changes, next]
+}
+
+/** Apply path repair to the retired Documents pane's still-unacknowledged localStorage copy. Returns
+ *  null only when that copy could not be read; otherwise returns (and, when needed, writes) its repaired
+ *  stable list. This synchronous rewrite closes the rename/delete-before-save crash window. */
+function repairLegacyDocPins(
+  projectPath: string,
+  changes: readonly LegacyKeptDocPathChange[],
+  keep: (path: string) => boolean = () => true,
+): string[] | null {
+  const key = `koda:doc-pins:${projectPath}`
+  try {
+    const raw: unknown = JSON.parse(localStorage.getItem(key) ?? '[]')
+    const pins = Array.isArray(raw) ? raw.filter((path): path is string => typeof path === 'string') : []
+    const repaired = mergeUniquePaths(
+      pins
+        .map((path) => applyLegacyPathChanges(path, changes))
+        .filter((path): path is string => !!path && keep(path)),
+    )
+    const unchanged = repaired.length === pins.length && repaired.every((path, index) => path === pins[index])
+    if (!unchanged) {
+      if (repaired.length) localStorage.setItem(key, JSON.stringify(repaired))
+      else localStorage.removeItem(key)
+    }
+    return repaired
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Carry the project's starred-document shelf through a rename, move, or delete. Starred paths are
+ * project-relative while file events are absolute, so this converts both ways around `projectPath`
+ * (main resolves that to the same realpath it derives `rel` from).
+ *
+ * Every old and new path also joins the append-only legacy ledger. That is not bookkeeping noise: an
+ * archived session may still carry the old path, and without the tombstone it could re-import the star
+ * the next time its index becomes readable. `next` returns the new absolute path, or null to drop it.
+ *
+ * Returns `{}` when nothing changed, so the caller can spread it into a `set` payload without ever
+ * replacing either array for a file event that touched no star.
+ */
+function remapStarredDocs(
+  state: {
+    starredDocs: string[]
+    legacyKeptDocsImported: string[]
+    projectPath: string | null
+  },
+  next: (abs: string) => string | null,
+): { starredDocs?: string[]; legacyKeptDocsImported?: string[] } {
+  const root = state.projectPath
+  if (!root) return {}
+  const touched: string[] = []
+  const mapped: string[] = []
+  for (const rel of state.starredDocs) {
+    const absolute = next(`${root}/${rel}`)
+    if (!absolute || !absolute.startsWith(`${root}/`)) {
+      touched.push(rel)
+      continue
+    }
+    const nextRel = absolute.slice(root.length + 1)
+    mapped.push(nextRel)
+    if (nextRel !== rel) touched.push(rel, nextRel)
+  }
+  const starredDocs = mergeUniquePaths(mapped)
+  const unchanged =
+    starredDocs.length === state.starredDocs.length &&
+    starredDocs.every((rel, index) => rel === state.starredDocs[index])
+  if (unchanged) return {}
+  return {
+    starredDocs,
+    legacyKeptDocsImported: mergeUniquePaths(state.legacyKeptDocsImported, touched),
+  }
+}
+
+/** Stable, first-seen ordering for path lists. Empty strings are never useful document identities. */
+function mergeUniquePaths(...lists: ReadonlyArray<readonly string[]>): string[] {
+  const seen = new Set<string>()
+  const merged: string[] = []
+  for (const list of lists) {
+    for (const path of list) {
+      if (!path || seen.has(path)) continue
+      seen.add(path)
+      merged.push(path)
+    }
+  }
+  return merged
+}
+
+/** The migration order preserves the shelf currently in front of the user, then the remaining live
+ * chats in their saved order, then archived chats newest-first. */
+function legacyKeptDocsInOrder(
+  sessions: PersistedSession[],
+  activeId: string | null,
+  archived: ArchivedSessionMeta[],
+): string[] {
+  const active = activeId ? sessions.find((session) => session.id === activeId) : undefined
+  const ordered = active
+    ? [active, ...sessions.filter((session) => session.id !== active.id)]
+    : sessions
+  return mergeUniquePaths(
+    ...ordered.map((session) => session.keptDocs ?? []),
+    ...archived.map((session) => session.keptDocs ?? []),
+  )
 }
 
 /** Is `filePath` inside `dir`? Both are absolute POSIX paths (Edit tools pass absolute file_path).
@@ -3574,20 +4603,22 @@ function maxTranscriptReplaySeq(items: Entry[]): number {
   return max
 }
 
-/** Derived per-session status (one source per signal). */
+/** Derived per-session status (one source per signal). A delegated task the engine backgrounded
+ *  outlives its parent turn, so `busy` alone would settle the icon on the finished check while the
+ *  fan-out is still running — and re-twinkle on each follow-up turn. Work in flight is work in
+ *  flight, whoever is doing it. */
 export function statusOf(s: SessionState, pending: ApprovalRequest[]): SessionStatus {
   if (pending.some((r) => r.sessionId === s.id)) return 'waiting'
-  if (s.busy) return 'thinking'
+  if (s.busy || hasRunningDelegation(s.items)) return 'thinking'
   if (s.errored) return 'error'
   return 'idle'
 }
 
 // ── Per-session change attribution ─────────────────────────────────────────────────
 // Git has ONE working tree per project (all sessions edit the same files), so `gitFiles` is aggregate.
-// But Koda records every file each session's agent edited (edit-tool cards carry `input.file_path`),
-// so we can slice that shared pile per session. A dirty file no recorded edit card touched falls into
-// "Loose changes" (manual edits, npm install, Bash codegen). That names the state without making the
-// false claim that no session caused it. Best-effort by design.
+// Main's completion tracker provides exact turn-boundary paths after a turn. Edit-tool cards remain the
+// best-effort fallback only for in-flight or older sessions. A dirty file neither source owns falls into
+// "Loose changes" without pretending Koda knows who caused it.
 
 /** A group of dirty files, all attributed to one session (or the loose/unattributed bucket). */
 export interface SessionChangeGroup {
@@ -3608,7 +4639,7 @@ export interface SessionChanges {
 /** Absolute file paths a session's agent wrote this run (edit-tool cards, incl. subagent children).
  *  We don't filter on isError: a failed edit that changed nothing won't appear in `gitFiles` anyway,
  *  so it can't create a phantom group — and skipping the check keeps this cheap. */
-function editedPathsOf(s: SessionState): string[] {
+function editedPathsOfCurrentTurn(s: SessionState): string[] {
   const out: string[] = []
   const take = (name: string, input: unknown): void => {
     if (!EDIT_TOOLS.has(name)) return
@@ -3616,7 +4647,9 @@ function editedPathsOf(s: SessionState): string[] {
     const p = i?.file_path ?? i?.notebook_path // NotebookEdit uses notebook_path
     if (p) out.push(p)
   }
-  for (const it of s.items) {
+  let turnStart = 0
+  for (let i = 0; i < s.items.length; i++) if (s.items[i].kind === 'user') turnStart = i + 1
+  for (const it of s.items.slice(turnStart)) {
     if (it.kind === 'tool') take(it.name, it.input)
     else if (it.kind === 'subagent') for (const c of it.children) if (c.kind === 'tool') take(c.name, c.input)
   }
@@ -3627,39 +4660,72 @@ function editedPathsOf(s: SessionState): string[] {
  *  the session cwd against the git root (a subdir project would otherwise mismatch): an absolute
  *  `/…/proj/src/a.ts` owns rel `src/a.ts`. */
 function touches(absPaths: string[], rel: string): boolean {
-  return absPaths.some((abs) => abs === rel || abs.endsWith('/' + rel))
+  return absPaths.some(
+    (abs) =>
+      abs === rel ||
+      abs.endsWith('/' + rel) ||
+      (rel.endsWith('/') && (abs.startsWith(rel) || abs.includes('/' + rel))),
+  )
+}
+
+/** Aggregate Git intentionally collapses a new untracked folder to `dir/`; main keeps the exact files
+ * below it. Treat that one row as representing every owned descendant without discarding the exact
+ * file count carried by completion state. */
+function completionTouches(paths: string[], rel: string): boolean {
+  return paths.some((path) => path === rel || (rel.endsWith('/') && path.startsWith(rel)))
 }
 
 /**
- * Attribute the aggregate working-tree changes to the sessions that produced them. Primary owner of a
- * file: the most-recently-created session that touched it (`order` is newest-first) — a pragmatic
- * "last writer" without per-edit timestamps. Deliberately independent of which session is focused: the
- * row's dirty count is a passive fact about the session, so it must not shift when you click into a
- * different one (a co-edited file kept jumping ownership to whichever row was active). Other touchers
- * surface as `alsoBy` hints. Untouched files fall to the null group.
+ * Attribute aggregate working-tree changes to sessions. Completed turns use main's safety-git boundary;
+ * a currently busy turn may provisionally fall back to only its latest recorded edit tools. Deliberately
+ * independent of focus: the row's loose count is a passive fact and must not jump when the user clicks
+ * another session. Other touchers surface as `alsoBy` hints; unowned files fall to the null group.
  */
 export function computeSessionChanges(
   sessions: Record<string, SessionState>,
   order: string[],
   files: GitStatusFile[],
+  completionBySession: Record<string, TaskCompletionState> = {},
 ): SessionChanges {
   // Clean tree (the common case, incl. every streaming re-render before anything's edited) — skip the
   // per-session items walk entirely.
   if (files.length === 0) return { groups: [], alsoBy: {}, countBySession: {} }
 
   const edited: Record<string, string[]> = {}
-  for (const id of order) if (sessions[id]) edited[id] = editedPathsOf(sessions[id])
+  for (const id of order) {
+    const session = sessions[id]
+    if (session?.busy) edited[id] = editedPathsOfCurrentTurn(session)
+  }
 
   const groups = new Map<string | null, GitStatusFile[]>()
   const alsoBy: Record<string, string[]> = {}
   const countBySession: Record<string, number> = {}
+  const provisionalCountBySession: Record<string, number> = {}
 
   for (const f of files) {
-    const owners = order.filter((id) => edited[id] && touches(edited[id], f.path))
+    const evidenceOwners = order.filter((id) => {
+      const completion = completionBySession[id]
+      return completion?.state === 'loose-ends' && completionTouches(completion.paths, f.path)
+    })
+    // The transcript heuristic is provisional and current-turn-only. Restored/idle transcripts never
+    // reclaim dirt after restart; absent main evidence means the honest Loose changes bucket.
+    const fallbackOwners = order.filter(
+      (id) =>
+        completionBySession[id]?.state !== 'needs-check' &&
+        edited[id] &&
+        touches(edited[id], f.path),
+    )
+    const owners = [...evidenceOwners, ...fallbackOwners.filter((id) => !evidenceOwners.includes(id))]
     const primary = owners.length === 0 ? null : owners[0]
     if (!groups.has(primary)) groups.set(primary, [])
     groups.get(primary)!.push(f)
-    if (primary) countBySession[primary] = (countBySession[primary] ?? 0) + 1
+    if (
+      primary &&
+      fallbackOwners.includes(primary) &&
+      !completionTouches(completionBySession[primary]?.paths ?? [], f.path)
+    ) {
+      provisionalCountBySession[primary] = (provisionalCountBySession[primary] ?? 0) + 1
+    }
     const others = owners.filter((id) => id !== primary)
     if (others.length) alsoBy[f.path] = others.map((id) => sessions[id]?.label ?? 'a session')
   }
@@ -3672,6 +4738,17 @@ export function computeSessionChanges(
   }
   const orphan = groups.get(null)
   if (orphan && orphan.length) ordered.push({ sessionId: null, label: 'Loose changes', files: orphan })
+
+  for (const id of order) {
+    const exact =
+      completionBySession[id]?.state === 'loose-ends'
+        ? completionBySession[id].paths.filter((path) =>
+            files.some((file) => completionTouches([path], file.path)),
+          ).length
+        : 0
+    const count = exact + (provisionalCountBySession[id] ?? 0)
+    if (count > 0) countBySession[id] = count
+  }
 
   return { groups: ordered, alsoBy, countBySession }
 }

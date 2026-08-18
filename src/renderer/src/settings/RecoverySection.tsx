@@ -116,7 +116,7 @@ function Timeline({
         <h2 className="px-1 font-display text-sm font-semibold text-text">Recovery</h2>
         <p className="mt-1 px-1 text-xs leading-relaxed text-text-muted">
           Save points Koda kept as you worked. Hover a point to see what going back would undo, then
-          pick one. Going back is reversible — your current work is saved first.
+          pick one. Going back is reversible, because your current work is saved first.
         </p>
         {/* Live span hint — reserved height so the list never jumps as it appears/updates. */}
         <div className="mt-2 min-h-[16px] px-1 text-[11px] leading-4">

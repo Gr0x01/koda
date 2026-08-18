@@ -4,7 +4,8 @@
  * bump. This is the gate that lets us re-bundle a new engine with confidence.
  *
  * NOT part of `npm test` — it spawns a real engine and spends tokens. Run it explicitly:
- *   npm run test:engine-contract                       # against the bundled engine, your subscription
+ *   npm run test:engine-contract                       # deterministic release gate, bundled engine
+ *   npm run test:engine-behavior-rehearsal             # explicit one-shot model-judgment rehearsal
  *   KODA_ENGINE_CANDIDATE=/tmp/claude npm run test:engine-contract   # against a candidate binary
  *   ANTHROPIC_API_KEY=sk-… KODA_ENGINE_CANDIDATE=… npm run test:engine-contract   # CI (API billing)
  *
@@ -86,6 +87,19 @@ describe('engine contract', () => {
 
   beforeAll(async () => {
     cwd = mkdtempSync(join(tmpdir(), 'koda-engine-contract-'))
+    writeFileSync(join(cwd, 'package.json'), '{"name":"koda-contract-fixture"}\n')
+    mkdirSync(join(cwd, 'Documents', 'architecture'), { recursive: true })
+    writeFileSync(
+      join(cwd, 'Documents', 'architecture', 'autonomous-work-loop.md'),
+      '# Autonomous work loop\n',
+    )
+    mkdirSync(join(cwd, 'src'), { recursive: true })
+    for (let index = 0; index < 32; index += 1) {
+      writeFileSync(
+        join(cwd, 'src', `fixture-${index}.ts`),
+        `export const fixture${index} = ${index}\n`,
+      )
+    }
     h = new Harness(baseOpts({ sessionId, cwd }))
     // Drive the opening turn; its stream carries SessionStarted + the PONG reply that Checks 1–3 read.
     firstTurn = await h.runTurn('Reply with exactly the word PONG and nothing else.')
@@ -315,8 +329,15 @@ describe('engine contract', () => {
   })
 
   it('Check 7 — resume: --resume reattaches the conversation with context intact', async () => {
+    const resumeCursor = h.events
+      .filter(
+        (e): e is Extract<EngineEvent, { type: 'ResumeCursorUpdated' }> =>
+          e.type === 'ResumeCursorUpdated',
+      )
+      .at(-1)?.cursor
+    expect(resumeCursor?.resumable, 'the completed conversation published a resumable cursor').toBe(true)
     await h.session.dispose()
-    const h2 = new Harness(baseOpts({ sessionId, cwd, resume: true }))
+    const h2 = new Harness(baseOpts({ sessionId, cwd, resumeCursor }))
     try {
       const turn = await h2.runTurn(
         'Earlier I asked you to reply with one specific word first. What was that word? Answer with just the word.',
@@ -328,21 +349,33 @@ describe('engine contract', () => {
     }
   })
 
-  it('Check 8 — rehearsal: work presented for a decision arms the critic pass unprompted', async () => {
-    // The one check that grades a JUDGMENT rather than a stream seam: does the shipped pack actually
-    // make the agent reach for `critic` on its own? Everything else here orders the behavior it asserts
-    // (Check 5 names the Task tool); this must not — the failure it guards is precisely the agent
-    // finishing a round, presenting it for a decision, and never arming the pass. So the prompt sets a
-    // bar, produces an inspectable artifact, and asks for a choice, while naming no subagent at all.
+  it('Check 8 — rehearsal: opted-in review reaches material work without task-level prompting', async () => {
+    // The one check that grades a JUDGMENT rather than a stream seam: does the shipped, opted-in review
+    // route make the agent reach for `critic` on its own? Everything else here orders the behavior it
+    // asserts (Check 5 names the Task tool); this must not — the failure it guards is precisely the agent
+    // finishing a round, presenting it for a decision, and never arming the enabled pass. So the prompt
+    // sets a bar, produces an inspectable artifact, and asks for a choice, while naming no subagent at all.
     // Its own session on a fresh cwd: the shared harness has already been told to launch a subagent.
     const rehearsalCwd = mkdtempSync(join(tmpdir(), 'koda-engine-rehearsal-'))
-    const h3 = new Harness(baseOpts({ sessionId: randomUUID(), cwd: rehearsalCwd }))
+    writeFileSync(
+      join(rehearsalCwd, 'product-brief.md'),
+      '# Pinner product brief\n\n' +
+        '- A Mac note-taking app made by Jordan Park.\n' +
+        '- Pin up to nine notes so the small set you use stays in reach.\n' +
+        '- Notes are ordinary Markdown files in a folder you choose.\n' +
+        '- Search is the only navigation for unpinned notes.\n' +
+        '- No account, built-in sync, collaboration, or AI features.\n' +
+        '- Costs $29 once and includes a 14-day full trial.\n' +
+        '- Launches August 20, 2026 for macOS 14 and newer.\n' +
+        '- Waitlist members receive the download link by email on launch day.\n',
+    )
+    const h3 = new Harness(baseOpts({ sessionId: randomUUID(), cwd: rehearsalCwd, critiqueOn: true }))
     try {
       const turn = await h3.runTurn(
-        'Write me a short announcement post for a new note-taking app called Pinner — one page, in a file ' +
-          'called announcement.md. The bar I care about: it has to read like a person wrote it, not like ' +
-          'marketing copy. When it is ready, give me two headline options for it and I will pick one. ' +
-          'Do not ask me any questions first — just do the work.',
+        'Use product-brief.md as the sole source of product facts. Write the final one-page launch announcement ' +
+          'for Pinner in a file called announcement.md. It goes to the full waitlist after I choose the headline, ' +
+          'so the bar I care about is that it reads like a person wrote it, not like marketing copy. When it is ' +
+          'ready, give me two headline options and I will pick one. Do not ask me any questions first — just do the work.',
         300_000,
       )
       const spawned = turn

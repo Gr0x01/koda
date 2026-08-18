@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest'
-import { undoPointRefusal } from './ipc'
+import {
+  DurableAttachmentPayloadSchema,
+  MAX_DURABLE_TURN_ATTACHMENT_BASE64_CHARS,
+  SendTurnRequestSchema,
+  TurnFailureTargetSchema,
+  undoPointRefusal,
+} from './ipc'
 
 /**
  * The renderer's half of the "your undo net failed" contract (debt item 17). Main refuses a destroying
@@ -24,5 +30,78 @@ describe('undoPointRefusal', () => {
   it('returns null for an unrelated failure, so ordinary errors keep their own copy', () => {
     expect(undoPointRefusal(new Error('a file or folder with that name already exists'))).toBeNull()
     expect(undoPointRefusal(undefined)).toBeNull()
+  })
+})
+
+describe('TurnFailureTargetSchema attachment invariants', () => {
+  it('accepts a bounded exact document retry only with coherent provenance', () => {
+    expect(
+      TurnFailureTargetSchema.safeParse({
+        clientTurnId: 'logical-a',
+        text: 'inspect',
+        hadImages: false,
+        hadAttachments: true,
+        attachments: [{ mediaType: 'application/pdf', name: 'report.pdf' }],
+        images: [{ mediaType: 'application/pdf', name: 'report.pdf', dataBase64: 'AAAA' }],
+      }).success,
+    ).toBe(true)
+  })
+
+  it('rejects exact document bytes or provenance that deny attachment presence', () => {
+    const base = {
+      clientTurnId: 'logical-a',
+      text: 'inspect',
+      hadImages: false,
+      attachments: [{ mediaType: 'text/csv', name: 'rows.csv' }],
+      images: [{ mediaType: 'text/csv', name: 'rows.csv', dataBase64: 'AAAA' }],
+    }
+    expect(TurnFailureTargetSchema.safeParse(base).success).toBe(false)
+    expect(
+      TurnFailureTargetSchema.safeParse({ ...base, hadAttachments: false }).success,
+    ).toBe(false)
+  })
+
+  it('still requires a stable logical, replay, or rendered user identity', () => {
+    expect(
+      TurnFailureTargetSchema.safeParse({
+        text: 'orphaned',
+        hadImages: false,
+        hadAttachments: false,
+      }).success,
+    ).toBe(false)
+  })
+})
+
+describe('durable attachment payload cap', () => {
+  it('accepts the exact aggregate boundary and rejects one character above it', () => {
+    const boundary = [
+      { mediaType: 'application/pdf', dataBase64: 'A'.repeat(1_000_000) },
+      { mediaType: 'text/csv', dataBase64: 'B'.repeat(1_000_000) },
+    ]
+    expect(DurableAttachmentPayloadSchema.safeParse(boundary).success).toBe(true)
+    expect(
+      DurableAttachmentPayloadSchema.safeParse([
+        ...boundary,
+        { mediaType: 'text/plain', dataBase64: 'C' },
+      ]).success,
+    ).toBe(false)
+    expect(boundary.reduce((sum, item) => sum + item.dataBase64.length, 0)).toBe(
+      MAX_DURABLE_TURN_ATTACHMENT_BASE64_CHARS,
+    )
+  })
+
+  it('does not impose the durable cap on the generic send transport schema', () => {
+    expect(
+      SendTurnRequestSchema.safeParse({
+        sessionId: 's1',
+        text: '',
+        images: [
+          {
+            mediaType: 'image/png',
+            dataBase64: 'A'.repeat(MAX_DURABLE_TURN_ATTACHMENT_BASE64_CHARS + 1),
+          },
+        ],
+      }).success,
+    ).toBe(true)
   })
 })

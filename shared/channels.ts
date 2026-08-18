@@ -13,6 +13,10 @@ export const IpcChannels = {
   stopSubagent: 'engine:stopSubagent',
   disposeSession: 'engine:dispose',
   engineEvent: 'engine:event',
+  // Main-owned, turn-scoped completion evidence. Separate from the transcript event stream: this is
+  // live repository hygiene, not conversation history, and must not replay stale after a restart.
+  completionState: 'completion:state',
+  completionList: 'completion:list',
   // Side questions ("btw" / aside) — a throwaway one-shot fork of the live session; the answer streams
   // back over `asideEvent` and never enters the conversation.
   askAside: 'aside:ask',
@@ -25,7 +29,7 @@ export const IpcChannels = {
   safetyChanges: 'safety:changes',
   safetyFileDiff: 'safety:fileDiff',
   // Multi-session persistence — open sessions + their transcripts survive an app restart.
-  // load = invoke (returns the saved blob); save = send (fire-and-forget, debounced in the renderer).
+  // load = invoke (returns the saved blob); save = invoke too, so a migration may wait for durability.
   sessionsLoad: 'sessions:load',
   sessionsSave: 'sessions:save',
   // Archived sessions live in their own COLD per-project file (they'd otherwise ride the hot blob
@@ -62,9 +66,10 @@ export const IpcChannels = {
   rendererLog: 'app:rendererLog',
   // Count of sessions needing attention → the macOS dock badge (send, not invoke).
   setAttentionCount: 'app:setAttentionCount',
-  // Local-assist: on-device QoL micro-tasks (e.g. a clean session title). invoke; falls back
-  // to a deterministic string in main, so the renderer always gets a usable answer.
-  assistTitle: 'assist:title',
+  // Name a session (title + one-line overview) through ENGINE text generation — the schema-constrained
+  // initial/regenerate prompt split behind the sessions map. invoke; main falls back to the local-assist
+  // floor and then to first-words, so the renderer always gets a usable answer.
+  sessionName: 'sessions:name',
   // Project Files browser — path-contained to the project root, size-capped. invoke.
   // readDir/readFile are read-only; writeFile (the editor's save) checkpoints via safety-git first.
   fsReadDir: 'fs:readDir',
@@ -98,6 +103,7 @@ export const IpcChannels = {
   // to the project root; import writes external bytes, never follows an external path. invoke.
   fsDuplicatePath: 'fs:duplicatePath',
   fsImportFiles: 'fs:importFiles',
+  fsImportFilesFromMenu: 'fs:importFilesFromMenu',
   // Basic Mac QoL from the Files right-click: reveal a file/folder in Finder, or open it in the OS
   // default app. Read-only shell actions, path-contained to the project root. invoke.
   fsRevealPath: 'fs:revealPath',
@@ -114,6 +120,15 @@ export const IpcChannels = {
   // Project-wide replace — checkpoints the tree via safety-git first (undoable as one step), then
   // rewrites every case-insensitive occurrence. invoke.
   fsReplaceAll: 'fs:replaceAll',
+  // The Library — the document surface (document-workspace.md). query = the one read behind the list:
+  // the doc walk plus content search, reconciled in main so no caller can surface CLAUDE.md, a
+  // vendored skill file or a dependency README that the doc list correctly hides. ask = a question
+  // answered across the project's documents AND its session transcripts, returned with citations into
+  // both. Both read-only, contained to the per-window root. invoke.
+  libraryQuery: 'library:query',
+  libraryResolve: 'library:resolve',
+  libraryAsk: 'library:ask',
+  libraryAskCancel: 'library:askCancel',
   // User-git (the real `.git`) — the "Versions" panel. detect/status/graph/review are read-only;
   // init/commit + the user-confirmed discardBranch are the mutations. All per-window root.
   gitDetect: 'git:detect',
@@ -122,6 +137,9 @@ export const IpcChannels = {
   gitInit: 'git:init',
   gitCommit: 'git:commit',
   gitCommitPaths: 'git:commitPaths',
+  // A proposed description for the save the user is about to make, written from the diff by the
+  // app-global generated-text choice (or the deterministic floor). Read-only; never blocks the save.
+  gitProposeMessage: 'git:proposeMessage',
   // Reword the just-saved version (amend HEAD's message) — the "Rename" on a one-click save. Safe
   // only while that version is still HEAD; the main process refuses otherwise (no history rewrite).
   gitRenameHead: 'git:renameHead',
@@ -203,6 +221,7 @@ export const IpcChannels = {
   // quick-pick next time (Koda can't enumerate available models; see AddRecentModelSchema).
   modelsGetRecent: 'models:getRecent',
   modelsAddRecent: 'models:addRecent',
+  modelsGetProviderCatalogs: 'models:getProviderCatalogs',
   codexModels: 'engine:codexModels',
   codexAuthStatus: 'engine:codexAuthStatus',
   // Codex (ChatGPT OAuth) sign-in — loginStart = invoke (spawns `codex login`, fire-and-forget);
@@ -238,6 +257,10 @@ export const IpcChannels = {
   // on a clean print page in a hidden window (printToPDF), saves where the user picks, then opens it.
   docExportPdf: 'doc:exportPdf',
   previewShow: 'preview:show',
+  // The window's dev server is no longer serving (it exited, crashed, or was replaced/killed). The
+  // renderer marks that preview surface as not live so its tab stops claiming a running app — the
+  // iframe keeps showing its last paint, which is exactly why a stale "connected" mark would lie.
+  previewStopped: 'preview:stopped',
   // Re-run a session's last preview (dev command or static file) when it's gone — the user-facing
   // "Restart preview" button. A window-direct invoke (like previewStaticUrl), NOT the agent's gated
   // capability: it re-runs a command the user already saw the agent run. See preview.ts.
@@ -254,14 +277,14 @@ export const IpcChannels = {
   composerPickPath: 'composer:pickPath',
   // List the project's recent scratch images (newest first) for the Recent images strip. See scratch.ts.
   scratchList: 'scratch:list',
-  // A scratch image landed outside the composer (a phone turn saved one main-side) → the owning window
+  // Scratch contents changed (a phone image landed or retention pruned old attachments) → the window
   // refreshes its Recent images strip. main→renderer push.
   scratchChanged: 'scratch:changed',
   // Read/write a doc's presentation sidecar (table column widths, …) under `.koda/docmeta/`. The doc
   // file stays canonical markdown; layout state lives beside it. invoke. See docmeta.ts.
   docmetaGet: 'docmeta:get',
   docmetaSet: 'docmeta:set',
-  // How heavy this project's always-injected memory pair (MEMORY.md + active-context.md) is — powers
+  // How heavy this project's memory navigation pair (MEMORY.md + active-context.md) is — powers
   // the status-bar tidy pill + Settings → Memory. Read-only. invoke. See engine/pack.ts.
   memoryWeight: 'memory:weight',
   // Encrypted cloud backup (dogfood-flagged; Documents/release/ship-checklist-backup-sync.md).
@@ -365,6 +388,24 @@ export const IpcChannels = {
   // Cloud-relay feature flag (LAN-only first release) — invoke, returns whether the from-anywhere
   // tier is enabled on this Mac; the renderer hides every cloud surface when it's off. See settings.ts.
   remoteCloudEnabled: 'remote:cloudEnabled',
+  // Connect tier (the embedded tailnet node — connect-embedded-tailscale.md Build A).
+  // connectState = invoke (flag/available + the one lifecycle owner's state → the "reachable from your
+  // phone" indicator); connectDevices = invoke (the account's devices from the coordination plane);
+  // connectRevoke = compatibility wire name for Reset access (all three planes, account-wide);
+  // connectActivity = main→renderer push (the node's state changed). See remote/connect-node.ts.
+  connectState: 'connect:state',
+  connectDevices: 'connect:devices',
+  connectRevoke: 'connect:revoke',
+  // connectReconnect = invoke (the row's "Reconnect": leave + rejoin through the one door, so a stuck
+  // node never needs a Koda restart to recover).
+  connectReconnect: 'connect:reconnect',
+  connectActivity: 'connect:activity',
+  // The second-device enrolment gate. connectEnrollments = invoke (the devices asking to join this
+  // account's private network, readable only by a Mac that holds the account's approver credential);
+  // connectEnrollmentDecide = invoke (allow or refuse one of them). A Koda account password alone must
+  // never be enough to reach this Mac, and these two are what makes that true. See connect-approver.ts.
+  connectEnrollments: 'connect:enrollments',
+  connectEnrollmentDecide: 'connect:enrollmentDecide',
   // Provider-health watch — providerStatus = main→renderer push (an engine's provider entered/left a
   // feed-confirmed incident → the engine chip's health dot); providerStatusGet = invoke (seed a window
   // that opens mid-incident); providerStatusRefresh = invoke (on-arrival check when a window gains focus,

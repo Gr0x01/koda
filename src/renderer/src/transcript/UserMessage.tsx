@@ -1,6 +1,12 @@
 import { useWorkspace } from '../workspace/store'
 import { FileChip } from './FileChip'
 
+export function visiblePhotoAttachments(
+  images?: { mediaType: string; dataBase64: string }[],
+): { mediaType: string; dataBase64: string }[] {
+  return images?.filter((image) => image.mediaType.startsWith('image/')) ?? []
+}
+
 /** The user's turn — the instruction that opens a turn. Rendered inside the pinned card (see
  *  PinnedUserMessage), so this is just the content: attachment chips/thumbnails above the text.
  *
@@ -18,7 +24,8 @@ export function UserMessage({
   files?: string[]
 }) {
   const setLightbox = useWorkspace((s) => s.setLightbox)
-  const hasImages = images && images.length > 0
+  const photos = visiblePhotoAttachments(images)
+  const hasImages = photos.length > 0
   return (
     <div className="flex flex-col items-start gap-1.5">
       {files && files.length > 0 && (
@@ -30,7 +37,7 @@ export function UserMessage({
       )}
       {hasImages && (
         <div className="flex flex-wrap items-center gap-2">
-          {images.map((img, i) => (
+          {photos.map((img, i) => (
             <button
               key={i}
               type="button"
@@ -47,7 +54,7 @@ export function UserMessage({
           ))}
           {!text && (
             <span className="text-xs text-text-muted">
-              {images.length > 1 ? `${images.length} images` : 'Image'}
+              {photos.length > 1 ? `${photos.length} images` : 'Image'}
             </span>
           )}
         </div>

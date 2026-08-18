@@ -1,0 +1,24 @@
+{
+  "name": "deep-review",
+  "version": "0.1.2",
+  "description": "Repository-wide detective review with evidence-backed 1–5 readiness scoring.",
+  "author": {
+    "name": "Koda"
+  },
+  "license": "MIT",
+  "keywords": ["code-review", "debugging", "validation"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Deep Review",
+    "shortDescription": "Trace a change deeply and score its readiness.",
+    "longDescription": "Investigates a bounded change beyond its diff, follows its blast radius through the repository, challenges candidate findings, and can make an authorized repair and rescore.",
+    "developerName": "Koda",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Write"],
+    "defaultPrompt": [
+      "Review this branch deeply and score it out of 5.",
+      "Fix supported findings, then rescore once; it was authored by Claude.",
+      "Challenge these review findings before I fix them."
+    ]
+  }
+}

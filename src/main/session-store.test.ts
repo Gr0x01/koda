@@ -50,6 +50,7 @@ import {
   MAX_CORRUPT_BACKUPS,
   noteProjectClosed,
   noteProjectOpened,
+  pruneGhostSessions,
   purgeProjectSessions,
   readClaudeConversationReplay,
   saveArchivedMeta,
@@ -58,6 +59,7 @@ import {
   StoreReadError,
   writeArchivedBody,
   type StoreReadReport,
+  withResumeCursorFallback,
 } from './session-store'
 import { log } from './logger'
 import { ReplayEntrySchema } from '@shared/ipc'
@@ -97,11 +99,28 @@ afterEach(() => {
     }
     rmSync(`${indexPath(p)}.v1.bak`, { force: true })
     rmSync(`${indexPath(p)}.tmp`, { recursive: true, force: true }) // the index-write blocker below
+    rmSync(`${storePath(p)}.tmp`, { recursive: true, force: true })
     rmSync(bodiesDir(p), { recursive: true, force: true })
   }
 })
 
 describe('archive storage split', () => {
+  it('collapses repeated metadata rows by id and keeps the newest row', () => {
+    const p = uniqueProject()
+    saveArchivedMeta(p, [
+      { id: 'same', label: 'Newest', cwd: '/proj', archivedAt: 30 },
+      { id: 'other', label: 'Other', cwd: '/proj', archivedAt: 25 },
+      { id: 'same', label: 'Older', cwd: '/proj', archivedAt: 20 },
+    ])
+
+    expect(loadArchivedMeta(p).map((meta) => [meta.id, meta.label])).toEqual([
+      ['same', 'Newest'],
+      ['other', 'Other'],
+    ])
+    const saved = JSON.parse(readFileSync(indexPath(p), 'utf8')) as { archived: { id: string }[] }
+    expect(saved.archived.map((meta) => meta.id)).toEqual(['same', 'other'])
+  })
+
   it('migrates a v1 blob: bodies split out, metadata baked, original backed up', () => {
     const p = uniqueProject()
     const s1Items = [
@@ -149,6 +168,39 @@ describe('archive storage split', () => {
     deleteArchivedBody(p, 'a')
     expect(loadArchivedBody(p, 'a')).toBeNull() // gone → null (a failed read, NOT a genuine empty [])
     expect(loadArchivedMeta(p).map((m) => m.id)).toEqual(['a']) // metadata untouched
+  })
+
+  it('bounds tool output on main-side hot and cold writes', () => {
+    const p = uniqueProject()
+    const long = `old-${'x'.repeat(4_000)}-LATEST`
+    const items = [
+      { id: 1, kind: 'tool', name: 'Bash', toolUseId: 'top', input: {}, result: long },
+      {
+        id: 2,
+        kind: 'subagent',
+        children: [
+          { id: 3, kind: 'tool', name: 'Read', toolUseId: 'child', input: {}, result: long },
+        ],
+      },
+    ]
+
+    writeArchivedBody(p, 'cold', items)
+    const cold = loadArchivedBody(p, 'cold') as typeof items
+    const coldChild = (cold[1] as { children: { result?: string }[] }).children[0]
+    expect(cold[0].result).toHaveLength(2_000)
+    expect(coldChild?.result).toHaveLength(2_000)
+
+    saveProjectSessions(p, {
+      version: 3,
+      activeId: 'hot',
+      sessions: [{ id: 'hot', label: 'Hot', cwd: p, items }],
+    })
+    const hot = JSON.parse(readFileSync(storePath(p), 'utf8')) as {
+      sessions: { items: typeof items }[]
+    }
+    const hotChild = (hot.sessions[0].items[1] as { children: { result?: string }[] }).children[0]
+    expect(hot.sessions[0].items[0].result).toHaveLength(2_000)
+    expect(hotChild?.result).toHaveLength(2_000)
   })
 
   it('distinguishes a genuinely empty body ([]) from a failed read (null)', () => {
@@ -201,6 +253,17 @@ describe('archive storage split', () => {
     expect(loadArchivedBody(p, 'fresh')).toEqual([{ id: 3, kind: 'user', text: 'yo' }])
   })
 
+  it('re-ingesting the same archive replaces its metadata instead of duplicating the row', () => {
+    const p = uniqueProject()
+    const first = { id: 'retry', label: 'First', cwd: '/x', archivedAt: 1, items: [{ id: 1 }] }
+    expect(ingestFullArchives(p, [first])).toBe(true)
+    expect(ingestFullArchives(p, [{ ...first, label: 'Retried', archivedAt: 2 }])).toBe(true)
+
+    expect(loadArchivedMeta(p).filter((meta) => meta.id === 'retry')).toEqual([
+      expect.objectContaining({ label: 'Retried', archivedAt: 2 }),
+    ])
+  })
+
   it('keeps everything forever when retention is 0 (the default)', () => {
     const p = uniqueProject()
     const ancient = Date.now() - 3650 * 86_400_000
@@ -232,6 +295,47 @@ describe('archive storage split', () => {
     ])
   })
 
+  it('protects an expired archive-only legacy star until its project migration is acknowledged', () => {
+    retentionDays = 30
+    const p = uniqueProject()
+    const ancient = Date.now() - 40 * 86_400_000
+    saveArchivedMeta(p, [
+      {
+        id: 'old-star-owner',
+        label: 'O',
+        cwd: '/x',
+        archivedAt: ancient,
+        keptDocs: ['Documents/only-copy.md'],
+      },
+      {
+        id: 'old-without-star',
+        label: 'Purge me',
+        cwd: '/x',
+        archivedAt: ancient,
+      },
+    ])
+    writeArchivedBody(p, 'old-star-owner', [{ id: 1 }])
+    writeArchivedBody(p, 'old-without-star', [{ id: 2 }])
+
+    expect(loadArchivedMeta(p).map((meta) => meta.id)).toEqual(['old-star-owner'])
+    expect(loadArchivedBody(p, 'old-star-owner')).toEqual([{ id: 1 }])
+    expect(loadArchivedBody(p, 'old-without-star')).toBeNull()
+
+    expect(
+      saveProjectSessions(p, {
+        version: 3,
+        activeId: null,
+        sessions: [],
+        starredDocs: ['Documents/only-copy.md'],
+        legacyKeptDocsImported: ['Documents/only-copy.md'],
+        legacyKeptDocsMigrationComplete: true,
+      }),
+    ).toBe(true)
+
+    expect(loadArchivedMeta(p)).toEqual([])
+    expect(loadArchivedBody(p, 'old-star-owner')).toBeNull()
+  })
+
   // The purge is a delete, so it follows the delete order: index first, bodies only once the index took
   // it. Unlinking first and then failing to write leaves rows on disk whose transcripts are gone, and
   // the retention filter hides those rows on every load — so nothing looks wrong until the user sets
@@ -261,6 +365,157 @@ describe('archive storage split', () => {
   })
 })
 
+describe('project-wide document stars', () => {
+  it('round-trips an ordered shelf even when the project has no sessions', () => {
+    const p = uniqueProject()
+    const store = {
+      version: 3 as const,
+      activeId: null,
+      sessions: [],
+      starredDocs: ['Documents/brief.md', 'Documents/plans/launch.md'],
+      legacyKeptDocsImported: ['Documents/brief.md'],
+    }
+
+    expect(saveProjectSessions(p, store)).toBe(true)
+    expect(loadProjectSessions(p)).toEqual(store)
+  })
+
+  it('upgrades v2 in place while preserving per-session shelves for renderer migration', () => {
+    const p = uniqueProject()
+    writeFileSync(
+      storePath(p),
+      JSON.stringify({
+        version: 2,
+        projectPath: p,
+        activeId: 'a',
+        sessions: [
+          {
+            id: 'a',
+            label: 'a',
+            cwd: p,
+            items: [],
+            keptDocs: ['Documents/brief.md'],
+          },
+        ],
+      }),
+    )
+
+    const loaded = loadProjectSessions(p)
+
+    expect(loaded).toMatchObject({
+      version: 3,
+      activeId: 'a',
+      sessions: [{ id: 'a', keptDocs: ['Documents/brief.md'] }],
+    })
+    expect(JSON.parse(readFileSync(storePath(p), 'utf8')).version).toBe(3)
+  })
+
+  it('moves an expired inline archive before the cold read and protects its only legacy star', () => {
+    retentionDays = 30
+    const p = uniqueProject()
+    writeFileSync(
+      storePath(p),
+      JSON.stringify({
+        version: 2,
+        projectPath: p,
+        activeId: null,
+        sessions: [],
+        archived: [
+          {
+            id: 'inline-old',
+            label: 'Inline old',
+            cwd: p,
+            archivedAt: Date.now() - 40 * 86_400_000,
+            items: [{ id: 1, kind: 'user', text: 'keep this' }],
+            keptDocs: ['Documents/archive-only.md'],
+          },
+        ],
+      }),
+    )
+
+    // The renderer now awaits this hot read before asking for the cold snapshot. The hot read moves
+    // the inline archive first; because no acknowledged migration marker exists yet, retention returns
+    // the row instead of deleting its sole star before hydration can see it.
+    expect(loadProjectSessions(p)).toMatchObject({ version: 3, sessions: [] })
+    expect(loadArchivedMeta(p)).toEqual([
+      expect.objectContaining({
+        id: 'inline-old',
+        keptDocs: ['Documents/archive-only.md'],
+      }),
+    ])
+    expect(loadArchivedBody(p, 'inline-old')).toEqual([{ id: 1, kind: 'user', text: 'keep this' }])
+  })
+
+  it('blocks hydration when an inline archive cannot reach the cold index', () => {
+    const p = uniqueProject()
+    const original = JSON.stringify({
+      version: 2,
+      projectPath: p,
+      activeId: null,
+      sessions: [],
+      archived: [
+        {
+          id: 'inline-retry',
+          label: 'Inline retry',
+          cwd: p,
+          archivedAt: 1,
+          items: [{ id: 1, kind: 'user', text: 'irreplaceable' }],
+          keptDocs: ['Documents/archive-only.md'],
+        },
+      ],
+    })
+    writeFileSync(storePath(p), original)
+    // Atomic index writes stage through this path; occupying it with a directory makes the cold write
+    // fail while the hot project file remains writable — the exact asymmetric failure that used to let
+    // the renderer hydrate and then save away the inline copy.
+    mkdirSync(`${indexPath(p)}.tmp`, { recursive: true })
+
+    const err = catchError(() => loadProjectSessions(p))
+
+    expect(err).toBeInstanceOf(StoreReadError)
+    expect((err as StoreReadError).backupKept).toBe(false)
+    expect(readFileSync(storePath(p), 'utf8')).toBe(original)
+    expect(JSON.parse(readFileSync(storePath(p), 'utf8')).archived[0].keptDocs).toEqual([
+      'Documents/archive-only.md',
+    ])
+  })
+
+  it('does not prune an otherwise-empty v3 session that still owns an unmigrated legacy star', () => {
+    const p = uniqueProject()
+    const appStatePath = join(tmpdir(), 'koda-app-state.json')
+    writeFileSync(
+      appStatePath,
+      JSON.stringify({ version: 1, openProjects: [], recentProjects: [p], knownProjects: [p] }),
+    )
+    writeFileSync(
+      storePath(p),
+      JSON.stringify({
+        version: 3,
+        projectPath: p,
+        activeId: 'a',
+        sessions: [
+          {
+            id: 'a',
+            label: 'a',
+            cwd: p,
+            items: [],
+            keptDocs: ['Documents/only-copy.md'],
+          },
+        ],
+      }),
+    )
+
+    try {
+      pruneGhostSessions()
+      expect(loadProjectSessions(p)?.sessions).toEqual([
+        expect.objectContaining({ id: 'a', keptDocs: ['Documents/only-copy.md'] }),
+      ])
+    } finally {
+      rmSync(appStatePath, { force: true })
+    }
+  })
+})
+
 // The defect these pin: a read failure that returns an empty-looking success. The renderer can't tell
 // that from a genuinely empty store, hydrates it, and its debounced save writes the emptiness back over
 // the user's real file ~500ms later with no interaction at all. The realistic trigger is schema/version
@@ -284,7 +539,7 @@ describe('a store that failed to load is never reported as empty', () => {
     const p = uniqueProject()
     vi.spyOn(log, 'warn').mockImplementation(() => {})
     // Written by a newer build, read back by an older one after a .dmg reinstall.
-    writeFileSync(storePath(p), JSON.stringify({ version: 3, activeId: null, sessions: [], projectPath: p }))
+    writeFileSync(storePath(p), JSON.stringify({ version: 4, activeId: null, sessions: [], projectPath: p }))
     expect(() => loadProjectSessions(p)).toThrow()
   })
 
@@ -299,7 +554,7 @@ describe('a store that failed to load is never reported as empty', () => {
     expect(backups).toHaveLength(1)
     expect(readFileSync(backups[0], 'utf8')).toBe(original)
     // The save path is the thing that would replace it; the copy still holds the original bytes after.
-    saveProjectSessions(p, { version: 2, activeId: null, sessions: [] })
+    saveProjectSessions(p, { version: 3, activeId: null, sessions: [] })
     expect(readFileSync(storePath(p), 'utf8')).not.toBe(original)
     expect(readFileSync(backups[0], 'utf8')).toBe(original)
   })
@@ -453,7 +708,7 @@ describe('archiveSession keeps the row alive until the archive write actually la
 
   it('a throwing archive ingest leaves the session in the hot store — never gone from both places', () => {
     const p = uniqueProject()
-    const store = { version: 2 as const, activeId: 's1', sessions: [session('s1')] }
+    const store = { version: 3 as const, activeId: 's1', sessions: [session('s1')] }
     saveProjectSessions(p, store)
     vi.spyOn(log, 'warn').mockImplementation(() => {})
     writeFileSync(indexPath(p), '{"version":2,"archived":[{"id":"a"') // present but unreadable
@@ -466,12 +721,174 @@ describe('archiveSession keeps the row alive until the archive write actually la
 
   it('on a clean archive write, removes the row from the hot store and adds it to the archive', () => {
     const p = uniqueProject()
-    const store = { version: 2 as const, activeId: 's1', sessions: [session('s1')] }
+    const store = {
+      version: 3 as const,
+      activeId: 's1',
+      sessions: [session('s1')],
+      starredDocs: ['Documents/brief.md'],
+      legacyKeptDocsImported: ['Documents/brief.md'],
+    }
     saveProjectSessions(p, store)
 
     expect(archiveSession(p, store, session('s1'), 's1')).toBe(true)
     expect(loadProjectSessions(p)?.sessions).toEqual([])
+    expect(loadProjectSessions(p)).toMatchObject({
+      starredDocs: ['Documents/brief.md'],
+      legacyKeptDocsImported: ['Documents/brief.md'],
+    })
     expect(loadArchivedMeta(p).map((m) => m.id)).toEqual(['s1'])
+  })
+
+  it('repairs a stale hot row when the same id is already durably archived', () => {
+    const p = uniqueProject()
+    const stale = session('stale')
+    const live = session('live')
+    saveProjectSessions(p, {
+      version: 3,
+      activeId: stale.id,
+      sessions: [stale, live],
+    })
+    saveArchivedMeta(p, [
+      { id: stale.id, label: stale.label, cwd: stale.cwd, archivedAt: Date.now() },
+    ])
+    writeArchivedBody(p, stale.id, stale.items)
+
+    const loaded = loadProjectSessions(p)
+
+    expect(loaded?.sessions.map((row) => row.id)).toEqual(['live'])
+    expect(loaded?.activeId).toBeNull()
+    const repaired = JSON.parse(readFileSync(storePath(p), 'utf8')) as {
+      activeId: string | null
+      sessions: { id: string }[]
+    }
+    expect(repaired.sessions.map((row) => row.id)).toEqual(['live'])
+    expect(repaired.activeId).toBeNull()
+  })
+
+  it('lets a legacy inline archive migrate before it tombstones the stale hot twin', () => {
+    const p = uniqueProject()
+    const stale = session('stale')
+    saveProjectSessions(p, { version: 3, activeId: stale.id, sessions: [stale] })
+    writeFileSync(
+      indexPath(p),
+      JSON.stringify({
+        version: 1,
+        archived: [
+          {
+            ...stale,
+            items: [{ id: 7, kind: 'user', text: 'durable archive' }],
+            archivedAt: Date.now(),
+          },
+        ],
+      }),
+    )
+
+    expect(loadProjectSessions(p)?.sessions).toEqual([])
+    expect(loadArchivedBody(p, stale.id)).toEqual([
+      { id: 7, kind: 'user', text: 'durable archive' },
+    ])
+    expect(JSON.parse(readFileSync(indexPath(p), 'utf8')).version).toBe(2)
+  })
+
+  it('repairs an expired legacy archive twin before retention removes its migrated body', () => {
+    retentionDays = 30
+    const p = uniqueProject()
+    const stale = session('stale')
+    saveProjectSessions(p, { version: 3, activeId: stale.id, sessions: [stale] })
+    writeFileSync(
+      indexPath(p),
+      JSON.stringify({
+        version: 1,
+        archived: [
+          {
+            ...stale,
+            items: [{ id: 7, kind: 'user', text: 'durable archive' }],
+            archivedAt: Date.now() - 40 * 86_400_000,
+          },
+        ],
+      }),
+    )
+
+    expect(loadProjectSessions(p)?.sessions).toEqual([])
+    expect(loadArchivedMeta(p)).toEqual([])
+    expect(loadArchivedBody(p, stale.id)).toBeNull()
+    const repaired = JSON.parse(readFileSync(storePath(p), 'utf8')) as { sessions: unknown[] }
+    expect(repaired.sessions).toEqual([])
+  })
+
+  it('keeps the hot row when archive metadata has no readable transcript body', () => {
+    const p = uniqueProject()
+    const stale = session('stale')
+    saveProjectSessions(p, { version: 3, activeId: stale.id, sessions: [stale] })
+    saveArchivedMeta(p, [
+      { id: stale.id, label: stale.label, cwd: stale.cwd, archivedAt: Date.now() },
+    ])
+
+    const report: StoreReadReport = { dropped: 0 }
+    expect(loadProjectSessions(p, report)?.sessions.map((row) => row.id)).toEqual([stale.id])
+    expect(report.unreadableArchiveBodyIds).toEqual([stale.id])
+    const onDisk = JSON.parse(readFileSync(storePath(p), 'utf8')) as { sessions: { id: string }[] }
+    expect(onDisk.sessions.map((row) => row.id)).toEqual([stale.id])
+  })
+
+  it('repairs an expired archive twin before retention deletes its tombstone and body', () => {
+    retentionDays = 30
+    const p = uniqueProject()
+    const stale = session('stale')
+    saveProjectSessions(p, { version: 3, activeId: stale.id, sessions: [stale] })
+    saveArchivedMeta(p, [
+      {
+        id: stale.id,
+        label: stale.label,
+        cwd: stale.cwd,
+        archivedAt: Date.now() - 40 * 86_400_000,
+      },
+    ])
+    writeArchivedBody(p, stale.id, stale.items)
+
+    expect(loadProjectSessions(p)?.sessions).toEqual([])
+    expect(loadArchivedMeta(p)).toEqual([])
+    expect(loadArchivedBody(p, stale.id)).toBeNull()
+    const repaired = JSON.parse(readFileSync(storePath(p), 'utf8')) as { sessions: unknown[] }
+    expect(repaired.sessions).toEqual([])
+  })
+
+  it('defers retention when the stale hot-row repair could not reach disk', () => {
+    retentionDays = 30
+    const p = uniqueProject()
+    const stale = session('stale')
+    saveProjectSessions(p, { version: 3, activeId: stale.id, sessions: [stale] })
+    saveArchivedMeta(p, [
+      {
+        id: stale.id,
+        label: stale.label,
+        cwd: stale.cwd,
+        archivedAt: Date.now() - 40 * 86_400_000,
+      },
+    ])
+    writeArchivedBody(p, stale.id, stale.items)
+    mkdirSync(`${storePath(p)}.tmp`)
+
+    // Memory may honor the archive for this run, but the old hot bytes are still on disk. The cold
+    // tombstone therefore has to survive too, ready for the next boot's repair retry.
+    expect(loadProjectSessions(p)?.sessions).toEqual([])
+    expect(loadArchivedMeta(p).map((meta) => meta.id)).toEqual([stale.id])
+    expect(loadArchivedBody(p, stale.id)).toEqual(stale.items)
+    const stillStale = JSON.parse(readFileSync(storePath(p), 'utf8')) as { sessions: { id: string }[] }
+    expect(stillStale.sessions.map((row) => row.id)).toEqual([stale.id])
+  })
+
+  it('a refused body write leaves the only transcript in the hot store', () => {
+    const p = uniqueProject()
+    const store = { version: 3 as const, activeId: 's1', sessions: [session('s1')] }
+    saveProjectSessions(p, store)
+    // Block creation of the bodies directory with a regular file. The writer must report failure,
+    // splitArchive must throw, and archiveSession must never reach the hot-store removal.
+    writeFileSync(bodiesDir(p), 'not a directory')
+
+    expect(() => archiveSession(p, store, session('s1'), 's1')).toThrow(/body could not be persisted/)
+    expect(loadProjectSessions(p)?.sessions.map((s) => s.id)).toEqual(['s1'])
+    expect(loadArchivedMeta(p)).toEqual([])
   })
 })
 
@@ -555,8 +972,8 @@ describe('a zero-length store file reads as absent, not corrupt (W2)', () => {
     expect(corruptBackups(storePath(p))).toHaveLength(0) // nothing to protect — no backup taken
 
     // Not bricked: a normal save afterward lands fine (the old bug refused to save over it forever).
-    saveProjectSessions(p, { version: 2, activeId: null, sessions: [] })
-    expect(loadProjectSessions(p)).toEqual({ version: 2, activeId: null, sessions: [] })
+    saveProjectSessions(p, { version: 3, activeId: null, sessions: [] })
+    expect(loadProjectSessions(p)).toEqual({ version: 3, activeId: null, sessions: [] })
   })
 
   it('whitespace-only counts as empty too', () => {
@@ -582,7 +999,7 @@ describe('one drifted session field costs only itself, not the whole project (W5
     writeFileSync(
       storePath(p),
       JSON.stringify({
-        version: 2,
+        version: 3,
         activeId: 'b',
         projectPath: p,
         sessions: [
@@ -613,7 +1030,7 @@ describe('a partial drop reports how many rows it set aside (C1)', () => {
     writeFileSync(
       storePath(p),
       JSON.stringify({
-        version: 2,
+        version: 3,
         activeId: 'a',
         projectPath: p,
         sessions: [
@@ -648,9 +1065,31 @@ describe('a partial drop reports how many rows it set aside (C1)', () => {
     expect(report.dropped).toBe(1)
   })
 
+  it('the preliminary tombstone read does not hide a malformed archive row from the reported load', () => {
+    const p = uniqueProject()
+    vi.spyOn(log, 'warn').mockImplementation(() => {})
+    saveProjectSessions(p, { version: 3, activeId: null, sessions: [] })
+    writeFileSync(
+      indexPath(p),
+      JSON.stringify({
+        version: 2,
+        archived: [
+          { id: 'same', label: 'Newest', cwd: '/x', archivedAt: 30 },
+          { id: 'drifted', label: 'Unreadable', cwd: '/x' },
+          { id: 'same', label: 'Older', cwd: '/x', archivedAt: 20 },
+        ],
+      }),
+    )
+
+    loadProjectSessions(p)
+    const report: StoreReadReport = { dropped: 0 }
+    expect(loadArchivedMeta(p, report).map((meta) => meta.id)).toEqual(['same'])
+    expect(report.dropped).toBe(1)
+  })
+
   it('a clean read reports no drops at all', () => {
     const p = uniqueProject()
-    saveProjectSessions(p, { version: 2, activeId: null, sessions: [] })
+    saveProjectSessions(p, { version: 3, activeId: null, sessions: [] })
     const report: StoreReadReport = { dropped: 0 }
     loadProjectSessions(p, report)
     expect(report.dropped).toBe(0)
@@ -872,3 +1311,37 @@ function catchError(fn: () => unknown): unknown {
   }
   throw new Error('expected a throw, got a clean return')
 }
+
+/**
+ * Resume state moved into a driver-owned blob. Rows saved before that (and headless phone rows, whose
+ * transcript main never persists) carry no cursor, so the store rebuilds one from what the row can
+ * prove — otherwise every existing chat would silently restart clean on the next launch.
+ */
+describe('resume cursor fallback for rows saved without one', () => {
+  it('rebuilds a Codex cursor from the old engineNativeId field', () => {
+    expect(
+      withResumeCursorFallback({ id: 's1', cwd: '/tmp/p', engineId: 'codex', engineNativeId: 'thread-1', items: [{}] }),
+    ).toMatchObject({ resumeCursor: { engine: 'codex', resumable: true, data: { threadId: 'thread-1', turns: 1 } } })
+  })
+
+  it('rebuilds a Claude cursor from the session id and its transcript', () => {
+    expect(withResumeCursorFallback({ id: 's2', cwd: '/tmp/p', items: [{}] })).toMatchObject({
+      resumeCursor: { engine: 'claude', resumable: true, data: { sessionId: 's2', turns: 1 } },
+    })
+  })
+
+  it('leaves a row with nothing to reattach to restarting clean', () => {
+    expect(withResumeCursorFallback({ id: 's3', cwd: '/tmp/koda-no-conversation-here', items: [] })).toMatchObject({
+      resumeCursor: { engine: 'claude', resumable: false, data: { turns: 0 } },
+    })
+    // A Codex row with no thread id has nothing to rebuild from at all.
+    expect(withResumeCursorFallback({ id: 's4', cwd: '/tmp/p', engineId: 'codex', items: [{}] })).not.toHaveProperty(
+      'resumeCursor',
+    )
+  })
+
+  it('never overwrites a cursor the driver already reported', () => {
+    const row = { id: 's5', cwd: '/tmp/p', items: [{}], resumeCursor: { engine: 'claude', resumable: false, data: {} } }
+    expect(withResumeCursorFallback(row)).toBe(row)
+  })
+})

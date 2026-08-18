@@ -16,6 +16,7 @@ import { GuardrailsSection, SkillsSection } from './GuardrailsSection'
 import { MemorySection } from './MemorySection'
 import { KodaAccountSection, RemoteSection } from './RemoteSection'
 import { FeedbackSection } from './FeedbackSection'
+import { windowHasOpenModal } from '../window-modal'
 import {
   IconSliders,
   IconAppearance,
@@ -90,7 +91,7 @@ const NAV_GROUPS: { title: string; items: NavItemDef[] }[] = [
     items: [
       { id: 'approvals', label: 'Agent & Approvals', icon: <IconShield /> },
       { id: 'guardrails', label: 'Guardrails', icon: <IconBook /> },
-      { id: 'skills', label: 'Skills', icon: <IconBlocks /> },
+      { id: 'skills', label: 'Playbook library', icon: <IconBlocks /> },
       { id: 'memory', label: 'Memory', icon: <IconMemory /> },
       { id: 'tools', label: 'Toolkit', icon: <IconToolbox /> },
     ],
@@ -135,7 +136,7 @@ export function Settings() {
     (CATEGORIES.some((c) => c.id === pendingSection) ? pendingSection : 'general') as CategoryId,
   )
   const setSettingsOpen = useWorkspace((s) => s.setSettingsOpen)
-  // Attention dot on the Memory row when this project's always-injected memory has grown heavy —
+  // Attention dot on the Memory row when this project's navigation notes have grown heavy —
   // the same signal the status-bar pill rides, so the cue survives once Settings is open.
   const memoryHeavy = useWorkspace((s) => s.memoryWeight?.heavy ?? false)
 
@@ -171,6 +172,7 @@ export function Settings() {
   // Esc closes the pane (matches the recovery drawer / macOS dialog feel).
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
+      if (windowHasOpenModal()) return
       if (e.key === 'Escape') setSettingsOpen(false)
     }
     window.addEventListener('keydown', onKey)
@@ -245,7 +247,9 @@ export function Settings() {
         </div>
       ) : (
         <div className="min-h-0 flex-1 overflow-y-auto">
-          <div className="mx-auto max-w-2xl space-y-8 px-8 py-9">
+          {/* space-y-10 is the section boundary: with rows unboxed, the gap between groups is what
+              tells them apart, so it has to be clearly bigger than the gap between rows. */}
+          <div className="mx-auto max-w-2xl space-y-10 px-8 py-9">
             {active === 'general' && <GeneralSection />}
             {active === 'koda-account' && <KodaAccountSection />}
             {active === 'providers' && <ProvidersSection />}

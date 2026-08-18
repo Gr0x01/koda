@@ -4,6 +4,13 @@ import type { GuardrailItemRef, GuardrailSaveRequest, GuardrailsLayer } from '@s
 import { loadPackRules, loadPresentation, type PackRule, resolvePack } from './engine/pack'
 import { catalogSkillIds } from './engine/skills-catalog'
 import {
+  type ProjectSkillDescriptor,
+  projectSkillClaims,
+  projectSkillCollisionNames,
+  projectSkillDescriptors,
+  slugifyBehaviorName,
+} from './project-skills'
+import {
   principleKey,
   readDisabledSet,
   readOverrides,
@@ -27,6 +34,17 @@ import {
 type Rule = GuardrailsLayer['rules'][number]
 type Item = GuardrailsLayer['skills'][number]
 
+function skillClaims(projectRoot: string, name: string): ProjectSkillDescriptor[] {
+  return projectSkillClaims(projectRoot).filter((descriptor) => descriptor.name === name)
+}
+
+function uniqueSkillForMutation(projectRoot: string, name: string): ProjectSkillDescriptor | undefined {
+  const claims = skillClaims(projectRoot, name)
+  if (claims.length > 1)
+    throw new Error(`Multiple project skill folders declare \`${name}\`. Resolve that collision before editing it.`)
+  return claims[0]
+}
+
 interface ResolvedPrinciple {
   id: string
   title: string
@@ -41,6 +59,7 @@ export function listGuardrails(projectRoot: string, resourcesPath?: string): Gua
   let packAgents: Item[] = []
   let projSkills: Item[] = []
   let projAgents: Item[] = []
+  let skillCollisions = new Set<string>()
   const disabled = readDisabledSet(projectRoot)
   const overrides = readOverrides(projectRoot)
 
@@ -76,6 +95,7 @@ export function listGuardrails(projectRoot: string, resourcesPath?: string): Gua
 
   // This project — its own behavior layer (CLAUDE.md + .claude/skills + .claude/agents).
   if (projectRoot) {
+    skillCollisions = new Set(projectSkillCollisionNames(projectRoot))
     const claudeMd = join(projectRoot, 'CLAUDE.md')
     if (existsSync(claudeMd)) {
       const body = safeRead(claudeMd).trim()
@@ -86,15 +106,15 @@ export function listGuardrails(projectRoot: string, resourcesPath?: string): Gua
     // like a hand-made one, but the Skills gallery owns them (turning them on/off). Surfacing them
     // here too would let a Guardrails disable/remove silently contradict the gallery.
     const ownedByGallery = catalogSkillIds(resourcesPath)
-    projSkills = readSkills(join(projectRoot, '.claude', 'skills'), 'project', disabled).filter(
-      (s) => !ownedByGallery.has(s.name),
-    )
+    projSkills = readProjectSkills(projectRoot, disabled, ownedByGallery)
     projAgents = readAgents(join(projectRoot, '.claude', 'agents'), 'project', disabled)
   }
 
   return {
     rules,
-    skills: mergeItems(packSkills, projSkills),
+    // An ambiguous canonical identity is not an actionable Settings row. Hide both project claims
+    // and any bundled row with the same engine-visible name until the user resolves the collision.
+    skills: mergeItems(packSkills.filter((item) => !skillCollisions.has(item.name)), projSkills),
     subagents: mergeItems(packAgents, projAgents),
   }
 }
@@ -127,17 +147,21 @@ function memberLine(r: PackRule): string {
 /**
  * Resolve the pack rules + presentation grouping into the principles the surface shows. Falls back to
  * one principle per rule group when presentation.json is missing, and sweeps any rule the presentation
- * forgot into a trailing "More" principle so nothing live in the prompt goes invisible (or un-toggleable).
+ * forgot into a trailing "More" principle so nothing public in the prompt goes invisible (or
+ * un-toggleable). Internal dogfood routes remain runtime-only by design.
  */
 function buildPrinciples(packDir: string): ResolvedPrinciple[] {
   const packRules = loadPackRules(packDir)
   if (!packRules) return []
+  const visibleGroups = packRules.groups
+    .map((group) => ({ ...group, rules: group.rules.filter((rule) => !rule.internal) }))
+    .filter((group) => group.rules.length > 0)
   const byId = new Map<string, PackRule>()
-  for (const g of packRules.groups) for (const r of g.rules) byId.set(r.id, r)
+  for (const g of visibleGroups) for (const r of g.rules) byId.set(r.id, r)
 
   const presentation = loadPresentation(packDir)
   if (!presentation) {
-    return packRules.groups.map((g) => ({
+    return visibleGroups.map((g) => ({
       id: g.id,
       title: g.heading,
       section: 'core' as const,
@@ -206,9 +230,9 @@ export function setRuleOverride(
 export async function saveGuardrail(
   projectRoot: string,
   req: GuardrailSaveRequest,
-  // Awaited immediately before the actual write — the caller's safety-git checkpoint. Validation
+  // Wraps the actual write in the caller's checkpoint + external-writer boundary. Validation
   // (missing name, name clash) throws BEFORE this runs, so a rejected paste never checkpoints.
-  beforeWrite: () => Promise<unknown>,
+  writeBoundary: <T>(write: () => T | Promise<T>) => Promise<T>,
 ): Promise<{ path: string }> {
   if (!projectRoot) throw new Error('Open a project first.')
   const text = req.text.trim()
@@ -217,44 +241,44 @@ export async function saveGuardrail(
   if (req.kind === 'rule') {
     const file = join(projectRoot, 'CLAUDE.md')
     const existing = existsSync(file) ? readFileSync(file, 'utf8').trimEnd() : ''
-    await beforeWrite()
-    writeFileSync(file, existing ? `${existing}\n\n${text}\n` : `${text}\n`, 'utf8')
-    return { path: file }
+    return writeBoundary(() => {
+      writeFileSync(file, existing ? `${existing}\n\n${text}\n` : `${text}\n`, 'utf8')
+      return { path: file }
+    })
   }
 
-  // skills/subagents: the name drives the file path, so it must come from the pasted file's frontmatter.
+  // Skills/subagents: the name drives the file path, so it must come from the pasted file's
+  // frontmatter. Skill names are their engine identity and must equal their directory slug; this keeps
+  // later Settings and Codex toggles from targeting different names.
   const name = parseFrontmatter(text).name
-  const slug = slugify(name || '')
+  const slug = slugifyBehaviorName(name || '')
   if (!slug) {
     throw new Error(
       'This needs a `name:` line at the top (paste the whole file), or use Create with agent to scaffold it.',
     )
+  }
+  if (req.kind === 'skill' && name !== slug) {
+    throw new Error(`A skill’s \`name:\` must use lowercase letters, numbers, and hyphens (try \`${slug}\`).`)
   }
 
   const file =
     req.kind === 'skill'
       ? join(projectRoot, '.claude', 'skills', slug, 'SKILL.md')
       : join(projectRoot, '.claude', 'agents', `${slug}.md`)
-  if (existsSync(file)) {
+  const skillIdentityExists = req.kind === 'skill' && skillClaims(projectRoot, name!).length > 0
+  if (existsSync(file) || skillIdentityExists) {
     throw new Error(`A ${req.kind} named “${slug}” already exists — rename it or edit the existing one.`)
   }
-  await beforeWrite()
-  mkdirSync(dirname(file), { recursive: true })
-  writeFileSync(file, text.endsWith('\n') ? text : `${text}\n`, 'utf8')
-  return { path: file }
+  return writeBoundary(() => {
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(file, text.endsWith('\n') ? text : `${text}\n`, 'utf8')
+    return { path: file }
+  })
 }
 
-/** A safe file/dir slug from a frontmatter name — strips separators/traversal entirely. */
-function slugify(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-}
-
-// Where a skill (a <name>/SKILL.md directory) or subagent (a flat <name>.md) lives in this project
-// (.claude/skills//.claude/agents/). NB: save/remove resolve the path from slugify(frontmatter name) —
-// assumes a pack item's `name:` equals its on-disk name (true for every current pack item; keep in sync).
+// Where a new skill (a <name>/SKILL.md directory) or subagent (a flat <name>.md) lives in this project.
+// Existing project skills resolve through projectSkillDescriptors because an older hand-made skill may
+// have a directory that differs from its frontmatter identity.
 const projectItemPath = (root: string, kind: GuardrailItemRef['kind'], slug: string): string =>
   kind === 'skill'
     ? join(root, '.claude', 'skills', slug, 'SKILL.md')
@@ -274,18 +298,30 @@ export async function saveItemBody(
   projectRoot: string,
   ref: GuardrailItemRef,
   content: string,
-  beforeWrite: () => Promise<unknown>,
+  writeBoundary: <T>(write: () => T | Promise<T>) => Promise<T>,
 ): Promise<{ path: string }> {
   if (!projectRoot) throw new Error('Open a project first.')
-  const slug = slugify(ref.name)
+  const slug = slugifyBehaviorName(ref.name)
   if (!slug) throw new Error('Invalid name.')
   if (!content.trim()) throw new Error('This can’t be empty.')
-  const dest = projectItemPath(projectRoot, ref.kind, slug)
-  await beforeWrite()
-  mkdirSync(dirname(dest), { recursive: true })
-  writeFileSync(dest, content.endsWith('\n') ? content : `${content}\n`, 'utf8')
-  setGuardrailsDisabled(projectRoot, [itemKey(ref.kind, slug)], false)
-  return { path: dest }
+  const existingSkill =
+    ref.kind === 'skill'
+      ? uniqueSkillForMutation(projectRoot, ref.name)
+      : undefined
+  if (ref.kind === 'skill') {
+    const editedName = parseFrontmatter(content).name
+    if (!editedName) throw new Error('A skill needs a `name:` line in its frontmatter.')
+    if (editedName !== ref.name) {
+      throw new Error(`Keep this skill’s \`name:\` as \`${ref.name}\`; create a new skill to rename it.`)
+    }
+  }
+  const dest = existingSkill?.file ?? projectItemPath(projectRoot, ref.kind, slug)
+  return writeBoundary(() => {
+    mkdirSync(dirname(dest), { recursive: true })
+    writeFileSync(dest, content.endsWith('\n') ? content : `${content}\n`, 'utf8')
+    setGuardrailsDisabled(projectRoot, [itemKey(ref.kind, slug)], false)
+    return { path: dest }
+  })
 }
 
 /**
@@ -296,16 +332,21 @@ export async function saveItemBody(
 export async function removeGuardrailItem(
   projectRoot: string,
   ref: GuardrailItemRef,
-  beforeWrite: () => Promise<unknown>,
+  writeBoundary: <T>(write: () => T | Promise<T>) => Promise<T>,
 ): Promise<void> {
   if (!projectRoot) throw new Error('Open a project first.')
-  const slug = slugify(ref.name)
+  const slug = slugifyBehaviorName(ref.name)
   if (!slug) throw new Error('Invalid name.')
-  const file = projectItemPath(projectRoot, ref.kind, slug)
+  const existingSkill =
+    ref.kind === 'skill'
+      ? uniqueSkillForMutation(projectRoot, ref.name)
+      : undefined
+  const file = existingSkill?.file ?? projectItemPath(projectRoot, ref.kind, slug)
   if (!existsSync(file)) throw new Error('That item no longer exists.')
-  await beforeWrite()
-  // A skill is a directory (<name>/SKILL.md); a subagent is a single file.
-  rmSync(ref.kind === 'skill' ? dirname(file) : file, { recursive: true, force: true })
+  await writeBoundary(() => {
+    // A skill is a directory (<name>/SKILL.md); a subagent is a single file.
+    rmSync(ref.kind === 'skill' ? dirname(file) : file, { recursive: true, force: true })
+  })
 }
 
 /** Skills live at <dir>/<name>/SKILL.md. */
@@ -316,6 +357,21 @@ function readSkills(dir: string, scope: Item['scope'], disabled: Set<string>): I
       return existsSync(file) ? itemFrom(file, entry, scope, disabled, skillKey) : null
     })
     .filter((x): x is Item => x !== null)
+}
+
+/** Project skills use their frontmatter name as the one canonical engine identity. The gallery,
+ *  however, owns the exact catalog directory it copies/removes. A legacy folder whose frontmatter
+ *  happens to claim a catalog identity stays here in Guardrails because the gallery cannot manage it. */
+function readProjectSkills(
+  projectRoot: string,
+  disabled: Set<string>,
+  galleryDirectories: Set<string>,
+): Item[] {
+  return projectSkillDescriptors(projectRoot)
+    .filter((descriptor) => !galleryDirectories.has(descriptor.directoryName))
+    .map((descriptor) =>
+      itemFrom(descriptor.file, descriptor.name, 'project', disabled, skillKey, descriptor.name),
+    )
 }
 
 /** Subagents are flat <dir>/<name>.md files. */
@@ -331,10 +387,11 @@ function itemFrom(
   scope: Item['scope'],
   disabled: Set<string>,
   keyFor: (name: string) => string,
+  canonicalName?: string,
 ): Item {
   const content = safeRead(file)
   const fm = parseFrontmatter(content)
-  const name = fm.name || fallbackName
+  const name = canonicalName ?? fm.name ?? fallbackName
   // Uniform: every item — Koda default or the project's own — has an on/off toggle (by name, via
   // --disallowedTools) and is editable in place (the panel edits `body`; saving a Koda default forks
   // it into the project). `openPath` marks a project file (inside the per-window root).

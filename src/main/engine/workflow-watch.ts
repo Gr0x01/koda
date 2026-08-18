@@ -35,9 +35,12 @@ export class WorkflowWatcher {
   private timer: ReturnType<typeof setInterval> | null = null
   private linesSeen = 0
   private readonly agents = new Set<string>()
+  /** Members whose journal has a start but no result. They become unknown if observation ends. */
+  private readonly runningAgents = new Set<string>()
   private lastChange = Date.now()
   private readonly startedAt = Date.now()
   private done = false
+  private stopped = false
   private resultDelivered = false
 
   constructor(
@@ -57,9 +60,35 @@ export class WorkflowWatcher {
     this.timer = setInterval(() => this.tick(), POLL_MS)
   }
 
+  /** Exact members whose start is still missing a result. Main snapshots this across renderer/phone
+   *  reattachment so hydration can restore only work the live watcher still observes. */
+  activeAgentIds(): string[] {
+    return [...this.runningAgents]
+  }
+
+  /** User-visible work is live until coordinator completion, or whenever a late wave has a member
+   *  without a result. The watcher itself intentionally outlives this state to catch possible writers. */
+  isLive(): boolean {
+    return !this.stopped && (!this.done || this.runningAgents.size > 0)
+  }
+
   stop(): void {
+    if (this.stopped) return
+    this.stopped = true
     if (this.timer) clearInterval(this.timer)
     this.timer = null
+    const unresolvedAgentIds = [...this.runningAgents]
+    // A quiet completion with every known result is already terminal. Every other teardown is one
+    // atomic observer-loss fact: a missing result is not success, and the coordinator is not live.
+    if (!this.done || unresolvedAgentIds.length > 0) {
+      this.emit({
+        type: 'WorkflowObservationEnded',
+        sessionId: this.sessionId,
+        runId: this.runId,
+        unresolvedAgentIds,
+      })
+    }
+    this.runningAgents.clear()
   }
 
   private tick(): void {
@@ -79,16 +108,15 @@ export class WorkflowWatcher {
     // Surface "complete" + notify ONCE, the first time the journal goes quiet after producing
     // output. We keep watching afterward so a later wave's agents still surface (readNewLines emits
     // them), but we don't re-notify — `done` stays set so this fires a single time.
-    if (!this.done && this.linesSeen > 0 && quietFor > COMPLETE_AFTER_QUIET_MS) {
+    if (!this.done && this.linesSeen > 0 && this.runningAgents.size === 0 && quietFor > COMPLETE_AFTER_QUIET_MS) {
       this.done = true
       this.emit({ type: 'WorkflowCompleted', sessionId: this.sessionId, runId: this.runId, agentCount: this.agents.size })
     }
 
-    // Fully stop once it's been quiet long past completion, or hit the lifetime backstop.
-    if (expired || (this.linesSeen > 0 && quietFor > STOP_AFTER_QUIET_MS)) {
-      if (!this.done) {
-        this.emit({ type: 'WorkflowCompleted', sessionId: this.sessionId, runId: this.runId, agentCount: this.agents.size })
-      }
+    // Fully stop once a settled journal has been quiet long past completion, or hit the lifetime
+    // backstop. Journal quiet is not evidence that a member whose `started` line has no matching
+    // result stopped writing: keep observing that known owner across arbitrarily long agent work.
+    if (expired || (this.linesSeen > 0 && this.runningAgents.size === 0 && quietFor > STOP_AFTER_QUIET_MS)) {
       this.finish()
     }
   }
@@ -109,9 +137,11 @@ export class WorkflowWatcher {
       if (!agentId) continue
       if (rec.type === 'started') {
         this.agents.add(agentId)
+        this.runningAgents.add(agentId)
         this.emit({ type: 'WorkflowAgent', sessionId: this.sessionId, runId: this.runId, agentId, status: 'running' })
       } else if (rec.type === 'result') {
         this.agents.add(agentId)
+        this.runningAgents.delete(agentId)
         const result = typeof rec.result === 'string' ? rec.result.slice(0, RESULT_CAP) : undefined
         this.emit({ type: 'WorkflowAgent', sessionId: this.sessionId, runId: this.runId, agentId, status: 'done', result })
       }
@@ -148,6 +178,21 @@ export class WorkflowWatcher {
     }
     if (rec.status !== 'completed') return // still running (e.g. a long pause between waves)
     this.resultDelivered = true
+    // Coordinator completion begins the same late-wave observation window as a final journal row.
+    // Without this reset, a result file discovered after a long-running member crossed the old journal
+    // quiet threshold would settle that member and stop the observer in the same tick.
+    this.lastChange = Date.now()
+    // The engine's result file is stronger evidence than journal quiet. Settle any member whose
+    // final journal line lagged or never arrived, then publish the coordinator's completion now so
+    // an immediate engine close cannot downgrade confirmed work to observer loss.
+    for (const agentId of this.runningAgents) {
+      this.emit({ type: 'WorkflowAgent', sessionId: this.sessionId, runId: this.runId, agentId, status: 'done' })
+    }
+    this.runningAgents.clear()
+    if (!this.done) {
+      this.done = true
+      this.emit({ type: 'WorkflowCompleted', sessionId: this.sessionId, runId: this.runId, agentCount: this.agents.size })
+    }
     const label =
       (typeof rec.workflowName === 'string' && rec.workflowName) ||
       (typeof rec.summary === 'string' && rec.summary) ||

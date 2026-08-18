@@ -54,6 +54,20 @@ import {
 const H = 3_600_000
 const NOW = 1_000_000_000_000
 
+function passingOwnership(cwd: string, sessionId = 's1') {
+  const scope = { cwd, sessionId, checkpointId: 'before-tidy' }
+  return {
+    beginProjectMutationScope: vi.fn().mockResolvedValue(scope),
+    finishProjectMutationScope: vi.fn(async (_scope: typeof scope, mutate: () => Promise<unknown>) => ({
+      overlapObserved: false,
+      result: await mutate(),
+    })),
+    withExternalProjectMutation: vi.fn(
+      async (_project: string, _options: unknown, mutate: (checkpointed: boolean) => unknown) => mutate(true),
+    ),
+  }
+}
+
 function activity(entries: Record<string, number>): Map<string, number> {
   return new Map(Object.entries(entries))
 }
@@ -261,7 +275,9 @@ describe('DreamScheduler.dreamProject: unattended flag lifecycle', () => {
       sendTurn: vi.fn().mockResolvedValue('sent'),
       lastAssistantReply: vi.fn().mockReturnValue('did stuff'),
       clearUnattended: vi.fn(),
+      revealDreamSession: vi.fn(),
       awaitTurnEnd: vi.fn().mockReturnValue(new Promise(() => {})),
+      ...passingOwnership('/tmp/koda-test-project'),
     }
   }
 
@@ -301,7 +317,9 @@ describe('DreamScheduler.dreamProject: unattended flag lifecycle', () => {
       sendTurn: vi.fn().mockRejectedValue(new Error('unknown session')),
       lastAssistantReply: vi.fn().mockReturnValue(undefined),
       clearUnattended: vi.fn(),
+      revealDreamSession: vi.fn(),
       awaitTurnEnd: vi.fn().mockReturnValue(new Promise(() => {})),
+      ...passingOwnership('/tmp/koda-test-project'),
     }
     const scheduler = new DreamScheduler(sessions as unknown as EngineSessionManager)
     await expect(
@@ -326,6 +344,8 @@ describe('DreamScheduler.dreamProject: REM lifecycle', () => {
   })
 
   function remSessions() {
+    const cwd = '/tmp/koda-rem-project'
+    const scope = { cwd, sessionId: 's-tidy', checkpointId: 'before-tidy' }
     return {
       isWorking: vi.fn().mockReturnValue(false),
       lastEngineEventAt: vi.fn().mockReturnValue(Date.now()),
@@ -336,12 +356,96 @@ describe('DreamScheduler.dreamProject: REM lifecycle', () => {
       sendTurn: vi.fn().mockResolvedValue('sent'),
       lastAssistantReply: vi.fn().mockReturnValueOnce('Tidy complete.').mockReturnValueOnce('REM brief.'),
       clearUnattended: vi.fn(),
+      revealDreamSession: vi.fn(),
       dispose: vi.fn().mockResolvedValue(undefined),
       forgetSession: vi.fn(),
       awaitTurnEnd: vi.fn().mockReturnValue(Promise.resolve()),
       remoteRateLimits: vi.fn().mockReturnValue({}),
+      beginProjectMutationScope: vi.fn(async () => {
+        try {
+          const pre = await checkpointMock(cwd, 'before overnight memory tidy')
+          return pre?.id ? { ...scope, checkpointId: pre.id } : null
+        } catch {
+          return null
+        }
+      }),
+      finishProjectMutationScope: vi.fn(async (
+        _active: typeof scope,
+        mutate: () => Promise<unknown>,
+      ) => ({
+        overlapObserved: false,
+        result: await mutate(),
+      })),
+      checkpointProjectForSession: vi.fn(async () => {
+        try {
+          return await checkpointMock(cwd, 'before overnight REM')
+        } catch {
+          return null
+        }
+      }),
+      withExternalProjectMutation: vi.fn(
+        async (_project: string, _options: unknown, mutate: (checkpointed: boolean) => unknown) => mutate(true),
+      ),
     }
   }
+
+  it('uses a memory-only tidy gate and never performs destructive live-tree cleanup', async () => {
+    checkpointMock.mockResolvedValueOnce({ id: 'before-tidy' })
+    const sessions = remSessions()
+    const scheduler = new DreamScheduler(sessions as unknown as EngineSessionManager)
+
+    await (
+      scheduler as unknown as { dreamProject: (cwd: string) => Promise<void> }
+    ).dreamProject('/tmp/koda-rem-project')
+
+    expect(sessions.startDreamSession).toHaveBeenNthCalledWith(
+      1,
+      '/tmp/koda-rem-project',
+      expect.stringContaining('Dream'),
+      { deferVisibility: true, memoryOnly: true },
+    )
+    expect(sessions.sendTurn.mock.calls[0][4]).toEqual({
+      projectMutationScope: expect.objectContaining({ sessionId: 's-tidy' }),
+    })
+    expect(restoreMock).not.toHaveBeenCalled()
+    expect(runGitMock).not.toHaveBeenCalled()
+    expect(rmMock).not.toHaveBeenCalled()
+    expect(atomicWriteMock.mock.calls.some(([path]) => String(path).endsWith('dream-digest.md'))).toBe(true)
+  })
+
+  it('still lands the digest when manager-observed ownership overlaps', async () => {
+    checkpointMock.mockResolvedValueOnce({ id: 'before-tidy' })
+    const sessions = remSessions()
+    sessions.finishProjectMutationScope.mockImplementation(async (_scope, mutate) => ({
+      overlapObserved: true,
+      result: await mutate(),
+    }))
+    const scheduler = new DreamScheduler(sessions as unknown as EngineSessionManager)
+
+    await (
+      scheduler as unknown as { dreamProject: (cwd: string) => Promise<void> }
+    ).dreamProject('/tmp/koda-rem-project')
+
+    expect(atomicWriteMock.mock.calls.some(([path]) => String(path).endsWith('dream-digest.md'))).toBe(true)
+    expect(restoreMock).not.toHaveBeenCalled()
+    expect(runGitMock).not.toHaveBeenCalled()
+  })
+
+  it('tears down the never-used tidy session when its baseline cannot be made', async () => {
+    checkpointMock.mockResolvedValueOnce({ id: undefined })
+    const sessions = remSessions()
+    const scheduler = new DreamScheduler(sessions as unknown as EngineSessionManager)
+
+    await (
+      scheduler as unknown as { dreamProject: (cwd: string) => Promise<void> }
+    ).dreamProject('/tmp/koda-rem-project')
+
+    expect(sessions.sendTurn).not.toHaveBeenCalled()
+    expect(sessions.dispose).toHaveBeenCalledWith('s-tidy')
+    expect(sessions.forgetSession).toHaveBeenCalledWith('s-tidy')
+    expect(sessions.revealDreamSession).not.toHaveBeenCalled()
+    expect(atomicWriteMock.mock.calls.some(([path]) => String(path).endsWith('dream-digest.md'))).toBe(false)
+  })
 
   it('runs REM in a read-only disposable snapshot and writes both digests', async () => {
     checkpointMock
@@ -363,16 +467,20 @@ describe('DreamScheduler.dreamProject: REM lifecycle', () => {
       expect.stringContaining('Dream REM'),
       { readOnly: true, visible: false },
     )
-    expect(changesMock).toHaveBeenNthCalledWith(1, '/tmp/koda-rem-project', 'before-tidy')
+    expect(changesMock).not.toHaveBeenCalled()
     expect(atomicWriteMock.mock.calls.some(([path]) => String(path).endsWith('rem-digest.md'))).toBe(true)
     expect(atomicWriteMock.mock.calls.some(([path]) => String(path).endsWith('dream-digest.md'))).toBe(true)
     expect(sessions.clearUnattended).toHaveBeenCalledWith('s-tidy')
+    expect(sessions.revealDreamSession).toHaveBeenCalledWith('s-tidy')
     expect(sessions.dispose).toHaveBeenCalledWith('s-rem')
     expect(sandboxRemoveMock).toHaveBeenCalledWith('/tmp/koda-rem-sandbox')
     expect(sessions.dispose.mock.invocationCallOrder[0]).toBeLessThan(sandboxRemoveMock.mock.invocationCallOrder[0])
     const remWriteIndex = atomicWriteMock.mock.calls.findIndex(([path]) => String(path).endsWith('rem-digest.md'))
     expect(sandboxRemoveMock.mock.invocationCallOrder[0]).toBeLessThan(
       atomicWriteMock.mock.invocationCallOrder[remWriteIndex],
+    )
+    expect(atomicWriteMock.mock.invocationCallOrder[remWriteIndex]).toBeLessThan(
+      sessions.revealDreamSession.mock.invocationCallOrder[0],
     )
   })
 
@@ -388,10 +496,28 @@ describe('DreamScheduler.dreamProject: REM lifecycle', () => {
     ).dreamProject('/tmp/koda-rem-project', true)
 
     expect(sessions.sendTurn).toHaveBeenCalledTimes(1)
-    expect(changesMock).toHaveBeenCalledWith('/tmp/koda-rem-project', 'before-tidy')
+    expect(changesMock).not.toHaveBeenCalled()
     expect(sandboxCreateMock).not.toHaveBeenCalled()
     const remWrite = atomicWriteMock.mock.calls.find(([path]) => String(path).endsWith('rem-digest.md'))
     expect(remWrite?.[1]).toContain('could not make the safety checkpoint')
+  })
+
+  it('does not write a REM digest when the digest recovery point cannot be made', async () => {
+    const sessions = remSessions()
+    sessions.remoteRateLimits.mockReturnValue({ claude: { five_hour: { usedPercent: 80 } } })
+    sessions.withExternalProjectMutation.mockImplementation(async (_project, _options, mutate) => mutate(false))
+    const scheduler = new DreamScheduler(sessions as unknown as EngineSessionManager)
+
+    await (
+      scheduler as unknown as { runRem: (cwd: string, night: Date, owner: string, force: boolean) => Promise<void> }
+    ).runRem('/tmp/koda-rem-project', new Date(2026, 7, 10, 23, 5), 's-tidy', false)
+
+    expect(sessions.withExternalProjectMutation).toHaveBeenCalledWith(
+      '/tmp/koda-rem-project',
+      { checkpointLabel: 'before overnight REM digest', refreshOwnership: false },
+      expect.any(Function),
+    )
+    expect(atomicWriteMock.mock.calls.some(([path]) => String(path).endsWith('rem-digest.md'))).toBe(false)
   })
 
   it('tears down an interrupted REM engine before deleting its sandbox', async () => {
@@ -407,8 +533,8 @@ describe('DreamScheduler.dreamProject: REM lifecycle', () => {
     ).mockResolvedValue('interrupted')
 
     await (
-      scheduler as unknown as { runRem: (cwd: string, night: Date, force: boolean) => Promise<void> }
-    ).runRem('/tmp/koda-rem-project', new Date(2026, 7, 10, 23, 5), true)
+      scheduler as unknown as { runRem: (cwd: string, night: Date, owner: string, force: boolean) => Promise<void> }
+    ).runRem('/tmp/koda-rem-project', new Date(2026, 7, 10, 23, 5), 's-tidy', true)
 
     expect(sessions.dispose).toHaveBeenCalledWith('s-rem')
     expect(sessions.forgetSession).toHaveBeenCalledWith('s-rem')
@@ -422,8 +548,8 @@ describe('DreamScheduler.dreamProject: REM lifecycle', () => {
     const scheduler = new DreamScheduler(sessions as unknown as EngineSessionManager)
 
     await (
-      scheduler as unknown as { runRem: (cwd: string, night: Date, force: boolean) => Promise<void> }
-    ).runRem('/tmp/koda-rem-project', new Date(2026, 7, 10, 23, 5), true)
+      scheduler as unknown as { runRem: (cwd: string, night: Date, owner: string, force: boolean) => Promise<void> }
+    ).runRem('/tmp/koda-rem-project', new Date(2026, 7, 10, 23, 5), 's-tidy', true)
 
     expect(sandboxRemoveMock).toHaveBeenCalledWith('/tmp/koda-rem-sandbox')
     expect(sessions.sendTurn).not.toHaveBeenCalled()
@@ -438,8 +564,8 @@ describe('DreamScheduler.dreamProject: REM lifecycle', () => {
     const scheduler = new DreamScheduler(sessions as unknown as EngineSessionManager)
 
     await (
-      scheduler as unknown as { runRem: (cwd: string, night: Date, force: boolean) => Promise<void> }
-    ).runRem('/tmp/koda-rem-project', new Date(2026, 7, 10, 23, 5), true)
+      scheduler as unknown as { runRem: (cwd: string, night: Date, owner: string, force: boolean) => Promise<void> }
+    ).runRem('/tmp/koda-rem-project', new Date(2026, 7, 10, 23, 5), 's-tidy', true)
 
     const remWrite = atomicWriteMock.mock.calls.find(([path]) => String(path).endsWith('rem-digest.md'))
     expect(remWrite?.[1]).toContain('CONTAINMENT FAILED')

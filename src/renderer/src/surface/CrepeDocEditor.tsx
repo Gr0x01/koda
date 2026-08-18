@@ -2,7 +2,9 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Crepe } from '@milkdown/crepe'
 import { editorViewCtx } from '@milkdown/kit/core'
 import { replaceAll } from '@milkdown/kit/utils'
+import { splitDocumentFrontmatter } from '@shared/document-contract'
 import { useWorkspace } from '../workspace/store'
+import { Collapse } from '../motion'
 import { IconButton } from '../ui'
 import { useTableColumnResize } from './useTableColumnResize'
 import { buildDocBlockMenu, docBlockPlugins } from './blocks'
@@ -10,6 +12,8 @@ import { DocOutline, docHeadingEls, headingSlug } from './DocOutline'
 import { DocPageChrome } from './DocPageChrome'
 import { TranscriptFind } from './TranscriptFind'
 import './doc-theme.css'
+import { windowHasOpenModal } from '../window-modal'
+import { registerFileWriter } from '../workspace/file-writer-registry'
 
 /** A frozen text selection inside the doc + where to join the Canvas controls beneath Crepe's toolbar. */
 type CanvasSelection = { text: string; top: number; left: number }
@@ -24,11 +28,6 @@ const KODA_AI_ICON =
  * metadata survives byte-for-byte. The match captures its own trailing newline so `frontmatter + body`
  * reconstructs the original exactly.
  */
-function splitFrontmatter(raw: string): { frontmatter: string; body: string } {
-  const m = /^---\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/.exec(raw)
-  return m ? { frontmatter: m[0], body: raw.slice(m[0].length) } : { frontmatter: '', body: raw }
-}
-
 /** Resolve a doc-relative link target against the doc's own folder — a pure string walk (no node:path
  *  in the renderer). An absolute path passes through (the contained-fs gate downstream judges it); a
  *  `..` escape above root returns null and the click is simply ignored. */
@@ -46,9 +45,98 @@ function resolveDocLink(docPath: string, ref: string): string | null {
 }
 
 /**
+ * The two "you can't type here" facts a document holds at once, deliberately kept apart.
+ *
+ * `readOnly` is about the FILE: today only a truncated read, where saving would destroy the part we
+ * never loaded. Reading state is about the USER: they opened the doc and haven't asked to edit it.
+ * Collapsing them (the obvious `readOnly={!editing}`) would also stop the agent's live rewrite, the
+ * re-read after an engine edit, and the select-a-passage path — the three things a document being
+ * READ has to keep doing.
+ */
+export function docEditorGuards({ readOnly, editing }: { readOnly: boolean; editing: boolean }): {
+  /** ProseMirror's own `editable` flag: this gates the user's keystrokes and nothing else. */
+  userEditable: boolean
+  /** A programmatic `replaceAll` (agent edit, re-read) still lands while the doc is being read. */
+  acceptsRefresh: boolean
+  /** Selecting a passage to work on it with Koda is what reading state is FOR. */
+  selectable: boolean
+} {
+  return { userEditable: !readOnly && editing, acceptsRefresh: !readOnly, selectable: !readOnly }
+}
+
+/** How long the doc sits still before a coalesced autosave lands. Long enough that ordinary typing
+ *  doesn't put a file write and a safety-git checkpoint behind every word, short enough that "saved
+ *  automatically" is already true by the time the user looks away. */
+export const DOC_AUTOSAVE_IDLE_MS = 900
+
+export type SaveCoalescer = {
+  /** The body changed: restart the idle timer. */
+  schedule: () => void
+  /** Write now, resolving once the write settles — leaving edit mode, ⌘S, an ask, or unmount. */
+  flush: () => Promise<void>
+  /** Drop a pending timer without writing (the editor is about to hold a different file). */
+  cancel: () => void
+}
+
+/**
+ * Coalesces the document's writes. Milkdown reports a change per keystroke, so saving on each one
+ * would put a file write and a safety-git checkpoint behind every character. One trailing timer,
+ * restarted by each change, is what "saved automatically" means here.
+ *
+ * Writes are also serialised: a flush arriving mid-write (the Stage tab switch that unmounts the
+ * editor) queues one more pass instead of racing the first, so the last keystrokes can't lose to an
+ * earlier write landing after them. The returned promise covers the queued pass too.
+ */
+export function createSaveCoalescer(save: () => Promise<void>, idleMs = DOC_AUTOSAVE_IDLE_MS): SaveCoalescer {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  let inFlight: Promise<void> | null = null
+  let queued = false
+  const cancel = (): void => {
+    if (timer !== null) clearTimeout(timer)
+    timer = null
+  }
+  const run = (): Promise<void> => {
+    if (inFlight) {
+      queued = true
+      return inFlight
+    }
+    inFlight = (async () => {
+      try {
+        await save()
+      } finally {
+        inFlight = null
+        if (queued) {
+          queued = false
+          await run()
+        }
+      }
+    })()
+    return inFlight
+  }
+  return {
+    schedule: () => {
+      cancel()
+      timer = setTimeout(() => {
+        timer = null
+        void run()
+      }, idleMs)
+    },
+    flush: () => {
+      cancel()
+      return run()
+    },
+    cancel,
+  }
+}
+
+/**
  * The WYSIWYG document body — Crepe (Milkdown) over a markdown file. The file on disk stays canonical
  * markdown (the agent reads/writes it unchanged); this is purely a rich VIEW + write-back. Lazy-loaded
  * so Crepe stays out of the conversation-only bundle (loads only when a doc is opened).
+ *
+ * A doc opens in READING state and enters editing only when the user picks Edit; see `docEditorGuards`
+ * for why that is not the `readOnly` prop. Editing saves itself: every write, autosaved or manual,
+ * goes through the one `save()` below, so there is a single writer to reason about.
  *
  * Saves flow through `fs:writeFile`, where main checkpoints the pre-edit tree before writing — so a
  * user's doc edit is recoverable exactly like an engine tool write (dual-git thesis).
@@ -58,18 +146,23 @@ function resolveDocLink(docPath: string, ref: string): string | null {
  * a doc never shows spurious "unsaved changes"; the first real save normalises the file once on disk
  * (idempotent thereafter).
  */
-export function CrepeDocEditor({
+function CrepeDocEditor({
   path,
+  surfacePath,
   initialContent,
   readOnly = false,
   sessionId,
   className = '',
 }: {
+  /** Main's resolved path: the one identity used for writes and destructive-boundary matching. */
   path: string
+  /** The lexical path that keys this open Stage surface. */
+  surfacePath: string
   /** The file's current on-disk content. Re-passed (freshly read) when the engine edits the file;
    *  since the user's own edits live inside Crepe, a change here means the AGENT edited — we swap the
    *  editor body in place so the user watches the doc build without a remount. */
   initialContent: string
+  /** The FILE can't be written back (a truncated read). Not "not editing yet" — see `docEditorGuards`. */
   readOnly?: boolean
   /** The session whose agent last edited this doc — used to detect a new turn (busy rising edge) so the
    *  Keep/Revert review re-baselines per turn instead of accumulating across turns. */
@@ -99,17 +192,32 @@ export function CrepeDocEditor({
   }, [busy])
   // Frontmatter is held aside (never enters the editor) and re-attached on save; the editor + dirty
   // baseline only ever deal with the prose body.
-  const { frontmatter, body } = useMemo(() => splitFrontmatter(initialContent), [initialContent])
+  const { frontmatter, body } = useMemo(() => splitDocumentFrontmatter(initialContent), [initialContent])
   const baselineRef = useRef(body)
   const [dirty, setDirty] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // `save` reports failures in the pane instead of rejecting every fire-and-forget autosave. The
+  // writer registry still needs a hard failure signal so a confirmed delete can stop before main.
+  const lastSaveErrorRef = useRef<unknown>(null)
+  // Reading vs. direct editing. A doc always opens in reading state; Edit is the one way in.
+  const [editing, setEditing] = useState(false)
+  const guards = docEditorGuards({ readOnly, editing })
+  const editingRef = useRef(editing)
+  editingRef.current = editing
+  // The body as the editor was torn down. Milkdown's markdown listener is debounced (200ms) and is
+  // CANCELLED when the view is destroyed, so the last keystrokes before a tab switch exist nowhere but
+  // the editor itself — this is where they are caught on the way out, for the flush that follows.
+  const finalBodyRef = useRef<string | null>(null)
+  // Autosave. `saveRef` is filled in below (the save closure wants this render's frontmatter and path);
+  // the coalescer only calls it when a write is actually due, which is what keeps one writer.
+  const saveRef = useRef<() => Promise<void>>(async () => {})
+  const autosaveRef = useRef<SaveCoalescer | null>(null)
+  if (!autosaveRef.current) autosaveRef.current = createSaveCoalescer(() => saveRef.current())
+  const autosave = autosaveRef.current
   // The last save landed but main couldn't take a recovery point for it. Silence would leave the user
   // believing this edit is undoable when it isn't. Cleared by the next save that does get one.
   const [noUndo, setNoUndo] = useState(false)
-  // The pane swaps a new file's content INTO this instance rather than remounting it, so a per-file
-  // flag follows the user to the next doc unless it's cleared here.
-  useEffect(() => setNoUndo(false), [path])
   // Flips true once Crepe finishes mounting — also the re-trigger that lets the live-edit effect catch
   // up on any `body` that advanced during the (async) mount window.
   const [ready, setReady] = useState(false)
@@ -133,7 +241,8 @@ export function CrepeDocEditor({
 
   // Notion-grade table column resizing — overlaid on Crepe's table NodeView; widths persist to the
   // doc's `.koda/docmeta/` sidecar (the markdown stays plain). Runs once Crepe has mounted.
-  useTableColumnResize({ hostRef, path, ready, readOnly, fullWidth })
+  // Drag handles are a user mutation, so they follow the human-editing state, not the file's.
+  useTableColumnResize({ hostRef, path, ready, readOnly: !guards.userEditable, fullWidth })
 
   // ⌘F finds inside THIS doc when the user is working in it (focus inside the editor); the
   // conversation's own ⌘F handler stands down for that case (it skips [data-doc-editor], the same
@@ -141,6 +250,7 @@ export function CrepeDocEditor({
   const [findOpen, setFindOpen] = useState(false)
   useEffect(() => {
     function onKey(e: KeyboardEvent): void {
+      if (windowHasOpenModal()) return
       if (!(e.metaKey || e.ctrlKey) || e.shiftKey || e.code !== 'KeyF') return
       const wrap = wrapRef.current
       if (!wrap || !wrap.contains(document.activeElement)) return
@@ -242,14 +352,22 @@ export function CrepeDocEditor({
     crepe.editor.use(docBlockPlugins)
     crepe.on((api) => {
       api.markdownUpdated((_ctx, markdown) => {
-        if (!disposed) setDirty(markdown !== baselineRef.current)
+        if (disposed) return
+        const changed = markdown !== baselineRef.current
+        setDirty(changed)
+        // Only the user's own typing arms the autosave. An agent swap also lands here, and its content
+        // is already the file on disk — re-baselined a line later, so a queued write would be a no-op
+        // anyway, but arming on it would mean reading a doc could write it.
+        if (changed && editingRef.current) autosave.schedule()
       })
     })
     crepe
       .create()
       .then(() => {
         if (disposed) return
-        crepe.setReadonly(readOnly)
+        // Reading state is the resting state, so a doc is born non-editable; the effect below follows
+        // the Edit action from here on.
+        crepe.setReadonly(!docEditorGuards({ readOnly, editing: editingRef.current }).userEditable)
         // Baseline against the normalised form so the doc doesn't open pre-dirtied.
         baselineRef.current = crepe.getMarkdown()
         crepeRef.current = crepe
@@ -258,11 +376,31 @@ export function CrepeDocEditor({
       .catch((e) => !disposed && setError(String(e)))
     return () => {
       disposed = true
+      // Hand the body to the unmount flush while the editor still exists. This must stay ahead of
+      // `destroy()`, and this effect must stay ahead of the flush effect below, because React runs
+      // cleanups in the order their effects were declared.
+      if (crepeRef.current === crepe) finalBodyRef.current = crepe.getMarkdown()
       crepeRef.current = null
       void crepe.destroy()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path])
+
+  // A new file in this instance is a new document: it opens in reading state, carries none of the
+  // previous doc's per-file flags, and must not inherit a pending write — a queued autosave firing
+  // after the swap would put the old body under the new path.
+  useEffect(() => {
+    setEditing(false)
+    setNoUndo(false)
+    finalBodyRef.current = null
+    autosave.cancel()
+  }, [path, autosave])
+
+  // The Edit action reaches ProseMirror here. Also re-asserted on `ready` so a doc that finished
+  // mounting after the user pressed Edit still lands editable.
+  useEffect(() => {
+    crepeRef.current?.setReadonly(!guards.userEditable)
+  }, [guards.userEditable, ready])
 
   // Local images: a doc's markdown keeps plain relative refs (`assets/pic.png`), but the renderer's
   // origin can't load them. Rewrite each `<img>`'s src in place to a `koda-preview://` URL that serves
@@ -322,10 +460,11 @@ export function CrepeDocEditor({
   useEffect(() => {
     if (body === syncedRef.current) return
     const crepe = crepeRef.current
-    // Advance `synced` only once we actually apply — an early return here (still mounting, or read-only)
-    // must NOT consume the revision, or an edit landing in the mount window (or before a readOnly→editable
-    // flip) would be dropped and never re-applied.
-    if (!crepe || readOnly) return
+    // Advance `synced` only once we actually apply — an early return here (still mounting, or a file we
+    // can't write back) must NOT consume the revision, or an edit landing in the mount window would be
+    // dropped and never re-applied. Reading state deliberately does NOT gate this: a doc the user is
+    // only reading still has to show the agent's work land.
+    if (!crepe || !guards.acceptsRefresh) return
     // Preserve scroll: replaceAll rebuilds the whole doc, which otherwise yanks the view to the top when
     // the agent edits a part the user isn't looking at. (Caret-level preservation — a ProseMirror
     // region-diff transaction — is deferred; the scroll jump is the felt problem.)
@@ -351,7 +490,7 @@ export function CrepeDocEditor({
         host.scrollTop = scroll
       })
     }
-  }, [body, readOnly, ready])
+  }, [body, guards.acceptsRefresh, ready])
 
   // Revert a pending agent edit: write the pre-edit body back (checkpointed like any save) and swap the
   // editor to it. A user save doesn't bump `rev`, so this won't re-trigger the live-edit effect.
@@ -359,18 +498,16 @@ export function CrepeDocEditor({
     const target = review
     if (target == null) return
     setReview(null)
+    // A pending autosave holds the pre-revert body; letting it fire afterwards would undo the revert.
+    autosave.cancel()
     const crepe = crepeRef.current
     if (!crepe) return
     syncedRef.current = target
     crepe.editor.action(replaceAll(target))
-    baselineRef.current = crepe.getMarkdown()
-    setDirty(false)
-    try {
-      const res = await window.koda.writeFile({ path, content: frontmatter + target })
-      setNoUndo(res.checkpointed === false)
-    } catch (e) {
-      setError(String(e))
-    }
+    setDirty(true)
+    // Revert is a write too. Sending it through the same serial coalescer means a sidebar delete can
+    // await it, and a failed revert leaves the old on-disk baseline intact for Retry to write again.
+    await autosave.flush()
   }
 
   // If the user starts editing on top of a pending agent edit, treat it as an implicit Keep — so Revert
@@ -380,11 +517,22 @@ export function CrepeDocEditor({
     if (dirty && review !== null) setReview(null)
   }, [dirty, review])
 
+  // The document's ONE writer: autosave, ⌘S, the retry button, an ask, and the unmount flush all land
+  // here, so there is a single place where a doc reaches disk and a single place a checkpoint comes
+  // from. Serialisation across overlapping calls belongs to the coalescer, not to a `saving` guard —
+  // a dropped call would be a lost keystroke.
   async function save(): Promise<void> {
-    const crepe = crepeRef.current
-    if (!crepe || readOnly || saving) return
-    const markdown = crepe.getMarkdown()
-    if (markdown === baselineRef.current) return
+    if (readOnly) return
+    // Ask the editor, not the debounced change listener: a save can land within 200ms of a keystroke
+    // (leaving edit mode, ⌘S) and the listener would still be holding it. `finalBodyRef` covers the
+    // one case the editor can't: the flush that runs after this pane has been torn down.
+    const markdown = crepeRef.current?.getMarkdown() ?? finalBodyRef.current
+    if (markdown === null) return
+    if (markdown === baselineRef.current) {
+      lastSaveErrorRef.current = null
+      setError(null)
+      return
+    }
     setSaving(true)
     setError(null)
     try {
@@ -392,28 +540,53 @@ export function CrepeDocEditor({
       baselineRef.current = markdown
       setDirty(false)
       setNoUndo(res.checkpointed === false)
+      lastSaveErrorRef.current = null
     } catch (e) {
+      lastSaveErrorRef.current = e
       setError(String(e))
+      // The error line can only be read while this pane is mounted, and the flush that matters most
+      // runs as it unmounts — so a failed save leaves a trace the user can be pointed at later.
+      window.koda.logFromRenderer({ level: 'error', args: [`Document save failed (${path}): ${String(e)}`] })
     } finally {
       setSaving(false)
     }
   }
-  const saveRef = useRef(save)
   saveRef.current = save
 
-  // ⌘S anywhere in the doc saves (matches Monaco's binding).
+  // The store cannot see an editor's live buffer, so expose one path-scoped drain for destructive
+  // mutations. Keep the registration until the unmount flush settles: a delete requested just after
+  // a tab switch must still wait for the write already leaving this editor. This effect stays after
+  // Crepe's mount effect so its cleanup receives the finalBodyRef snapshot made before destroy().
+  useEffect(() => {
+    const unregister = registerFileWriter(path, surfacePath, async () => {
+      await autosave.flush()
+      if (lastSaveErrorRef.current) throw lastSaveErrorRef.current
+    })
+    return () => {
+      void autosave.flush().catch(() => {}).finally(unregister)
+    }
+  }, [path, surfacePath, autosave])
+
+  // ⌘S anywhere in the doc saves (matches Monaco's binding). It flushes rather than saving directly so
+  // it can't race a coalesced write already on its way.
   useEffect(() => {
     const host = hostRef.current
     if (!host) return
     const onKey = (e: KeyboardEvent): void => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
         e.preventDefault()
-        void saveRef.current()
+        void autosave.flush()
       }
     }
     host.addEventListener('keydown', onKey)
     return () => host.removeEventListener('keydown', onKey)
-  }, [])
+  }, [autosave])
+
+  // Leaving edit mode is a promise that what was typed is on disk, so it flushes before the door shuts.
+  function stopEditing(): void {
+    setEditing(false)
+    void autosave.flush()
+  }
 
   // Canvas affordance: detect a non-empty selection and remember Crepe's own bubble geometry. The
   // formatting toolbar includes one Koda action; choosing it transforms that same popover position
@@ -421,7 +594,9 @@ export function CrepeDocEditor({
   useEffect(() => {
     const host = hostRef.current
     const wrap = wrapRef.current
-    if (!host || !wrap || readOnly) return
+    // Reading state keeps this: pointing at a passage and asking Koda about it is the whole reason a
+    // document that can't be typed into is still live.
+    if (!host || !wrap || !guards.selectable) return
     let positionTimer: number | null = null
     const capture = (event: MouseEvent | KeyboardEvent): void => {
       // Crepe runs toolbar commands on pointerdown. Don't let that same interaction's mouseup bubble
@@ -458,7 +633,22 @@ export function CrepeDocEditor({
       host.removeEventListener('keyup', capture)
       host.removeEventListener('scroll', dismiss)
     }
-  }, [readOnly, ready])
+  }, [guards.selectable, ready])
+
+  // Focus leaving the document drops the frozen passage. Without this there are two live inputs at
+  // once: the user types in the composer while the Canvas bubble still holds a passage, and the next
+  // ⏎ is ambiguous about which one it belongs to. One staged input at a time.
+  useEffect(() => {
+    if (!sel) return
+    const onFocusIn = (e: FocusEvent): void => {
+      const target = e.target as Node | null
+      if (!target || wrapRef.current?.contains(target)) return
+      setSel(null)
+      setAiOpen(false)
+    }
+    document.addEventListener('focusin', onFocusIn)
+    return () => document.removeEventListener('focusin', onFocusIn)
+  }, [sel])
 
   // Hand the frozen selection + instruction to the active session's agent. Auto-save first so the file
   // on disk matches what the user sees (the agent locates the passage in the file) and a checkpoint exists.
@@ -466,7 +656,7 @@ export function CrepeDocEditor({
     if (!sel || !instruction.trim()) return
     const selection = sel.text
     setSel(null)
-    await save()
+    await autosave.flush()
     await sendCanvasEdit({ path, selection, instruction: instruction.trim() })
   }
 
@@ -488,11 +678,20 @@ export function CrepeDocEditor({
         <div
           ref={hostRef}
           data-doc-fullwidth={fullWidth ? 'true' : undefined}
+          data-doc-editing={guards.userEditable ? 'true' : undefined}
           className="h-full overflow-auto bg-surface"
         >
-          <DocPageChrome path={path} readOnly={readOnly} fullWidth={fullWidth} />
+          {/* The title renames the file, so it follows the same human-editing state as the body. */}
+          <DocPageChrome path={path} readOnly={!guards.userEditable} fullWidth={fullWidth} />
           <div ref={crepeRootRef} />
         </div>
+        {/* The editable region's edge, so "this page takes typing now" is visible in the page and not
+            only in the footer label. An overlay rather than a ring on the scroll host: Milkdown paints
+            its own background over an ancestor's inset ring, leaving the edge drawn only above the
+            title. Inert and inset, so it changes no layout and eats no clicks. */}
+        {guards.userEditable && (
+          <div aria-hidden className="pointer-events-none absolute inset-0 z-10 ring-1 ring-inset ring-accent/30" />
+        )}
         {/* Quiet page-layout control — reading column ⇄ full width, persisted per doc. */}
         <IconButton
           label={fullWidth ? 'Reading column' : 'Full width'}
@@ -519,7 +718,7 @@ export function CrepeDocEditor({
         {findOpen && (
           <TranscriptFind containerRef={hostRef} placeholder="Find in document" onClose={() => setFindOpen(false)} />
         )}
-        {sel && aiOpen && !readOnly && (
+        {sel && aiOpen && guards.selectable && (
           <CanvasToolbar
             top={sel.top}
             left={sel.left}
@@ -532,46 +731,70 @@ export function CrepeDocEditor({
           />
         )}
       </div>
-      {review !== null && !readOnly ? (
-        <div className="flex items-center justify-between gap-3 border-t border-border px-4 py-1.5">
-          <span className="text-[11px] text-text-muted">Claude edited this document</span>
-          <div className="flex shrink-0 items-center gap-2">
-            <button
-              onClick={() => void revertReview()}
-              className="rounded-lg px-3 py-1 text-[11px] font-medium text-text-muted transition-colors hover:bg-bg hover:text-text"
-            >
-              Revert
-            </button>
-            <button
-              onClick={() => setReview(null)}
-              className="rounded-lg bg-accent px-3 py-1 text-[11px] font-medium text-white transition-opacity hover:opacity-90"
-            >
-              Keep
-            </button>
+      {/* The live region is mounted for the life of the pane, not with the bar: a screen reader only
+          reliably announces into a region that was already there. The bar names Koda, never an engine —
+          the same document surface runs behind Claude and Codex. */}
+      <div role="status">
+        <Collapse open={review !== null && !readOnly}>
+          <div className="flex items-center justify-between gap-3 border-t border-border px-4 py-1.5">
+            <span className="text-[11px] text-text-muted">Koda changed 1 passage</span>
+            <div className="flex shrink-0 items-center gap-2">
+              <button
+                onClick={() => void revertReview()}
+                className="rounded-lg px-3 py-1 text-[11px] font-medium text-text-muted transition-colors hover:bg-bg hover:text-text"
+              >
+                Revert
+              </button>
+              {/* The change is already in the file — this dismisses the revert window, it applies nothing. */}
+              <button
+                onClick={() => setReview(null)}
+                className="rounded-lg bg-accent px-3 py-1 text-[11px] font-medium text-white transition-opacity hover:opacity-90"
+              >
+                Accept edit
+              </button>
+            </div>
           </div>
-        </div>
-      ) : (dirty || error || noUndo) && !readOnly ? (
+        </Collapse>
+      </div>
+      {!readOnly && (
         <div className="flex items-center justify-between gap-3 border-t border-border px-4 py-1.5">
           {error ? (
-            <span className="truncate text-[11px] text-red-400">Couldn't save: {error}</span>
-          ) : dirty ? (
-            <span className="text-[11px] text-text-muted">Unsaved changes</span>
-          ) : (
+            <span role="status" className="truncate text-[11px] text-red-400">
+              Couldn't save: {error}
+            </span>
+          ) : noUndo ? (
             <span role="status" className="truncate text-[11px] text-amber-600 dark:text-amber-400">
               Saved, but Koda couldn't add this to the recovery timeline.
             </span>
+          ) : (
+            <span className="truncate text-[11px] text-text-muted">
+              {editing ? 'Type directly, or select a passage to ask Koda' : 'Select any passage to work on it with Koda.'}
+            </span>
           )}
-          {(dirty || error) && (
+          <div className="flex shrink-0 items-center gap-2">
+            {error && (
+              <button
+                onClick={() => void autosave.flush()}
+                disabled={saving}
+                className="rounded-lg bg-accent px-3 py-1 text-[11px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+              >
+                {saving ? 'Saving…' : 'Retry'}
+              </button>
+            )}
+            {/* A failed save drops the "saved automatically" half of the label: the error beside it is
+                the truth, and two claims that contradict each other are worse than either alone. */}
             <button
-              onClick={() => void save()}
-              disabled={saving}
-              className="shrink-0 rounded-lg bg-accent px-3 py-1 text-[11px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+              onClick={() => (editing ? stopEditing() : setEditing(true))}
+              aria-pressed={editing}
+              className={`rounded-lg px-3 py-1 text-[11px] font-medium transition-colors ${
+                editing ? 'bg-accent/10 text-accent' : 'text-text-muted hover:bg-bg hover:text-text'
+              }`}
             >
-              {saving ? 'Saving…' : 'Save'}
+              {!editing ? 'Edit' : error ? 'Editing' : 'Editing · saved automatically'}
             </button>
-          )}
+          </div>
         </div>
-      ) : null}
+      )}
     </div>
   )
 }

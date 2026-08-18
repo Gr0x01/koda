@@ -1,6 +1,6 @@
 ---
 name: review-architecture
-description: "Review a completed feature or multi-file refactor for architectural drift that a normal diff review misses: duplicated behavior or state, competing sources of truth, parallel old and new flows, boundary bypasses, shallow abstractions, and responsibilities in the wrong place. Use after verifying a feature-sized change, when a change adds a model, helper, storage path, lifecycle, or cross-layer flow, or when the user asks whether a completed change duplicated existing work, weakened maintainability, introduced poor architecture, or created sprawl. Skip one-line fixes and repository-wide architecture audits."
+description: "Review a completed feature or multi-file refactor for duplicated behavior or state, competing sources of truth, parallel old and new flows, boundary bypasses, shallow abstractions, and misplaced responsibilities. Use when `review-work` routes a verified feature-sized change here, or when the user explicitly asks about architectural drift, duplication, maintainability, or sprawl. Do not self-activate merely because a feature changed. Skip one-line fixes and repository-wide audits."
 ---
 
 # Review Architecture

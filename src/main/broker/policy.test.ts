@@ -1,11 +1,18 @@
 import { describe, it, expect } from 'vitest'
-import { destructiveGit, isMutating, isEditTool, protectedTarget } from './policy'
+import {
+  checkpointLabel,
+  destructiveGit,
+  isAlwaysConfirm,
+  isMutating,
+  isEditTool,
+  protectedTarget,
+} from './policy'
 import { ApprovalGate } from './gate'
 
 /**
  * policy.ts is pure classification with no I/O — the cheapest place to pin the guardrail invariants.
- * The destructive-git tripwire is a security boundary (it's the hard DENY that safety-git can't undo),
- * so a pattern that stops matching must fail here rather than in production.
+ * The destructive-git tripwire forces a confirm the posture would otherwise skip, so a pattern that
+ * stops matching must fail here rather than in production.
  */
 
 describe('destructiveGit tripwire', () => {
@@ -20,6 +27,67 @@ describe('destructiveGit tripwire', () => {
     expect(bash('git branch -D feature')?.what).toBe('branch force-delete')
     expect(bash('git branch --delete --force feature')?.what).toBe('branch force-delete')
     expect(bash('git tag -d v1.0')?.what).toBe('tag delete')
+  })
+
+  it('separates remote damage from local, so the confirm can be worded honestly', () => {
+    // Already on a server Koda can't reach back into.
+    expect(bash('git push --force origin main')?.scope).toBe('remote')
+    expect(bash('git push origin +main')?.scope).toBe('remote')
+    // Still in this checkout, so the old tip is generally still in the reflog.
+    expect(bash('git rebase -i main')?.scope).toBe('local')
+    expect(bash('git reset --hard HEAD~3')?.scope).toBe('local')
+    expect(bash('git branch -D feature')?.scope).toBe('local')
+  })
+
+  it('never blocks the way OUT of an in-progress operation', () => {
+    // Refusing these preserves nothing (the rewrite is already half-applied) and strands the repo
+    // mid-operation, which is how a non-Git user ends up in a terminal.
+    expect(bash('git rebase --abort')).toBeNull()
+    expect(bash('git rebase --continue')).toBeNull()
+    expect(bash('git rebase --skip')).toBeNull()
+    expect(bash('git rebase --quit')).toBeNull()
+    expect(bash('git merge --abort')).toBeNull()
+    expect(bash('git cherry-pick --abort')).toBeNull()
+    expect(bash('git revert --abort')).toBeNull()
+    expect(bash('GIT_EDITOR=true git rebase --continue')).toBeNull()
+    // Starting one is still where the tripwire belongs.
+    expect(bash('git rebase origin/main')?.what).toBe('rebase (history rewrite)')
+  })
+
+  it('does not let an exempt exit vouch for the rest of a compound command', () => {
+    // The exemption speaks for its own command only. Chaining a destructive op behind a harmless
+    // exit must not buy that op a free pass — in Auto that would be an unprompted force-push.
+    expect(bash('git rebase --continue && git push --force origin main')?.what).toBe('force-push')
+    expect(bash('git rebase --abort; git reset --hard HEAD~5')?.what).toBe('hard reset')
+    expect(bash('git merge --abort || git branch -D feature')?.what).toBe('branch force-delete')
+    // Newlines end a command too, and are the shape a multi-line Bash block actually arrives in.
+    expect(bash('git rebase --continue\ngit push --force origin main')?.what).toBe('force-push')
+    // Order doesn't matter: the destructive op is judged wherever it sits.
+    expect(bash('git push --force origin main && git rebase --continue')?.what).toBe('force-push')
+    // And the exemption still holds when nothing destructive rides along.
+    expect(bash('git rebase --continue && npm test')).toBeNull()
+    expect(bash('git add -A && git rebase --continue')).toBeNull()
+  })
+
+  it('sees a destructive op nested in a command substitution', () => {
+    // The shell runs a substitution BEFORE the command hosting it, so an exempt outer command must
+    // not vouch for whatever is nested inside it. Otherwise `--continue $(…)` is a free pass.
+    expect(bash('git rebase --continue $(git push --force origin main)')?.what).toBe('force-push')
+    expect(bash('git rebase --abort `git push --force origin main`')?.what).toBe('force-push')
+    expect(bash('echo $(git reset --hard HEAD~9)')?.what).toBe('hard reset')
+    // A subshell is the same story.
+    expect(bash('(git push --force origin main)')?.what).toBe('force-push')
+    // A harmless substitution alongside an exit still clears.
+    expect(bash('git rebase --continue $(date +%s)')).toBeNull()
+  })
+
+  it('still sees a command split across a line continuation', () => {
+    // Segments end at a newline, but a backslash-newline is one command wearing two lines. Splitting
+    // there would hand back a `git push \` fragment and a `--force …` fragment, neither of which
+    // matches, and the force-push would walk straight through.
+    expect(bash('git push \\\n  --force origin main')?.what).toBe('force-push')
+    expect(bash('git reset \\\n  --hard HEAD~2')?.what).toBe('hard reset')
+    expect(bash('git push \\\r\n  --force origin main')?.what).toBe('force-push')
   })
 
   it('lets safe git through — the tripwire is not a blanket git block', () => {
@@ -52,6 +120,15 @@ describe('protectedTarget self-protection tier (forced ask, even in Auto)', () =
         file_path: '/Users/x/Library/Application Support/Koda/koda-settings.json',
       })?.what,
     ).toBe("Koda's app settings")
+  })
+
+  it('catches a protected path anywhere in one multi-file edit', () => {
+    expect(
+      protectedTarget('Write', {
+        file_path: 'src/ordinary.ts',
+        file_paths: ['src/ordinary.ts', '.koda/guardrails.json'],
+      })?.what,
+    ).toBe("this project's guardrail switches")
   })
 
   it('catches Bash aimed at the same targets, including deleting .koda wholesale', () => {
@@ -145,6 +222,23 @@ describe('gate wiring: self-protection survives Auto-approve', () => {
     expect(pushed).toHaveLength(0)
   })
 
+  it('a protected later path in a Codex-style multi-file edit still forces the Auto ask', async () => {
+    const { gate, pushed } = makeGate()
+    const decision = gate.decide('s1', {
+      toolUseId: 'multi-protected',
+      toolName: 'Write',
+      input: {
+        file_path: 'src/ordinary.ts',
+        file_paths: ['src/ordinary.ts', '.koda/safety.git/config'],
+      },
+    })
+    await new Promise((r) => setTimeout(r, 0))
+    expect(pushed).toHaveLength(1)
+    expect((pushed[0] as { reason?: string }).reason).toContain('recovery store')
+    gate.resolve('multi-protected', { kind: 'allow' })
+    expect((await decision).kind).toBe('allow')
+  })
+
   it('a bare user deny carries the standing register; an explicit reason passes through', async () => {
     const { gate } = makeGate()
     gate.setDefaultMode('ask')
@@ -192,7 +286,8 @@ describe('gate wiring: self-protection survives Auto-approve', () => {
 
 describe('mutation classification is fail-closed', () => {
   it('treats reads as non-mutating (no checkpoint needed)', () => {
-    for (const t of ['Read', 'Grep', 'Glob', 'WebFetch']) expect(isMutating(t)).toBe(false)
+    for (const t of ['Read', 'Grep', 'Glob', 'WebFetch', 'mcp__koda_broker__capabilities'])
+      expect(isMutating(t)).toBe(false)
   })
 
   it('treats edits, commands, and UNKNOWN tools as mutating (checkpoint first)', () => {
@@ -203,5 +298,47 @@ describe('mutation classification is fail-closed', () => {
     expect(isEditTool('Edit')).toBe(true)
     expect(isEditTool('MultiEdit')).toBe(true)
     expect(isEditTool('Bash')).toBe(false)
+  })
+
+  /**
+   * `keep_document` writes a file into the user's project, and it is deliberately absent from every
+   * list in this module — the fail-closed default is already the behavior it wants. Pinned because the
+   * absence reads as an oversight otherwise, and because adding it to READ_ONLY_TOOLS to "match the
+   * other broker tools" would silently drop the checkpoint that makes a kept document undoable.
+   */
+  it('leaves keep_document on the fail-closed default: checkpointed, and not an auto-passing edit', () => {
+    expect(isMutating('mcp__koda_broker__keep_document')).toBe(true)
+    expect(isEditTool('mcp__koda_broker__keep_document')).toBe(false)
+    // Not an always-confirm either: the user asked for the document, so Auto should not re-ask.
+    expect(isAlwaysConfirm('mcp__koda_broker__keep_document')).toBe(false)
+  })
+})
+
+/**
+ * The recovery timeline is read by someone who has never seen a tool name, so the label is the whole
+ * product surface of a checkpoint. `keep_document` carries no `file_path` and no `command`, so the
+ * generic path produced `before mcp__koda_broker__keep_document` — the exact leak the module already
+ * names as a reason to keep internal tools out of the timeline.
+ */
+describe('checkpointLabel', () => {
+  it('says what a kept document was, in the user\'s own words', () => {
+    expect(checkpointLabel('mcp__koda_broker__keep_document', { title: 'Branch management notes' })).toBe(
+      'before keeping "Branch management notes" as a document',
+    )
+    expect(checkpointLabel('mcp__koda_broker__keep_document', {})).toBe('before keeping a document')
+    // Never the raw MCP name, whatever the input.
+    expect(checkpointLabel('mcp__koda_broker__keep_document', { body: 'x' })).not.toContain('mcp__')
+  })
+
+  it('clamps a long title so one row cannot take over the timeline', () => {
+    const label = checkpointLabel('mcp__koda_broker__keep_document', { title: 'x'.repeat(120) })
+    expect(label.length).toBeLessThan(120)
+    expect(label.endsWith('\u2026" as a document')).toBe(true)
+  })
+
+  it('still labels the ordinary tools by their target', () => {
+    expect(checkpointLabel('Write', { file_path: 'notes.md' })).toBe('before Write: notes.md')
+    expect(checkpointLabel('Bash', { command: 'npm install' })).toBe('before Bash: npm install')
+    expect(checkpointLabel('Glob', {})).toBe('before Glob')
   })
 })

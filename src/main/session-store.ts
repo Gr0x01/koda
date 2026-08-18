@@ -38,7 +38,10 @@ import {
   type PersistedSession,
   type PersistedSessions,
   type ReplayEntry,
+  type EngineId,
 } from '@shared/ipc'
+import { engineCapabilities, isEngineId } from '@shared/engine-capabilities'
+import { compactTranscriptToolOutput } from '@shared/tool-output'
 import { writeFileAtomic } from './atomic-write'
 import { loadArchiveRetentionDays } from './settings'
 import { log } from './logger'
@@ -48,7 +51,12 @@ import {
   settleRestoredDelegationReplay,
   transcriptFromReplay,
 } from '@shared/delegation'
-import { deleteRemoteReplay, loadRemoteReplay, purgeRemoteReplayProject } from './remote-replay-store'
+import {
+  deleteRemoteReplay,
+  loadRemoteReplay,
+  loadRemoteReplayBounded,
+  purgeRemoteReplayProject,
+} from './remote-replay-store'
 
 /** A store that exists but could not be read, carrying whether the copy `keepCorrupt` tried to make
  *  actually landed. Every failure path below reports that real answer instead of discarding it: the
@@ -71,6 +79,9 @@ export class StoreReadError extends Error {
  *  show it (the IPC boundary) pass one in; everyone else ignores it. */
 export interface StoreReadReport {
   dropped: number
+  /** Archive metadata overlapped a live row, but its transcript body was missing/unreadable. The hot
+   * fallback stays intact; these ids let boot omit the broken tombstones and explain why they lost. */
+  unreadableArchiveBodyIds?: string[]
 }
 
 /** The on-disk per-project shape = the renderer's blob + the project it belongs to (main-stamped). */
@@ -83,6 +94,9 @@ type StoredProject = z.infer<typeof StoredProjectSchema>
  *  `PersistedSessionsSchema` — that data was just computed by the live renderer, so schema drift can't
  *  have happened yet; only DISK data ages across builds. */
 const StoredProjectReadSchema = StoredProjectSchema.extend({ sessions: z.array(z.unknown()) })
+/** Version 2 is read only for the one-way v3 migration. Keeping it separate from the shared write
+ * schema is what makes a downgrade safe: an older build sees v3 as unknown and refuses to rewrite it. */
+const StoredProjectV2ReadSchema = StoredProjectReadSchema.extend({ version: z.literal(2) })
 
 /** Stable per-project filename: hash the project path so no path chars / length leak into the name. */
 function projectStorePath(projectPath: string): string {
@@ -159,7 +173,9 @@ function maxArchivedItemId(items: unknown[]): number {
 /** Split one full archived session into its metadata (with baked preview + maxItemId) after writing its
  *  body out. Used by both v1 migration and hot-blob ingest. */
 function splitArchive(projectPath: string, full: ArchivedSession): ArchivedSessionMeta {
-  writeArchivedBody(projectPath, full.id, full.items)
+  if (!writeArchivedBody(projectPath, full.id, full.items)) {
+    throw new Error(`archive body could not be persisted for session ${full.id}`)
+  }
   const { items, ...rest } = full
   return { ...rest, preview: buildArchivePreview(items), maxItemId: maxArchivedItemId(items) }
 }
@@ -174,6 +190,22 @@ function splitArchive(projectPath: string, full: ArchivedSession): ArchivedSessi
  *  list gets rewritten to empty. Individual malformed ROWS are dropped, not fatal (keepValidRows), and
  *  counted into `report` so the caller can tell the user how many. */
 export function loadArchivedMeta(projectPath: string, report?: StoreReadReport): ArchivedSessionMeta[] {
+  return loadArchivedMetaInternal(projectPath, report, true)
+}
+
+/** Read validated metadata before retention or de-duplication mutates a current index. Reconciliation
+ * uses this view so an expired row can remove its stale hot twin first, and so the later user-reported
+ * load still sees malformed rows rather than an already-shortened file. A valid legacy v1 blob still
+ * performs its lossless split migration here so its inline transcript qualifies as a durable body. */
+function loadArchivedMetaBeforeMaintenance(projectPath: string): ArchivedSessionMeta[] {
+  return loadArchivedMetaInternal(projectPath, undefined, false)
+}
+
+function loadArchivedMetaInternal(
+  projectPath: string,
+  report: StoreReadReport | undefined,
+  maintainIndex: boolean,
+): ArchivedSessionMeta[] {
   const path = archiveIndexPath(projectPath)
   if (!existsSync(path)) return []
   let metas: ArchivedSessionMeta[] = []
@@ -210,7 +242,7 @@ export function loadArchivedMeta(projectPath: string, report?: StoreReadReport):
   }
   const v2 = ArchiveIndexSchema.safeParse(raw)
   if (v2.success) {
-    metas = keepValidRows(ArchivedSessionMetaSchema, path, v2.data.archived, projectPath, 'archive', text, report)
+    metas = keepValidRows(ArchivedSessionMetaSchema, path, v2.data.archived.map(withResumeCursorFallback), projectPath, 'archive', text, report)
   } else {
     const v1 = ArchiveFileV1Schema.safeParse(raw)
     if (!v1.success) {
@@ -240,7 +272,28 @@ export function loadArchivedMeta(projectPath: string, report?: StoreReadReport):
       })
     }
   }
-  return applyArchiveRetention(projectPath, metas)
+  if (!maintainIndex) return metas
+  const retained = applyArchiveRetention(projectPath, metas)
+  const unique: ArchivedSessionMeta[] = []
+  const seen = new Set<string>()
+  for (const meta of retained) {
+    if (seen.has(meta.id)) continue
+    seen.add(meta.id)
+    unique.push(meta)
+  }
+  if (unique.length !== retained.length) {
+    const removed = retained.length - unique.length
+    if (saveArchivedMeta(projectPath, unique))
+      log.info('session-store', `removed ${removed} duplicate archived session row(s)`, {
+        project: projectPath,
+      })
+    else
+      log.warn('session-store', 'could not persist the de-duplicated archive index', {
+        project: projectPath,
+        removed,
+      })
+  }
+  return unique
 }
 
 /** Validate an array's rows INDIVIDUALLY against `schema`, dropping the ones that fail rather than
@@ -357,29 +410,82 @@ export function saveArchivedMeta(projectPath: string, archived: ArchivedSessionM
  *  be `[]` for a minimal/headless archive), or `null` when the read/parse FAILED — so a caller that's about
  *  to consume-and-delete the body (restore) can tell "genuinely empty" from "couldn't read it" and never
  *  destroy a transcript it merely failed to load. */
-export function loadArchivedBody(projectPath: string, sessionId: string): unknown[] | null {
+function readArchivedBodyFile(projectPath: string, sessionId: string): unknown[] | null {
   try {
     const parsed = ArchivedBodySchema.safeParse(JSON.parse(readFileSync(archiveBodyPath(projectPath, sessionId), 'utf8')))
-    if (!parsed.success) return null
-    const replay = normalizeReplaySequence(
-      settleRestoredDelegationReplay(loadRemoteReplay(projectPath, sessionId, sessionId)),
-    )
-    if (!replay.length) return parsed.data.items
-    return parsed.data.items.length
-      ? mergeReplayIntoTranscript(parsed.data.items, replay)
-      : transcriptFromReplay(replay)
+    return parsed.success ? parsed.data.items : null
   } catch {
     return null
   }
 }
 
+/** Whether a metadata row has the readable cold transcript required to outrank a stale hot copy. */
+export function hasReadableArchivedBody(projectPath: string, sessionId: string): boolean {
+  return readArchivedBodyFile(projectPath, sessionId) !== null
+}
+
+export function loadArchivedBody(projectPath: string, sessionId: string): unknown[] | null {
+  const stored = readArchivedBodyFile(projectPath, sessionId)
+  if (stored === null) return null
+  const replay = normalizeReplaySequence(
+    settleRestoredDelegationReplay(loadRemoteReplay(projectPath, sessionId, sessionId)),
+  )
+  const items = !replay.length
+    ? stored
+    : stored.length
+      ? mergeReplayIntoTranscript(stored, replay)
+      : transcriptFromReplay(replay)
+  // Legacy bodies and windowless replay can predate renderer-side compaction. Bound the payload before
+  // this array crosses archivedLoadBody IPC, while preserving semantic AskUserQuestion results.
+  return compactTranscriptToolOutput(items)
+}
+
+/** Retrieval-only archive read with an allocation bound across the cold body and replay sidecar.
+ * Restore intentionally keeps the complete reader above; Ask skips an over-budget conversation and
+ * marks its answer partial instead of synchronously parsing an arbitrarily large file in Electron main. */
+export function loadArchivedBodyForSearch(
+  projectPath: string,
+  sessionId: string,
+  maxBytes: number,
+): { items: unknown[] | null; bytes: number; truncated: boolean } {
+  try {
+    const path = archiveBodyPath(projectPath, sessionId)
+    const bodyBytes = statSync(path).size
+    if (bodyBytes > maxBytes) return { items: null, bytes: bodyBytes, truncated: true }
+    const parsed = ArchivedBodySchema.safeParse(JSON.parse(readFileSync(path, 'utf8')))
+    if (!parsed.success) return { items: null, bytes: bodyBytes, truncated: true }
+    const replay = loadRemoteReplayBounded(
+      projectPath,
+      sessionId,
+      Math.max(0, maxBytes - bodyBytes),
+      sessionId,
+    )
+    if (replay.truncated)
+      return { items: parsed.data.items, bytes: bodyBytes + replay.bytes, truncated: true }
+    const normalized = normalizeReplaySequence(settleRestoredDelegationReplay(replay.entries))
+    const items = !normalized.length
+      ? parsed.data.items
+      : parsed.data.items.length
+        ? mergeReplayIntoTranscript(parsed.data.items, normalized)
+        : transcriptFromReplay(normalized)
+    return { items, bytes: bodyBytes + replay.bytes, truncated: false }
+  } catch {
+    return { items: null, bytes: 0, truncated: true }
+  }
+}
+
 /** Persist one archived session's transcript body to its own file. */
-export function writeArchivedBody(projectPath: string, sessionId: string, items: unknown[]): void {
+export function writeArchivedBody(projectPath: string, sessionId: string, items: unknown[]): boolean {
   try {
     mkdirSync(archiveBodiesDir(projectPath), { recursive: true })
-    writeFileAtomic(archiveBodyPath(projectPath, sessionId), JSON.stringify({ items }))
+    writeFileAtomic(
+      archiveBodyPath(projectPath, sessionId),
+      JSON.stringify({ items: compactTranscriptToolOutput(items) }),
+    )
+    return true
   } catch (err) {
     log.warn('session-store', 'failed to persist archived body', err instanceof Error ? err.message : err)
+    return false
   }
 }
 
@@ -404,17 +510,59 @@ export function deleteArchivedBody(projectPath: string, sessionId: string): void
 export function ingestFullArchives(projectPath: string, full: ArchivedSession[]): boolean {
   const existing = loadArchivedMeta(projectPath)
   const metas = full.map((f) => splitArchive(projectPath, f))
-  return saveArchivedMeta(projectPath, [...metas, ...existing])
+  const incomingIds = new Set(metas.map((meta) => meta.id))
+  // Idempotent because archiveSession can legitimately retry: the cold write may have landed while
+  // the following hot-store rewrite failed, leaving the same session in both places. A second ingest
+  // replaces that row instead of duplicating it forever in Settings and Library retrieval.
+  return saveArchivedMeta(projectPath, [...metas, ...existing.filter((meta) => !incomingIds.has(meta.id))])
 }
+
+/** Has the renderer durably imported every archive shelf it could read into project-owned stars? This
+ *  intentionally peeks at only one marker rather than calling `loadProjectSessions`: archive loading is
+ *  itself part of that function's old-inline migration, so a full read here would recurse. Any miss or
+ *  unreadable hot store is safely "not complete". */
+function legacyArchiveStarMigrationComplete(projectPath: string): boolean {
+  const path = projectStorePath(projectPath)
+  if (!existsSync(path)) return false
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf8')) as {
+      version?: unknown
+      legacyKeptDocsMigrationComplete?: unknown
+    }
+    return raw.version === 3 && raw.legacyKeptDocsMigrationComplete === true
+  } catch {
+    return false
+  }
+}
+
+const retentionBlockedByHotRepair = new Set<string>()
 
 /** The opt-in retention purge: when `archiveRetentionDays > 0`, drop (and unlink the bodies of) archives
  *  older than the window. Default 0 = keep forever (archives live outside safety-git, so a purge is
- *  permanent — the safe default never deletes; the user opts in from the Archived settings section). */
+ *  permanent — the safe default never deletes; the user opts in from the Archived settings section).
+ *
+ *  During the v3 star migration, an expired archive can still hold the ONLY copy of a session-scoped
+ *  `keptDocs` path. Protect just those rows until the renderer acknowledges one hot-store blob carrying
+ *  both their promoted project stars and the migration-complete marker. Legacy-free rows still obey the
+ *  user's retention choice immediately. */
 function applyArchiveRetention(projectPath: string, metas: ArchivedSessionMeta[]): ArchivedSessionMeta[] {
   const days = loadArchiveRetentionDays()
   if (days <= 0) return metas
+  // A failed stale-hot repair means this archive row/body is still the only tombstone stopping the old
+  // live copy from returning. Keep every archive for this project until the next process/boot retries;
+  // deleting the tombstone now would turn a disk-write failure into a resurrection.
+  if (retentionBlockedByHotRepair.has(projectPath)) {
+    log.warn('session-store', 'retention purge deferred until stale hot rows can be repaired', {
+      project: projectPath,
+      days,
+    })
+    return metas
+  }
   const cutoff = Date.now() - days * 86_400_000
-  const kept = metas.filter((m) => m.archivedAt >= cutoff)
+  const migrationComplete = legacyArchiveStarMigrationComplete(projectPath)
+  const kept = metas.filter(
+    (m) => m.archivedAt >= cutoff || (!migrationComplete && !!m.keptDocs?.length),
+  )
   if (kept.length === metas.length) return metas
   // Index first and only carry on if it took the write — the same order `deleteArchived` follows, and
   // for the same reason. Unlinking the bodies first leaves rows on disk whose transcripts are gone, and
@@ -427,7 +575,8 @@ function applyArchiveRetention(projectPath: string, metas: ArchivedSessionMeta[]
     })
     return metas
   }
-  for (const m of metas) if (m.archivedAt < cutoff) deleteArchivedBody(projectPath, m.id)
+  const keptIds = new Set(kept.map((meta) => meta.id))
+  for (const meta of metas) if (!keptIds.has(meta.id)) deleteArchivedBody(projectPath, meta.id)
   log.info('session-store', `auto-deleted ${metas.length - kept.length} archived session(s) past retention`, {
     project: projectPath,
     days,
@@ -477,7 +626,8 @@ export function loadProjectSessions(projectPath: string, report?: StoreReadRepor
     })
     throw new StoreReadError(err instanceof Error ? err.message : String(err), backupKept)
   }
-  const stored = StoredProjectReadSchema.safeParse(raw)
+  const current = StoredProjectReadSchema.safeParse(raw)
+  const stored = current.success ? current : StoredProjectV2ReadSchema.safeParse(raw)
   if (!stored.success) {
     const backupKept = keepCorrupt(path, text)
     log.warn('session-store', 'session store present but invalid — refusing to report it as empty', {
@@ -487,19 +637,20 @@ export function loadProjectSessions(projectPath: string, report?: StoreReadRepor
     })
     throw new StoreReadError('session store is present but unreadable', backupKept)
   }
+  const migratedFromV2 = stored.data.version === 2
   // Sessions are validated row-by-row (keepValidRows/W5) rather than all-or-nothing — one drifted field
   // on one session (e.g. a new `approvalMode` enum value an older build doesn't know, the named trigger
   // for this whole branch) must not cost the user every other chat in the project.
   const sessions = keepValidRows(
     PersistedSessionSchema,
     path,
-    stored.data.sessions,
+    stored.data.sessions.map(withResumeCursorFallback),
     projectPath,
     'session',
     text,
     report,
   )
-  const data = { ...stored.data, sessions }
+  const data = { ...stored.data, version: 3 as const, sessions }
   // One-shot migration to the cold archive store: a pre-split store carries `archived` inline — move
   // them out (split to body + metadata) and rewrite the hot file without (shrinking it by whatever the
   // archive had grown to). After this runs once the branch never triggers again for that project.
@@ -514,14 +665,92 @@ export function loadProjectSessions(projectPath: string, report?: StoreReadRepor
         project: projectPath,
         count: data.archived.length,
       })
-      return PersistedSessionsSchema.parse(hot)
+      return reconcileArchivedHotRows(projectPath, PersistedSessionsSchema.parse(hot), report)
     }
     log.warn('session-store', 'archive cold-store migration write failed — kept inline for retry', {
       project: projectPath,
     })
+    // Returning the inline blob as a successful load is not safe: the renderer deliberately omits
+    // `archived` from its next hot save, so that save would strip the only indexed copy even though this
+    // migration just failed. Fail the session load instead; hydration (and therefore hot persistence)
+    // stays gated, while the original file remains byte-for-byte available for the next boot's retry.
+    throw new StoreReadError('archive cold-store migration could not be persisted — kept inline for retry', false)
+  }
+  // v2 already used one file per project; v3 only adds project-owned document stars. Rewrite the
+  // validated payload once so an older build cannot later parse it as v2, strip those fields, and
+  // silently erase every star. Legacy per-session `keptDocs` stay in this first rewrite so renderer
+  // hydration can import them before its ordinary save retires them.
+  if (migratedFromV2 && !data.archived?.length) {
+    const { archived: _archived, ...hot } = data
+    writeFileAtomic(path, JSON.stringify(hot, null, 2))
+    log.info('session-store', 'migrated project session store v2 → v3', { project: projectPath })
+    return reconcileArchivedHotRows(projectPath, PersistedSessionsSchema.parse(hot), report)
   }
   // The renderer doesn't need projectPath back — PersistedSessionsSchema strips it.
-  return PersistedSessionsSchema.parse(data)
+  return reconcileArchivedHotRows(projectPath, PersistedSessionsSchema.parse(data), report)
+}
+
+/**
+ * The cold archive is the durable record of an archive click. A renderer can have acknowledged that
+ * write and then fail to push its much larger hot-session blob (historically, once the IPC payload
+ * crossed Chromium's message ceiling). On the next read, let the archive act as a tombstone and repair
+ * the stale hot copy instead of showing the conversation as live again.
+ *
+ * Archive read failures stay fail-soft here: the dedicated archive load reports them to the renderer,
+ * while a healthy hot store remains usable and is never rewritten from an archive we could not read.
+ */
+function reconcileArchivedHotRows(
+  projectPath: string,
+  data: PersistedSessions,
+  report?: StoreReadReport,
+): PersistedSessions {
+  let archivedMetaIds: Set<string>
+  try {
+    archivedMetaIds = new Set(loadArchivedMetaBeforeMaintenance(projectPath).map((meta) => meta.id))
+  } catch {
+    return data
+  }
+  const overlaps = data.sessions.filter((session) => archivedMetaIds.has(session.id))
+  const archivedIds = new Set(
+    overlaps
+      .filter((session) => hasReadableArchivedBody(projectPath, session.id))
+      .map((session) => session.id),
+  )
+  const unreadableBodies = overlaps.length - archivedIds.size
+  if (unreadableBodies) {
+    if (report)
+      report.unreadableArchiveBodyIds = overlaps
+        .filter((session) => !archivedIds.has(session.id))
+        .map((session) => session.id)
+    log.warn('session-store', 'kept hot session rows whose archived bodies could not be read', {
+      project: projectPath,
+      count: unreadableBodies,
+    })
+  }
+  if (!archivedIds.size) {
+    retentionBlockedByHotRepair.delete(projectPath)
+    return data
+  }
+  const sessions = data.sessions.filter((session) => !archivedIds.has(session.id))
+  const repaired: PersistedSessions = {
+    ...data,
+    activeId: data.activeId && archivedIds.has(data.activeId) ? null : data.activeId,
+    sessions,
+  }
+  const removed = data.sessions.length - sessions.length
+  if (saveProjectSessions(projectPath, repaired)) {
+    retentionBlockedByHotRepair.delete(projectPath)
+    log.info('session-store', `removed ${removed} archived session row(s) from the hot store`, {
+      project: projectPath,
+    })
+  } else {
+    retentionBlockedByHotRepair.add(projectPath)
+    log.warn('session-store', 'could not persist the archive/hot-store reconciliation', {
+      project: projectPath,
+      removed,
+    })
+  }
+  return repaired
 }
 
 /** Lean read of ONE session's persisted record, for the remote transcript path. `loadProjectSessions`
@@ -545,25 +774,74 @@ export function readPersistedSession(
         ? hit.raw
         : (JSON.parse(readFileSync(file, 'utf8')) as { sessions?: PersistedSessions['sessions'] })
     if (!hit || hit.mtimeMs !== mtimeMs) parsedStoreCache.set(file, { mtimeMs, raw })
-    return raw.sessions?.find((s) => s.id === sessionId) ?? null
+    const found = raw.sessions?.find((s) => s.id === sessionId) ?? null
+    return found ? (withResumeCursorFallback(found) as PersistedSessions['sessions'][number]) : null
   } catch {
     return null
   }
 }
 const parsedStoreCache = new Map<string, { mtimeMs: number; raw: { sessions?: PersistedSessions['sessions'] } }>()
 
+/**
+ * Every LIVE conversation in a project's hot store, read the lean way — the sibling of
+ * `readPersistedSession` for a caller that wants all of them rather than one. Same reasoning: the
+ * whole-store Zod validation `loadProjectSessions` runs costs seconds on a heavy dogfood store and
+ * buys a read-only consumer nothing, so this parses once (through the same mtime cache) and hands the
+ * rows back.
+ *
+ * Fail-soft on purpose, and that is a DEPARTURE from `loadProjectSessions`, which throws rather than
+ * report an unreadable store as empty. The distinction is who acts on the answer: the boot path
+ * hydrates the renderer and then saves back over the file, so a wrong "empty" destroys data. A reader
+ * that only searches writes nothing, so the worst an unreadable store can cost it is a thinner answer,
+ * and letting the throw out would turn one corrupt file into a broken feature. Callers must not
+ * mutate the returned rows — the parsed object is shared with the cache.
+ */
+export function listHotSessions(projectPath: string): {
+  sessions: unknown[]
+  truncated: boolean
+} {
+  try {
+    const file = projectStorePath(projectPath)
+    if (!existsSync(file)) return { sessions: [], truncated: false }
+    const mtimeMs = statSync(file).mtimeMs
+    const hit = parsedStoreCache.get(file)
+    const raw =
+      hit && hit.mtimeMs === mtimeMs
+        ? hit.raw
+        : (JSON.parse(readFileSync(file, 'utf8')) as { sessions?: PersistedSessions['sessions'] })
+    if (!hit || hit.mtimeMs !== mtimeMs) parsedStoreCache.set(file, { mtimeMs, raw })
+    return Array.isArray(raw.sessions)
+      ? { sessions: raw.sessions, truncated: false }
+      : { sessions: [], truncated: true }
+  } catch {
+    return { sessions: [], truncated: true }
+  }
+}
+
 /** Persist a project's sessions. `projectPath` is main-supplied (the window's root), never trusted
  *  from the renderer — that's why it's a separate arg, not part of the renderer's blob. */
-export function saveProjectSessions(projectPath: string, data: PersistedSessions): void {
+export function saveProjectSessions(projectPath: string, data: PersistedSessions): boolean {
   try {
     // `archived` never rides the hot file anymore (cold store above) — strip it even if a caller
     // still passes it, so nothing can quietly re-fatten this constantly-rewritten file.
-    const stored: StoredProject = { ...data, archived: undefined, projectPath }
+    const stored: StoredProject = {
+      ...data,
+      archived: undefined,
+      projectPath,
+      // Renderer saves are already compact before IPC. Repeat the shared boundary here for phone,
+      // replay and migration paths that write main-side without ever visiting the renderer.
+      sessions: data.sessions.map((session) => ({
+        ...session,
+        items: compactTranscriptToolOutput(session.items),
+      })),
+    }
     // Atomic (temp + rename): this file is rewritten every few hundred ms while a session streams,
     // and a torn write here = the project's entire transcript history gone (fail-soft read → null).
     writeFileAtomic(projectStorePath(projectPath), JSON.stringify(stored, null, 2))
+    return true
   } catch (err) {
     log.warn('session-store', 'failed to persist sessions', err instanceof Error ? err.message : err)
+    return false
   }
 }
 
@@ -583,12 +861,11 @@ export function archiveSession(
   storedId: string,
 ): boolean {
   if (!ingestFullArchives(projectPath, [{ ...session, archivedAt: Date.now() }])) return false
-  saveProjectSessions(projectPath, {
+  return saveProjectSessions(projectPath, {
     ...store,
     activeId: store.activeId === storedId ? null : store.activeId,
     sessions: store.sessions.filter((s) => s.id !== storedId),
   })
-  return true
 }
 
 // ── Ghost-session hygiene ──────────────────────────────────────────────────────
@@ -600,6 +877,89 @@ export function archiveSession(
 // accumulate forever and surface as dead entries. Prune the safe subset at boot: nothing was ever said
 // (zero transcript items) AND the engine holds no conversation. Anything with content is kept — its
 // transcript still renders even if resume would fail.
+
+/**
+ * Fill in a row's resume cursor when the stored blob has none. Two rows land here: one saved before
+ * resume state became a driver-owned blob (Codex kept its thread id in `engineNativeId`, Claude
+ * reattached by session id alone), and a headless phone session, whose transcript main never persists.
+ * Both are still resumable, so the cursor is rebuilt from what the row can prove: for Codex the old
+ * thread id, for Claude the conversation the engine itself holds on disk. A row with no evidence of a
+ * conversation restores clean, which is what it would have done anyway. Read-side only — the renderer
+ * saves a real cursor on its next write and this stops firing for that row.
+ */
+export function withResumeCursorFallback(row: unknown): unknown {
+  if (!row || typeof row !== 'object') return row
+  const r = row as Record<string, unknown>
+  if (r.resumeCursor !== undefined) return row
+  const id = typeof r.id === 'string' ? r.id : ''
+  const cwd = typeof r.cwd === 'string' ? r.cwd : ''
+  const hasItems = Array.isArray(r.items) && r.items.length > 0
+  const engineId: EngineId = typeof r.engineId === 'string' && isEngineId(r.engineId) ? r.engineId : 'claude'
+  // The two historical row shapes differ for one reason, so read that reason rather than the name: an
+  // engine that keeps its history in its OWN store was reattached by a native id Koda recorded
+  // (`engineNativeId`), while an engine with an on-disk conversation is proved by the file itself.
+  if (!engineCapabilities(engineId).transcriptOnDisk) {
+    const threadId = typeof r.engineNativeId === 'string' ? r.engineNativeId : ''
+    if (!threadId) return row
+    const turns = hasItems ? 1 : 0
+    return { ...r, resumeCursor: { engine: engineId, resumable: turns > 0, data: { threadId, turns } } }
+  }
+  if (!id) return row
+  const turns = hasItems || (cwd && engineConversationExists(engineId, cwd, id)) ? 1 : 0
+  return { ...r, resumeCursor: { engine: engineId, resumable: turns > 0, data: { sessionId: id, turns } } }
+}
+
+/**
+ * Does the engine still hold this conversation on disk?
+ *
+ * Only an engine whose capabilities declare `transcriptOnDisk` keeps a readable per-session file Koda
+ * can check (Claude does; Codex keeps its history inside its own store). For any other engine there is
+ * nothing to disprove, so the answer is yes and Koda's own record decides — callers pass the engine id
+ * and never branch on which one it is.
+ */
+export function engineConversationExists(engineId: EngineId | undefined, cwd: string, sessionId: string): boolean {
+  if (!engineCapabilities(engineId).transcriptOnDisk) return true
+  return claudeConversationExists(cwd, sessionId)
+}
+
+/** Does the engine's own on-disk conversation PROVE this session has content? Unlike
+ *  `engineConversationExists` (which answers "nothing disproves it"), an engine that keeps no readable
+ *  file proves nothing here and the caller's other signals decide. */
+export function engineConversationHasContent(engineId: EngineId | undefined, cwd: string, sessionId: string): boolean {
+  if (!engineCapabilities(engineId).transcriptOnDisk) return false
+  return claudeConversationExists(cwd, sessionId)
+}
+
+/** Last-activity time from the engine's own conversation file, or 0 when this engine keeps none (the
+ *  caller falls back to stored order). */
+export function engineConversationMtime(engineId: EngineId | undefined, cwd: string, sessionId: string): number {
+  if (!engineCapabilities(engineId).transcriptOnDisk) return 0
+  return claudeConversationMtime(cwd, sessionId)
+}
+
+/** Rebuild a session's displayable history from the engine's own conversation file, or nothing when
+ *  this engine keeps none. Same contract as an empty replay buffer. */
+export function readEngineConversationReplay(
+  engineId: EngineId | undefined,
+  cwd: string,
+  sessionId: string,
+  liveId: string,
+): ReplayEntry[] {
+  return readEngineConversationReplayDetailed(engineId, cwd, sessionId, liveId).entries
+}
+
+/** Search needs to tell "there was no on-disk transcript" from "a transcript existed but a cap/read
+ *  failure hid it." The normal replay consumers intentionally keep their fail-soft `[]` contract;
+ *  this sibling preserves that API while exposing the honesty bit retrieval needs. */
+export function readEngineConversationReplayDetailed(
+  engineId: EngineId | undefined,
+  cwd: string,
+  sessionId: string,
+  liveId: string,
+): { entries: ReplayEntry[]; truncated: boolean } {
+  if (!engineCapabilities(engineId).transcriptOnDisk) return { entries: [], truncated: false }
+  return readClaudeConversationReplayDetailed(cwd, sessionId, liveId)
+}
 
 /** Does the Claude engine still hold this conversation? Its per-cwd dir slugs every non-alphanumeric
  *  to '-'; the cwd it was spawned with may be the realpath, so accept either form. (We deliberately
@@ -656,23 +1016,37 @@ const MAX_CONVERSATION_BYTES = 32 * 1024 * 1024
  *  stamps each event so the phone's reducer keys them to the session it actually has open (a resumed
  *  session's live id differs from the stored id the file is named by). */
 export function readClaudeConversationReplay(cwd: string, sessionId: string, liveId: string): ReplayEntry[] {
+  return readClaudeConversationReplayDetailed(cwd, sessionId, liveId).entries
+}
+
+function readClaudeConversationReplayDetailed(
+  cwd: string,
+  sessionId: string,
+  liveId: string,
+): { entries: ReplayEntry[]; truncated: boolean } {
   const path = claudeConversationPaths(cwd, sessionId).find((p) => existsSync(p))
-  if (!path) return []
+  if (!path) return { entries: [], truncated: false }
   let raw: string
   try {
-    if (statSync(path).size > MAX_CONVERSATION_BYTES) return []
+    if (statSync(path).size > MAX_CONVERSATION_BYTES) return { entries: [], truncated: true }
     raw = readFileSync(path, 'utf8')
   } catch {
-    return []
+    return { entries: [], truncated: true }
   }
   const out: ReplayEntry[] = []
-  for (const line of raw.split('\n')) {
+  let truncated = false
+  const lines = raw.split('\n')
+  for (let lineNo = 0; lineNo < lines.length; lineNo++) {
+    const line = lines[lineNo]
     if (!line) continue
     let entry: any
     try {
       entry = JSON.parse(line)
     } catch {
-      continue // a torn tail line (engine mid-write) is expected, not an error
+      // A torn final line is normal while the engine writes, but it can still hide the newest turn;
+      // retrieval keeps the readable prefix and says it was partial.
+      truncated = true
+      continue
     }
     if (entry?.isSidechain === true || entry?.isMeta === true) continue
     const content = entry?.message?.content
@@ -682,6 +1056,7 @@ export function readClaudeConversationReplay(cwd: string, sessionId: string, liv
         if (content.trim()) out.push({ type: 'RemoteUserTurn', sessionId: liveId, text: content })
         continue
       }
+      if (typeof content !== 'string' && !Array.isArray(content)) truncated = true
       for (const block of Array.isArray(content) ? content : []) {
         if (block?.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
           out.push({ type: 'RemoteUserTurn', sessionId: liveId, text: block.text })
@@ -696,6 +1071,7 @@ export function readClaudeConversationReplay(cwd: string, sessionId: string, liv
         }
       }
     } else if (entry?.type === 'assistant') {
+      if (!Array.isArray(content)) truncated = true
       for (const block of Array.isArray(content) ? content : []) {
         if (block?.type === 'text' && typeof block.text === 'string') {
           out.push({ type: 'AssistantBlock', sessionId: liveId, markdown: block.text })
@@ -711,7 +1087,7 @@ export function readClaudeConversationReplay(cwd: string, sessionId: string, liv
       }
     }
   }
-  return out
+  return { entries: out, truncated }
 }
 
 /** A tool_result's displayable text — the block's content is a bare string or an array of text parts. */
@@ -734,9 +1110,14 @@ export function pruneGhostSessions(): void {
       if (!stored.success) continue
       const kept = stored.data.sessions.filter(
         (s) =>
-          (s.engineId ?? 'claude') !== 'claude' || // Codex resumes by its own thread id — don't judge it here
           s.items.length > 0 ||
-          claudeConversationExists(s.cwd || projectPath, s.id),
+          // A pre-v3 renderer could star from an otherwise-empty chat. Keep that row for one launch so
+          // hydration can migrate its only copy into project-level `starredDocs`; the renderer's next
+          // save drops this legacy field and an actually empty ghost becomes prunable again.
+          !!s.keptDocs?.length ||
+          // An engine that keeps no readable conversation on disk (Codex resumes by its own thread id)
+          // answers "still there" — there is no ghost to prove.
+          engineConversationExists(s.engineId, s.cwd || projectPath, s.id),
       )
       if (kept.length === stored.data.sessions.length) continue
       const activeId = kept.some((s) => s.id === stored.data.activeId) ? stored.data.activeId : null
@@ -748,12 +1129,12 @@ export function pruneGhostSessions(): void {
   }
 }
 
-// ── v1 → v2 migration ─────────────────────────────────────────────────────────
+// ── v1 → current migration ─────────────────────────────────────────────────────
 //
 // v1 was ONE global blob (koda-sessions.json) holding all sessions across all projects with a single
-// activeId. v2 splits it per-project. Migration buckets v1 sessions by their `cwd`, writes one v2
-// file per project, then renames the v1 file to `.v1.bak`. Idempotent: the rename happens only after
-// every write succeeds, so a crash mid-migration just re-runs next boot (re-deriving the same buckets).
+// activeId. The current store is per-project. Migration buckets v1 sessions by their `cwd`, writes one
+// current-version file per project, then renames the v1 file to `.v1.bak`. Idempotent: the rename
+// happens only after every write succeeds, so a crash mid-migration just re-runs next boot.
 
 const V1Schema = z.object({
   version: z.literal(1),
@@ -793,11 +1174,11 @@ export function migrateV1IfPresent(): void {
       list.push(s)
       buckets.set(root, list)
     }
-    // Write one v2 file per project; activeId carries over only into the bucket that owns it.
+    // Write one current-version file per project; activeId carries over only into its owning bucket.
     for (const [root, list] of buckets) {
       const ownsActive = list.some((s) => (s as { id?: string }).id === activeId)
       const stored: StoredProject = {
-        version: 2,
+        version: 3,
         projectPath: root,
         activeId: ownsActive ? activeId : null,
         // Re-validate each session against the real schema (drops anything malformed).
@@ -806,9 +1187,9 @@ export function migrateV1IfPresent(): void {
       writeFileAtomic(projectStorePath(root), JSON.stringify(stored, null, 2))
     }
     renameSync(legacy, `${legacy}.v1.bak`) // only after every bucket wrote — keeps retry-on-crash safe
-    log.info('session-store', `migrated v1 store → ${buckets.size} project file(s)`)
+    log.info('session-store', `migrated v1 store → ${buckets.size} current project file(s)`)
   } catch (err) {
-    log.warn('session-store', 'v1→v2 migration failed (left v1 intact)', err instanceof Error ? err.message : err)
+    log.warn('session-store', 'v1 migration failed (left v1 intact)', err instanceof Error ? err.message : err)
   }
 }
 

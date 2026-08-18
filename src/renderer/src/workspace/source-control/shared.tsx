@@ -36,6 +36,7 @@ export function FileButton({
   active,
   onClick,
   title,
+  mono,
   trailing,
   onOpen,
   onReveal,
@@ -45,6 +46,8 @@ export function FileButton({
   active: boolean
   onClick: () => void
   title: string
+  /** Render the name as code — used where the row reads as a path (the working tip's file list). */
+  mono?: boolean
   /** Optional right-aligned cue (e.g. "shown above ↑" tying the row to the staged diff). */
   trailing?: ReactNode
   /** Open the actual file in the editor (read/edit) — surfaces a hover button + a menu item. */
@@ -84,7 +87,7 @@ export function FileButton({
         }`}
       >
         <StatusGlyph status={file.status} />
-        <span className="min-w-0 flex-1 truncate">{name}</span>
+        <span className={`min-w-0 flex-1 truncate ${mono ? 'font-mono text-[12px]' : ''}`}>{name}</span>
       </button>
       {trailing}
       {/* Hover-revealed fast path: an explicit "see what changed" eye (the row click, made legible),
@@ -298,7 +301,7 @@ const GLYPH: Record<GitStatusFile['status'], { ch: string; cls: string; title: s
   other: { ch: '•', cls: 'text-text-muted', title: 'Changed' },
 }
 
-export function StatusGlyph({ status }: { status: GitStatusFile['status'] }) {
+function StatusGlyph({ status }: { status: GitStatusFile['status'] }) {
   const g = GLYPH[status]
   return (
     <span

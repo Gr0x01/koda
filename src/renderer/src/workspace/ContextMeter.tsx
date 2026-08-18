@@ -1,13 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 import type { ContextUsage } from '@shared/ipc'
+import { MessageSquarePlus } from 'lucide-react'
 import { Menu } from '../motion'
 
 /**
  * The context-window meter (ui-workspace.md §7a) — the careful-engineer signal a non-engineer
- * lacks: how full is the conversation, and when to stop / start fresh. Two tiers:
- *  - `ContextMeter` — a thin red/yellow/green bar for the sidebar session rows (glance).
- *  - `ContextReadout` — `used / window · %` with an expandable token breakdown, for the focused
- *    session header.
+ * lacks: how full is the conversation, and when to stop / start fresh. `ContextReadout` shows the
+ * focused session's percentage and expandable token breakdown; `SegmentBar` supplies the shared
+ * pixel gauge used by the desktop and phone.
  * The category split (`/context` system-prompt/tools/memory) isn't in the headless stream, so the
  * breakdown shows what the engine DOES report: fresh vs cached input, output, cost.
  */
@@ -28,8 +28,8 @@ export function contextFull(c?: ContextUsage): boolean {
   return r !== null && r >= AMBER
 }
 
-/** The one-button handoff CTA, shown in the composer footer only once context is nearly full. Asks the
- *  agent for a summary and carries it into a fresh session (see store.continueInFreshChat). */
+/** The compact handoff action, shown beside the context meter only once context is nearly full. Asks
+ *  the agent for a summary and carries it into a fresh session (see store.continueInFreshChat). */
 export function ContinueFreshButton({
   context,
   busy,
@@ -45,9 +45,10 @@ export function ContinueFreshButton({
       onClick={onClick}
       disabled={busy}
       title="This chat is getting long. Carry a summary into a fresh chat to keep going fast."
-      className="flex shrink-0 items-center gap-1 rounded-lg bg-amber-500/10 px-2 py-1 text-[11px] font-medium text-amber-600 transition-colors hover:bg-amber-500/20 disabled:opacity-40 dark:text-amber-400"
+      aria-label="Continue in a fresh chat"
+      className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-text-muted transition-colors hover:bg-surface-hover hover:text-text disabled:opacity-40"
     >
-      Keep going in a fresh chat
+      <MessageSquarePlus size={14} aria-hidden />
     </button>
   )
 }
@@ -64,7 +65,6 @@ function fmt(n: number): string {
   return String(n)
 }
 
-const SEGMENTS = 5
 // The focused composer readout flattens the bar, so it uses more sections to keep resolution.
 const COMPOSER_SEGMENTS = 10
 
@@ -124,19 +124,6 @@ export function SegmentBar({
       })}
     </div>
   )
-}
-
-/** Glance meter — context fullness as a 5-segment battery (not exact). Callers gate on fill (the
- *  sidebar omits it until turn 1) — an empty gauge only earns pixels where "empty ≠ missing" matters. */
-export function ContextMeter({ context, className = '' }: { context?: ContextUsage; className?: string }) {
-  const ratio = context ? ratioOf(context) : null
-  const pct = ratio === null ? null : Math.round(ratio * 100)
-  const title = !context
-    ? 'No turns yet, context is empty'
-    : ratio === null
-      ? `${fmt(context.contextTokens)} tokens in context`
-      : `Context ${fmt(context.contextTokens)} / ${fmt(context.contextWindow!)} (${pct}%)`
-  return <SegmentBar filled={filledOf(ratio, SEGMENTS)} segments={SEGMENTS} className={className} title={title} />
 }
 
 /** Focused readout — headline number + bar, click to expand the token breakdown.

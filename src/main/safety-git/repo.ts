@@ -94,6 +94,8 @@ const EXCLUDE = [
   '/.koda/safety.git/',
   // Pasted-image scratch store: binary, auto-pruned, never part of the project's content (scratch.ts).
   '/.koda/scratch/',
+  // Document layout sidecars are editor presentation state, not project content (docmeta.ts).
+  '/.koda/docmeta/',
   // Local databases (SQLite & sidecars): binary, churn every write, meaningless to diff — and
   // keeping them out means a "go back" rolls back code WITHOUT wiping the user's seeded data.
   // Sidecars are matched broadly (*-wal/*-shm/*-journal) so a stale WAL/journal can never be

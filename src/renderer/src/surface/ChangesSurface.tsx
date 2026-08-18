@@ -1,7 +1,5 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useWorkspace, computeSessionChanges, activeEditor } from '../workspace/store'
-import { Collapse } from '../motion'
-import { Caret } from '../Caret'
 import { DockEmpty } from './Dock'
 import { Button } from '../ui'
 import {
@@ -14,72 +12,24 @@ import {
 } from './ChangesReview'
 
 /**
- * The DESK — the slim strip under the stage that owns "what did the agent change?". Collapsed it's a
- * one-line ambient read (count + a dirty dot); clicking expands the review sheet (the session-grouped
- * changes list + saving) up out of it. Clicking a file stages its diff on the STAGE above — the desk
- * is the selector, the stage shows the change: one review unit, not a second diff pane walled off
- * inside the desk.
- */
-export function StageDesk() {
-  const gitRepo = useWorkspace((s) => s.gitRepo)
-  const fileCount = useWorkspace((s) => s.gitFiles.length)
-  const deskOpen = useWorkspace((s) => s.deskOpen)
-  const setDeskOpen = useWorkspace((s) => s.setDeskOpen)
-  return (
-    // The single hairline at the stage↔desk edge — the one honest section boundary. When open, the
-    // sheet owns its own footer (count + Save), so the peek strip renders only while COLLAPSED (there'd
-    // be nothing to re-open otherwise). No stacked bottom rules.
-    <div className="shrink-0 border-t border-border">
-      <Collapse open={deskOpen}>
-        <div className="h-[46vh] min-h-[240px]">
-          <ChangesSurface onCollapse={() => setDeskOpen(false)} />
-        </div>
-      </Collapse>
-      {!deskOpen && (
-        <button
-          onClick={() => setDeskOpen(true)}
-          title="Review what changed, and save a version"
-          aria-expanded={false}
-          className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-text-muted transition-colors hover:bg-surface hover:text-text"
-        >
-          <BranchGlyph size={13} />
-          {!gitRepo ? (
-            <span>No version history</span>
-          ) : fileCount > 0 ? (
-            <span className="flex items-center gap-2">
-              <span className="h-1.5 w-1.5 rounded-full bg-accent" aria-hidden />
-              <span className="font-medium text-text">
-                {fileCount} {fileCount === 1 ? 'change' : 'changes'}
-              </span>
-            </span>
-          ) : (
-            <span>All saved</span>
-          )}
-          <span className="ml-auto flex items-center gap-1.5">
-            {gitRepo && fileCount > 0 && <span>Review &amp; save</span>}
-            <Caret dir="up" size={12} />
-          </span>
-        </button>
-      )}
-    </div>
-  )
-}
-
-/**
- * The desk's review sheet — user-git working-tree review, grouped by the session that made each change.
- * Git has ONE tree per project (changes are aggregate), but Koda attributes them per session from its
- * own edit history (see computeSessionChanges). Clicking a file stages its diff on the stage above
+ * CHANGES — user-git working-tree review, on stage as a tab like everything else (it used to expand out
+ * of a strip pinned under the stage, which made it the one surface with its own way of appearing).
+ * Grouped by the session that made each change: git has ONE tree per project (changes are aggregate),
+ * but Koda attributes them per session from its turn-boundary evidence, with edit history as an
+ * in-flight fallback (see computeSessionChanges). Clicking a file opens its diff as its own tab
  * (openFile as a `diff` view with no sessionId → the diff is vs HEAD = "since last version", matching
- * this surface's framing). Saving is ONE version of everything: the footer's Save commits the whole
- * working tree, auto-named from the lone session, and a green strip lets you rename that fresh version.
- * Per-session granular saves are a rare, advanced case — ask Claude — so they don't cost a button here.
+ * this surface's framing), so this tab stays one click away in the strip. Saving is ONE version of
+ * everything: the footer's Save commits the whole working tree, auto-named from the lone session, and a
+ * green strip lets you rename that fresh version. Per-session granular saves are a rare, advanced case
+ * — ask Claude — so they don't cost a button here.
  */
-function ChangesSurface({ onCollapse }: { onCollapse: () => void }) {
+export function ChangesSurface() {
   const gitRepo = useWorkspace((s) => s.gitRepo)
   const files = useWorkspace((s) => s.gitFiles)
   const truncated = useWorkspace((s) => s.gitChangesTruncated)
   const sessions = useWorkspace((s) => s.sessions)
   const order = useWorkspace((s) => s.order)
+  const completionBySession = useWorkspace((s) => s.completionBySession)
   const changesFocus = useWorkspace((s) => s.changesFocus)
   const refreshGitStatus = useWorkspace((s) => s.refreshGitStatus)
   const setVersionsOpen = useWorkspace((s) => s.setVersionsOpen)
@@ -87,7 +37,7 @@ function ChangesSurface({ onCollapse }: { onCollapse: () => void }) {
   const closeSurface = useWorkspace((s) => s.closeSurface)
 
   // Which file is on the stage right now (a diff surface) — drives the active row + its "shown above"
-  // cue. Reads the ACTIVE session's editor (openFile stages there), so the desk and the stage agree.
+  // cue. Reads the ACTIVE session's editor (openFile stages there), so the list and the stage agree.
   const stagedPath = useWorkspace((s) => {
     const ed = activeEditor(s)
     const cur = ed.surfaces.find((x) => x.path === ed.activeSurfaceId)
@@ -97,8 +47,8 @@ function ChangesSurface({ onCollapse }: { onCollapse: () => void }) {
   const [saved, setSaved] = useState<SavedInfo | null>(null)
 
   const { groups, alsoBy } = useMemo(
-    () => computeSessionChanges(sessions, order, files),
-    [sessions, order, files],
+    () => computeSessionChanges(sessions, order, files, completionBySession),
+    [sessions, order, files, completionBySession],
   )
 
   // Refresh whenever the surface is shown (a turn may have landed while another tool was up).
@@ -106,20 +56,25 @@ function ChangesSurface({ onCollapse }: { onCollapse: () => void }) {
     void refreshGitStatus()
   }, [refreshGitStatus])
 
-  // Consume a focus hint from openChanges(sessionId): stage that session's first changed file.
+  // Consume a focus hint from openChanges(sessionId): scroll that session's group into view. It must
+  // NOT stage a diff — that would select the diff's tab and switch straight back off this one.
+  const groupEls = useRef(new Map<string, HTMLDivElement>())
+  const holdGroup = useCallback((id: string, el: HTMLDivElement | null) => {
+    if (el) groupEls.current.set(id, el)
+    else groupEls.current.delete(id)
+  }, [])
   useEffect(() => {
     if (!changesFocus) return
-    const g = groups.find((x) => x.sessionId === changesFocus)
-    if (g?.files[0]) openFile(g.files[0].path, undefined, { view: 'diff' })
+    groupEls.current.get(changesFocus)?.scrollIntoView({ block: 'nearest' })
     useWorkspace.setState({ changesFocus: null })
-  }, [changesFocus, groups, openFile])
+  }, [changesFocus, groups])
 
   async function onSaved(info: SavedInfo): Promise<void> {
     setSaved(info)
     await refreshGitStatus()
   }
 
-  // Stage the file's diff on the stage above. No sessionId ⇒ the diff is vs HEAD (last saved version),
+  // Open the file's diff as its own tab. No sessionId ⇒ the diff is vs HEAD (last saved version),
   // which is what "Changes" means here (not the narrower since-this-turn baseline agent edits use).
   const onSelect = (path: string): void => openFile(path, undefined, { view: 'diff' })
 
@@ -165,23 +120,14 @@ function ChangesSurface({ onCollapse }: { onCollapse: () => void }) {
 
   return (
     <div className="flex h-full flex-col bg-bg">
-      {/* Section header — the whole title row collapses the sheet, mirroring the full-width strip that
-          expands it (a lone far-right caret made closing needlessly hard to reach). Always present: the
-          footer's handle disappears once everything's saved, so this is the "All saved" sheet's only close.
-          History stays its own action on the right. */}
+      {/* Section header. The tab already names the surface, so this row exists for the count and for
+          History — closing is the tab's ✕, like every other surface. */}
       <div className="flex items-stretch pr-3">
-        <button
-          onClick={onCollapse}
-          title="Collapse the review sheet"
-          aria-label="Collapse"
-          aria-expanded
-          className="group flex flex-1 items-center gap-2 px-3 pb-2 pt-4 text-left transition-colors hover:text-text"
-        >
-          <span className="font-display text-[11px] font-semibold uppercase tracking-wider text-text-muted transition-colors group-hover:text-text">
+        <div className="flex flex-1 items-center gap-2 px-3 pb-2 pt-3">
+          <span className="font-display text-[11px] font-semibold uppercase tracking-wider text-text-muted">
             Changes
           </span>
-          <Caret dir="down" size={12} className="text-text-muted transition-colors group-hover:text-text" />
-        </button>
+        </div>
         <button
           onClick={() => setVersionsOpen(true)}
           className="shrink-0 self-center text-[11px] font-medium text-text-muted transition-colors hover:text-text"
@@ -191,7 +137,7 @@ function ChangesSurface({ onCollapse }: { onCollapse: () => void }) {
         </button>
       </div>
 
-      {/* The list scrolls; the footer stays anchored at the sheet's bottom edge (below). */}
+      {/* The list scrolls; the footer stays anchored at the surface's bottom edge (below). */}
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
         {saved && (
           <SavedStrip saved={saved} onDone={() => setSaved(null)} onRenamed={(n) => setSaved(n)} />
@@ -207,16 +153,17 @@ function ChangesSurface({ onCollapse }: { onCollapse: () => void }) {
           )
         ) : (
           groups.map((g) => (
-            <ChangeGroup
-              key={g.sessionId ?? 'no-session'}
-              group={g}
-              alsoBy={alsoBy}
-              stagedPath={stagedPath}
-              onSelect={onSelect}
-              onOpen={onOpen}
-              onReveal={onReveal}
-              onDiscard={onDiscard}
-            />
+            <div key={g.sessionId ?? 'no-session'} ref={(el) => holdGroup(g.sessionId ?? 'no-session', el)}>
+              <ChangeGroup
+                group={g}
+                alsoBy={alsoBy}
+                stagedPath={stagedPath}
+                onSelect={onSelect}
+                onOpen={onOpen}
+                onReveal={onReveal}
+                onDiscard={onDiscard}
+              />
+            </div>
           ))
         )}
         {truncated && (
@@ -228,7 +175,9 @@ function ChangesSurface({ onCollapse }: { onCollapse: () => void }) {
 
       {/* One anchored footer: a quiet count label on the left, one real Save button on the right. Flush
           at the bottom — no floating hero, no internal rule. Collapse lives on the header above. */}
-      {files.length > 0 && <Footer groups={groups} fileCount={files.length} onSaved={onSaved} />}
+      {files.length > 0 && (
+        <Footer groups={groups} fileCount={files.length} truncated={truncated} onSaved={onSaved} />
+      )}
     </div>
   )
 }

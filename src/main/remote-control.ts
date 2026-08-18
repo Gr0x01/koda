@@ -1,7 +1,7 @@
 /**
  * Remote control seam — open-source build.
  *
- * The phone-control stack (LAN server, cloud relay, pairing, phone tunnel) is part of Koda's hosted
+ * The phone-control stack (LAN server, cloud relay, pairing, and away web surfaces) is part of Koda's hosted
  * cloud service and is not in the public repo. This stub keeps the seam's API
  * so the rest of main compiles unchanged, answers the Settings → Remote channels with inert state
  * (`available: false` hides those surfaces), and wires nothing.
@@ -22,6 +22,14 @@ const remoteState = {
   available: false,
 }
 const authState = { signedIn: false, email: null, userId: null }
+const connectState = {
+  available: false,
+  enabled: false,
+  state: 'idle' as const,
+  reason: 'unavailable' as const,
+  nodeName: null,
+  path: null,
+}
 const relayState = { signedIn: false, running: false, paired: false }
 
 export function initRemoteControl(_engineSessions: EngineSessionManager): void {}
@@ -55,6 +63,14 @@ export function registerRemoteIpcHandlers(_broadcastSettings: () => void): void 
     throw new Error(NOT_IN_BUILD)
   })
   ipcMain.handle(IpcChannels.remoteRelayForget, () => relayState)
+  ipcMain.handle(IpcChannels.connectState, () => connectState)
+  ipcMain.handle(IpcChannels.connectDevices, () => ({ devices: [], error: NOT_IN_BUILD }))
+  ipcMain.handle(IpcChannels.connectReconnect, () => connectState)
+  ipcMain.handle(IpcChannels.connectRevoke, () => ({
+    ok: false,
+    failed: ['tailnet', 'pairing', 'account'],
+    message: NOT_IN_BUILD,
+  }))
 }
 
 export async function disposeRemoteControl(): Promise<void> {}

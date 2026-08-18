@@ -20,6 +20,7 @@ import type { FriendlyEngineError } from '@shared/engine-error'
 import { loadHasOnboarded, loadTelemetryEnabled, loadTelemetryInstallId } from './settings'
 import { POSTHOG_KEY } from './koda-service-config'
 import { log } from './logger'
+import { isE2EProfile } from './runtime-profile'
 
 const POSTHOG_HOST = 'https://us.i.posthog.com'
 
@@ -44,6 +45,9 @@ type TelemetryEvents = {
 }
 
 export function track<E extends keyof TelemetryEvents>(event: E, props: TelemetryEvents[E]): void {
+  // Tests are product instrumentation, not product usage. This hard gate also protects a future test
+  // that forgets to seed telemetryEnabled:false in its throwaway settings.
+  if (isE2EProfile()) return
   // The hasOnboarded gate is what makes default-on honest: the consent toggle is on the onboarding
   // safety step, so nothing may leave before the user has been shown it.
   if (!loadHasOnboarded() || !loadTelemetryEnabled()) return

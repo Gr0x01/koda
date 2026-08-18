@@ -30,6 +30,12 @@
      question never reads as an action that touches the project. One place to retune the whole surface. */
   --koda-aside: #8a7d5c;
   --koda-aside-tint: #f5f1e6;
+  /* Engine marks (session row meta line) — a brand tint, not text-muted: monochrome at 12px
+     they vanish, which is the whole reason they need one. Claude gets a warm clay (inside the
+     warm-neutral family); Codex a neutral graphite. Not either vendor's brand color, just two
+     tones that read apart at a glance and stay legible on warm paper. */
+  --koda-claude: #c2643f;
+  --koda-codex: #6b6b73;
   /* Popover elevation (`shadow-pop`) — for anchored menus/dropdowns that float OVER
      a raised card, where `shadow-soft` (same as the card) reads same-plane. A white
      menu on the warm off-white canvas has no visible fill contrast, so the first layer
@@ -61,6 +67,9 @@
   /* Aside, dark — lifted so it stays legible on near-black, same warm secondary family. */
   --koda-aside: #c9b888;
   --koda-aside-tint: #211f18;
+  /* Engine marks, dark — lifted the same way the accent is, so they stay legible on near-black. */
+  --koda-claude: #d98a63;
+  --koda-codex: #8f8f97;
   /* On near-black, same-tone-over-same-tone needs a stronger, deeper shadow than light
      to separate a floating menu from the card beneath it. */
   --koda-shadow-pop: 0 1px 1px rgba(0, 0, 0, 0.4), 0 6px 14px -4px rgba(0, 0, 0, 0.5),
@@ -86,6 +95,8 @@
   --color-accent: var(--koda-accent);
   --color-aside: var(--koda-aside);
   --color-aside-tint: var(--koda-aside-tint);
+  --color-claude: var(--koda-claude);
+  --color-codex: var(--koda-codex);
   /* Body default (font-sans / inherited), editorial headings (font-display), code (font-mono). */
   --font-sans: 'Be Vietnam Pro', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
   --font-display: 'Schibsted Grotesk Variable', 'Be Vietnam Pro', ui-sans-serif, system-ui, sans-serif;

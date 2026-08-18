@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { useWorkspace } from '../../workspace/store'
+import { stageVisible, useWorkspace } from '../../workspace/store'
 import { IconButton, Input } from '../../ui'
 
 /**
@@ -17,7 +17,7 @@ export function SessionHeader({
   onRename: (name: string) => void
   onArchive: () => void
 }) {
-  const dockOpen = useWorkspace((s) => s.dockOpen)
+  const dockOpen = useWorkspace(stageVisible)
   const toggleDock = useWorkspace((s) => s.toggleDock)
   const [renaming, setRenaming] = useState(false)
   const [draft, setDraft] = useState(label)

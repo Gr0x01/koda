@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { docMention, docMentionLabel } from '../../doc-mentions'
+import { docMention, docMentionLabel, hasDocMention } from '../../doc-mentions'
 
 type DocEntry = { path: string; rel: string; name: string; mtimeMs: number }
 
@@ -114,12 +114,15 @@ export function useMentionPicker(opts: {
   draft: string
   setDraft: (id: string, text: string) => void
   textareaRef: React.RefObject<HTMLTextAreaElement | null>
+  /** `filesRev`: invalidates both the list and its lazy excerpts after a document write/move/delete. */
+  revision?: number
 }) {
-  const { activeId, draft, setDraft, textareaRef } = opts
+  const { activeId, draft, setDraft, textareaRef, revision = 0 } = opts
   const [mention, setMention] = useState<{ start: number; query: string } | null>(null)
   const [index, setIndex] = useState(0)
   const [docs, setDocs] = useState<DocEntry[]>([])
-  // The activeId whose doc list is loaded — refetch on session switch (a different project root).
+  // The session + file revision whose doc list is loaded. Revision is part of the identity so an old
+  // request cannot repopulate the list after a write/move/delete starts a fresher one for the same chat.
   const loadedRef = useRef<string | null>(null)
   // The token start-offset the user dismissed with Escape — keep the menu closed for that same token so
   // a caret-move keyup doesn't reopen it. Cleared once the caret leaves the token (start changes / null).
@@ -128,7 +131,7 @@ export function useMentionPicker(opts: {
   const excerptsRef = useRef(new Map<string, Excerpt | null>())
   const [, setExcerptTick] = useState(0)
 
-  // Reset when switching sessions: the doc list belongs to a project, so it can't carry over.
+  // A different session may belong to a different project, so nothing carries across it.
   useEffect(() => {
     loadedRef.current = null
     setDocs([])
@@ -136,23 +139,38 @@ export function useMentionPicker(opts: {
     excerptsRef.current.clear()
   }, [activeId])
 
-  // Load the doc list the first time a mention opens for this session. listDocs is cached in the main
-  // process (~10s), so re-opening is cheap; a just-created doc shows up a beat late at worst.
+  // A project write/move/delete invalidates the choices and lazy previews, but keep the token itself
+  // open: the effect below immediately reloads it against the new revision.
   useEffect(() => {
-    if (!mention || !activeId || loadedRef.current === activeId) return
-    let cancelled = false
+    loadedRef.current = null
+    setDocs([])
+    excerptsRef.current.clear()
+  }, [revision])
+
+  // Load the doc list the first time this session needs it: a mention token being typed (the menu) or a
+  // draft that already holds an `@` (the context receipt, which has to resolve those tokens to say how
+  // many documents the message really carries — including a draft that was pasted or restored without
+  // the menu ever opening). listDocs is cached in the main process (~10s), so this is cheap; a
+  // just-created doc shows up a beat late at worst.
+  useEffect(() => {
+    const loadKey = activeId ? `${activeId}\u0000${revision}` : null
+    if ((!mention && !hasDocMention(draft)) || !activeId || !loadKey || loadedRef.current === loadKey) return
+    // Claim the load before awaiting it: this now re-runs on every keystroke of a draft holding an `@`,
+    // and an in-flight fetch that has not yet marked itself loaded would be re-issued on each one.
+    // Marking the session/revision snapshot here means exactly one round-trip for that snapshot, and a
+    // failure releases the claim so the next keystroke retries.
+    loadedRef.current = loadKey
     window.koda
       .listDocs({})
       .then((res) => {
-        if (cancelled) return
-        loadedRef.current = activeId
-        setDocs(res?.docs ?? [])
+        // A session switch or file revision has already reset the list; a late answer for the old
+        // project snapshot must not repopulate it.
+        if (loadedRef.current === loadKey) setDocs(res?.docs ?? [])
       })
-      .catch(() => {})
-    return () => {
-      cancelled = true
-    }
-  }, [mention, activeId])
+      .catch(() => {
+        if (loadedRef.current === loadKey) loadedRef.current = null
+      })
+  }, [mention, draft, activeId, revision])
 
   // Matches for the current query. Empty query → most-recent docs (the list already arrives mtime-desc).
   const matches = useMemo(() => {
@@ -178,11 +196,12 @@ export function useMentionPicker(opts: {
     window.koda
       .readFile({ path: selected.path })
       .then((res) => {
+        if (stale) return
         cache.set(selected.path, res.binary ? { lead: '', rest: '' } : excerptFrom(res.content))
-        if (!stale) setExcerptTick((t) => t + 1)
+        setExcerptTick((t) => t + 1)
       })
       .catch(() => {
-        cache.delete(selected.path)
+        if (!stale) cache.delete(selected.path)
       })
     return () => {
       stale = true
@@ -343,5 +362,7 @@ export function useMentionPicker(opts: {
     </div>
   ) : null
 
-  return { menu, onKeyDown, sync, close, open }
+  // `docs` rides out with the menu: the context receipt resolves the same list the picker inserts
+  // from, so the count it states and the paths the send transmits come from one source.
+  return { menu, onKeyDown, sync, close, open, docs }
 }

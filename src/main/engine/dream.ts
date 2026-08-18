@@ -13,21 +13,18 @@
  * Inert unless the user-facing `loadDreamEnabled()` setting is on. The generative second turn has a
  * separate hidden `loadRemEnabled()` dogfood gate, so enabling tidy never silently opts into REM.
  *
- * Containment: a labeled safety-git checkpoint before each project's turn, and a post-turn scope
- * tripwire that reverts any change OUTSIDE `.koda/memory/` back to that checkpoint. The turn itself
- * runs under the normal broker gate (per-tool checkpoints included).
+ * Containment: a labeled safety-git checkpoint before each project's turn plus a Dream-specific gate
+ * that permits local reads and realpath-contained edits under `.koda/memory/` only. Shell, network,
+ * unknown mutators, traversal, and symlink escapes are denied. There is deliberately no live-tree
+ * rollback: an editor or raw terminal outside Koda's mutation doors can never be mistaken for Dream
+ * work and deleted during cleanup.
  */
 import { existsSync } from 'node:fs'
-import { rm } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { app, powerMonitor, powerSaveBlocker } from 'electron'
 import type { EngineSessionManager } from './sessions'
 import { loadDreamEnabled, loadRemEnabled } from '../settings'
-import { checkpoint } from '../safety-git/checkpoint'
-import { checkpointChanges } from '../safety-git/changes'
-import { restore } from '../safety-git/restore'
-import { runGit } from '../safety-git/repo'
 import { createCheckpointSandbox, removeCheckpointSandbox } from '../safety-git/sandbox'
 import { writeFileAtomic } from '../atomic-write'
 import { log } from '../logger'
@@ -69,14 +66,14 @@ const REM_HEADROOM_LIMIT_PCT = 60
 const DREAM_PROMPT = `This is an unattended overnight maintenance turn — the user is asleep and nobody is watching. Your ONLY job is to consolidate THIS project's memory in .koda/memory/. Approvals are auto-declined tonight: if something would need one, skip it and flag it instead.
 
 1. Read .koda/memory/MEMORY.md and active-context.md. Skim today's transcripts for this project (under ~/.claude/projects/, matched by the cwd field inside the .jsonl files) only as far as needed to spot decisions, reversals, or shipped work the memory hasn't recorded — sample with Grep and targeted reads, never read multi-MB files wholesale.
-2. Apply the memory skill's tidy discipline as DELTA edits, never wholesale rewrites: strike active-context lines whose work shipped or verified; keep active-context to one-liners + pointers, moving narrative into the right topic note; fold replaced approaches into their survivor (keep the lesson, delete the leftover and its index line); keep every index line in sync with its note. KEEP WEIRD SPECIFICS — concrete gotchas relocate verbatim, only narrative compresses. Also prune rot while distilling: entries that were stale on arrival (PR numbers, commit hashes, task-progress logs — git already records those), negative claims about tools ("X is broken" — these harden into refusals that outlive the fix), and approaches that never actually worked recorded as if they were reliable workflows; a still-live blocker becomes a dated open problem in active-context, the rest goes. Never delete or archive a decision record. If memory is already lean, change nothing — a no-op is a valid result.
+2. Load the \`memory\` playbook and apply its tidy and project-card contracts as DELTA edits, never wholesale rewrites: strike active-context lines whose work shipped or verified; keep active-context to one-liners + pointers, moving narrative into the right topic note; fold replaced approaches into their survivor (keep the lesson, delete the leftover and its index line); keep every index line in sync with its note. Update project-card.md only when its durable orientation changed, and never turn it into another index. KEEP WEIRD SPECIFICS — concrete gotchas relocate verbatim, only narrative compresses. Also prune rot while distilling: entries that were stale on arrival (PR numbers, commit hashes, task-progress logs — git already records those), negative claims about tools ("X is broken" — these harden into refusals that outlive the fix), and approaches that never actually worked recorded as if they were reliable workflows; a still-live blocker becomes a dated open problem in active-context, the rest goes. Never delete or archive a decision record. If memory is already lean, change nothing — a no-op is a valid result.
 3. Anything that needs a human (a contradiction you didn't fix, a distillation too risky to do blind, wrong-but-authoritative facts, a bug noticed in passing) goes as a dated one-liner under a "**Dream flags:**" section at the bottom of active-context.md — max 3 lines; delete your own stale flags whose issue is resolved. Flags must never accrete.
 4. Touch NOTHING outside .koda/memory/ — no code, no Documents/, no git. End with a 3–6 line plain-language summary of what you consolidated, flagged, or skipped; that message becomes the night's digest entry the user reads in the morning. If you changed nothing AND flagged nothing, your entire final message must be exactly "${QUIET_NIGHT}" — nothing else; never combine it with content.`
 
 export const NO_REM_PROBLEM = 'No REM problem — nothing previously worked and stuck.'
 
 /** An explicit focus is a dogfood seam, not a second queue system. It is a one-line handoff in the
- *  always-loaded file the dream already reads; normal sessions remove it once the result is reviewed. */
+ *  current-state file the dream already reads; normal sessions remove it once the result is reviewed. */
 export function remFocus(activeContext: string): string | undefined {
   const match = activeContext.match(/^\s*(?:[-*]\s*)?\*\*REM focus(?:\s*\([^)]*\))?:?\*\*\s*:?\s*(.+)$/im)
   return match?.[1]?.trim() || undefined
@@ -251,7 +248,7 @@ export class DreamScheduler {
   }
 
   /** Dev-menu live-fire: dream NOW, skipping the quiet timer, the at-desk/battery/headroom guards,
-   *  and the per-project timing gates. Containment (pre-checkpoint, scope tripwire, turn cap,
+   *  and the per-project timing gates. Containment (pre-checkpoint, memory-only gate, turn cap,
    *  auto-declined approvals) applies exactly as on a real night — that's what's being tested. */
   dreamNow(): void {
     log.info('dream', 'forced run from Developer menu')
@@ -376,71 +373,83 @@ export class DreamScheduler {
   }
 
   private async dreamProject(cwd: string, includeRem = false, forceRem = false): Promise<void> {
-    const pre = await checkpoint(cwd, 'before overnight memory tidy')
     log.info('dream', `starting overnight tidy: ${cwd}`)
     // One Date for the session name AND the digest stamp — a turn crossing midnight must not name
     // itself yesterday and stamp its digest tomorrow.
     const night = new Date()
-    const { sessionId } = await this.sessions.startDreamSession(cwd, dreamSessionName(night))
+    const { sessionId } = await this.sessions.startDreamSession(cwd, dreamSessionName(night), {
+      memoryOnly: true,
+      deferVisibility: true,
+    })
+    const scope = await this.sessions.beginProjectMutationScope(sessionId, 'before overnight memory tidy')
+    if (!scope) {
+      this.sessions.clearUnattended(sessionId)
+      log.warn('dream', `tidy skipped because its safety checkpoint failed: ${cwd}`)
+      // No protected turn ever ran, so neither a digest write nor a visible conversation is safe or
+      // useful. Reap the never-published session instead of manufacturing project state without the
+      // baseline that was supposed to protect it.
+      try {
+        await this.sessions.dispose(sessionId)
+      } catch (err) {
+        log.warn('dream', `unused tidy session teardown failed: ${cwd}`, err instanceof Error ? err.message : err)
+      } finally {
+        this.sessions.forgetSession(sessionId)
+      }
+      return
+    }
     let outcome: 'completed' | 'interrupted' | 'failed' = 'failed'
     let tidyReply: string | undefined
     let tidyError: unknown
     try {
-      await this.sessions.sendTurn(sessionId, DREAM_PROMPT, undefined, 'remote')
-      outcome = await this.waitForTurnEnd(sessionId)
-      tidyReply = this.sessions.lastAssistantReply(sessionId)
-    } catch (err) {
-      tidyError = err
-      tidyReply = `Dream tidy failed before it could leave a summary: ${err instanceof Error ? err.message : String(err)}`
+      try {
+        // The exact in-memory scope is a one-use scheduler capability. No renderer/phone caller can
+        // start or replace this reserved turn while the session is still unpublished.
+        await this.sessions.sendTurn(sessionId, DREAM_PROMPT, undefined, 'remote', {
+          projectMutationScope: scope,
+        })
+        outcome = await this.waitForTurnEnd(sessionId)
+        tidyReply = this.sessions.lastAssistantReply(sessionId)
+      } catch (err) {
+        tidyError = err
+        tidyReply = `Dream tidy failed before it could leave a summary: ${err instanceof Error ? err.message : String(err)}`
+      }
+      await this.sessions.finishProjectMutationScope(scope, async () => {
+        // The scheduler, not the agent, writes the digest — so an interrupted or silent night still
+        // leaves its dated trace. It stays inside the same completion boundary as the tidy turn.
+        this.writeDigestFile(cwd, night, tidyReply, outcome === 'interrupted')
+      })
+      if (tidyError) throw tidyError
+      if (includeRem && outcome === 'completed') await this.runRem(cwd, night, sessionId, forceRem)
+      log.info('dream', `finished overnight tidy: ${cwd}`)
     } finally {
-      // The unattended turn is over — every later turn on this session is a human's (the morning
-      // adoption, or a resume), so forced asks must go back to asking instead of auto-denying
-      // (gate.ts UNATTENDED_REASON). Not startDreamSession's job: an open window can adopt this tab
-      // WHILE the dream is still running (notifyDesktopOfHeadless), and clearing there would let the
-      // dream start prompting a window nobody's watching at 3am. Tied to a `finally`, not sequential
-      // awaits: by here `startDreamSession` has already persisted this as a listed, resumable chat —
-      // if `sendTurn`/`waitForTurnEnd` throws (the freshly spawned child already exited: auth expiry,
-      // an engine update mid-flight, a bad flag), the flag must still clear, or the user opens this
-      // chat in the morning and every forced ask auto-denies while telling the model they never
-      // consented — the exact bug this exists to fix, just reached from the throwing path (CRITICAL).
-      this.sessions.clearUnattended(sessionId)
+      // Publish only after every scheduler-owned write is done. Even on failure, the resulting chat is
+      // normal and answerable when it first becomes visible; if its process disappeared, reveal is a no-op.
+      try {
+        this.sessions.clearUnattended(sessionId)
+      } finally {
+        this.sessions.revealDreamSession(sessionId)
+      }
     }
-    if (pre.id) await this.revertOutOfScope(cwd, pre.id)
-    // The scheduler, not the agent, writes the digest — so an interrupted or silent night still
-    // leaves its dated trace (a night with no record is indistinguishable from a night that never
-    // ran, which is exactly the ambiguity the 08-07 dream flag caught). Written after the scope
-    // revert; `.koda/memory/` is in scope so this can't be swept by it.
-    this.writeDigest(cwd, night, tidyReply, outcome === 'interrupted')
-    if (tidyError) throw tidyError
-    if (includeRem && outcome === 'completed') await this.runRem(cwd, night, forceRem)
-    log.info('dream', `finished overnight tidy: ${cwd}`)
   }
 
   /** The read-only generative half. It gets a fresh post-tidy checkpoint and is skipped entirely if
    *  that checkpoint cannot be made: paralysis is a mechanism, not a sentence in the prompt. */
-  private async runRem(cwd: string, night: Date, force = false): Promise<void> {
+  private async runRem(cwd: string, night: Date, sourceSessionId: string, force = false): Promise<void> {
     if (!force && !this.headroomOk(REM_HEADROOM_LIMIT_PCT)) {
       log.info('dream', `REM skipped for plan headroom: ${cwd}`)
-      this.writeRemDigest(cwd, night, 'REM skipped — the current plan window was over 60% used.', false, true)
-      return
-    }
-    let pre: Awaited<ReturnType<typeof checkpoint>>
-    try {
-      pre = await checkpoint(cwd, 'before overnight REM')
-    } catch (err) {
-      log.warn('dream', `REM skipped because its safety checkpoint threw: ${cwd}`, err instanceof Error ? err.message : err)
-      this.writeRemDigest(
+      await this.writeRemDigest(
         cwd,
         night,
-        'REM skipped — Koda could not make the safety checkpoint that keeps the pass read-only.',
+        'REM skipped — the current plan window was over 60% used.',
         false,
         true,
       )
       return
     }
-    if (!pre.id) {
+    const pre = await this.sessions.checkpointProjectForSession(sourceSessionId, 'before overnight REM')
+    if (!pre) {
       log.warn('dream', `REM skipped because its safety checkpoint failed: ${cwd}`)
-      this.writeRemDigest(
+      await this.writeRemDigest(
         cwd,
         night,
         'REM skipped — Koda could not make the safety checkpoint that keeps the pass read-only.',
@@ -455,7 +464,7 @@ export class DreamScheduler {
       sandbox = await createCheckpointSandbox(cwd, pre.id)
     } catch (err) {
       log.warn('dream', `REM skipped because its sandbox failed: ${cwd}`, err instanceof Error ? err.message : err)
-      this.writeRemDigest(
+      await this.writeRemDigest(
         cwd,
         night,
         'REM skipped — Koda could not materialize the disposable safety snapshot.',
@@ -484,7 +493,7 @@ export class DreamScheduler {
       const reply = `REM failed before its isolated session could start: ${err instanceof Error ? err.message : String(err)}`
       log.warn('dream', `REM session start failed: ${cwd}`, err instanceof Error ? err.message : err)
       const cleaned = await removeCheckpointSandbox(sandbox).then(() => true).catch(() => false)
-      this.writeRemDigest(cwd, night, reply, false, cleaned)
+      await this.writeRemDigest(cwd, night, reply, false, cleaned)
       return
     }
 
@@ -516,13 +525,17 @@ export class DreamScheduler {
           return false
         })
       : false
-    this.writeRemDigest(cwd, night, reply, outcome === 'interrupted', containmentHeld)
+    await this.writeRemDigest(
+      cwd,
+      night,
+      reply,
+      outcome === 'interrupted',
+      containmentHeld,
+    )
     log.info('dream', `finished read-only REM pass: ${cwd}`)
   }
 
-  /** Append the night's entry to the project's dream digest — the one file RB reads to judge the
-   *  feature. Fail-soft: a digest write must never fail the night. */
-  private writeDigest(cwd: string, night: Date, reply: string | undefined, interrupted: boolean): void {
+  private writeDigestFile(cwd: string, night: Date, reply: string | undefined, interrupted: boolean): void {
     const path = join(cwd, '.koda', 'memory', 'dream-digest.md')
     try {
       let existing = ''
@@ -537,7 +550,31 @@ export class DreamScheduler {
     }
   }
 
-  private writeRemDigest(
+  private async writeRemDigest(
+    cwd: string,
+    night: Date,
+    reply: string | undefined,
+    interrupted: boolean,
+    containmentHeld: boolean,
+  ): Promise<void> {
+    try {
+      await this.sessions.withExternalProjectMutation(
+        cwd,
+        { checkpointLabel: 'before overnight REM digest', refreshOwnership: false },
+        (checkpointed) => {
+          if (!checkpointed) {
+            log.warn('dream', `REM digest skipped because its safety checkpoint failed: ${cwd}`)
+            return
+          }
+          this.writeRemDigestFile(cwd, night, reply, interrupted, containmentHeld)
+        },
+      )
+    } catch (err) {
+      log.warn('dream', `REM digest ownership boundary failed: ${cwd}`, err instanceof Error ? err.message : err)
+    }
+  }
+
+  private writeRemDigestFile(
     cwd: string,
     night: Date,
     reply: string | undefined,
@@ -613,31 +650,4 @@ export class DreamScheduler {
     return 'completed'
   }
 
-  /** The scope tripwire: anything the dream changed outside .koda/memory/ goes back to the
-   *  pre-dream checkpoint. Added files are deleted; modified/deleted files are checked out.
-   *  A snapshot is taken first so even a wrong revert is recoverable from the safety timeline,
-   *  and a truncated diff (>500 files — a runaway) triggers a FULL restore, not a partial one. */
-  private async revertOutOfScope(cwd: string, checkpointId: string): Promise<void> {
-    const changes = await checkpointChanges(cwd, checkpointId).catch(() => null)
-    if (!changes) return
-    if (changes.truncated) {
-      log.warn('dream', `scope tripwire: diff truncated (runaway change set) — full restore in ${cwd}`)
-      await restore(cwd, checkpointId).catch((err) =>
-        log.warn('dream', 'full restore failed', err instanceof Error ? err.message : err),
-      )
-      return
-    }
-    const outside = changes.files.filter((f) => !f.path.startsWith('.koda/memory/'))
-    if (outside.length === 0) return
-    log.warn('dream', `scope tripwire: reverting ${outside.length} out-of-scope change(s) in ${cwd}`)
-    await checkpoint(cwd, 'before overnight scope revert') // whatever the revert removes stays recoverable
-    for (const f of outside) {
-      try {
-        if (f.status === 'added') await rm(join(cwd, f.path), { force: true })
-        else await runGit(cwd, ['checkout', checkpointId, '--', f.path])
-      } catch (err) {
-        log.warn('dream', `revert failed for ${f.path}`, err instanceof Error ? err.message : err)
-      }
-    }
-  }
 }

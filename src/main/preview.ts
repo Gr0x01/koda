@@ -12,7 +12,7 @@
 import { protocol, ipcMain, BrowserWindow } from 'electron'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { readFile, stat } from 'node:fs/promises'
+import { stat } from 'node:fs/promises'
 import { extname } from 'node:path'
 import http from 'node:http'
 import https from 'node:https'
@@ -21,6 +21,7 @@ import { track } from './telemetry'
 import { PreviewRectSchema, type PreviewRect } from '@shared/ipc'
 import { BROKER_TOKEN_ENV } from './broker/server'
 import { containedReal } from './fs-browse'
+import { readWholeContainedRegularFile } from './contained-read'
 import { userPath } from './engine/user-path'
 import { contextForPreviewToken, previewTokenForWindow } from './window-registry'
 import { log } from './logger'
@@ -31,7 +32,7 @@ export const PREVIEW_SCHEME = 'koda-preview'
  * The current preview URL per session — the one fact phone preview needs that main didn't keep (the URL
  * was pushed to the renderer and forgotten). Written when a dev server confirms serving or a static file
  * is shown; read by remote-control.ts to expose that session's dev server to the phone (LAN forwarder or
- * WG tunnel). `kind` distinguishes a live dev server from a static koda-preview:// file.
+ * Connect). `kind` distinguishes a live dev server from a static koda-preview:// file.
  */
 const sessionPreviews = new Map<string, { url: string; kind: 'dev' | 'static'; winId: number }>()
 
@@ -142,18 +143,16 @@ export function registerPreviewProtocol(): void {
     let rel = decodeURIComponent(url.pathname)
     if (rel === '/' || rel === '') rel = '/index.html'
 
-    let file: string
     try {
-      file = containedReal(ctx.projectPath, rel.replace(/^\/+/, '')) // strip leading '/' → project-relative
-    } catch {
-      // Escapes the root, or the file doesn't exist — same opaque blank either way (don't leak which).
-      return blankPreviewResponse(404)
-    }
-
-    try {
-      const body = await readFile(file)
-      return new Response(body, { headers: { 'Content-Type': contentType(file) } })
+      // Validation and bytes come from one opened descriptor. A path-only realpath check followed by
+      // `readFile(path)` left a swap window where a project asset could become an outside symlink.
+      const { bytes, path } = await readWholeContainedRegularFile(
+        ctx.projectPath,
+        rel.replace(/^\/+/, ''), // strip leading '/' → project-relative
+      )
+      return new Response(bytes, { headers: { 'Content-Type': contentType(path) } })
     } catch (err) {
+      // Escapes, missing files and read failures are deliberately indistinguishable to the preview.
       log.warn('preview', 'read failed', err instanceof Error ? err.message : err)
       return blankPreviewResponse(404)
     }
@@ -207,6 +206,15 @@ interface DevServer {
 
 /** Live dev servers keyed by window id (one per window — starting a new one replaces the old). */
 const devServers = new Map<number, DevServer>()
+
+/** Tell the window a dev-server URL has stopped serving, so its preview tab drops the live mark. Only
+ *  worth sending for a URL that actually served: before that the renderer was never pointed at it. The
+ *  iframe keeps its last paint either way, which is exactly why the mark has to be told the truth. */
+function notePreviewStopped(winId: number, url?: string): void {
+  if (!url) return
+  const win = BrowserWindow.fromId(winId)
+  if (win && !win.isDestroyed()) win.webContents.send(IpcChannels.previewStopped, { url })
+}
 
 // eslint-disable-next-line no-control-regex -- stripping ANSI color codes means matching the raw ESC byte
 const ANSI = /\x1b\[[0-9;]*m/g
@@ -358,6 +366,8 @@ export function startDevServer(
     )
     child.on('exit', (code) => {
       if (isCurrent()) devServers.delete(winId)
+      // A server that had come up and then died: the renderer is pointed at a URL nothing answers now.
+      notePreviewStopped(winId, entry.url)
       finish(() =>
         reject(
           new Error(
@@ -380,6 +390,8 @@ export function killDevServer(winId: number): void {
   const entry = devServers.get(winId)
   if (!entry) return
   devServers.delete(winId)
+  // Listeners come off next, so the exit handler will never fire — say it here instead.
+  notePreviewStopped(winId, entry.url)
   entry.child.removeAllListeners()
   entry.child.stdout?.removeAllListeners()
   entry.child.stderr?.removeAllListeners()

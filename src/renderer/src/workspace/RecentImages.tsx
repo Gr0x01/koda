@@ -1,157 +1,123 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ScratchImage } from '@shared/ipc'
-import { motion } from '../motion'
-import { Caret } from '../Caret'
+import { HoverCard } from '../ui'
+import { RailFootLine } from './RailFoot'
 import { useWorkspace } from './store'
-import { PanelHeader } from './PanelHeader'
 
 const PAGE = 30
 
-// Resting (collapsed) height: the h-9 (36px) header + a one-row peek (h-12 thumb + pt-2/pb-2 = 64px)
-// + the 1px border-t. These are fixed-px Tailwind utilities — the text-size setting only scales the
-// --prose-* vars, not the rem base — so this constant is stable. Used as a static flex-basis while
-// expand/collapse animates flex-GROW (a unitless, valid-CSS number that reflows for real, so the
-// thumbnails never scale-distort the way a transform-based `layout` animation made them).
-const COLLAPSED_PX = 101
-
-// A horizontal mask that dissolves whichever edge has more content scrolled past it. Undefined (no mask)
-// when neither edge fades, so the expanded grid and a non-overflowing row render at full opacity.
-const FADE = 24
-function edgeMask({ left, right }: { left: boolean; right: boolean }): string | undefined {
-  if (!left && !right) return undefined
-  const from = left ? 'transparent' : 'black'
-  const to = right ? 'transparent' : 'black'
-  return `linear-gradient(to right, ${from}, black ${FADE}px, black calc(100% - ${FADE}px), ${to})`
-}
-
 /**
- * A strip of this project's recent scratch images — the durable copies of every screenshot you've handed
- * Claude (kept in `.koda/scratch/`, otherwise invisible). Click a thumb to view it full-size; the `+`
- * re-attaches it to the active session. Hidden when the project has none.
+ * **Recent images** — this project's scratch images, the durable copies of every screenshot handed to
+ * the agent (kept in `.koda/scratch/`, otherwise invisible). One line at the rail's foot; the grid
+ * lives in its hover card. Click a thumb to view it full-size, `+` to re-attach it to the active
+ * session. Renders nothing when the project has none.
  *
- * Two heights via the title-bar chevron: **collapsed** = a one-row horizontal peek; **expanded** = a
- * vertical grid that grows into (scrunches) the Files section so you can review many at once. Either way
- * it **lazy-loads** a page at a time as the end sentinel scrolls into view — so a long retention can hold
- * "whatever amount" without the renderer ever holding every image in memory. Refetches on each new send.
+ * It used to be an always-visible strip with a collapsed peek and an expanded grid. A thumbnail strip
+ * answers *what exists*, so it does not earn permanent rail height; the expanded grid is the shape
+ * that survived, and the card is where it lives.
+ *
+ * Still **lazy-loads** a page at a time as the end sentinel scrolls into view, so a long retention
+ * never puts every image in the renderer at once. The scroll container and sentinel are held as state
+ * via callback refs rather than `useRef`, because they only exist while the card is open — a plain ref
+ * would still be null on the render that wires the observer, and paging would never start.
  */
 export function RecentImages() {
   const tick = useWorkspace((s) => s.scratchTick)
-  const expanded = useWorkspace((s) => s.recentImagesExpanded)
-  const toggleExpanded = useWorkspace((s) => s.toggleRecentImagesExpanded)
   const setLightbox = useWorkspace((s) => s.setLightbox)
   const addAttachments = useWorkspace((s) => s.addAttachments)
   const activeId = useWorkspace((s) => s.activeId)
 
   const [images, setImages] = useState<ScratchImage[]>([])
   const [total, setTotal] = useState(0)
-  // Edge-fade state for the collapsed horizontal row: fade the right while more scrolls off-screen,
-  // fade the left once you've scrolled away from the start. Both false in the expanded vertical grid.
-  const [fade, setFade] = useState({ left: false, right: false })
   const loadingRef = useRef(false)
-  const scrollRef = useRef<HTMLDivElement>(null)
-  const sentinelRef = useRef<HTMLDivElement>(null)
+  const refreshQueuedRef = useRef(false)
+  const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null)
+  const [sentinelEl, setSentinelEl] = useState<HTMLDivElement | null>(null)
 
   // Load one page. offset 0 replaces (a fresh refresh); >0 appends (lazy "load more").
   const loadPage = useCallback(async (offset: number) => {
-    if (loadingRef.current) return
+    // Retention can change while the initial page is still in flight. A fresh refresh is authoritative,
+    // so queue offset 0 instead of dropping it behind that older request. Lazy-page overlaps may still
+    // collapse into one request; the sentinel will ask again if more remains.
+    if (loadingRef.current) {
+      if (offset === 0) refreshQueuedRef.current = true
+      return
+    }
     loadingRef.current = true
+    let nextOffset = offset
     try {
-      const r = await window.koda.listScratchImages({ offset, limit: PAGE })
-      setTotal(r.total)
-      setImages((prev) => (offset === 0 ? r.images : [...prev, ...r.images]))
-    } catch {
-      if (offset === 0) {
-        setImages([])
-        setTotal(0)
+      while (true) {
+        const requestOffset = nextOffset
+        if (requestOffset === 0) refreshQueuedRef.current = false
+        try {
+          const r = await window.koda.listScratchImages({ offset: requestOffset, limit: PAGE })
+          setTotal(r.total)
+          setImages((prev) => (requestOffset === 0 ? r.images : [...prev, ...r.images]))
+        } catch {
+          if (requestOffset === 0) {
+            setImages([])
+            setTotal(0)
+          }
+        }
+        if (!refreshQueuedRef.current) break
+        nextOffset = 0
       }
     } finally {
       loadingRef.current = false
     }
   }, [])
 
-  // Refresh from the top on mount and whenever a new image is sent.
+  // Refresh from the top on mount and whenever a new image is sent. The first page loads even while
+  // the card is shut, because the line itself has to show a count.
   useEffect(() => {
     void loadPage(0)
   }, [tick, loadPage])
 
-  // Recompute the edge fades from the scroll position. Only the collapsed row scrolls horizontally;
-  // the expanded grid has no overflow-x, so scrollWidth === clientWidth and both fades stay off.
-  const updateFade = useCallback(() => {
-    const el = scrollRef.current
-    if (!el) return setFade({ left: false, right: false })
-    const max = el.scrollWidth - el.clientWidth
-    setFade({ left: el.scrollLeft > 1, right: el.scrollLeft < max - 1 })
-  }, [])
-
-  // Re-evaluate when content changes (new page, refresh, expand/collapse) and on container resize.
+  // Lazy-load the next page when the end sentinel scrolls into view; the card's scroll box is the
+  // observer root, so nothing fires until the card is actually open.
   useEffect(() => {
-    updateFade()
-    const el = scrollRef.current
-    if (!el) return
-    const ro = new ResizeObserver(updateFade)
-    ro.observe(el)
-    return () => ro.disconnect()
-  }, [images.length, expanded, updateFade])
-
-  // Lazy-load the next page when the end sentinel scrolls into view — the scroll container is the
-  // observer root, so the same sentinel works for the horizontal row and the vertical grid alike.
-  useEffect(() => {
-    const sentinel = sentinelRef.current
-    const root = scrollRef.current
-    if (!sentinel || !root) return
+    if (!sentinelEl || !scrollEl) return
     const io = new IntersectionObserver(
       (entries) => {
         if (entries[0]?.isIntersecting && images.length < total) void loadPage(images.length)
       },
-      { root },
+      { root: scrollEl },
     )
-    io.observe(sentinel)
+    io.observe(sentinelEl)
     return () => io.disconnect()
-  }, [images.length, total, loadPage])
+  }, [sentinelEl, scrollEl, images.length, total, loadPage])
 
-  if (images.length === 0) return null
+  if (total === 0) return null
   const more = images.length < total
+
   return (
-    // Animate flex-GROW 0⇄1 (collapsed peek ⇄ expanded fill). flex-grow is unitless, so each frame is
-    // valid CSS and reflows the real flex column — the Files sibling (flex-1) yields/reclaims space on
-    // its own, no transforms, no thumbnail distortion. flex-basis holds the one-row resting height.
-    <motion.div
-      className="flex min-h-0 flex-col border-t border-border"
-      style={{ flexBasis: COLLAPSED_PX, flexShrink: 0 }}
-      initial={false}
-      animate={{ flexGrow: expanded ? 1 : 0 }}
-      transition={{ duration: 0.24, ease: [0.22, 1, 0.36, 1] }}
+    <HoverCard
+      interactive
+      heading="Recent images"
+      ariaLabel="Recent images"
+      width={272}
+      trigger={
+        <RailFootLine
+          icon={<IconImage />}
+          label="Recent images"
+          count={total}
+          aria-label={`Recent images (${total})`}
+        />
+      }
     >
-      <PanelHeader label="Recent images">
-        <button
-          onClick={toggleExpanded}
-          title={expanded ? 'Collapse' : 'Expand'}
-          aria-label={expanded ? 'Collapse recent images' : 'Expand recent images'}
-          aria-expanded={expanded}
-          className="-mr-1 flex h-5 w-5 items-center justify-center rounded text-text-muted transition-colors hover:bg-surface hover:text-text"
-        >
-          <Caret dir={expanded ? 'up' : 'down'} />
-        </button>
-      </PanelHeader>
       <div
-        ref={scrollRef}
-        onScroll={updateFade}
-        // pt-2/px-2: the `+` badge floats outside each thumb (-top-1 -right-1); a scroll container clips
-        // both axes (overflow-x:auto forces overflow-y to clip too), so pad enough to keep it visible.
-        className={
-          expanded
-            ? 'flex min-h-0 flex-1 flex-wrap content-start gap-1.5 overflow-y-auto px-2 pb-2 pt-2'
-            : 'flex gap-1.5 overflow-x-auto px-2 pb-2 pt-2'
-        }
-        style={{ WebkitMaskImage: edgeMask(fade), maskImage: edgeMask(fade) }}
+        ref={setScrollEl}
+        // p-1 rather than none: the `+` badge floats outside each thumb (-top-1 -right-1) and a scroll
+        // box clips it, so the grid needs a hair of room on every edge.
+        className="grid max-h-64 grid-cols-3 gap-1.5 overflow-y-auto p-1"
       >
         {images.map((img) => (
-          <div key={img.relPath} className="group relative shrink-0">
+          <div key={img.relPath} className="group relative">
             <button
               type="button"
               onClick={() => setLightbox(img)}
-              title={img.name}
-              className="block h-12 w-12 overflow-hidden rounded-md border border-border bg-surface transition-opacity hover:opacity-90"
+              aria-label={`View ${img.name}`}
+              className="block aspect-[4/3] w-full overflow-hidden rounded-md border border-border bg-bg outline-none transition-opacity hover:opacity-90 focus-visible:border-accent"
             >
               <img
                 src={`data:${img.mediaType};base64,${img.dataBase64}`}
@@ -162,6 +128,7 @@ export function RecentImages() {
             {activeId && (
               <button
                 type="button"
+                aria-label={`Add ${img.name} to your message`}
                 onClick={() =>
                   addAttachments(activeId, [
                     {
@@ -171,17 +138,28 @@ export function RecentImages() {
                     },
                   ])
                 }
-                title="Add to message"
-                aria-label="Add to message"
-                className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-accent text-[11px] leading-none text-white opacity-0 transition-opacity group-hover:opacity-100"
+                className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-accent text-[11px] leading-none text-white opacity-0 outline-none transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
               >
                 +
               </button>
             )}
           </div>
         ))}
-        {more && <div ref={sentinelRef} className="h-12 w-12 shrink-0" aria-hidden />}
+        {more && <div ref={setSentinelEl} className="aspect-[4/3] w-full" aria-hidden />}
       </div>
-    </motion.div>
+      <p className="mt-2 border-t border-border pt-2 text-[11px] text-text-muted">
+        Click one to view it, or <span className="text-text">+</span> to add it to your message.
+      </p>
+    </HoverCard>
+  )
+}
+
+function IconImage() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <circle cx="8.5" cy="8.5" r="1.5" />
+      <path d="m21 15-5-5L5 21" />
+    </svg>
   )
 }

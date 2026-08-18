@@ -1,0 +1,9 @@
+{
+  "name": "deep-review",
+  "description": "Repository-wide detective review with evidence-backed 1–5 readiness scoring.",
+  "version": "0.1.2",
+  "author": {
+    "name": "Koda"
+  },
+  "license": "MIT"
+}

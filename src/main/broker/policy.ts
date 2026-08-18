@@ -21,6 +21,9 @@
 export const RECOVERY_LIST_TOOL = 'mcp__koda_broker__list_checkpoints'
 export const RECOVERY_RESTORE_TOOL = 'mcp__koda_broker__restore_checkpoint'
 
+/** Koda's live capability directory only reads the tools registered for this session. */
+export const CAPABILITIES_TOOL = 'mcp__koda_broker__capabilities'
+
 /** Koda's preview capability (preview-surface.md, Rung 2) — the agent asks Koda to start the dev
  *  server. Mutates no project files (it spawns a process), so no safety checkpoint; the
  *  `previewAutoStart` setting decides whether the gate confirms it first (broker/gate.ts). */
@@ -46,10 +49,15 @@ export const PREVIEW_FILE_TOOL = 'mcp__koda_broker__preview_file'
  *  Auto-approve. */
 export const ENSURE_TOOL_TOOL = 'mcp__koda_broker__ensure_tool'
 
-/** Koda's "pop the terminal shelf" capability — the agent opens the in-app terminal for the user (for a
+/** Koda's "open the terminal" capability — the agent puts the in-app terminal on stage for the user (for a
  *  sudo/interactive command it can't run itself) and optionally stages a command at the prompt. It runs
  *  nothing and touches no project file → no checkpoint, and frictionless in Auto like the preview tools. */
 export const OPEN_TERMINAL_TOOL = 'mcp__koda_broker__open_terminal'
+
+/** Koda's "keep this as a document" capability — it WRITES a file into the user's project, so it stays
+ *  off every list in this module and takes the fail-closed pre-checkpoint. Named here only so
+ *  `checkpointLabel` can give that checkpoint a human sentence instead of the raw MCP tool name. */
+export const KEEP_DOCUMENT_TOOL = 'mcp__koda_broker__keep_document'
 
 /** The engine's plan-mode exit tool. Touches no project file (it presents a plan + asks to
  *  proceed), so no checkpoint — but it ALWAYS confirms (see ALWAYS_CONFIRM_TOOLS) so the user
@@ -85,6 +93,8 @@ const READ_ONLY_TOOLS = new Set([
   'NotebookRead',
   EXIT_PLAN_MODE_TOOL,
   ASK_USER_QUESTION_TOOL, // asks the user a question; mutates nothing (also auto-allowed in the gate)
+  // Reading the session's Koda capability directory mutates nothing and should never checkpoint.
+  CAPABILITIES_TOOL,
   // Listing recovery checkpoints only reads the safety store — no mutation, no pre-checkpoint.
   RECOVERY_LIST_TOOL,
   // Starting the preview server spawns a process; it doesn't edit project files, so no checkpoint.
@@ -96,7 +106,7 @@ const READ_ONLY_TOOLS = new Set([
   // Installing a CLI lands in Koda's own dir, not the user's project — no checkpoint (it still always
   // confirms via ALWAYS_CONFIRM_TOOLS).
   ENSURE_TOOL_TOOL,
-  // Popping the terminal shelf (and staging, never running, a command) mutates no project file.
+  // Opening the terminal (and staging, never running, a command) mutates no project file.
   OPEN_TERMINAL_TOOL,
 ])
 
@@ -147,34 +157,64 @@ export function isSelfCheckpointing(toolName: string): boolean {
 }
 
 /**
- * Destructive-git hard-stop tripwire (dual-git.md §3, guardrails.md §7). These operations
- * rewrite or delete the user's *history* — safety-git protects working *files*, but it can't
- * bring back a force-pushed remote or a deleted branch. So they're denied even in Auto-approve;
- * the engine must stop and ask. Git runs via Bash in our setup, so we scan Bash command strings.
+ * Getting OUT of an in-progress git operation is never the destructive act. `--abort` only
+ * restores, and `--continue` / `--skip` / `--quit` finish a rewrite the repository is already
+ * halfway through, so refusing them preserves nothing. Refusing them does cause real harm: it
+ * strands the repository mid-operation with no agent-reachable way out, which puts a git command in
+ * the hands of the person least equipped to run one. Starting the operation is where the tripwire
+ * belongs, so these clear before the patterns below are consulted.
+ */
+const GIT_IN_PROGRESS_EXIT_RE =
+  /\bgit\b[^&|;]*\b(rebase|merge|cherry-pick|revert|am)\b[^&|;]*--(abort|continue|skip|quit)\b/
+
+/**
+ * Where a destructive op does its damage, which is what decides whether Koda can offer a way back.
+ * `local` rewrites history that still lives in this checkout, so the old tip is generally still
+ * reachable through the reflog. `remote` has already reached a server Koda can neither see nor
+ * restore.
+ */
+export type GitScope = 'local' | 'remote'
+
+/**
+ * Destructive-git tripwire (dual-git.md §3, guardrails.md §7). These operations rewrite or delete
+ * the user's *history* — safety-git protects working *files*, so it can't bring back a force-pushed
+ * remote or a deleted branch. That's why they always look the user in the eye, even in Auto-approve.
+ * Git runs via Bash in our setup, so we scan Bash command strings.
+ *
+ * They're a forced ASK rather than a hard deny. A deny reads as safety but spends it in the wrong
+ * place: the operation is usually one the user actually wants, and refusing it doesn't remove the
+ * work, it relocates the work to their terminal. Someone who came to Koda precisely to avoid
+ * writing git commands is exactly who a deny hands one to.
  *
  * Deliberately conservative pattern set — covers the named ops (force-push, hard-reset, history
  * rewrite, branch/tag delete) without trying to be a full git parser. False positives are
- * acceptable here (the user can rephrase or approve explicitly); a missed destructive op is not.
+ * acceptable here (the user sees a card and allows it); a missed destructive op is not.
  */
-const DESTRUCTIVE_GIT_PATTERNS: ReadonlyArray<{ re: RegExp; what: string }> = [
-  { re: /\bgit\b[^&|;]*\bpush\b[^&|;]*(--force\b|--force-with-lease\b|\s-f\b)/, what: 'force-push' },
-  { re: /\bgit\b[^&|;]*\bpush\b[^&|;]*\s\+[^\s]/, what: 'force-push (+refspec)' },
-  { re: /\bgit\b[^&|;]*\breset\b[^&|;]*--hard\b/, what: 'hard reset' },
-  { re: /\bgit\b[^&|;]*\brebase\b/, what: 'rebase (history rewrite)' },
-  { re: /\bgit\b[^&|;]*\bfilter-branch\b/, what: 'filter-branch (history rewrite)' },
-  { re: /\bgit\b[^&|;]*\bfilter-repo\b/, what: 'filter-repo (history rewrite)' },
+const DESTRUCTIVE_GIT_PATTERNS: ReadonlyArray<{ re: RegExp; what: string; scope: GitScope }> = [
+  { re: /\bgit\b[^&|;]*\bpush\b[^&|;]*(--force\b|--force-with-lease\b|\s-f\b)/, what: 'force-push', scope: 'remote' },
+  { re: /\bgit\b[^&|;]*\bpush\b[^&|;]*\s\+[^\s]/, what: 'force-push (+refspec)', scope: 'remote' },
+  { re: /\bgit\b[^&|;]*\breset\b[^&|;]*--hard\b/, what: 'hard reset', scope: 'local' },
+  { re: /\bgit\b[^&|;]*\brebase\b/, what: 'rebase (history rewrite)', scope: 'local' },
+  { re: /\bgit\b[^&|;]*\bfilter-branch\b/, what: 'filter-branch (history rewrite)', scope: 'local' },
+  { re: /\bgit\b[^&|;]*\bfilter-repo\b/, what: 'filter-repo (history rewrite)', scope: 'local' },
   // Only the FORCE delete (-D, or --delete --force) is destructive — it discards unmerged commits.
   // Safe delete (git branch -d / --delete) refuses to drop unmerged work, so it's routine merge
   // cleanup the agent is told to do (CLAUDE.md "a merge isn't done until the branch is gone") — must
   // pass. tag -d has no safe variant (it's the only way to delete a tag, and that's history), so it stays.
-  { re: /\bgit\b[^&|;]*\bbranch\b[^&|;]*(\s-D\b|--delete\b[^&|;]*--force\b|--force\b[^&|;]*--delete\b)/, what: 'branch force-delete' },
-  { re: /\bgit\b[^&|;]*\btag\b[^&|;]*\s-d\b/, what: 'tag delete' },
-  { re: /\bgit\b[^&|;]*\breflog\b[^&|;]*\bexpire\b/, what: 'reflog expire' },
-  { re: /\bgit\b[^&|;]*\bupdate-ref\b[^&|;]*\s-d\b/, what: 'ref delete' },
+  { re: /\bgit\b[^&|;]*\bbranch\b[^&|;]*(\s-D\b|--delete\b[^&|;]*--force\b|--force\b[^&|;]*--delete\b)/, what: 'branch force-delete', scope: 'local' },
+  { re: /\bgit\b[^&|;]*\btag\b[^&|;]*\s-d\b/, what: 'tag delete', scope: 'local' },
+  { re: /\bgit\b[^&|;]*\breflog\b[^&|;]*\bexpire\b/, what: 'reflog expire', scope: 'local' },
+  { re: /\bgit\b[^&|;]*\bupdate-ref\b[^&|;]*\s-d\b/, what: 'ref delete', scope: 'local' },
 ]
 
 export interface TripwireHit {
   what: string
+}
+
+/** A destructive-git hit, carrying the scope so the caller can word the confirm honestly: a local
+ *  rewrite can point at the reflog, a remote one has to admit there's no way back. */
+export interface DestructiveGitHit extends TripwireHit {
+  scope: GitScope
 }
 
 /**
@@ -223,11 +263,12 @@ const KODA_DIR_DELETE_RE = /\brm\b[^&|;]*\s["']?(?:\S*[\\/])?\.koda[\\/]?(?:[\s;
 export function protectedTarget(toolName: string, input: unknown): TripwireHit | null {
   const i = input as Record<string, unknown> | null | undefined
   if (isEditTool(toolName)) {
-    const target = [i?.file_path, i?.path, i?.notebook_path].find((v) => typeof v === 'string') as
-      | string
-      | undefined
-    if (!target) return null
-    for (const { re, what } of PROTECTED_PATH_PATTERNS) if (re.test(target)) return { what }
+    // Codex's one approval can cover several changed files. Treat every path as part of the action;
+    // checking only the first lets an ordinary lead file hide a later guardrail/settings/recovery edit.
+    const targets = [i?.file_path, i?.path, i?.notebook_path, ...(Array.isArray(i?.file_paths) ? i.file_paths : [])]
+      .filter((value): value is string => typeof value === 'string' && Boolean(value.trim()))
+    for (const target of targets)
+      for (const { re, what } of PROTECTED_PATH_PATTERNS) if (re.test(target)) return { what }
     return null
   }
   if (toolName === 'Bash') {
@@ -244,15 +285,45 @@ export function protectedTarget(toolName: string, input: unknown): TripwireHit |
 }
 
 /**
+ * One shell command per element. The exit exemption has to be judged per command rather than per
+ * request, or `git rebase --continue && git push --force` would clear the whole string on the
+ * strength of its harmless first half. The destructive patterns themselves already can't span `&|;`
+ * (their inner `[^&|;]*` forbids it), so splitting doesn't change what they match. It only decides
+ * which commands the exemption is allowed to speak for.
+ *
+ * Split points, and why each one is here:
+ * - `&&` `||` `;` `|` `&` and a newline: the ordinary ways one command ends and the next begins.
+ * - `$(` `` ` `` `(` `)`: a substitution or subshell RUNS, and it runs before the command hosting
+ *   it. `git rebase --continue $(git push --force …)` must not be excused by its exempt outer half,
+ *   so the nested command becomes a segment of its own and is judged on its own.
+ *
+ * A backslash-newline is healed first: it's one command wearing two lines, and splitting there
+ * would leave a `git push \` fragment and a `--force …` fragment, neither of which matches anything.
+ *
+ * This is a shell-shaped guess, in a file whose own architecture note concedes the ceiling. It is
+ * deliberately biased toward over-splitting: an extra split can only turn a miss into a confirm the
+ * user clicks through, while a missed split is a destructive op running unseen.
+ */
+function shellSegments(command: string): string[] {
+  return command.replace(/\\\r?\n/g, ' ').split(/&&|\|\||\$\(|[;|&\n`()]/)
+}
+
+/**
  * Returns the matched destructive op when this tool call is a destructive git command, else null.
  * Only Bash can run git in our setup; the engine's own edit tools can't force-push.
  */
-export function destructiveGit(toolName: string, input: unknown): TripwireHit | null {
+export function destructiveGit(toolName: string, input: unknown): DestructiveGitHit | null {
   if (toolName !== 'Bash') return null
   const command = (input as { command?: unknown })?.command
   if (typeof command !== 'string') return null
-  for (const { re, what } of DESTRUCTIVE_GIT_PATTERNS) {
-    if (re.test(command)) return { what }
+  for (const segment of shellSegments(command)) {
+    // Leaving a half-finished rebase/merge/cherry-pick is the way OUT of the dangerous state rather
+    // than a way further into it, so this command is exempt. Only THIS command: a destructive op
+    // chained after it is still judged on its own below.
+    if (GIT_IN_PROGRESS_EXIT_RE.test(segment)) continue
+    for (const { re, what, scope } of DESTRUCTIVE_GIT_PATTERNS) {
+      if (re.test(segment)) return { what, scope }
+    }
   }
   return null
 }
@@ -264,6 +335,13 @@ export function destructiveGit(toolName: string, input: unknown): TripwireHit | 
  */
 export function checkpointLabel(toolName: string, input: unknown): string {
   const i = input as Record<string, unknown> | null | undefined
+  // Koda's own capability tools carry no `file_path`/`command`, so the generic path below would print
+  // their raw MCP name — `before mcp__koda_broker__keep_document` — into the one timeline that is
+  // supposed to be readable by someone who has never seen a tool name.
+  if (toolName === KEEP_DOCUMENT_TOOL) {
+    const title = firstLine(pickString(i?.title))
+    return title ? `before keeping "${title}" as a document` : 'before keeping a document'
+  }
   const target =
     pickString(i?.file_path) ??
     pickString(i?.path) ??

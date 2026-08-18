@@ -11,7 +11,7 @@
  */
 import { spawn as ptySpawn, type IPty } from 'node-pty'
 import { BrowserWindow, ipcMain, type WebContents } from 'electron'
-import { homedir } from 'node:os'
+import { homedir, userInfo } from 'node:os'
 import { IpcChannels } from '@shared/channels'
 import { TerminalSizeSchema, TerminalInputSchema, type TerminalStartResult } from '@shared/ipc'
 import { userPath } from './engine/user-path'
@@ -23,10 +23,10 @@ type Term = { pty: IPty; cwd: string }
 /** One shell per window (the Dock is window-scoped; every session in the window shares its project cwd). */
 const terms = new Map<number, Term>()
 
-/** The user's interactive login shell. A pty makes it interactive (reads ~/.zshrc → aliases); PATH is
+/** The user's interactive login shell. A pty makes it read that shell's startup files; PATH is
  *  restored via userPath() so brew/nvm tools resolve. Windows falls back to PowerShell. */
 const DEFAULT_SHELL =
-  process.platform === 'win32' ? 'powershell.exe' : process.env.SHELL || '/bin/zsh'
+  process.platform === 'win32' ? 'powershell.exe' : process.env.SHELL || userInfo().shell || '/bin/sh'
 
 /** Spawn (or re-ensure) the window's shell at `cols`×`rows`. Respawns if the prior one exited (the
  *  user typed `exit`, or a crash). Returns the cwd so the renderer can show it once as a hint. */
@@ -62,7 +62,7 @@ function ensureTerm(win: BrowserWindow, cols: number, rows: number): Term {
   return term
 }
 
-/** Pop the terminal shelf open in a window (the agent's open_terminal tool). `command`, when given, is
+/** Put the terminal on stage in a window (the agent's open_terminal tool). `command`, when given, is
  *  staged at the prompt for the user to run — never executed here. The renderer owns the open + the
  *  staging (it drives the pty), so timing against the shell prompt stays correct. */
 export function showTerminal(winId: number, sessionId: string, command?: string): void {

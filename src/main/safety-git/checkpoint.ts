@@ -3,6 +3,9 @@
  * before each risky tool call (broker-wired, elsewhere) and at turn boundaries. Labels come from
  * data Koda already holds (the user's turn prompt) — no model call.
  */
+import { realpathSync } from 'node:fs'
+import { lstat } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { runGit } from './repo'
 
 export interface Checkpoint {
@@ -39,6 +42,42 @@ export function checkpointKind(label: string): 'moment' | 'step' {
 export interface CheckpointResult extends Checkpoint {
   /** True when nothing changed since the last checkpoint — `id` points at the existing tip. */
   skipped: boolean
+}
+
+/** Exact identity of one regular file that a destructive caller requires this checkpoint to carry. */
+export interface RequiredCheckpointFile {
+  /** Absolute lexical path. The parent is realpath-resolved; the leaf itself is never followed. */
+  path: string
+  /** POSIX project-relative path used as one literal git pathspec. */
+  rel: string
+  /** The pre-check identity. Nanosecond timestamps catch same-size rewrites. */
+  fingerprint: {
+    dev: bigint
+    ino: bigint
+    type: 'regular-file'
+    size: bigint
+    mtimeNs: bigint
+    ctimeNs: bigint
+  }
+}
+
+export interface CheckpointOptions {
+  /** Force-add exactly this validated regular file, even when the project's ignore rules hide it. */
+  requiredFile?: RequiredCheckpointFile
+}
+
+export function sameRequiredFileFingerprint(
+  left: RequiredCheckpointFile['fingerprint'],
+  right: RequiredCheckpointFile['fingerprint'],
+): boolean {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.type === right.type &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs
+  )
 }
 
 /** Current tip, or null when there are no commits yet (first checkpoint). */
@@ -78,6 +117,64 @@ async function treeOfCommit(projectDir: string, sha: string): Promise<string> {
   return stdout.trim()
 }
 
+function isContained(root: string, target: string): boolean {
+  const rel = relative(root, target)
+  return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`))
+}
+
+/** Re-check the caller's exact lexical file identity without ever following its leaf. */
+async function assertRequiredFileStable(
+  projectDir: string,
+  required: RequiredCheckpointFile,
+): Promise<void> {
+  const root = realpathSync(projectDir)
+  const candidate = resolve(root, required.path)
+  const parent = realpathSync(dirname(candidate))
+  if (!isContained(root, parent)) throw new Error('required checkpoint file escapes the project root')
+  const path = join(parent, basename(candidate))
+  const nativeRel = relative(root, path)
+  if (!nativeRel || !isContained(root, path))
+    throw new Error('required checkpoint file is not a contained project file')
+  const rel = nativeRel.split(sep).join('/')
+  if (path !== required.path || rel !== required.rel)
+    throw new Error('required checkpoint file changed path')
+
+  const current = await lstat(path, { bigint: true })
+  if (!current.isFile()) throw new Error('required checkpoint file is not a regular file')
+  const fingerprint: RequiredCheckpointFile['fingerprint'] = {
+    dev: current.dev,
+    ino: current.ino,
+    type: 'regular-file',
+    size: current.size,
+    mtimeNs: current.mtimeNs,
+    ctimeNs: current.ctimeNs,
+  }
+  if (!sameRequiredFileFingerprint(required.fingerprint, fingerprint))
+    throw new Error('required checkpoint file changed before it could be protected')
+}
+
+/** A successful git command is not enough: the exact returned checkpoint must own this file blob. */
+async function assertRequiredFileBlob(
+  projectDir: string,
+  checkpointId: string,
+  required: RequiredCheckpointFile,
+): Promise<void> {
+  const pathspec = `:(literal)${required.rel}`
+  const { stdout } = await runGit(projectDir, ['ls-tree', '-z', checkpointId, '--', pathspec])
+  const entries = stdout.split('\0').filter(Boolean)
+  if (entries.length !== 1) throw new Error('required checkpoint file is missing from the checkpoint')
+  const tab = entries[0].indexOf('\t')
+  const [mode, type, object = ''] = entries[0].slice(0, tab).split(' ')
+  const path = tab >= 0 ? entries[0].slice(tab + 1) : ''
+  if (
+    (mode !== '100644' && mode !== '100755') ||
+    type !== 'blob' ||
+    !/^[0-9a-f]{40,64}$/.test(object) ||
+    path !== required.rel
+  )
+    throw new Error('required checkpoint file is not a regular-file blob in the checkpoint')
+}
+
 /**
  * Snapshot the working tree under `label`. When nothing changed since the last checkpoint we
  * skip the commit and point at the prior one — an empty commit would only clutter the recovery
@@ -87,14 +184,38 @@ async function treeOfCommit(projectDir: string, sha: string): Promise<string> {
  * snapshot) commits to `refs/koda/steps` via `commit-tree`, leaving HEAD/master untouched so the
  * browsable timeline never carries the fine-grained noise and retention can prune steps cheaply.
  */
-export async function checkpoint(projectDir: string, label: string): Promise<CheckpointResult> {
+export async function checkpoint(
+  projectDir: string,
+  label: string,
+  options: CheckpointOptions = {},
+): Promise<CheckpointResult> {
   // Collapse to a single line so the commit subject (%s) is the full label and the log parses cleanly.
   const subject = label.replace(/\s+/g, ' ').trim() || 'checkpoint'
+  const required = options.requiredFile
+
+  // This option is deliberately singular: a document delete may pierce project ignore rules for the
+  // one regular file it already validated, never broaden the safety store's normal exclusion policy.
+  if (required) await assertRequiredFileStable(projectDir, required)
 
   await runGit(projectDir, ['add', '-A'])
+  if (required) {
+    await runGit(projectDir, ['add', '--force', '--', `:(literal)${required.rel}`])
+    await assertRequiredFileStable(projectDir, required)
+  }
 
-  if (checkpointKind(subject) === 'step') return commitStep(projectDir, subject)
+  const result =
+    checkpointKind(subject) === 'step'
+      ? await commitStep(projectDir, subject)
+      : await commitMoment(projectDir, subject)
 
+  if (required) {
+    await assertRequiredFileBlob(projectDir, result.id, required)
+    await assertRequiredFileStable(projectDir, required)
+  }
+  return result
+}
+
+async function commitMoment(projectDir: string, subject: string): Promise<CheckpointResult> {
   const prior = await headSha(projectDir)
   if (prior) {
     // `diff --cached --quiet` exits 0 = nothing staged, 1 = staged changes. Only exit 1 means
@@ -168,4 +289,20 @@ export async function listCheckpoints(projectDir: string): Promise<Checkpoint[]>
       const [id, ct, label] = line.split('\0')
       return { id, label, createdAt: Number(ct), kind: checkpointKind(label) }
     })
+}
+
+/**
+ * One checkpoint by sha, from either lane (a restore target may be a hidden step, which
+ * `listCheckpoints` never walks). Null when the sha isn't in this store — callers use it to name a
+ * restore target in prose, so an unreadable point degrades the sentence rather than the operation.
+ */
+export async function readCheckpoint(projectDir: string, sha: string): Promise<Checkpoint | null> {
+  try {
+    const { stdout } = await runGit(projectDir, ['show', '-s', '--format=%H%x00%ct%x00%s', sha])
+    const [id, ct, label = ''] = stdout.trim().split('\0')
+    if (!id) return null
+    return { id, label, createdAt: Number(ct), kind: checkpointKind(label) }
+  } catch {
+    return null
+  }
 }

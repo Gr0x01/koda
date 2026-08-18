@@ -22,6 +22,7 @@ import { app } from 'electron'
 import { z } from 'zod'
 import { getApiKey } from './api-key'
 import { log } from './logger'
+import { publishedRate } from '@shared/model-pricing'
 
 // ── Tier map ──────────────────────────────────────────────────────────────────────────────────────
 
@@ -31,8 +32,8 @@ import { log } from './logger'
  * catalog moves. Prices are USD per million tokens, used only for the user-facing spend estimate.
  */
 export const BRIDGE_TIERS = {
-  fast: { model: 'claude-haiku-4-5', inputUsdPerMTok: 1, outputUsdPerMTok: 5 },
-  smart: { model: 'claude-sonnet-5', inputUsdPerMTok: 3, outputUsdPerMTok: 15 },
+  fast: { model: 'claude-haiku-4-5' },
+  smart: { model: 'claude-sonnet-5' },
 } as const
 export type BridgeTier = keyof typeof BRIDGE_TIERS
 
@@ -47,10 +48,15 @@ export const InferRequestSchema = z.object({
 })
 export type InferRequest = z.infer<typeof InferRequestSchema>
 
-/** Estimated USD for one call — an honest approximation for the spend line, not an invoice. */
+/**
+ * Measured tokens at the tier model's published rate — the spend line, not an invoice. Rates come from
+ * `shared/model-pricing.ts` so this file and the Usage view can never quote a model differently; a tier
+ * pointed at a model that table can't price bills 0 here, which `app-bridge.test.ts` guards against.
+ */
 export function estimateUsd(tier: BridgeTier, inputTokens: number, outputTokens: number): number {
-  const t = BRIDGE_TIERS[tier]
-  return (inputTokens * t.inputUsdPerMTok + outputTokens * t.outputUsdPerMTok) / 1_000_000
+  const rate = publishedRate(BRIDGE_TIERS[tier].model)
+  if (!rate) return 0
+  return (inputTokens * rate.inputPerMTok + outputTokens * rate.outputPerMTok) / 1_000_000
 }
 
 // ── Per-app consent + spend store ─────────────────────────────────────────────────────────────────

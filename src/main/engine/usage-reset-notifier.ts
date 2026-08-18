@@ -21,6 +21,8 @@ import { Notification } from 'electron'
 import type { RateLimitInfo } from '@shared/ipc'
 import { loadUsageResetNotify } from '../settings'
 import { log } from '../logger'
+import { engineCapabilities } from '@shared/engine-capabilities'
+import type { EngineId } from '@shared/ipc'
 
 /** Best-effort phone push (via the cloud relay when a phone is paired). Injected by the IPC layer. */
 type PushFn = (title: string, body: string) => void
@@ -45,7 +47,7 @@ const windows = new Map<string, TrackedWindow>() // key = `${engine}:${rateLimit
 const ROLLOVER_SLACK_S = 15 * 60
 
 /** Feed every `RateLimitUpdate` here; overage variants are the same window re-reported. */
-export function noteRateLimit(engine: string, info: RateLimitInfo): void {
+export function noteRateLimit(engine: EngineId, info: RateLimitInfo): void {
   if (typeof info.resetsAt !== 'number' || info.rateLimitType.includes('overage')) return
   const key = `${engine}:${info.rateLimitType}`
   const maxed = info.status === 'rejected' // both engines: the cap is hit
@@ -72,7 +74,7 @@ export function noteRateLimit(engine: string, info: RateLimitInfo): void {
   windows.set(key, cur)
 }
 
-function arm(key: string, engine: string, type: string, cur: TrackedWindow): void {
+function arm(key: string, engine: EngineId, type: string, cur: TrackedWindow): void {
   clearTimer(cur)
   // Fire just after the reset instant so the window is genuinely clear by the time the banner lands.
   const delay = Math.max(0, cur.resetsAt * 1000 - Date.now()) + 2000
@@ -81,14 +83,14 @@ function arm(key: string, engine: string, type: string, cur: TrackedWindow): voi
   }, delay)
 }
 
-function fire(key: string, engine: string, type: string): void {
+function fire(key: string, engine: EngineId, type: string): void {
   const cur = windows.get(key)
   if (cur) {
     cur.fired = true // mark this reset handled even when silenced, so it can't re-fire later
     clearTimer(cur)
   }
   if (!loadUsageResetNotify()) return // toggled off in Settings — read live at fire time
-  const label = engine === 'codex' ? 'OpenAI' : 'Claude'
+  const label = engineCapabilities(engine).accountLabel
   const windowWord = type === 'five_hour' ? '5-hour' : 'weekly'
   const title = 'Usage limit reset'
   const body = `Your ${label} ${windowWord} limit has reset. You're good to go.`

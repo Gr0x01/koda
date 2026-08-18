@@ -1,6 +1,5 @@
 import { basename, dirname, join } from 'node:path'
 import { existsSync, realpathSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, screen, session, shell } from 'electron'
 import { IpcChannels } from '@shared/channels'
 import { disposeEngineSessions, getEngineSessions, registerIpcHandlers, runDreamNow } from './ipc'
@@ -34,26 +33,30 @@ import { resumePlaywrightIfEnabled } from './playwright'
 import { killTerminal, registerTerminalIpc } from './terminal'
 import { track } from './telemetry'
 import { startSuspensionWatchdog } from './suspension-watchdog'
-import { importFilesIntoProject } from './fs-browse'
+import { startProbeGovernor } from './probe-governor'
+import { startScratchRetentionSweep } from './scratch-retention'
 import { closeAllNeuralViews, openNeuralView } from './neural-view'
+import { appNameFor, runtimeProfile } from './runtime-profile'
 
 // Pin the app name before any getPath() call (unpackaged Electron would otherwise name it
-// "Electron"). In dev we deliberately use a DISTINCT name so a `npm run dev` instance and the
-// installed .app can run side by side: it drives the dock label + menu-bar name (so you can tell
-// them apart at a glance) AND forks userData/Logs to `Koda Dev`, so the two live processes never
-// stomp each other's session stores or safety-git checkpoints.
-app.setName(process.env.ELECTRON_RENDERER_URL ? 'Koda Dev' : 'Koda')
+// "Electron"). Dev and E2E deliberately get distinct identities: dev can coexist with the installed
+// app, while E2E must never write/prune either app's logs or contend for its single-instance lock.
+const profile = runtimeProfile()
+app.setName(appNameFor(profile))
+if (profile === 'e2e') app.setAppLogsPath(join(app.getPath('userData'), 'logs'))
 
 // Register the preview scheme as a privileged web origin — MUST run before app `ready` (Electron
 // requirement), so it's a module-level call, not inside whenReady. The request handler is wired
 // after ready (see whenReady).
 registerPreviewScheme()
 
-const isDev = !!process.env.ELECTRON_RENDERER_URL
+// E2E drives the built renderer and MUST keep the strict CSP; only electron-vite dev relaxes it.
+const isDev = profile === 'dev'
 
 // Set on before-quit so window-close teardown can tell "user closed this window" (drop it from the
 // restore-on-boot set) from "the app is quitting" (keep the set so boot reopens these projects).
 let quitting = false
+let stopScratchRetentionSweep: (() => void) | null = null
 
 /**
  * Strict CSP for packaged builds (local content only). Dev is left relaxed so
@@ -327,19 +330,6 @@ function openRecentProject(path: string): void {
   buildAppMenu() // bumping a project to the front should immediately reorder Open Recent
 }
 
-async function importFilesFromMenu(): Promise<void> {
-  const project = focusedProject()
-  if (!project) return
-  const res = await dialog.showOpenDialog(project.win, { properties: ['openFile', 'multiSelections'] })
-  if (res.canceled || !res.filePaths.length) return
-  const files = await Promise.all(
-    res.filePaths.map(async (path) => ({ name: basename(path), data: new Uint8Array(await readFile(path)) })),
-  )
-  await getEngineSessions().checkpointProjectEdit(project.path, `import ${files.length} file(s)`)
-  await importFilesIntoProject(project.path, undefined, files)
-  project.win.webContents.send(IpcChannels.uiFileCommand, 'filesImported')
-}
-
 /** App menu. On macOS the app submenu is built by hand (rather than `role: 'appMenu'`) so the
  *  conventional "Settings…" item (⌘,) sits in its standard place; the rest mirrors the default roles. */
 export function buildAppMenu(): void {
@@ -352,7 +342,7 @@ export function buildAppMenu(): void {
     ...(isMac
       ? [
           {
-            label: isDev ? 'Koda Dev' : 'Koda',
+            label: appNameFor(profile),
             submenu: [
               { role: 'about' as const },
               { type: 'separator' as const },
@@ -394,10 +384,7 @@ export function buildAppMenu(): void {
         {
           label: 'Import Files…',
           enabled: hasProject,
-          click: () =>
-            void importFilesFromMenu().catch((err) =>
-              log.error('files', 'menu import failed', err instanceof Error ? err.message : err),
-            ),
+          click: () => sendFileCommand('importFiles'),
         },
         { type: 'separator' },
         // Sends the command to the focused window; the visible doc surface answers. Docs only —
@@ -494,6 +481,9 @@ app.whenReady().then(async () => {
   if (!isPrimaryInstance) return // quitting — don't boot services underneath the running instance
   initLogger() // open the run's log file + crash traps before anything can fail
   startSuspensionWatchdog() // so a socket-drop diagnosis can say "the process was stopped", not guess
+  // Power/focus signals for the non-essential background probes. Must be after ready (powerMonitor is
+  // unusable before it) and before anything that registers a probe, so the first tick is already governed.
+  startProbeGovernor()
   migrateV1IfPresent() // one-shot: split the legacy global session blob into per-project files
   pruneGhostSessions() // drop recorded sessions the engine never wrote (start failed / nothing said)
   backfillKnownProjects() // seed the phone's full project list from the on-disk stores (past the 20-recents cap)
@@ -501,6 +491,7 @@ app.whenReady().then(async () => {
   registerPreviewProtocol() // serve koda-preview:// (scheme was registered pre-ready, above)
   registerPreviewCaptureResponder() // renderer→main iframe-rect replies for the agent's view_preview
   registerIpcHandlers()
+  stopScratchRetentionSweep = startScratchRetentionSweep()
   registerTerminalIpc() // the Dock's interactive shell (per-window pty)
   activateProvisionedRuntimes() // re-activate on-demand Node/Python installs from a previous session
   activateToolsBinDir() // pre-register the CLI tools bin dir on PATH so mid-session installs are usable
@@ -596,6 +587,8 @@ app.on('before-quit', (event) => {
   }
   stopAllLanForwards()
   closeAllNeuralViews()
+  stopScratchRetentionSweep?.()
+  stopScratchRetentionSweep = null
   // Flush the renderers' pending saves in parallel with engine + mini-app teardown — all bounded.
   // Mini apps get SIGTERM → short-grace SIGKILL (a port held by a half-dead child would break the
   // next launch's boot-restart); their desired-running state survives, so they come back next launch.

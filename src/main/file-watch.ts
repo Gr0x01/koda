@@ -13,7 +13,7 @@ import { containedReal } from './fs-browse'
  * when the `fs:fileChanged` push names its path. Keyed by the exact path string the renderer passed so
  * the echo back matches without the renderer having to know main's resolved absolute path.
  */
-type Entry = { watcher: FSWatcher | null; timer?: NodeJS.Timeout }
+type Entry = { watcher: FSWatcher | null; timer?: NodeJS.Timeout; refs: number }
 const perWc = new Map<WebContents, Map<string, Entry>>()
 
 export function watchProjectFile(wc: WebContents, root: string, requested: string): void {
@@ -24,9 +24,13 @@ export function watchProjectFile(wc: WebContents, root: string, requested: strin
     perWc.set(wc, map)
     wc.once('destroyed', () => disposeAll(wc))
   }
-  if (map.has(requested)) return
+  const existing = map.get(requested)
+  if (existing) {
+    existing.refs += 1
+    return
+  }
 
-  const entry: Entry = { watcher: null }
+  const entry: Entry = { watcher: null, refs: 1 }
   const arm = (): FSWatcher =>
     // Re-armed after every event: an atomic save (write-temp + rename) swaps the inode, which would
     // silently orphan a path-based watcher. Debounced so a burst of writes pings the renderer once.
@@ -62,6 +66,8 @@ export function unwatchProjectFile(wc: WebContents, requested: string): void {
   const map = perWc.get(wc)
   const entry = map?.get(requested)
   if (!entry || !map) return
+  entry.refs -= 1
+  if (entry.refs > 0) return
   clearTimeout(entry.timer)
   try {
     entry.watcher?.close()
@@ -69,6 +75,11 @@ export function unwatchProjectFile(wc: WebContents, requested: string): void {
     /* already gone */
   }
   map.delete(requested)
+}
+
+/** Narrow state probe for deterministic ownership tests; production callers never need this. */
+export function projectFileWatchRefsForTest(wc: WebContents, requested: string): number {
+  return perWc.get(wc)?.get(requested)?.refs ?? 0
 }
 
 function disposeAll(wc: WebContents): void {

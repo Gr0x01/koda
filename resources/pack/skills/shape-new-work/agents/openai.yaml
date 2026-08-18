@@ -1,0 +1,4 @@
+interface:
+  display_name: "Shape New Work"
+  short_description: "Shape a genuinely new app or major feature before construction."
+  default_prompt: "Use $shape-new-work to shape the first useful slice before building."

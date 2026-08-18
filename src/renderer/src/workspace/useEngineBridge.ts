@@ -5,41 +5,18 @@ import type {
   EngineEvent,
   PersistedSessions,
   SessionsLoadResult,
+  TaskCompletionState,
 } from '@shared/ipc'
-import type { Entry } from '../transcript/Transcript'
 import {
   setNotifyEnabled,
   setNotifyOk,
   useWorkspace,
   activeEditor,
+  stageVisible,
   PREVIEW_SURFACE_ID,
-  type PersistedBlob,
 } from './store'
 import { connectApprovals } from './approval-catchup'
-
-/** Keep the main-owned persisted shape and renderer hydration shape in one explicit mapping. A missing
- * replay cursor here makes adoption replay the entire sidecar through a non-idempotent live reducer. */
-export function sessionForHydration(
-  s: PersistedSessions['sessions'][number],
-): PersistedBlob['sessions'][number] {
-  return {
-    id: s.id,
-    label: s.label,
-    cwd: s.cwd,
-    userNamed: s.userNamed,
-    approvalMode: s.approvalMode,
-    model: s.model,
-    effort: s.effort,
-    engineId: s.engineId,
-    engineNativeId: s.engineNativeId,
-    context: s.context,
-    spendUsd: s.spendUsd,
-    byModel: s.byModel,
-    lastPreview: s.lastPreview,
-    replaySeq: s.replaySeq,
-    items: s.items as Entry[],
-  }
-}
+import { windowHasOpenModal } from '../window-modal'
 
 /**
  * Wires the workspace store to the main process: engine-event demux, approval queue, persistence,
@@ -49,6 +26,7 @@ export function sessionForHydration(
  */
 export function useEngineBridge(): void {
   const applyEngineEvent = useWorkspace((s) => s.applyEngineEvent)
+  const applyCompletionState = useWorkspace((s) => s.applyCompletionState)
   const applyAsideEvent = useWorkspace((s) => s.applyAsideEvent)
   const applyProviderStatus = useWorkspace((s) => s.applyProviderStatus)
   const addPending = useWorkspace((s) => s.addPending)
@@ -67,11 +45,20 @@ export function useEngineBridge(): void {
   const archiveSession = useWorkspace((s) => s.archiveSession)
   const renameSession = useWorkspace((s) => s.renameSession)
   const applyRemoteUserTurn = useWorkspace((s) => s.applyRemoteUserTurn)
-  const openTerminalShelf = useWorkspace((s) => s.openTerminalShelf)
+  const openTerminal = useWorkspace((s) => s.openTerminal)
   const setStoreIntegrity = useWorkspace((s) => s.setStoreIntegrity)
 
   // Engine event stream → store demux.
   useEffect(() => window.koda.onEngineEvent((e: EngineEvent) => applyEngineEvent(e)), [applyEngineEvent])
+
+  // Completion truth is a separate passive stream, not transcript content. Subscribe before the
+  // catch-up read so a turn ending during renderer reload cannot fall through the gap; applying the
+  // same state twice is an idempotent record replacement.
+  useEffect(() => {
+    const off = window.koda.onCompletionState((state: TaskCompletionState) => applyCompletionState(state))
+    window.koda.listCompletionStates().then((states) => states.forEach(applyCompletionState)).catch(console.error)
+    return off
+  }, [applyCompletionState])
 
   // Side-question ("btw" / aside) answer stream → the matching session's aside overlay.
   useEffect(() => window.koda.onAsideEvent((e) => applyAsideEvent(e)), [applyAsideEvent])
@@ -136,11 +123,20 @@ export function useEngineBridge(): void {
     [openPreview, rememberPreview],
   )
 
-  // The agent's open_terminal: pop the terminal shelf and, if it staged a command, hand it to the store
-  // so the terminal view types it at the prompt (never runs it). The push already targets this window.
+  // A dev server that stopped serving (exited, crashed, or was replaced): the preview tab drops its
+  // green live mark. Optional-chained — in dev, HMR can hand this renderer a preload that predates it.
   useEffect(
-    () => window.koda.onTerminalShow(({ command }) => openTerminalShelf(command)),
-    [openTerminalShelf],
+    () => window.koda.onPreviewStopped?.((url) => useWorkspace.getState().notePreviewStopped(url)),
+    [],
+  )
+
+  // The agent's open_terminal: put the terminal on stage and, if it staged a command, hand it to the
+  // store so the terminal view types it at the prompt (never runs it). The push already targets this
+  // window; `sessionId` targets the conversation INSIDE it, so a background session's request lands
+  // as a tab in its own editor instead of taking over the stage the user is reading.
+  useEffect(
+    () => window.koda.onTerminalShow(({ command, sessionId }) => openTerminal(command, sessionId)),
+    [openTerminal],
   )
 
   // The agent's view_preview: main asks for the preview iframe's on-screen rect, then capturePage's it.
@@ -164,7 +160,7 @@ export function useEngineBridge(): void {
       // "Front" = the dock is open AND the preview is on stage. If not, bring it there (remounts the
       // iframe → reloads), so the agent can look even if the user staged something else or collapsed
       // the dock. An explicit "look at it", so it overrides a pin.
-      const front = st.dockOpen && activeEditor(st).activeSurfaceId === PREVIEW_SURFACE_ID
+      const front = stageVisible(st) && activeEditor(st).activeSurfaceId === PREVIEW_SURFACE_ID
       if (!front) st.bringPreviewToStage()
 
       // Poll for the iframe (a just-fronted preview mounts async). Already front → its content is live,
@@ -225,7 +221,9 @@ export function useEngineBridge(): void {
     // back and must read it as the success it is instead of as a failure.
     const loadSessions = async (): Promise<SessionsLoadResult> => {
       const raw = (await window.koda.loadSessions()) as SessionsLoadResult | PersistedSessions | null
-      return raw && 'ok' in raw ? raw : { ok: true, data: raw, droppedSessions: 0 }
+      return raw && 'ok' in raw
+        ? raw
+        : { ok: true, data: raw, droppedSessions: 0, unreadableArchiveBodyIds: [] }
     }
     const loadArchived = async (): Promise<ArchivedLoadResult> => {
       try {
@@ -240,13 +238,20 @@ export function useEngineBridge(): void {
         return { ok: false, backupKept: null }
       }
     }
-    Promise.all([loadSessions(), loadArchived()])
+    // Hot first, cold second. `loadSessions` can perform the one-shot migration of old inline archives
+    // into the cold index; reading both concurrently could snapshot the index before that move, then
+    // acknowledge an incomplete archive-star migration and let retention delete the missed row.
+    loadSessions()
+      .then(async (sessionsResult) => [sessionsResult, await loadArchived()] as const)
       .then(([sessionsResult, archivedResult]) => {
         // Set before the hydrate branch: the banner must be right whether or not this run hydrates.
         setStoreIntegrity({
           sessionsLoadFailed: !sessionsResult.ok,
           sessionsBackupKept: sessionsResult.ok ? null : sessionsResult.backupKept,
           droppedSessions: sessionsResult.ok ? sessionsResult.droppedSessions : 0,
+          unreadableArchiveBodies: sessionsResult.ok
+            ? (sessionsResult.unreadableArchiveBodyIds?.length ?? 0)
+            : 0,
           archiveLoadFailed: !archivedResult.ok,
           archiveBackupKept: archivedResult.ok ? null : archivedResult.backupKept,
           droppedArchives: archivedResult.ok ? archivedResult.droppedArchives : 0,
@@ -261,14 +266,37 @@ export function useEngineBridge(): void {
           return
         }
         const data = sessionsResult.data
-        const archived = archivedResult.ok ? archivedResult.archived : []
+        const unreadableArchiveBodyIds = new Set(
+          sessionsResult.ok ? (sessionsResult.unreadableArchiveBodyIds ?? []) : [],
+        )
+        // A metadata row without a readable body cannot act as a tombstone. Keep it out of the visible
+        // archive list so hydrate preserves the known-readable hot fallback, but carry it separately so
+        // every later archive-index rewrite retains that recovery metadata.
+        const archived = archivedResult.ok
+          ? archivedResult.archived.filter((meta) => !unreadableArchiveBodyIds.has(meta.id))
+          : []
+        const protectedArchived = archivedResult.ok
+          ? archivedResult.archived.filter((meta) => unreadableArchiveBodyIds.has(meta.id))
+          : []
         hydrate({
-          version: 2,
+          version: 3,
           activeId: data?.activeId ?? null,
-          sessions: (data?.sessions ?? []).map(sessionForHydration),
+          sessions: data?.sessions ?? [],
+          starredDocs: data?.starredDocs,
+          legacyKeptDocsImported: data?.legacyKeptDocsImported,
+          legacyKeptDocPathChanges: data?.legacyKeptDocPathChanges,
+          // A successful archive read means hydration below saw every currently available legacy
+          // shelf. Persist this marker in the SAME blob as the promoted stars; until that write is
+          // acknowledged, main protects expired archive-only stars from retention.
+          legacyKeptDocsMigrationComplete:
+            data?.legacyKeptDocsMigrationComplete === true ||
+            (archivedResult.ok &&
+              archivedResult.droppedArchives === 0 &&
+              unreadableArchiveBodyIds.size === 0),
           // Archived-session metadata from the cold index. Any archives still inline in an old hot blob
           // are migrated out (split to body + metadata) by main's loadProjectSessions before we get here.
           archived,
+          protectedArchived,
           rateLimits: data?.rateLimits, // restore the 5-hour/weekly footer (refreshed next turn)
         })
         // A project opened with no sessions + no guidelines yet → offer the one-time intake (common
@@ -309,15 +337,49 @@ export function useEngineBridge(): void {
   // these, so main forwards them here → append (+ auto-title for real first prompts).
   useEffect(
     () =>
-      window.koda.onRemoteUserTurn(({ sessionId, text, replaySeq, append }) =>
-        applyRemoteUserTurn(sessionId, text, replaySeq, append),
+      window.koda.onRemoteUserTurn(({
+        sessionId,
+        text,
+        replaySeq,
+        append,
+        hadImages,
+        images,
+        clientTurnId,
+        hadAttachments,
+        attachments,
+      }) =>
+        applyRemoteUserTurn(
+          sessionId,
+          text,
+          replaySeq,
+          append,
+          hadImages,
+          images,
+          clientTurnId,
+          hadAttachments,
+          attachments,
+        ),
       ),
     [applyRemoteUserTurn],
   )
 
-  // A phone turn's image was saved to scratch main-side → refresh the Recent images strip live.
+  // Scratch changed main-side (a phone image landed or retention pruned old copies) → refresh Recent images.
   // Optional-chained: dev HMR reloads the renderer against a preload that predates this API.
   useEffect(() => window.koda.onScratchChanged?.(() => useWorkspace.getState().bumpScratch()), [])
+
+  // Anything (usually the agent) writing under `Documents/` → one debounced `filesRev` bump, which is
+  // already the signal every document surface re-reads on: the Library, the kept-documents shelf and
+  // the Files tree. The watch lives here, for the window's lifetime, rather than in whichever panel
+  // happens to be mounted — main also uses this same event to push the phone's replica, so a watcher
+  // that came and went with a panel would make hand edits reach the phone only sometimes.
+  useEffect(() => {
+    window.koda.watchDocs()
+    const off = window.koda.onDocsChanged(() => useWorkspace.getState().bumpFilesRev())
+    return () => {
+      window.koda.unwatchDocs()
+      off()
+    }
+  }, [])
 
   // The archived list has NO subscription-driven save. It used to have one here, watching the array
   // reference and writing fire-and-forget, so the three actions that move a session between the hot
@@ -330,16 +392,29 @@ export function useEngineBridge(): void {
   // deltas don't thrash the disk: only durable fields are saved, an unchanged blob is skipped, and
   // the timer resets to the latest change. Gated until the boot-load settles.
   const saveTimer = useRef<number | null>(null)
-  const lastSaved = useRef('')
+  const lastQueued = useRef('')
   useEffect(() => {
     const persistNow = (): void => {
       const st = useWorkspace.getState()
       if (!st.hydrated) return
       const blob = st.persistBlob()
       const serialized = JSON.stringify(blob)
-      if (serialized === lastSaved.current) return
-      lastSaved.current = serialized
-      window.koda.saveSessions(blob)
+      if (serialized === lastQueued.current) return
+      lastQueued.current = serialized
+      window.koda
+        .saveSessions(blob)
+        .then((saved) => {
+          if (saved) useWorkspace.getState().completeDocPinMigration(blob)
+          else if (lastQueued.current === serialized) {
+            lastQueued.current = ''
+          }
+        })
+        .catch((err) => {
+          if (lastQueued.current === serialized) {
+            lastQueued.current = ''
+          }
+          console.error(err)
+        })
     }
     const schedule = (): void => {
       if (saveTimer.current) window.clearTimeout(saveTimer.current)
@@ -388,6 +463,10 @@ export function useEngineBridge(): void {
   // Window-level shortcuts: ⌘P / ⌘⇧F → Find overlay, ⌘/Ctrl + 1–9 → fast-switch sessions.
   useEffect(() => {
     function onKey(e: KeyboardEvent): void {
+      // A modal owns the window while it is open. Inert blocks pointer/focus traversal, but global
+      // listeners still fire unless they explicitly yield; without this, ⌘W archived the chat behind
+      // the Library and ⌘1–9 silently changed the engine its ask would use.
+      if (windowHasOpenModal()) return
       if (!(e.metaKey || e.ctrlKey)) return
       // ⌘P (quick open) or ⌘⇧F (find in files) — summon the Find overlay. ⌘F stays Monaco's in-file
       // find; ⌘⇧F never collides with it (the shift distinguishes them).

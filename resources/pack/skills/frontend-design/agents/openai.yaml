@@ -1,4 +1,4 @@
 interface:
   display_name: "Frontend Design"
   short_description: "Distinctive, intentional visual design for new or reshaped UI"
-  default_prompt: "Design this UI with a deliberate aesthetic direction instead of templated defaults."
+  default_prompt: "Use $frontend-design to give this UI a deliberate, distinctive direction."

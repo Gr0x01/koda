@@ -1,4 +1,4 @@
-import type { SubagentUsage } from '@shared/ipc'
+import type { SubagentUsage, TurnFailureEnvelope } from '@shared/ipc'
 import type { TaskRow } from './TaskList'
 import type { WorkflowItemData } from './WorkflowCard'
 
@@ -15,13 +15,31 @@ export type TurnItem = (
       /** Staged attachments. On the phone, document files (csv/pdf) ride here too, marked by a
        *  non-`image/*` mediaType + their original `name` (the desktop uses `files` instead). */
       images?: { mediaType: string; dataBase64: string; name?: string }[]
+      /** True when the original turn had image bytes even if an older replay could retain only the
+       * display sentinel. A failed turn with no retained bytes must ask for the images again. */
+      hadImages?: boolean
+      /** Stable logical identity assigned by a phone outbox. Engine-failure retries keep this id while
+       * transport attempts change, so replay/catch-up still renders one user bubble. */
+      clientTurnId?: string
+      /** Attachment provenance survives successful replay without retaining unbounded base64 bytes. */
+      hadAttachments?: boolean
+      attachments?: { mediaType: string; name?: string }[]
       /** Names of attached document files (csv/pdf) — bytes live in `.koda/scratch/`, not the transcript. */
       files?: string[]
+      /** How long the agent worked on this message, stamped when its turn ended. Rides with the item so
+       *  it survives a reload; absent on turns that predate it, which fold by step count instead. */
+      elapsedMs?: number
+      /** Phone-only identity for an optimistic/outbox turn. It binds reconnect admission and retry to
+       *  the exact bubble when several messages were queued before the Mac came back. Never persisted. */
+      localTurnId?: string
+      /** Canonical retryable terminal failure for this exact row. Persisted with the transcript so a
+       * renderer or phone reload restores the banner and payload without relying on session ephemera. */
+      turnFailure?: TurnFailureEnvelope
     }
   | { kind: 'assistant'; markdown: string }
   | { kind: 'tool'; toolUseId: string; name: string; input: unknown; liveOutput?: string; result?: string; isError?: boolean }
   | { kind: 'notice'; text: string }
-  | { kind: 'canvas'; docTitle: string; instruction: string }
+  | { kind: 'canvas'; docTitle: string; instruction: string; selectedWords?: number }
   | { kind: 'thinking'; estimatedTokens?: number; active: boolean }
   | { kind: 'tasklist'; tasks: TaskRow[] }
   | ({ kind: 'workflow' } & WorkflowItemData)

@@ -3,8 +3,9 @@ import { Transcript } from '../transcript/Transcript'
 import { ProjectIntake } from '../onboarding/ProjectIntake'
 import { ApprovalPrompt } from '../approval/ApprovalPrompt'
 import { TranscriptFind } from './TranscriptFind'
+import { anchorPlan } from './transcript-scroll'
 import { AnimatePresence, cardVariants, motion } from '../motion'
-import { useWorkspace, activeEditor } from '../workspace/store'
+import { useWorkspace } from '../workspace/store'
 import { busyActivity } from '../workspace/activity'
 import { ContextReadout, ContinueFreshButton } from '../workspace/ContextMeter'
 import { ApprovalModeControl, nextApprovalMode } from '../workspace/ApprovalModeControl'
@@ -17,19 +18,23 @@ import { ComposerError, ComposerNotice } from './conversation/ComposerError'
 import { ComposerPrimaryButton } from './conversation/ComposerPrimaryButton'
 import { AttachMenu } from './conversation/AttachMenu'
 import { useMentionPicker, inkTokens } from './conversation/useMentionPicker'
-import { stagingFromFiles, refusedAttachmentMessage, baseName } from './conversation/attach'
+import { stagingFromFiles, refusedAttachmentMessage } from './conversation/attach'
 import { FileChip } from '../transcript/FileChip'
-import { hasRunningSubagent } from '@shared/delegation'
+import { hasRunningDelegation } from '@shared/delegation'
+import { windowHasOpenModal } from '../window-modal'
 
 /**
  * The conversation surface (ui-workspace.md §3) — the always-present, premium center of the
  * workspace. A comfortable reading column: structured transcript above, the floating composer below,
  * Ask-me approvals stacked just over it.
  */
+/** Breathing room kept under an anchored turn, so its answer never starts flush against the composer. */
+const ANCHOR_GAP = 24
+
 export function ConversationSurface() {
   const activeId = useWorkspace((s) => s.activeId)
   const session = useWorkspace((s) => (s.activeId ? s.sessions[s.activeId] : null))
-  const postureLocked = !!session && (session.busy || hasRunningSubagent(session.items))
+  const postureLocked = !!session && (session.busy || hasRunningDelegation(session.items))
   // Select the stable `pending` ref and filter in render — a selector that returns a fresh array
   // each call makes zustand see a changed snapshot every render (infinite loop).
   const pending = useWorkspace((s) => s.pending)
@@ -40,7 +45,7 @@ export function ConversationSurface() {
   const send = useWorkspace((s) => s.send)
   const answerApproval = useWorkspace((s) => s.answerApproval)
   const interrupt = useWorkspace((s) => s.interrupt)
-  const stopSubagent = useWorkspace((s) => s.stopSubagent)
+  const openAgents = useWorkspace((s) => s.openAgents)
   const askAside = useWorkspace((s) => s.askAside)
   const dismissAside = useWorkspace((s) => s.dismissAside)
   const promoteAside = useWorkspace((s) => s.promoteAside)
@@ -57,17 +62,18 @@ export function ConversationSurface() {
   // Click a staged thumbnail to inspect it full-size before sending — at 56px square you can't tell two
   // screenshots apart. The shared lightbox (mounted at the Chassis root) handles the overlay + Esc.
   const setLightbox = useWorkspace((s) => s.setLightbox)
-  // The file the user is looking at travels to the agent as ambient context on send (store.send). Show
-  // it here so they know it's in view — a doc or a code file, never the preview. `surfaces` is a stable
-  // store ref; deriving in render avoids a fresh-array selector (which would loop zustand).
-  const editor = useWorkspace(activeEditor)
-  const viewingFile = editor.surfaces.find((s) => s.path === editor.activeSurfaceId && s.kind !== 'preview')
+  const filesRev = useWorkspace((s) => s.filesRev)
 
   // Stick-to-bottom: follow the conversation as it grows ONLY while the reader is already at the
   // bottom (or just sent) — the moment they scroll up to read, stop yanking them down.
   const scrollRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
   const pinnedRef = useRef(true)
+  const modeRef = useRef<'follow' | 'anchor' | 'free'>('follow')
+  /** The last scrollTop we wrote, so our own scrolls aren't mistaken for the reader's. */
+  const lastSetTopRef = useRef(0)
+  /** Room below the newest turn for it to scroll up into while anchored. Zero the rest of the time. */
+  const [anchorPad, setAnchorPad] = useState(0)
   const [findOpen, setFindOpen] = useState(false)
   // `pinnedRef` is a ref (read in effects without re-rendering); the jump-to-bottom button needs a
   // render trigger, so mirror the pinned state here. True while at/near the tail → button hidden.
@@ -112,12 +118,14 @@ export function ConversationSurface() {
     draft: session?.draft ?? '',
     setDraft,
     textareaRef: composerRef,
+    revision: filesRev,
   })
 
   // ⌘F opens find-in-transcript — but only when focus isn't in Monaco (its own ⌘F) or a doc
   // editor (which mounts this same find bar over the doc instead).
   useEffect(() => {
     function onKey(e: KeyboardEvent): void {
+      if (windowHasOpenModal()) return
       if (!(e.metaKey || e.ctrlKey) || e.shiftKey || e.code !== 'KeyF') return
       if ((document.activeElement as HTMLElement | null)?.closest('.monaco-editor, [data-doc-editor]')) return
       e.preventDefault()
@@ -150,60 +158,94 @@ export function ConversationSurface() {
   function onScroll(): void {
     const el = scrollRef.current
     if (!el) return
+    // Our own writes fire this too. Ignoring them is what keeps an anchored turn from reading as the
+    // user scrolling away from it the instant we place it.
+    if (Math.abs(el.scrollTop - lastSetTopRef.current) < 2) return
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    // Scrolling back to the tail resumes following; scrolling anywhere else is the user reading, and
+    // nothing moves under them until they come back down.
+    modeRef.current = nearBottom ? 'follow' : 'free'
+    if (!nearBottom) setAnchorPad(0)
     pinnedRef.current = nearBottom
     setAtBottom(nearBottom)
   }
 
-  // Jump-to-bottom button: smooth-scroll to the tail and re-pin so streaming follows again.
+  /** Measure, then apply what `anchorPlan` decides (see transcript-scroll.ts for the rule itself). */
+  const settle = useCallback(() => {
+    const el = scrollRef.current
+    const content = contentRef.current
+    if (!el || !content) return
+    const turn = content.lastElementChild
+    const elTop = el.getBoundingClientRect().top
+    const turnBox = turn?.getBoundingClientRect()
+    const plan = anchorPlan(modeRef.current, {
+      viewport: el.clientHeight,
+      contentHeight: el.scrollHeight,
+      turnTop: turnBox ? turnBox.top - elTop + el.scrollTop : 0,
+      turnHeight: turnBox ? content.getBoundingClientRect().bottom - turnBox.top : 0,
+      gap: ANCHOR_GAP,
+    })
+    if (!plan || (modeRef.current === 'anchor' && !turnBox)) return
+    modeRef.current = plan.mode
+    setAnchorPad(plan.pad)
+    lastSetTopRef.current = plan.top
+    el.scrollTop = plan.top
+  }, [])
+
+  // Stable across renders on purpose: the transcript's items are memoized, and an inline arrow here
+  // would be a fresh prop on every streamed event — missing every compare and re-rendering the whole
+  // conversation, which is exactly the cost the memoization exists to remove.
+  const sessionId = session?.id
+  const handleOpenAgents = useCallback(() => {
+    if (sessionId) openAgents(sessionId)
+  }, [sessionId, openAgents])
+
+  // Jump-to-bottom button: smooth-scroll to the tail and follow again.
   const scrollToBottom = useCallback(() => {
     const el = scrollRef.current
     if (!el) return
+    modeRef.current = 'follow'
+    setAnchorPad(0)
     pinnedRef.current = true
     setAtBottom(true)
     el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
   }, [])
 
-  // After each content change, if pinned, snap to the bottom. Layout effect = no visible jump.
-  // `busy` is a dep so the trailing working indicator appearing/clearing keeps the tail in view even
-  // when it toggles without an items change.
+  // After each content change, re-settle. Layout effect = no visible jump. `postureLocked` is a dep so
+  // the trailing working indicator appearing/clearing keeps the tail in view even when it toggles
+  // without an items change.
   useLayoutEffect(() => {
-    const el = scrollRef.current
-    if (el && pinnedRef.current) el.scrollTop = el.scrollHeight
-  }, [session?.items, session?.streaming, session?.busy])
+    settle()
+  }, [session?.items, session?.streaming, postureLocked, anchorPad, settle])
 
-  // A ResizeObserver on the content re-snaps to the tail whenever its height grows while pinned, so
-  // late-settling content (images decode, code blocks highlight) can't strand us above the fold.
+  // A ResizeObserver on the content re-settles whenever its height changes, so late-settling content
+  // (images decode, code blocks highlight) can't strand us — and a turn folding shut on completion
+  // doesn't leave the view hanging in the space its plumbing used to fill.
   useEffect(() => {
     const content = contentRef.current
     if (!content) return
-    const obs = new ResizeObserver(() => {
-      const el = scrollRef.current
-      if (el && pinnedRef.current) el.scrollTop = el.scrollHeight
-    })
+    const obs = new ResizeObserver(() => settle())
     obs.observe(content)
     return () => obs.disconnect()
-  }, [])
+  }, [settle])
 
-  // Switching sessions: show the newest message and re-pin. Re-snap across a few frames while still
-  // pinned so already-laid-out/cached content (where ResizeObserver never fires) doesn't strand us.
+  // Switching sessions: show the newest message and follow. Re-snap across a few frames while still
+  // following so already-laid-out/cached content (where ResizeObserver never fires) doesn't strand us.
   useLayoutEffect(() => {
+    modeRef.current = 'follow'
+    setAnchorPad(0)
     pinnedRef.current = true
     setAtBottom(true)
     let frame = 0
-    const snap = (): void => {
-      const el = scrollRef.current
-      if (el && pinnedRef.current) el.scrollTop = el.scrollHeight
-    }
-    snap()
+    settle()
     let raf = 0
     const tick = (): void => {
-      snap()
+      settle()
       if (++frame < 4) raf = requestAnimationFrame(tick)
     }
     raf = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(raf)
-  }, [activeId])
+  }, [activeId, settle])
 
   // "Btw" / aside: while the agent is BUSY, typing means a side question (answered from context, never
   // entering the conversation) rather than a queued instruction. It tracks busy LIVE — the instant the
@@ -214,11 +256,13 @@ export function ConversationSurface() {
   // while the agent is busy — that's how a side answer flows back to the agent.
   const asideMode = !!session && draftHasText && !session.replyStaged && session.busy
 
-  // The trailing "agent is working" one-liner. Shown whenever the turn is running, EXCEPT while the
+  // The trailing "agent is working" one-liner. Shown whenever work is in flight, EXCEPT while the
   // streaming caret already signals activity or an active thinking line is the tail (no double cue).
+  // `postureLocked`, not `busy`: a backgrounded delegate keeps running after its parent turn ends,
+  // and dropping the line there would read as finished while the fan-out is still going.
   const lastItem = session?.items[session.items.length - 1]
   const working =
-    session && session.busy && !session.streaming && !(lastItem?.kind === 'thinking' && lastItem.active)
+    session && postureLocked && !session.streaming && !(lastItem?.kind === 'thinking' && lastItem.active)
       ? busyActivity(session)
       : null
 
@@ -231,7 +275,10 @@ export function ConversationSurface() {
       askAside(activeId, session.draft)
       return
     }
+    // A turn you just sent belongs at the top of the viewport, with its answer filling the room below.
     pinnedRef.current = true
+    modeRef.current = 'anchor'
+    setAtBottom(true)
     send()
   }
 
@@ -273,7 +320,7 @@ export function ConversationSurface() {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-7 px-6 text-center">
         <h2 className="font-display text-[28px] font-medium tracking-tight">What are we building?</h2>
-        <Button onClick={startSession}>Start a session</Button>
+        <Button onClick={() => startSession()}>Start a session</Button>
       </div>
     )
   }
@@ -352,9 +399,14 @@ export function ConversationSurface() {
               items={session.items}
               streaming={session.streaming}
               working={working}
-              onStopSubagent={(taskId) => stopSubagent(session.id, taskId)}
+              live={postureLocked}
+              turnStartedAt={session.turnStartedAt}
+              onOpenAgents={handleOpenAgents}
             />
           </div>
+          {/* Room for the newest turn to sit at the top of the viewport. A sibling of the measured
+              content on purpose: inside it, it would feed its own height back into the anchor. */}
+          <div aria-hidden style={{ height: anchorPad }} />
         </div>
         {/* Gradient scrim painted over the bottom of the transcript (bg → transparent). Always present
             so the transcript never meets the composer at a hard line, whatever the scroll position. */}
@@ -399,19 +451,6 @@ export function ConversationSurface() {
             </motion.div>
           ))}
         </AnimatePresence>
-        {/* What the agent can see: the file you're looking at rides along as context on the next send.
-            A quiet cue so that's never a surprise — shown only when a file (doc or code) is open. */}
-        {viewingFile && (
-          <div className="mb-1.5 flex items-center gap-1.5 px-1 text-[11px] text-text-muted">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-              <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" />
-              <circle cx="12" cy="12" r="3" />
-            </svg>
-            <span className="truncate">
-              Agent can see <span className="text-text/80">{baseName(viewingFile.path)}</span>
-            </span>
-          </div>
-        )}
         {/* A "btw" / aside answer floats above the composer — clearly NOT part of the transcript. */}
         <AnimatePresence initial={false}>
           {session.aside && (

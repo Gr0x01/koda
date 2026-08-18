@@ -8,6 +8,7 @@ import type {
   AsideEvent,
   RenameRequested,
   EngineEvent,
+  TaskCompletionState,
   HeadlessAppeared,
   KodaApi,
   KodaSettings,
@@ -16,6 +17,7 @@ import type {
   RuntimeProgress,
   AuthProgress,
   CodexLoginProgress,
+  ConnectState,
   ProviderStatusEvent,
   UpdateStatus,
   RemoteActivity,
@@ -48,7 +50,7 @@ const api: KodaApi = {
   stopSubagent: (args) => ipcRenderer.invoke(IpcChannels.stopSubagent, args),
   disposeSession: (args) => ipcRenderer.invoke(IpcChannels.disposeSession, args),
   loadSessions: () => ipcRenderer.invoke(IpcChannels.sessionsLoad),
-  saveSessions: (data) => ipcRenderer.send(IpcChannels.sessionsSave, data),
+  saveSessions: (data) => ipcRenderer.invoke(IpcChannels.sessionsSave, data),
   loadArchived: () => ipcRenderer.invoke(IpcChannels.archivedLoad),
   // invoke, not send: the caller has to know whether the index landed before it removes the session
   // from the other store (see KodaApi.saveArchived).
@@ -89,6 +91,12 @@ const api: KodaApi = {
     ipcRenderer.on(IpcChannels.engineEvent, handler)
     return () => ipcRenderer.removeListener(IpcChannels.engineEvent, handler)
   },
+  onCompletionState: (listener) => {
+    const handler = (_e: IpcRendererEvent, state: TaskCompletionState) => listener(state)
+    ipcRenderer.on(IpcChannels.completionState, handler)
+    return () => ipcRenderer.removeListener(IpcChannels.completionState, handler)
+  },
+  listCompletionStates: () => ipcRenderer.invoke(IpcChannels.completionList),
   askAside: (args) => ipcRenderer.invoke(IpcChannels.askAside, args),
   cancelAside: (args) => ipcRenderer.invoke(IpcChannels.cancelAside, args),
   onAsideEvent: (listener) => {
@@ -102,9 +110,10 @@ const api: KodaApi = {
   checkpointFileDiff: (args) => ipcRenderer.invoke(IpcChannels.safetyFileDiff, args),
   logFromRenderer: (entry) => ipcRenderer.send(IpcChannels.rendererLog, entry),
   setAttentionCount: (count) => ipcRenderer.send(IpcChannels.setAttentionCount, { count }),
-  assistTitle: (args) => ipcRenderer.invoke(IpcChannels.assistTitle, args),
+  nameSession: (args) => ipcRenderer.invoke(IpcChannels.sessionName, args),
   readDir: (args) => ipcRenderer.invoke(IpcChannels.fsReadDir, args),
   listDocs: (args) => ipcRenderer.invoke(IpcChannels.fsListDocs, args),
+  libraryResolve: (args) => ipcRenderer.invoke(IpcChannels.libraryResolve, args),
   readFile: (args) => ipcRenderer.invoke(IpcChannels.fsReadFile, args),
   writeFile: (args) => ipcRenderer.invoke(IpcChannels.fsWriteFile, args),
   watchFile: (args) => ipcRenderer.send(IpcChannels.fsWatchFile, args),
@@ -126,6 +135,7 @@ const api: KodaApi = {
   deletePath: (args) => ipcRenderer.invoke(IpcChannels.fsDeletePath, args),
   duplicatePath: (args) => ipcRenderer.invoke(IpcChannels.fsDuplicatePath, args),
   importFiles: (args) => ipcRenderer.invoke(IpcChannels.fsImportFiles, args),
+  importFilesFromMenu: () => ipcRenderer.invoke(IpcChannels.fsImportFilesFromMenu),
   revealPath: (args) => ipcRenderer.invoke(IpcChannels.fsRevealPath, args),
   openPath: (args) => ipcRenderer.invoke(IpcChannels.fsOpenPath, args),
   startDrag: (args) => ipcRenderer.invoke(IpcChannels.fsStartDrag, args),
@@ -133,12 +143,16 @@ const api: KodaApi = {
   diffFile: (args) => ipcRenderer.invoke(IpcChannels.fsDiffFile, args),
   search: (args) => ipcRenderer.invoke(IpcChannels.fsSearch, args),
   replaceAll: (args) => ipcRenderer.invoke(IpcChannels.fsReplaceAll, args),
+  libraryQuery: (args) => ipcRenderer.invoke(IpcChannels.libraryQuery, args),
+  libraryAsk: (args) => ipcRenderer.invoke(IpcChannels.libraryAsk, args),
+  cancelLibraryAsk: (requestId) => ipcRenderer.send(IpcChannels.libraryAskCancel, requestId),
   gitDetect: () => ipcRenderer.invoke(IpcChannels.gitDetect),
   gitStatus: () => ipcRenderer.invoke(IpcChannels.gitStatus),
   gitGraph: (args) => ipcRenderer.invoke(IpcChannels.gitGraph, args),
   gitInit: () => ipcRenderer.invoke(IpcChannels.gitInit),
   gitCommit: (args) => ipcRenderer.invoke(IpcChannels.gitCommit, args),
   gitCommitPaths: (args) => ipcRenderer.invoke(IpcChannels.gitCommitPaths, args),
+  gitProposeMessage: (args) => ipcRenderer.invoke(IpcChannels.gitProposeMessage, args),
   gitRenameHead: (args) => ipcRenderer.invoke(IpcChannels.gitRenameHead, args),
   gitRestoreVersion: (args) => ipcRenderer.invoke(IpcChannels.gitRestoreVersion, args),
   gitDiscardFile: (args) => ipcRenderer.invoke(IpcChannels.gitDiscardFile, args),
@@ -205,6 +219,7 @@ const api: KodaApi = {
   addRecentModel: (args) => ipcRenderer.invoke(IpcChannels.modelsAddRecent, args),
   getCodexModels: () => ipcRenderer.invoke(IpcChannels.codexModels),
   getCodexAuthStatus: () => ipcRenderer.invoke(IpcChannels.codexAuthStatus),
+  getProviderModelCatalogs: () => ipcRenderer.invoke(IpcChannels.modelsGetProviderCatalogs),
   startCodexLogin: () => ipcRenderer.invoke(IpcChannels.codexLoginStart),
   cancelCodexLogin: () => ipcRenderer.invoke(IpcChannels.codexLoginCancel),
   onCodexLoginProgress: (listener) => {
@@ -249,6 +264,11 @@ const api: KodaApi = {
     ): void => listener(payload.url, payload.sessionId, payload.restart)
     ipcRenderer.on(IpcChannels.previewShow, handler)
     return () => ipcRenderer.removeListener(IpcChannels.previewShow, handler)
+  },
+  onPreviewStopped: (listener) => {
+    const handler = (_e: IpcRendererEvent, payload: { url: string }): void => listener(payload.url)
+    ipcRenderer.on(IpcChannels.previewStopped, handler)
+    return () => ipcRenderer.removeListener(IpcChannels.previewStopped, handler)
   },
   onPreviewCaptureRequest: (listener) => {
     const handler = (_e: IpcRendererEvent, payload: { correlationId: string }): void =>
@@ -323,6 +343,17 @@ const api: KodaApi = {
     const handler = (_e: IpcRendererEvent, activity: RemoteActivity): void => listener(activity)
     ipcRenderer.on(IpcChannels.remoteActivity, handler)
     return () => ipcRenderer.removeListener(IpcChannels.remoteActivity, handler)
+  },
+  getConnectState: () => ipcRenderer.invoke(IpcChannels.connectState),
+  getConnectDevices: () => ipcRenderer.invoke(IpcChannels.connectDevices),
+  revokeConnectDevice: (args) => ipcRenderer.invoke(IpcChannels.connectRevoke, args),
+  reconnectConnectNode: () => ipcRenderer.invoke(IpcChannels.connectReconnect),
+  getConnectEnrollments: () => ipcRenderer.invoke(IpcChannels.connectEnrollments),
+  decideConnectEnrollment: (args) => ipcRenderer.invoke(IpcChannels.connectEnrollmentDecide, args),
+  onConnectActivity: (listener) => {
+    const handler = (_e: IpcRendererEvent, state: ConnectState): void => listener(state)
+    ipcRenderer.on(IpcChannels.connectActivity, handler)
+    return () => ipcRenderer.removeListener(IpcChannels.connectActivity, handler)
   },
   onProviderStatus: (listener) => {
     const handler = (_e: IpcRendererEvent, ev: ProviderStatusEvent): void => listener(ev)

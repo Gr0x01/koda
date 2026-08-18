@@ -8,6 +8,8 @@
  */
 import type { ApprovalMode, ApprovalRequest, ToolDecision } from '@shared/ipc'
 import type { ApproveRequest } from './types'
+import { existsSync, realpathSync, statSync } from 'node:fs'
+import { basename, dirname, join, resolve, sep } from 'node:path'
 import {
   destructiveGit,
   isMutating,
@@ -18,7 +20,20 @@ import {
   isUserQuestion,
   isPreviewTool,
   protectedTarget,
+  type DestructiveGitHit,
 } from './policy'
+
+/**
+ * Why the card is asking, in the terms the person reading it can act on. The scope is the honest
+ * part: a local rewrite still has the old tip in the reflog, while a force-push has already reached
+ * a server Koda can't reach back into. Saying "Koda can't undo this" about a recoverable rebase
+ * would train the user to ignore the warning that matters.
+ */
+function destructiveGitReason(hit: DestructiveGitHit): string {
+  return hit.scope === 'remote'
+    ? `This rewrites history you've already published (${hit.what}). Koda can't undo it once it runs, so it always checks with you first.`
+    : `This rewrites your project's history (${hit.what}). Koda's recovery net covers your files but can't restore history, so it always checks with you first. Git keeps your previous position in its reflog if you need to get back.`
+}
 
 /**
  * Take a safety checkpoint of the session's working tree under `label`, completing BEFORE it
@@ -45,9 +60,92 @@ export type WarnFn = (sessionId: string, message: string) => void
 const UNATTENDED_REASON =
   'This is an unattended overnight run: anything needing a human is declined, not asked. The user has NOT consented to this action — do not retry it or attempt the same outcome via a different path. Skip it and flag it for a normal session instead.'
 
+/**
+ * What an engine WITHOUT a native plan mode hears when it reaches for a mutation in Plan posture.
+ * Claude gets this guarantee from `--permission-mode plan` inside the engine; Codex has no such mode,
+ * so this deny is what makes Plan a mode there instead of a request (the turn's steering block says
+ * this refusal exists — codex-steering.ts, PLAN_BODY — and this is the half that makes it true).
+ */
+const PLAN_FENCE_REASON =
+  'Plan mode is active: Koda declines every change to the project while planning, and this decline is a hard stop rather than a prompt. Do not retry it, reword it, or reach the same outcome another way. Keep exploring read-only and put the action in the plan; the user leaves Plan mode themselves.'
+
 /** REM may inspect only local evidence. This is intentionally narrower than policy.isMutating:
  *  browser/preview/web/task tools may not edit project files, but they still act outside the dream. */
 const REM_EVIDENCE_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LS', 'NotebookRead'])
+
+/** Tidy may inspect local project evidence and edit only the project's real memory tree. Network,
+ * shell, browser/capability, and unknown tools are outside an unattended consolidation pass. */
+const MEMORY_TIDY_READ_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LS', 'NotebookRead'])
+
+function realMemoryTargets(projectRoot: string, targets: string[], existingOnly = false): string[] | null {
+  if (!targets.length) return null
+  try {
+    const realProject = realpathSync(projectRoot)
+    const realMemory = realpathSync(join(realProject, '.koda', 'memory'))
+    if (!realMemory.startsWith(realProject + sep)) return null
+    const resolved = targets.map((target) => {
+      const requested = resolve(realProject, target)
+      // Existing leaves are realpath'd directly. A new leaf has no realpath yet, so resolve its
+      // existing parent and rejoin the basename; both forms defeat `..` and symlink escapes.
+      if (existingOnly && !existsSync(requested)) throw new Error('target does not exist')
+      return existsSync(requested)
+        ? realpathSync(requested)
+        : join(realpathSync(dirname(requested)), basename(requested))
+    })
+    return resolved.every((target) => target.startsWith(realMemory + sep)) ? resolved : null
+  } catch {
+    return null
+  }
+}
+
+function containedMemoryEdit(projectRoot: string, input: unknown): boolean {
+  const i = input as Record<string, unknown> | null | undefined
+  const targets = [i?.file_path, i?.path, i?.notebook_path, ...(Array.isArray(i?.file_paths) ? i.file_paths : [])]
+    .filter((value): value is string => typeof value === 'string' && Boolean(value.trim()))
+  return realMemoryTargets(projectRoot, targets) !== null
+}
+
+/** Parse only a single, non-recursive `rm` invocation. No shell operators, expansion, escapes,
+ * globs, double quotes, option surface beyond `-f`, or token concatenation. A filename this tiny
+ * grammar cannot express is left for a normal attended session. */
+function simpleRmTargets(command: unknown): string[] | null {
+  if (typeof command !== 'string' || /[\r\n]/.test(command)) return null
+  const tokens: string[] = []
+  let at = 0
+  while (at < command.length) {
+    while (/\s/.test(command[at] ?? '')) at++
+    if (at >= command.length) break
+    if (command[at] === "'") {
+      const end = command.indexOf("'", at + 1)
+      if (end < 0 || (command[end + 1] && !/\s/.test(command[end + 1]))) return null
+      tokens.push(command.slice(at + 1, end))
+      at = end + 1
+      continue
+    }
+    const start = at
+    while (at < command.length && !/\s/.test(command[at])) at++
+    const token = command.slice(start, at)
+    if (!token || /[;&|`$<>(){}[\]*?!\\"'#~]/.test(token)) return null
+    tokens.push(token)
+  }
+  if (tokens.shift() !== 'rm') return null
+  if (tokens[0] === '-f') tokens.shift()
+  if (tokens[0] === '--') tokens.shift()
+  if (!tokens.length || tokens.some((token) => token.startsWith('-'))) return null
+  return tokens
+}
+
+function containedMemoryDelete(projectRoot: string, input: unknown): boolean {
+  const command = (input as { command?: unknown } | null | undefined)?.command
+  const targets = simpleRmTargets(command)
+  if (!targets) return false
+  const real = realMemoryTargets(projectRoot, targets, true)
+  return Boolean(real?.every((target) => target.endsWith('.md') && statSync(target).isFile()))
+}
+
+function isMemorySkill(input: unknown): boolean {
+  return (input as { skill?: unknown } | null | undefined)?.skill === 'memory'
+}
 
 /** Attached to a user's deny when they gave no reason of their own. Without it the engine sees a
  *  bare rejection and commonly retries the same action reworded or reaches the same outcome down a
@@ -78,6 +176,17 @@ export class ApprovalGate {
   private readonly unattended = new Set<string>()
   /** Mechanically paralyzed sessions (REM): reads pass; every project/state mutation is denied. */
   private readonly readOnly = new Set<string>()
+  /** Sessions whose engine has no plan mode of its own (capabilities `planMode: 'turnText'`, i.e.
+   *  Codex). While their posture is `plan`, this gate IS the fence — see PLAN_FENCE_REASON. */
+  private readonly planFenced = new Set<string>()
+  /** The posture the IN-FLIGHT turn was actually steered with, pinned by the driver at the moment it
+   *  rendered that turn's mode block. The fence follows this, not the live posture: a mode the user
+   *  changes mid-turn reaches the model on the NEXT turn (that is what the block's supersession text
+   *  promises), so relaxing — or tightening — the fence underneath a running turn would enforce a
+   *  mode the model was never told about. Absent between turns, when the live posture is the truth. */
+  private readonly turnMode = new Map<string, ApprovalMode>()
+  /** Overnight tidy sessions: local evidence reads plus edits contained to this real memory tree. */
+  private readonly memoryTidyRoots = new Map<string, string>()
   /** requestId (= engine tool_use_id) → pending "Ask me" resolver. `at` feeds the phone's
    *  "Needs you · waiting Xm" readout; `toolName`/`input` let a late-joining head (the phone) rebuild
    *  the prompt it never saw pushed live (pendingRequests). */
@@ -121,6 +230,22 @@ export class ApprovalGate {
     if (on) this.readOnly.add(sessionId)
     else this.readOnly.delete(sessionId)
   }
+  /** Does Koda have to enforce Plan mode for this session itself? Set from the engine's declared
+   *  capabilities at spawn, never from an engine-name check here. */
+  setPlanFence(sessionId: string, on: boolean): void {
+    if (on) this.planFenced.add(sessionId)
+    else this.planFenced.delete(sessionId)
+  }
+  /** A turn just went out steered with `mode` (pin), or a turn ended (`null`, release). Called from the
+   *  driver's own turn delivery, so the pinned value is exactly what the model was told this turn. */
+  pinTurnMode(sessionId: string, mode: ApprovalMode | null): void {
+    if (mode) this.turnMode.set(sessionId, mode)
+    else this.turnMode.delete(sessionId)
+  }
+  setMemoryTidyRoot(sessionId: string, projectRoot: string | null): void {
+    if (projectRoot) this.memoryTidyRoots.set(sessionId, projectRoot)
+    else this.memoryTidyRoots.delete(sessionId)
+  }
   /** A session's posture, or the default until the renderer has set one. Public so a remote head can
    *  read the same mode the local window shows (remote-control-security.md §4 — remote inherits local
    *  policy exactly; the phone is another head with the same controls, not a stricter regime). */
@@ -133,26 +258,50 @@ export class ApprovalGate {
   }
 
   /**
-   * The decision flow. Tripwire first (a denied tool won't run, so it needs no checkpoint); then
-   * the mode decision; then — only when we're about to allow a MUTATING tool — the checkpoint,
-   * awaited so it lands before the engine acts on the allow.
+   * The decision flow. Context denials first (a denied tool won't run, so it needs no checkpoint);
+   * then the mode decision, which the forced-ask tiers can override; then — only when we're about to
+   * allow a MUTATING tool — the checkpoint, awaited so it lands before the engine acts on the allow.
+   *
+   * Destructive git used to short-circuit here as a hard deny. It's a forced ask now (below, beside
+   * the self-protection tier): the deny couldn't stop the operation, only relocate it to the user's
+   * terminal, and it stranded anyone mid-rebase who didn't already know Git.
    */
   async decide(sessionId: string, req: ApproveRequest): Promise<ToolDecision> {
-    const tripwire = destructiveGit(req.toolName, req.input)
-    if (tripwire) {
-      // A denial is a prompt the model reads — it must close every door, not just this one call
-      // (the Hermes denial register: no retry, no rephrase, no same outcome via a different path).
-      return {
-        kind: 'deny',
-        reason: `Koda blocks destructive git (${tripwire.what}) — it rewrites history that safety-git can't recover. Do NOT retry this, rephrase it, or attempt the same outcome via a different path. Ask the user to run this themselves if they're sure.`,
-      }
-    }
-
     if (this.readOnly.has(sessionId) && !REM_EVIDENCE_TOOLS.has(req.toolName)) {
       return {
         kind: 'deny',
         reason:
           'This is a read-only overnight REM pass. Do not edit files, run commands, launch tools, or act on the idea. Continue with read-only evidence and put the proposal in the waking brief.',
+      }
+    }
+
+    const memoryRoot = this.memoryTidyRoots.get(sessionId)
+    if (memoryRoot) {
+      if (req.toolName === 'Skill' && isMemorySkill(req.input)) return { kind: 'allow' }
+      const memoryDelete = req.toolName === 'Bash' && containedMemoryDelete(memoryRoot, req.input)
+      if (
+        !MEMORY_TIDY_READ_TOOLS.has(req.toolName) &&
+        !(isEditTool(req.toolName) && containedMemoryEdit(memoryRoot, req.input)) &&
+        !memoryDelete
+      ) {
+        return {
+          kind: 'deny',
+          reason:
+            'This is an overnight memory tidy. Only local reads, the memory playbook, realpath-contained memory edits, and simple deletion of contained Markdown notes are allowed. Do not use network tools or another path; skip the action and mention it in the digest instead.',
+        }
+      }
+      // The user opted into memory consolidation; a simple contained note deletion is the one shell
+      // action the tidy contract requires. Checkpoint it, then allow directly so an unattended
+      // accept-edits posture does not turn “remove the replaced note” into an impossible prompt.
+      if (memoryDelete) {
+        const ok = await this.checkpoint(sessionId, checkpointLabel(req.toolName, req.input))
+        if (!ok) this.warn(sessionId, "couldn't snapshot before removing the replaced memory note — it was left in place")
+        return ok
+          ? { kind: 'allow' }
+          : {
+              kind: 'deny',
+              reason: 'Koda could not make the recovery point required before deleting that memory note. Leave it in place and mention it in the digest.',
+            }
       }
     }
 
@@ -166,6 +315,20 @@ export class ApprovalGate {
     if (isUserQuestion(req.toolName)) {
       if (this.unattended.has(sessionId)) return { kind: 'deny', reason: UNATTENDED_REASON }
       return this.askUser(sessionId, req)
+    }
+
+    // Plan posture on an engine with no native plan mode: deny the mutation outright. Asking the user
+    // would be incoherent — the mode's own text tells the agent this cannot be approved while Plan is
+    // on. `Bash` is deliberately exempt: a Codex command runs in that engine's read-only sandbox (the
+    // driver refuses to widen it while planning), so commands are exploration — tests, builds, and
+    // checks are the part of planning worth keeping. Questions above are already past this point:
+    // asking the user IS planning. A denied tool never runs, so no checkpoint is owed.
+    // The mode this turn is being JUDGED under: the one it was steered with while it is still running,
+    // the live posture between turns. A switch mid-turn changes the next turn, not this one.
+    const steeredMode = this.turnMode.get(sessionId) ?? this.modeFor(sessionId)
+    const planFenced = this.planFenced.has(sessionId) && steeredMode === 'plan'
+    if (planFenced && isMutating(req.toolName) && req.toolName !== 'Bash') {
+      return { kind: 'deny', reason: PLAN_FENCE_REASON }
     }
 
     // Recovery restore (any always-confirm tool) ALWAYS surfaces a confirm — even in Auto-approve —
@@ -184,12 +347,25 @@ export class ApprovalGate {
     // `what` rides the request as `reason` so the card can say WHY Auto suddenly asked — an
     // unexplained prompt just gets rubber-stamped.
     const protectedHit = protectedTarget(req.toolName, req.input)
+    // Destructive-git tier: rewriting or deleting history is a forced ask even in Auto, for the same
+    // reason as self-protection — the user may well want it, what's banned is it happening unseen.
+    const gitHit = destructiveGit(req.toolName, req.input)
+    // Under the plan fence the only mutating tool that reaches here is a command, and it runs inside
+    // the engine's read-only sandbox (the driver refuses to widen it while planning). Prompting for
+    // every `grep`/`npm test` would make planning unusable and would be asking about something that
+    // cannot change the project. The forced-ask tiers above still apply, so a protected target or a
+    // destructive-git command is still put to the user.
     const ask =
       forcePreviewConfirm ||
       isAlwaysConfirm(req.toolName) ||
       protectedHit !== null ||
-      this.shouldAsk(this.modeFor(sessionId), req.toolName)
-    const reason = protectedHit ? `This changes ${protectedHit.what} — Koda always checks with you first.` : undefined
+      gitHit !== null ||
+      (!planFenced && this.shouldAsk(this.modeFor(sessionId), req.toolName))
+    const reason = protectedHit
+      ? `This changes ${protectedHit.what} — Koda always checks with you first.`
+      : gitHit
+        ? destructiveGitReason(gitHit)
+        : undefined
     const decision: ToolDecision = ask
       ? this.unattended.has(sessionId)
         ? { kind: 'deny', reason: UNATTENDED_REASON }
@@ -303,6 +479,9 @@ export class ApprovalGate {
         slot.resolve({ kind: 'deny', reason: 'session ended' })
       }
     }
+    // The process that was running the steered turn is gone, so nothing is in flight to protect. Left
+    // pinned, a stale mode would judge the FIRST turn of the respawned process.
+    this.turnMode.delete(sessionId)
     this.pushCancelled(sessionId)
   }
 
@@ -323,5 +502,8 @@ export class ApprovalGate {
     this.modes.delete(sessionId)
     this.unattended.delete(sessionId)
     this.readOnly.delete(sessionId)
+    this.planFenced.delete(sessionId)
+    this.turnMode.delete(sessionId)
+    this.memoryTidyRoots.delete(sessionId)
   }
 }

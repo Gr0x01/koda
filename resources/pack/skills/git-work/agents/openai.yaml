@@ -1,0 +1,4 @@
+interface:
+  display_name: "Git Work"
+  short_description: "Manage task branches, commits, and repository closure."
+  default_prompt: "Use $git-work to manage the branch, commits, and repository closure."

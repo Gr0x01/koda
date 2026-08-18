@@ -17,15 +17,19 @@ import { promisify } from 'node:util'
 import { app } from 'electron'
 import { resolveEnginePath } from './binary'
 import { buildEngineEnv } from './env'
-import { codexCleanFinishHooksJson } from './codex-clean-finish'
 import {
+  BROWSER_VERIFY_SKILL,
   CODEX_PACK_SKILLS,
+  DEEP_REVIEW_PLUGIN_NAME,
   GATED_PACK_SKILLS,
   codexPackMarker,
+  deepReviewPluginVersion,
+  resolveDeepReviewPlugin,
   resolvePack,
   resolveStagingPack,
 } from './pack'
-import { loadMiniAppsEnabled } from '../settings'
+import { readDisabledSet, skillKey } from '../guardrails-config'
+import { canonicalSkillName, projectSkillCollisionNames, projectSkillDescriptors } from '../project-skills'
 import { log } from '../logger'
 
 const execFileP = promisify(execFile)
@@ -146,12 +150,8 @@ export async function reconcileCodexAuth(opts: { resourcesPath?: string; apiKey?
   }
 }
 
-/** The pack skill that teaches browser verification — materialized for Codex only when Playwright is wired. */
-const BROWSER_VERIFY_SKILL = 'browser-verify'
-
-/** Codex-only skills (resources/codex-skills) that supplement the pack — e.g. code-review, which on
- *  Claude is a subagent (agents/code-reviewer.md), a mechanism Codex plugins can't carry, so Codex gets
- *  the same criteria as a self-invoked skill instead. Resolved like the pack: packaged Resources → repo. */
+/** Codex-only skills that supplement the shared pack — currently code-review, which is a named
+ *  specialist on Claude but a route-invoked skill on Codex. Resolved like the pack. */
 function codexOnlySkillsDir(resourcesPath?: string): string | null {
   const candidates: string[] = []
   if (resourcesPath) candidates.push(join(resourcesPath, 'codex-skills'))
@@ -164,7 +164,82 @@ const MARKETPLACE_NAME = 'koda-market'
 const PLUGIN_NAME = 'koda'
 const MARKER = 'koda-plugin-version'
 
-const marketplaceJson = () =>
+export interface CodexSkillConfigEntry {
+  path: string
+  enabled: boolean
+}
+
+export interface CodexSkillConfigOptions {
+  home?: string
+  playwrightWired?: boolean
+  miniAppsWired?: boolean
+}
+
+/**
+ * Codex's native per-skill config is the parity seam for Settings → Guardrails. The installed plugin
+ * remains one shared immutable catalog; each app-server spawn receives path-keyed enablement for THIS
+ * project. Codex selectors use the exact canonical `SKILL.md` file (a parent directory is not a valid
+ * identity). A project `.claude/skills/<name>` fork disables the same-named bundled skill and is exposed
+ * directly as the replacement, so editing or toggling a playbook has the same visible effect on both
+ * engines without rewriting the shared plugin between concurrent sessions.
+ */
+export function codexSkillConfig(
+  projectRoot: string,
+  appVersion: string,
+  opts: CodexSkillConfigOptions = {},
+): CodexSkillConfigEntry[] {
+  const home = opts.home ?? codexHome()
+  const disabled = readDisabledSet(projectRoot)
+  const installedSkills = join(home, 'plugins', 'cache', MARKETPLACE_NAME, PLUGIN_NAME, appVersion, 'skills')
+  const projectSkills = join(projectRoot, '.claude', 'skills')
+  const entries = new Map<string, CodexSkillConfigEntry>()
+  const capabilityDisabled = new Set<string>([
+    ...(opts.playwrightWired ? [] : [BROWSER_VERIFY_SKILL]),
+    ...(opts.miniAppsWired ? [] : GATED_PACK_SKILLS),
+  ])
+
+  // The private plugin is an immutable superset. Optional playbooks are switched off per app-server
+  // process, at the same native config seam as project guardrail toggles, so concurrent sessions with
+  // different feature snapshots cannot rewrite each other's shared cache.
+  for (const name of capabilityDisabled) {
+    const bundled = join(installedSkills, name, 'SKILL.md')
+    if (existsSync(bundled)) entries.set(bundled, { path: bundled, enabled: false })
+  }
+
+  const projectDescriptors = projectSkillDescriptors(projectRoot)
+  const projectNames = new Set(projectDescriptors.map((descriptor) => descriptor.name))
+
+  // Two project folders claiming one identity are unsafe to select. Codex does not discover the
+  // `.claude/skills` copies directly, but the same name may exist in Koda's bundled plugin; disable
+  // that too so both engines fail closed on the collision instead of silently choosing different work.
+  for (const name of projectSkillCollisionNames(projectRoot)) {
+    const bundled = join(installedSkills, name, 'SKILL.md')
+    if (existsSync(bundled)) entries.set(bundled, { path: bundled, enabled: false })
+  }
+
+  for (const descriptor of projectDescriptors) {
+    const name = descriptor.name
+    const bundled = join(installedSkills, name, 'SKILL.md')
+    if (existsSync(bundled)) entries.set(bundled, { path: bundled, enabled: false })
+    const local = join(projectSkills, descriptor.directoryName, 'SKILL.md')
+    entries.set(local, {
+      path: local,
+      enabled: !disabled.has(skillKey(name)) && !capabilityDisabled.has(name),
+    })
+  }
+
+  for (const key of disabled) {
+    if (!key.startsWith('skill:')) continue
+    const name = canonicalSkillName(key.slice('skill:'.length))
+    if (!name) continue
+    if (projectNames.has(name)) continue
+    const bundled = join(installedSkills, name, 'SKILL.md')
+    if (existsSync(bundled)) entries.set(bundled, { path: bundled, enabled: false })
+  }
+  return [...entries.values()].sort((a, b) => a.path.localeCompare(b.path))
+}
+
+export const codexMarketplaceJson = (includeDeepReview: boolean) =>
   JSON.stringify(
     {
       name: MARKETPLACE_NAME,
@@ -173,16 +248,26 @@ const marketplaceJson = () =>
         {
           name: PLUGIN_NAME,
           source: { source: 'local', path: `./plugins/${PLUGIN_NAME}` },
-          policy: { installation: 'AVAILABLE' },
+          policy: { installation: 'AVAILABLE', authentication: 'ON_INSTALL' },
           category: 'Productivity',
         },
+        ...(includeDeepReview
+          ? [
+              {
+                name: DEEP_REVIEW_PLUGIN_NAME,
+                source: { source: 'local', path: `./plugins/${DEEP_REVIEW_PLUGIN_NAME}` },
+                policy: { installation: 'AVAILABLE', authentication: 'ON_INSTALL' },
+                category: 'Developer Tools',
+              },
+            ]
+          : []),
       ],
     },
     null,
     2,
   )
 
-export const codexPluginJson = (version: string, hooksAvailable: boolean) =>
+export const codexPluginJson = (version: string) =>
   JSON.stringify(
     {
       name: PLUGIN_NAME,
@@ -191,7 +276,6 @@ export const codexPluginJson = (version: string, hooksAvailable: boolean) =>
       author: { name: 'Koda' },
       license: 'MIT',
       skills: './skills/',
-      ...(hooksAvailable ? { hooks: './hooks/hooks.json' } : {}),
       // No `agents` — Codex plugins don't load named subagents (verified: it reports "no installed
       // code-reviewer agent"). Its subagents are generic spawn_agent workers, not Claude-style personas.
       interface: {
@@ -205,42 +289,84 @@ export const codexPluginJson = (version: string, hooksAvailable: boolean) =>
     2,
   )
 
-let ready: Promise<void> | null = null
+/** Read the native CLI's installed-plugin inventory without treating malformed output as an empty
+ * inventory. Callers must fail closed on null so they never write a marker while stale Koda-owned
+ * plugins may still be active. */
+export function codexInstalledPluginIds(raw: string): Set<string> | null {
+  try {
+    const parsed = JSON.parse(raw) as { installed?: unknown }
+    if (!Array.isArray(parsed.installed)) return null
+    const ids = new Set<string>()
+    for (const entry of parsed.installed) {
+      if (!entry || typeof entry !== 'object') return null
+      const pluginId = (entry as { pluginId?: unknown }).pluginId
+      if (typeof pluginId !== 'string') return null
+      ids.add(pluginId)
+    }
+    return ids
+  } catch {
+    return null
+  }
+}
+
+interface CodexHomeSetupRequest {
+  appVersion: string
+  resourcesPath?: string
+}
+
+interface CodexHomeSetupFlight {
+  key: string
+  promise: Promise<void>
+  owner: object
+}
+
+let ready: CodexHomeSetupFlight | null = null
+
+/** Identity of the plugin materialization a session needs. Exported as a tripwire: adding another
+ * runtime-gated skill without folding its state into this key would resurrect a stale in-process
+ * cache even though the on-disk marker is correct. */
+export function codexHomeSetupKey(opts: CodexHomeSetupRequest): string {
+  const deepReviewVersion = deepReviewPluginVersion(resolveDeepReviewPlugin({ resourcesPath: opts.resourcesPath }))
+  return `${opts.resourcesPath ?? '<dev>'}:${codexPackMarker(opts.appVersion, deepReviewVersion)}`
+}
 
 /**
  * Ensure the isolated Codex home exists, carries a login, and has Koda's skills plugin
- * installed. Single-flight (concurrent first sessions share one run); version-keyed (re-installs only
- * when the app version changes); NEVER rejects (a failure logs + resets so a later session retries,
- * and the session starts regardless — skills are additive).
+ * installed. Single-flight per immutable catalog key (concurrent matching sessions share one run);
+ * re-installs when a content version or source changes; NEVER rejects (a failure logs + resets so a
+ * later session retries, and the session starts regardless — skills are additive).
  */
-export function ensureCodexHome(opts: {
-  appVersion: string
-  resourcesPath?: string
-  /** Whether the browser capability is wired — decides if browser-verify is materialized. Folded into
-   *  the version marker so toggling it re-installs the plugin on the next app run (within a run the
-   *  install is single-flighted; the MCP tools still attach live per-session via the driver). */
-  playwrightWired?: boolean
-}): Promise<void> {
-  if (!ready) {
-    ready = setup(opts).catch((err) => {
+export function ensureCodexHome(opts: CodexHomeSetupRequest): Promise<void> {
+  const key = codexHomeSetupKey(opts)
+  if (ready?.key === key) return ready.promise
+
+  // Different catalog sources serialize through the prior flight because they rewrite one isolated
+  // plugin cache. Runtime feature toggles deliberately do NOT enter this key: the installed catalog is
+  // a superset and each app-server receives its own native enablement in codexSkillConfig.
+  const prior = ready?.promise ?? Promise.resolve()
+  const owner = {}
+  const flight = prior
+    .then(() => setup(opts))
+    .catch((err) => {
       log.warn('codex-home', 'setup failed (Codex still usable, without Koda skills)', err?.message ?? err)
-      ready = null // let a later session retry
+      if (ready?.owner === owner) ready = null // let a later session retry this exact state
     })
-  }
-  return ready
+  ready = { key, promise: flight, owner }
+  return flight
 }
 
-async function setup(opts: {
-  appVersion: string
-  resourcesPath?: string
-  playwrightWired?: boolean
-}): Promise<void> {
+async function setup(opts: CodexHomeSetupRequest): Promise<void> {
   const home = codexHome()
   ensureCodexAuthSeed() // home dir + login (shared with the pre-session probes)
 
-  // Version-keyed install, plus the wired-state of optional skills, so a capability toggle re-installs.
-  const miniApps = loadMiniAppsEnabled()
-  const markerValue = codexPackMarker(opts.appVersion, opts.playwrightWired === true, miniApps)
+  // Version/source-keyed immutable catalog. Runtime optional-skill state belongs to each app-server.
+  const deepReviewSource = resolveDeepReviewPlugin({ resourcesPath: opts.resourcesPath })
+  const deepReviewVersion = deepReviewPluginVersion(deepReviewSource)
+  const deepReview = deepReviewVersion && deepReviewSource ? deepReviewSource : null
+  // Persist the SAME identity used by the in-process flight. If two same-version app/resource bundles
+  // share one user-data home, accepting a path-blind disk marker would silently keep the first bundle's
+  // cached plugin bodies even though the second flight correctly noticed a different source.
+  const markerValue = codexHomeSetupKey(opts)
   const markerPath = join(home, MARKER)
   if (existsSync(markerPath) && readFileSync(markerPath, 'utf8').trim() === markerValue) return
 
@@ -252,29 +378,21 @@ async function setup(opts: {
   const srcRoot = join(home, 'koda-plugin-src')
   rmSync(srcRoot, { recursive: true, force: true })
   const pluginDir = join(srcRoot, 'plugins', PLUGIN_NAME)
-  const codexHooks = join(pack.dir, 'codex-hooks')
-  const cleanFinishScript = join(codexHooks, 'clean-finish.js')
-  const hooksAvailable = existsSync(cleanFinishScript)
   mkdirSync(join(srcRoot, '.agents', 'plugins'), { recursive: true })
   mkdirSync(join(pluginDir, '.codex-plugin'), { recursive: true })
   mkdirSync(join(pluginDir, 'skills'), { recursive: true })
-  writeFileSync(join(srcRoot, '.agents', 'plugins', 'marketplace.json'), marketplaceJson())
-  writeFileSync(join(pluginDir, '.codex-plugin', 'plugin.json'), codexPluginJson(opts.appVersion, hooksAvailable))
-  if (hooksAvailable) {
-    const pluginHooks = join(pluginDir, 'hooks')
-    mkdirSync(pluginHooks, { recursive: true })
-    copyFileSync(cleanFinishScript, join(pluginHooks, 'clean-finish.js'))
-    writeFileSync(join(pluginHooks, 'hooks.json'), codexCleanFinishHooksJson())
-  }
-  const packSkills = opts.playwrightWired ? [...CODEX_PACK_SKILLS, BROWSER_VERIFY_SKILL] : [...CODEX_PACK_SKILLS]
+  writeFileSync(join(srcRoot, '.agents', 'plugins', 'marketplace.json'), codexMarketplaceJson(deepReview !== null))
+  writeFileSync(join(pluginDir, '.codex-plugin', 'plugin.json'), codexPluginJson(opts.appVersion))
+  const packSkills = [...CODEX_PACK_SKILLS, BROWSER_VERIFY_SKILL]
   for (const name of packSkills) {
     const from = join(pack.dir, 'skills', name)
     if (existsSync(from)) cpSync(from, join(pluginDir, 'skills', name), { recursive: true })
   }
-  // Built-but-unshipped skills live in the staging pack, not the main one — copy them only when the
-  // mini-apps dogfood flag is on (mirrors the Claude side's staging --plugin-dir; folded into the marker
-  // above so toggling re-installs). Absent staging (graduated/stripped build) ⇒ nothing to copy.
-  const staging = miniApps ? resolveStagingPack({ resourcesPath: opts.resourcesPath }) : null
+  // Codex gets one immutable private catalog. Staged skills remain unreachable when the feature is off
+  // because codexSkillConfig disables their exact paths for that app-server process. This differs from
+  // Claude's second --plugin-dir but prevents concurrent Codex starts from racing over one shared cache.
+  // Absent staging (graduated/stripped build) ⇒ nothing to copy.
+  const staging = resolveStagingPack({ resourcesPath: opts.resourcesPath })
   if (staging) {
     for (const name of GATED_PACK_SKILLS) {
       const from = join(staging.dir, 'skills', name)
@@ -289,6 +407,12 @@ async function setup(opts: {
       if (existsSync(join(from, 'SKILL.md'))) cpSync(from, join(pluginDir, 'skills', name), { recursive: true })
     }
   }
+  // Deep Review stays a real second plugin (and therefore a distinct namespace) instead of being
+  // flattened into Koda's behavior pack. Copy the same source Claude loads; its Codex manifest and
+  // shared skill already live beside the Claude manifest and named reviewers.
+  if (deepReview) {
+    cpSync(deepReview.dir, join(srcRoot, 'plugins', DEEP_REVIEW_PLUGIN_NAME), { recursive: true })
+  }
   // Install via the codex binary. CODEX_HOME rides buildEngineEnv (engineId:'codex') → these spawns
   // target the isolated home, same as every session spawn. marketplace-add is idempotent.
   const bin = resolveEnginePath({ resourcesPath: opts.resourcesPath, binaryName: 'codex' }).path
@@ -296,6 +420,20 @@ async function setup(opts: {
   const run = (args: string[]) => execFileP(bin, args, { env, timeout: 30_000 })
   await run(['plugin', 'marketplace', 'add', srcRoot])
   await run(['plugin', 'add', `${PLUGIN_NAME}@${MARKETPLACE_NAME}`])
+  const deepReviewId = `${DEEP_REVIEW_PLUGIN_NAME}@${MARKETPLACE_NAME}`
+  if (deepReview) {
+    await run(['plugin', 'add', deepReviewId])
+  } else {
+    // Unlike Claude's per-session source list, Codex installations persist in its isolated home.
+    // Reconcile absence explicitly so a stripped/older build cannot leave a stale first-party plugin.
+    const listed = await run(['plugin', 'list', '--json'])
+    const installed = codexInstalledPluginIds(listed.stdout.toString())
+    if (!installed) throw new Error('Codex returned an unreadable installed-plugin inventory')
+    if (installed.has(deepReviewId)) await run(['plugin', 'remove', deepReviewId])
+  }
   writeFileSync(markerPath, markerValue)
-  log.info('codex-home', `installed Koda plugin (${packSkills.join(', ')} + code-review) into ${home}`)
+  log.info(
+    'codex-home',
+    `installed Koda plugin (${packSkills.join(', ')} + code-review)${deepReview ? ' + deep-review' : ''} into ${home}`,
+  )
 }

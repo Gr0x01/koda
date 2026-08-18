@@ -14,7 +14,13 @@ function run() {
   }
   const input = event && event.tool_input
   if (event.tool_name !== 'Agent' || !input || typeof input !== 'object') return ''
-  if (input.subagent_type === 'koda:scout' || input.subagent_type === 'koda:worker') return ''
+  const backgroundLeaves = new Set([
+    'koda:scout',
+    'koda:worker',
+    'deep-review:detective',
+    'deep-review:finding-judge',
+  ])
+  if (backgroundLeaves.has(input.subagent_type)) return ''
   if (input.run_in_background === false) return ''
   return JSON.stringify({
     hookSpecificOutput: {

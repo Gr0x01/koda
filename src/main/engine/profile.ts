@@ -7,6 +7,7 @@
  * differs between engines, kept in one place so the wiring code stays engine-agnostic.
  */
 import type { EngineId } from '@shared/ipc'
+import { codexHome } from './codex-home'
 export type { EngineId }
 
 export interface EngineProfile {
@@ -28,6 +29,15 @@ export interface EngineProfile {
   disableUpdaterEnv: Readonly<Record<string, string>>
   /** The env var the API key is re-injected as, ONLY when the user explicitly chose API billing. */
   apiKeyEnvVar: string
+  /** Which stored setting holds this engine's billing choice. Per-engine because each bills a distinct
+   *  provider account, and Claude's field predates the second engine. */
+  billingModeSetting: 'billingMode' | 'codexBillingMode'
+  /**
+   * Env this engine's spawns need beyond the shared rules — the per-engine half of `buildEngineEnv`,
+   * kept here so the chokepoint itself never asks which engine it is serving. A function because a
+   * value can be resolved at spawn time (Codex's isolated home).
+   */
+  extraEnv: () => Record<string, string>
 }
 
 /**
@@ -59,6 +69,14 @@ export const CLAUDE_PROFILE: EngineProfile = {
   ],
   disableUpdaterEnv: { DISABLE_AUTOUPDATER: '1' },
   apiKeyEnvVar: 'ANTHROPIC_API_KEY',
+  billingModeSetting: 'billingMode',
+  // Claude delegation stays deliberately flat and small. Per-Agent foreground enforcement rides the
+  // bundled pack's PreToolUse hook; the global DISABLE_BACKGROUND_TASKS flag cannot be used because it
+  // also disables Koda's explicit `background: true` scout/worker profiles.
+  extraEnv: () => ({
+    CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: '3',
+    CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: '1',
+  }),
 }
 
 /**
@@ -74,6 +92,12 @@ export const CODEX_PROFILE: EngineProfile = {
   stripEnvKeys: ['OPENAI_API_KEY', 'OPENAI_BASE_URL', 'CODEX_HOME'],
   disableUpdaterEnv: {},
   apiKeyEnvVar: 'OPENAI_API_KEY',
+  billingModeSetting: 'codexBillingMode',
+  // Codex gets its OWN isolated home (not the user's ~/.codex) so Koda's bundled skills/subagents
+  // plugin installs there without polluting their standalone Codex. Set for EVERY Codex spawn (login,
+  // auth probe, driver) so they all agree on the home. CODEX_HOME is stripped above, so this is the
+  // sole source. See codex-home.ts.
+  extraEnv: () => ({ CODEX_HOME: codexHome() }),
 }
 
 const PROFILES: Record<EngineId, EngineProfile> = {

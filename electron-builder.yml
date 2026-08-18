@@ -29,6 +29,10 @@ extraResources:
   # resolved by resolveStagingPack in pack.ts. Graduates into `pack` above when the feature ships.
   - from: resources/pack-staging
     to: pack-staging
+  # First-party plugins that remain separate from Koda's always-on behavior pack. Each keeps its own
+  # namespace and is loaded through the native plugin mechanism on both engines.
+  - from: resources/plugins
+    to: plugins
   # Codex-only skills — supplements the pack skills for the Codex engine (e.g. code-review, which on
   # Claude is a subagent, not a skill). Materialized into the isolated Codex home by codex-home.ts.
   - from: resources/codex-skills
@@ -77,6 +81,9 @@ mac:
     NSSpeechRecognitionUsageDescription: Koda transcribes your speech on your device to type messages.
 dmg:
   artifactName: ${productName}-${version}-${arch}.dmg
+  # The nightly Gatekeeper gate assesses the outer container's primary signature after notarization.
+  # Sign the DMG before its blockmap is generated and before the release runner submits it to Apple.
+  sign: true
 # Auto-update feed. electron-builder writes app-update.yml into the packaged app from this block, and
 # electron-updater's `github` provider reads signed releases from the koda repo with NO baked token.
 # Cutting a release with `--publish` needs a GH_TOKEN with write to koda in the local env.
@@ -84,3 +91,7 @@ publish:
   provider: github
   owner: Gr0x01
   repo: koda
+  # GitHub publishing does not infer a feed name from a prerelease version. Stable builds set this to
+  # `latest`; the nightly runner sets it to `nightly`, producing `nightly-mac.yml` without touching the
+  # stable feed consumed by ordinary installs.
+  channel: '${env.KODA_UPDATE_CHANNEL}'

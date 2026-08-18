@@ -10,6 +10,96 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
 
 ## [Unreleased]
 
+### Added
+
+- Settings now uses the same provider-first model catalog as chat for the small writing Koda does
+  around your work. Apple Intelligence and Plain local text stay one level away; Claude and Codex
+  each open their own model list with a separate reasoning control. Both use their configured provider
+  account through one ephemeral, non-mutating background-generation boundary.
+### Changed
+
+- Model selection now opens inside the current AI provider, with a distinct Koda mark and a short
+  explanation for each curated model. Switching between Claude and Codex lives one level deeper, so
+  the everyday menu stays compact and can grow cleanly as Koda adds providers.
+
+### Fixed
+
+- A Preview or Agents roster pushed by an agent in a background chat now brings that chat and its
+  Stage forward, instead of leaving the result hidden behind the session picker.
+- New chats now remember the complete provider, model, and reasoning choice. Changing reasoning no
+  longer falls back to the engine default when the next chat starts.
+
+## [0.1.11] - 2026-08-17
+
+### Added
+
+- Press ⌘K for the Library, one place to create or find anything you and Koda have written.
+  Search by title, words inside the page, type, or date. You can also ask a question across
+  your documents and past chats. Koda lists the sources it used, and a chat source opens
+  that conversation.
+- Say “keep this as a document” and Koda writes the useful result into your Documents folder
+  only when you ask. The document remembers which chat it came from. Star a document to keep
+  it in the sidebar, where it stays available across chats.
+- Documents now open ready to read and switch to Edit when you want to type. Changes save as
+  you go, failed saves offer a retry, and selecting a passage shows how much text will travel
+  with your message to Koda.
+- Settings now lets you choose how Koda writes session names and saved-version descriptions.
+  Apple Intelligence stays on your Mac, Plain local text uses no AI, and Claude uses your
+  configured Anthropic account with tools turned off.
+- Koda now includes Deep Review for changes that need a closer look. It follows related code,
+  tests, and history, checks suspected problems, and gives the change an evidence-backed score.
+  It is available on Claude and Codex when you ask for it.
+
+### Changed
+
+- The Stage now keeps several things open as tabs. An app, document, diff, terminal, and agent
+  roster can stay together, and a narrow window moves the Stage over the conversation so both
+  remain readable.
+- Versions is now one timeline. Unsaved work sits at the top, saved versions run below it, side
+  work branches from the point where it began, and the GitHub boundary and push action sit on
+  the same line.
+- A turn's commands and file work now fold into one timed work line. When a chat sends work to
+  several agents, one fleet row opens a full Agents roster where you can inspect or stop each
+  live agent.
+- The sidebar is a quieter chat list. Each row shows what changed and moves the rest into a
+  hover card. Archived chats and recent images open from compact lines at the bottom, and old
+  chats stay in one list until you choose to archive them. Files now open through ⌘P and
+  documents through the Library.
+- Koda now matches planning and review to the size of the work. Agents open job-specific
+  playbooks when useful, check which Koda tools actually loaded, and show one Preview mock when
+  a screen needs a real design choice. Koda also answers more briefly after the work is done.
+- Usage now shows the full API value of your work, what caching saved, recent model costs, token
+  splits, and a daily chart. Short Claude turns that name a chat or describe a save count too.
+  Providers without a published price stay in tokens.
+- Background checks slow down when Koda is out of sight or your Mac is on battery. Update checks
+  pause while the screen is locked or the Mac is asleep, then refresh when you return.
+- Codex Plan mode now blocks project changes for the whole planned turn, and changing its
+  approval mode no longer restarts the chat. Koda's finishing guidance now chooses one matching
+  review lane, verifies repairs directly, and keeps Deep Review behind an explicit request.
+- The bundled Codex engine is updated to 0.147.0.
+
+### Fixed
+
+- Normal Codex work is no longer steered or interrupted by Koda after a fixed number of inference
+  steps or tokens. The separate per-tool output cap remains to prevent oversized tool results.
+- Chats now move between Needs you and Active based on what you can act on. Working in two chats
+  no longer leaves a permanent Needs check badge; each chat claims the files it changed, and a
+  shared file names both chats.
+- Stopping a turn now stops its delegated agents first. A chat stays working until its last agent
+  finishes, and files written by those agents stay attached to the chat that sent them.
+- Archived chats stay archived even when a very long transcript reaches the live-session size
+  limit. Repeated archive rows for the same chat also fold back into one.
+- Session names stop being rewritten by tool-only turns or a missed naming request. Desktop chats
+  also keep their true origin after a reload instead of returning with a phone label.
+- Saved-image cleanup now runs when a project opens, when the setting changes, and as files age
+  in a quiet project.
+- Restoring an earlier version now tells every open agent which files moved back. A chat whose
+  engine lost its earlier history resumes on a fresh engine conversation and tells you once.
+- The Stage keeps a readable conversation beside it, Preview drops its green mark when its server
+  stops, and merged branches reconnect to the version where they really began.
+- Various fixes improve screen-reader labels, sidebar menus, session attention, generated names,
+  document actions, and recovery after an engine reconnect.
+
 ## [0.1.10] - 2026-08-11
 
 ### Added
@@ -420,7 +510,8 @@ _First versioned build — the baseline the auto-updater ships from._
 - Settings now shows the Koda version, the bundled Claude engine version, and a
   "Check for updates" button.
 
-[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.11...HEAD
+[0.1.11]: https://github.com/Gr0x01/koda/releases/tag/v0.1.11
 [0.1.10]: https://github.com/Gr0x01/koda/releases/tag/v0.1.10
 [0.1.9]: https://github.com/Gr0x01/koda/releases/tag/v0.1.9
 [0.1.8]: https://github.com/Gr0x01/koda/releases/tag/v0.1.8

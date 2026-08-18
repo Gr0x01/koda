@@ -216,9 +216,9 @@ interface MutateOpts {
   userData: string
   projectRoot?: string
   resourcesPath?: string
-  /** The caller's safety-git checkpoint, awaited immediately before a PROJECT-scope fs write (so it's
-   *  recoverable). Global-scope writes land in userData, outside any project — no checkpoint needed. */
-  beforeWrite?: () => Promise<unknown>
+  /** Wraps a PROJECT-scope fs write in the caller's safety checkpoint + external-writer boundary.
+   *  Global-scope writes land in userData, outside any project — no boundary needed. */
+  writeBoundary?: <T>(write: () => T | Promise<T>) => Promise<T>
 }
 
 /** Turn a catalog skill on at the given scope (copy its folder in). No-op if already active. */
@@ -232,17 +232,21 @@ export async function activateSkill(opts: MutateOpts): Promise<void> {
   if (opts.scope === 'global') ensureGlobalPlugin(globalSkillsDir(opts.userData))
   const dest = destFor(opts.scope, opts.id, opts.userData, opts.projectRoot)
   if (existsSync(dest)) return
-  if (opts.scope === 'project') await opts.beforeWrite?.()
-  mkdirSync(dirname(dest), { recursive: true })
-  cpSync(src, dest, { recursive: true })
+  const write = (): void => {
+    mkdirSync(dirname(dest), { recursive: true })
+    cpSync(src, dest, { recursive: true })
+  }
+  if (opts.scope === 'project' && opts.writeBoundary) await opts.writeBoundary(write)
+  else write()
 }
 
 /** Turn a skill off at the given scope (delete its folder). No-op if not active. */
 export async function deactivateSkill(opts: MutateOpts): Promise<void> {
   const dest = destFor(opts.scope, opts.id, opts.userData, opts.projectRoot)
   if (!existsSync(dest)) return
-  if (opts.scope === 'project') await opts.beforeWrite?.()
-  rmSync(dest, { recursive: true, force: true })
+  const write = (): void => rmSync(dest, { recursive: true, force: true })
+  if (opts.scope === 'project' && opts.writeBoundary) await opts.writeBoundary(write)
+  else write()
 }
 
 /** The catalog with each skill's current active-scopes layered on, for the gallery. */

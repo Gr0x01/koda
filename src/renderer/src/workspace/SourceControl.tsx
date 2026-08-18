@@ -11,16 +11,16 @@ import { SIDEBAR_MIN_WIDTH } from '@shared/ipc'
 import { PanelHeader } from './PanelHeader'
 import { ResizeHandle } from './ResizeHandle'
 import { useWorkspace } from './store'
-import { Section, FileButton, basename, shortRoot } from './source-control/shared'
+import { FileButton, basename, shortRoot } from './source-control/shared'
 import { BranchGlyph } from './source-control/icons'
-import { Ledger } from './source-control/VersionLedger'
+import { VersionTimeline } from './source-control/VersionTimeline'
+import { WorkingTip } from './source-control/WorkingTip'
 import { BackupSection } from './source-control/BackupSection'
 import { BranchReview } from './source-control/BranchReview'
-import { LooseEnds } from './source-control/LooseEnds'
 import { RestoreBox } from './source-control/RestoreBox'
 import { SideBranchBanner } from './source-control/SideBranchBanner'
 import { Button, lazyWithRetry } from '../ui'
-import { gitErrorCopy } from '../git-error-copy'
+import { windowHasOpenModal } from '../window-modal'
 
 // Reuse the live-edits diff body (lazy — keeps monaco out of the bundle until a diff is shown).
 const MonacoDiffEditor = lazyWithRetry(() => import('../surface/MonacoDiffEditor'))
@@ -35,12 +35,11 @@ type RightView =
 /**
  * Source Control — the "Versions" surface (dual-git.md §3). The user's REAL git, the only place Koda
  * touches it; safety-git's invisible undo store never appears here, so a vibecoder never thinks Koda
- * set up a repo for them. A self-contained full-area view (like Settings → Recovery): a quiet
- * Save-a-version action, the working Changes, a GitHub section (one-click push, or hand "publish me
- * to GitHub" to the agent), and a calm linear History LEDGER of your current line (VersionLedger) —
- * NOT a lane graph. Anything off that line becomes a plain decision in Loose Ends: side lines the
- * agent never brought in (Review → bring-in / discard), stranded workspaces (Open), while the
- * provably-safe leftovers are auto-tidied. NOT a git IDE (no stage-hunks/rebase/branch switching).
+ * set up a repo for them. A self-contained full-area view (like Settings → Recovery), and one
+ * timeline rather than a stack of sections: the working tip (your unsaved work, and the button that
+ * saves it) sits at the top as the newest moment, history runs below it as a lane graph, open side
+ * lines sit in that graph where the work happened, and the GitHub boundary is a seam on the line with
+ * the push action on it. NOT a git IDE (no stage-hunks/rebase/branch switching).
  */
 export function SourceControl({ onLeave }: { onLeave: () => void }) {
   const [repo, setRepo] = useState<GitRepoInfo | null>(null)
@@ -60,6 +59,7 @@ export function SourceControl({ onLeave }: { onLeave: () => void }) {
   const width = useWorkspace((s) => s.sidebarWidth)
   const setWidth = useWorkspace((s) => s.setSidebarWidth)
   const persistLayout = useWorkspace((s) => s.persistLayout)
+  const refreshGitStatus = useWorkspace((s) => s.refreshGitStatus)
   const panelRef = useRef<HTMLDivElement>(null)
 
   const refresh = useCallback(async () => {
@@ -117,19 +117,27 @@ export function SourceControl({ onLeave }: { onLeave: () => void }) {
     }
   }, [])
 
+  // Source Control owns the detailed local view while the footer keeps the lightweight global cue.
+  // Refresh them as one operation after every mutation so they cannot disagree until the next focus.
+  const refreshAll = useCallback(async () => {
+    await refresh()
+    await refreshGitStatus()
+  }, [refresh, refreshGitStatus])
+
   // Fetch on mount and whenever the window regains focus — no file watcher (this view is for
   // deliberately saving a version / reviewing history, not live-watching the agent).
   useEffect(() => {
-    void refresh()
-    const onFocus = (): void => void refresh()
+    void refreshAll()
+    const onFocus = (): void => void refreshAll()
     window.addEventListener('focus', onFocus)
     return () => window.removeEventListener('focus', onFocus)
-  }, [refresh])
+  }, [refreshAll])
 
   // Esc leaves the whole surface back to the workspace (matches Settings / the recovery drawer). This
   // is the full-area escape; the branch-review sub-view keeps its own "‹ All versions" back.
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
+      if (windowHasOpenModal()) return
       if (e.key === 'Escape') onLeave()
     }
     window.addEventListener('keydown', onKey)
@@ -196,7 +204,7 @@ export function SourceControl({ onLeave }: { onLeave: () => void }) {
           {loading ? (
             <p className="px-4 py-2 text-xs text-text-muted">Loading…</p>
           ) : !repo?.isRepo ? (
-            <EmptyState onChanged={refresh} />
+            <EmptyState onChanged={refreshAll} />
           ) : reviewBranch ? (
             <BranchReview
               branch={reviewBranch}
@@ -207,7 +215,7 @@ export function SourceControl({ onLeave }: { onLeave: () => void }) {
               onLeave={onLeave}
               onDiscarded={() => {
                 closeReview()
-                void refresh()
+                void refreshAll()
               }}
             />
           ) : (
@@ -222,7 +230,7 @@ export function SourceControl({ onLeave }: { onLeave: () => void }) {
               trunk={repo.defaultBranch}
               enclosingRoot={repo.isSubdir ? repo.repoRoot : null}
               right={right}
-              onCommitted={refresh}
+              onCommitted={refreshAll}
               onOpenChange={(path) => setRight({ t: 'change', path })}
               onOpenCommit={(sha) => setRight({ t: 'commit', sha })}
               onReview={openReview}
@@ -243,7 +251,7 @@ export function SourceControl({ onLeave }: { onLeave: () => void }) {
       </div>
 
       {/* Right: the diff / commit detail */}
-      <RightPane view={right} onChanged={refresh} />
+      <RightPane view={right} onChanged={refreshAll} />
     </div>
   )
 }
@@ -310,16 +318,6 @@ function BrowseView({
   onReview: (branch: string) => void
   onLeave: () => void
 }) {
-  const unmerged = graph?.unmergedBranches ?? []
-  // Only OTHER checkouts are worth surfacing — this window's own is fully covered by Changes above.
-  // (Merged-leftover checkouts are already gone: they're auto-tidied on refresh.)
-  const siblings = worktrees.filter((w) => !w.isCurrent)
-  const looseWorktrees = siblings.filter((w) => !w.statusKnown || w.dirtyCount > 0 || w.prunable)
-  const branchesNotReady = new Set(
-    looseWorktrees
-      .filter((w) => (!w.statusKnown || w.dirtyCount > 0) && w.branch)
-      .map((w) => w.branch as string),
-  )
   const hasVersions = !!graph && graph.layout.rows.length > 0
   return (
     <div className="flex flex-col">
@@ -332,68 +330,32 @@ function BrowseView({
       {branch && trunk && branch !== trunk && (
         <SideBranchBanner branch={branch} trunk={trunk} onLeave={onLeave} />
       )}
-      <CommitBox hasChanges={files.length > 0} changeCount={files.length} onCommitted={onCommitted} />
 
-      <Section label="Changes" count={files.length}>
-        {files.length === 0 ? (
-          <p className="px-3 py-1.5 text-xs text-text-muted">Nothing changed since your last version.</p>
-        ) : (
-          <ul className="flex flex-col px-1.5">
-            {files.map((f) => (
-              <li key={f.path}>
-                <FileButton
-                  file={f}
-                  active={right.t === 'change' && right.path === f.path}
-                  onClick={() => onOpenChange(f.path)}
-                  title={`See what changed in ${f.path}`}
-                />
-              </li>
-            ))}
-            {changesTruncated && (
-              <li className="px-1.5 py-1 text-[11px] text-text-muted/70">
-                + more changes. Save from chat for very large changes.
-              </li>
-            )}
-          </ul>
-        )}
-      </Section>
-
-      {/* The GitHub section only makes sense once there's a version to push. */}
-      {sync && hasVersions && (
-        <BackupSection sync={sync} onPushed={onCommitted} onRecheck={onCommitted} onLeave={onLeave} />
-      )}
-
-      <LooseEnds
-        tidiedCount={tidiedCount}
-        // A dirty or unreadable checkout is not "ready" merely because its committed tip is
-        // reviewable. Its one truthful row is below; once confirmed clean, the ready side line returns.
-        sideLines={unmerged.filter((branch) => !branchesNotReady.has(branch.name))}
-        // A clean sibling checkout is already represented by its side line (or was auto-tidied); only
-        // surface the ones holding work that lives nowhere else, a failed status check, or a missing folder.
-        worktrees={looseWorktrees}
-        onReview={onReview}
-        onChanged={onCommitted}
+      {/* The newest moment on the line: what's changed right now, and the one button that saves it. */}
+      <WorkingTip
+        files={files}
+        truncated={changesTruncated}
+        activePath={right.t === 'change' ? right.path : null}
+        onOpenChange={onOpenChange}
+        onCommitted={onCommitted}
       />
 
-      <Section label="History">
-        {!hasVersions ? (
-          <p className="px-3 py-1.5 text-xs text-text-muted">
-            No versions yet. Save one to start your history.
-          </p>
-        ) : (
-          <Ledger
-            graph={graph}
-            selectedSha={right.t === 'commit' ? right.sha : null}
-            // How many newest versions aren't on GitHub yet — only when we've confirmed a real remote
-            // tip for this branch (verified + has an upstream). Anything less is a stale-cache guess, and
-            // the rail must never claim "safe" it can't back up; null then ⇒ no safe/unsafe split shown.
-            localOnlyCount={
-              sync?.verified && sync.hasRemote && sync.upstream ? sync.ahead : null
-            }
-            onOpenCommit={onOpenCommit}
-          />
-        )}
-      </Section>
+      {/* Publishing only makes sense once there's a version to publish; every other GitHub fact rides
+          the timeline's seam. */}
+      {sync && hasVersions && <BackupSection sync={sync} onLeave={onLeave} />}
+
+      <VersionTimeline
+        graph={graph}
+        sync={sync}
+        worktrees={worktrees}
+        trunk={trunk}
+        tidiedCount={tidiedCount}
+        selectedSha={right.t === 'commit' ? right.sha : null}
+        onOpenCommit={onOpenCommit}
+        onReview={onReview}
+        onChanged={onCommitted}
+        onLeave={onLeave}
+      />
     </div>
   )
 }
@@ -546,7 +508,7 @@ function EmptyState({ onChanged }: { onChanged: () => void }) {
   }
   return (
     <div className="px-3 py-4">
-      <div className="rounded-xl border border-border bg-surface p-4 shadow-soft">
+      <div className="rounded-xl bg-surface p-4 shadow-soft">
         <p className="font-display text-sm font-medium text-text">Not tracked by Git</p>
         <p className="mt-1.5 text-xs leading-relaxed text-text-muted">
           Version control lets you save snapshots of your project and look back at them. Koda's
@@ -557,112 +519,6 @@ function EmptyState({ onChanged }: { onChanged: () => void }) {
           Or just ask Claude: “set up version control for this project.”
         </p>
       </div>
-    </div>
-  )
-}
-
-// ── Save a version (quiet button → inline compose) ──────────────────────────────────
-// `paths` (optional) scopes the commit to just those files — the per-session "Save this session's
-// work". Omitted ⇒ save everything (gitCommit). `label`/`hint` let callers retitle the button.
-export function CommitBox({
-  hasChanges,
-  changeCount,
-  onCommitted,
-  paths,
-  label = 'Save a version',
-  hint = true,
-}: {
-  hasChanges: boolean
-  changeCount: number
-  onCommitted: () => void
-  paths?: string[]
-  label?: string
-  hint?: boolean
-}) {
-  const [composing, setComposing] = useState(false)
-  const [message, setMessage] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-
-  async function save(): Promise<void> {
-    const msg = message.trim()
-    if (!msg || busy) return
-    setBusy(true)
-    setError(null)
-    try {
-      const res =
-        paths && paths.length > 0
-          ? await window.koda.gitCommitPaths({ message: msg, paths })
-          : await window.koda.gitCommit({ message: msg })
-      if (res.ok) {
-        setMessage('')
-        setComposing(false)
-        onCommitted()
-      } else {
-        setError(gitErrorCopy(res.code, 'save'))
-      }
-    } catch (err) {
-      setError('Could not save a version.')
-      console.error('git commit failed', err)
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  if (!hasChanges) {
-    return (
-      <div className="flex items-center gap-2 border-b border-border px-3 py-3 text-xs text-text-muted">
-        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" />
-        You're all saved — nothing's changed since your last version.
-      </div>
-    )
-  }
-
-  return (
-    <div className="border-b border-border px-3 py-3">
-      {!composing ? (
-        <>
-          <button
-            onClick={() => setComposing(true)}
-            className="flex w-full items-center justify-center gap-2 rounded-lg border border-border bg-surface px-3 py-2 text-[12.5px] font-medium text-text transition-colors hover:border-accent/40"
-          >
-            <span aria-hidden>＋</span> {label}
-            <span className="text-text-muted">
-              {changeCount} {changeCount === 1 ? 'change' : 'changes'}
-            </span>
-          </button>
-          {hint && (
-            <p className="mt-2 text-[11px] leading-relaxed text-text-muted/80">
-              or ask Claude to <span className="text-text">“save a version.”</span>
-            </p>
-          )}
-        </>
-      ) : (
-        <>
-          <textarea
-            autoFocus
-            value={message}
-            onChange={(e) => setMessage(e.target.value)}
-            onKeyDown={(e) => {
-              if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-                e.preventDefault()
-                void save()
-              } else if (e.key === 'Escape') {
-                setComposing(false)
-                setError(null)
-              }
-            }}
-            rows={2}
-            placeholder="Describe this version, e.g. “add the login page”"
-            className="w-full resize-none rounded-lg border border-border bg-surface px-2.5 py-1.5 text-[13px] text-text placeholder:text-text-muted/60 focus:border-accent focus:outline-none"
-          />
-          <div className="mt-2 flex items-center gap-2">
-            <Button variant="primary" size="sm" onClick={save} disabled={busy || !message.trim()}>{busy ? 'Saving…' : 'Save version'}</Button>
-            <Button variant="ghost" size="sm" onClick={() => { setComposing(false); setError(null) }} disabled={busy}>Cancel</Button>
-          </div>
-        </>
-      )}
-      {error && <p className="mt-1.5 text-[11px] leading-relaxed text-red-400">{error}</p>}
     </div>
   )
 }

@@ -1,13 +1,13 @@
 ---
 name: code-review
-description: How to review a code change for real bugs, security holes, and obvious cleanups before it's considered done. Use proactively after writing or changing a non-trivial chunk of code, and whenever the user asks "is this right / safe / any problems?".
+description: Review a bounded code change for real bugs, security holes, and obvious cleanups. Use when review-work explicitly routes a finished change here, or when the user asks whether code is right or safe. Do not self-activate merely because code changed.
 metadata:
   short-description: Review a change for bugs, security, and cleanups
 ---
 
 # Code Review
 
-Koda works for someone who does not read code. When you finish a non-trivial change — or the user asks "is this right / safe / any problems?" — review the work before calling it done, and report what you find in terms they can act on. Catch the problems they never could.
+Koda works for someone who does not read code. When `review-work` routes a finished change here — or the user asks "is this right / safe / any problems?" — review it and report what you find in terms they can act on. Catch the problems they never could.
 
 For anything beyond a trivial one-line change, run this review in a **separate sub-agent** rather than inline: call `spawn_agent` with a task that asks it to review the change against the criteria below and report findings ordered by severity with file/line references. Then wait for it and summarize what it found for the user. This keeps the review in its own clean context (it doesn't clutter the main thread) and it's read-only by construction — the sub-agent inherits the session's read-only sandbox, so it inspects and reports, never edits. For a truly small change, just apply the criteria inline.
 

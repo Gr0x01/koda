@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { BackupManifest, BackupStatus } from '@shared/ipc'
 import { Button } from '../ui'
-import { SettingsSection, SettingsRow } from './controls'
+import { SettingsNote, SettingsSection, SettingsRow } from './controls'
 import { IconWarning } from './icons'
 
 /**
@@ -34,7 +34,7 @@ export function BackupSection() {
       setStatus(await window.koda.backupNow())
     } catch {
       setRestoreMsg(null)
-      setStatus((s) => (s ? { ...s, state: 'error', error: 'backup failed — try again' } : s))
+      setStatus((s) => (s ? { ...s, state: 'error', error: 'backup failed, try again' } : s))
     } finally {
       setBusy(false)
     }
@@ -85,7 +85,7 @@ export function BackupSection() {
       })
       setRestoreMsg(result.ok ? `Restored “${m.projectName}” to ${path}.` : result.error)
     } catch {
-      setRestoreMsg('Restore failed — try again.')
+      setRestoreMsg('Restore failed. Try again.')
     } finally {
       setBusy(false)
     }
@@ -100,19 +100,16 @@ export function BackupSection() {
 
   return (
     <>
-      <p className="text-[12.5px] leading-relaxed text-text-muted">
-        A copy of this project, sealed on your Mac before it leaves and stored in the cloud. If this
-        Mac dies, you can get your work back. No one else can open it — not even Koda. It covers
-        your files, documents, and the project’s memory; local databases and build output stay
-        local.
-      </p>
-      <SettingsSection title="This project">
+      <SettingsSection
+        title="This project"
+        note="A copy of this project, sealed on your Mac before it leaves and stored in the cloud, so you can get your work back if this Mac dies. No one else can open it, Koda included. It covers your files, documents, and the project's memory, while local databases and build output stay local."
+      >
         <SettingsRow
           label="Status"
           description={
             status?.signedIn
-              ? 'Backs up on its own a few minutes after you finish working.'
-              : 'Sign in to your Koda account (Settings → Koda account) to back up.'
+              ? 'This project backs itself up a few minutes after you finish working.'
+              : 'Sign in under Koda account to start backing this project up.'
           }
           control={
             status === null ? (
@@ -143,7 +140,7 @@ export function BackupSection() {
         />
         <SettingsRow
           label="Back up now"
-          description="Takes a fresh sealed copy without waiting for the next automatic one."
+          description="Take a fresh sealed copy without waiting for the next automatic one."
           control={
             <Button variant="ghost" size="md" disabled={busy || !status?.signedIn} onClick={() => void backupNow()}>
               Back up now
@@ -151,27 +148,32 @@ export function BackupSection() {
           }
         />
       </SettingsSection>
-      <SettingsSection title="Recovery code">
+      <SettingsSection
+        title="Recovery code"
+        note="Lose this Mac and the code and nobody can open your backups, Koda included. That is what keeps them private."
+      >
         <SettingsRow
           label="Your recovery code"
-          description="The one key to your backups. Save it somewhere safe — if you lose this Mac and the code, no one can recover your backups. Not even us. That’s what keeps them private."
+          description="The one key to your backups, worth saving somewhere safe today."
           control={
             <Button variant="ghost" size="md" onClick={() => void reveal()}>
               {code ? 'Hide' : 'Reveal'}
             </Button>
           }
-        />
-        {code && (
-          <div className="select-text px-4 py-2.5 font-mono text-[12px] leading-relaxed text-text">
-            {code}
-          </div>
-        )}
-        {revealMsg && <div className="px-4 py-2.5 text-[12px] text-text-muted">{revealMsg}</div>}
+        >
+          {code && (
+            <p className="select-text font-mono text-[12px] leading-relaxed text-text">{code}</p>
+          )}
+          {revealMsg && <p className="text-[12px] text-text-muted">{revealMsg}</p>}
+        </SettingsRow>
       </SettingsSection>
-      <SettingsSection title="Restore">
+      <SettingsSection
+        title="Restore"
+        note="Each project keeps one backup, its latest. On a new Mac you are asked for your recovery code first."
+      >
         <SettingsRow
           label="Restore a project"
-          description="Each project keeps one backup — its latest. Restoring rebuilds it into a new, empty folder, including its whole undo timeline. On a new Mac, you’ll be asked for your recovery code."
+          description="Rebuild a backed-up project into a new empty folder, undo timeline included."
           control={
             <Button variant="ghost" size="md" disabled={!status?.signedIn} onClick={() => void loadBackups()}>
               Show backed-up projects
@@ -181,7 +183,7 @@ export function BackupSection() {
         {backups && backups.length > 0 && (
           <SettingsRow
             label="Recovery code"
-            description="Only needed on a new Mac — leave empty if you set backup up on this one."
+            description="Needed only on a new Mac, so leave it empty if you set backup up on this one."
             control={
               <input
                 type="text"
@@ -195,7 +197,7 @@ export function BackupSection() {
           />
         )}
         {backupsError && (
-          <div className="flex items-center justify-between gap-3 px-4 py-2.5 text-[12px] text-amber-500">
+          <div className="flex items-center justify-between gap-3 py-2.5 text-[12px] text-amber-500">
             <span>Koda couldn’t load your backed-up projects. Your backups are still in the cloud.</span>
             <Button variant="ghost" size="sm" onClick={() => void loadBackups()}>
               Try again
@@ -203,7 +205,7 @@ export function BackupSection() {
           </div>
         )}
         {!backupsError && backups?.length === 0 && (
-          <div className="px-4 py-2.5 text-[12px] text-text-muted">No backups on this account yet.</div>
+          <SettingsNote>No backups on this account yet.</SettingsNote>
         )}
         {backups?.map((m) => (
           <SettingsRow
@@ -217,7 +219,7 @@ export function BackupSection() {
             }
           />
         ))}
-        {restoreMsg && <div className="px-4 py-2.5 text-[12px] text-text-muted">{restoreMsg}</div>}
+        {restoreMsg && <SettingsNote>{restoreMsg}</SettingsNote>}
       </SettingsSection>
     </>
   )

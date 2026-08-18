@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import type { ArchivedSessionMeta } from '@shared/ipc'
 import { useWorkspace } from '../workspace/store'
 import { Button } from '../ui'
-import { SegmentedControl, SettingsRow, SettingsSection } from './controls'
+import { SegmentedControl, SettingsNote, SettingsRow, SettingsSection } from './controls'
 import { IconTrash } from './icons'
 import { Caret } from '../Caret'
 
@@ -41,10 +41,13 @@ export function ArchivedSection() {
   }
 
   return (
-    <SettingsSection title="Archived sessions">
+    <SettingsSection
+      title="Archived sessions"
+      note="An archived chat keeps its whole conversation and sits outside the undo history, so deleting one is permanent."
+    >
       <SettingsRow
         label="Delete old archived chats"
-        description="Archived chats are kept forever by default. Set a limit and Koda deletes ones older than that. Archived chats are not in the undo history, so deleting them is permanent."
+        description="How long an archived chat is kept before Koda deletes it for good."
         control={
           <SegmentedControl
             ariaLabel="Delete old archived chats"
@@ -55,10 +58,9 @@ export function ArchivedSection() {
         }
       />
       {archived.length === 0 ? (
-        <div className="px-4 py-4 text-[12.5px] leading-snug text-text-muted">
-          Sessions you archive land here. Nothing is deleted. Restore one any time to pick up where you
-          left off.
-        </div>
+        <SettingsNote>
+          Sessions you archive land here, and Restore reopens one where you left off.
+        </SettingsNote>
       ) : (
         archived.map((a) => (
           <ArchivedRow
@@ -90,7 +92,7 @@ function ArchivedRow({
   const preview = session.preview ?? []
 
   return (
-    <div className="px-4 py-3">
+    <div className="py-3">
       <div className="flex items-center justify-between gap-4">
         {/* The label toggles the preview; the caret shows there's more to see. */}
         <button
@@ -105,7 +107,7 @@ function ArchivedRow({
           />
           <span className="min-w-0">
             <span className="block truncate text-[13.5px] font-medium text-text">{session.label}</span>
-            <span className="mt-0.5 block truncate text-[12px] text-text-muted">
+            <span className="mt-1 block truncate text-[12.5px] text-text-muted">
               {folderOf(session.cwd)} · archived {timeAgo(session.archivedAt)}
             </span>
           </span>

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Code Work"
+  short_description: "Make focused code changes that fit the project"
+  default_prompt: "Use $code-work to make this code change cleanly and proportionally."

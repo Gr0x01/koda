@@ -10,7 +10,6 @@ export default tseslint.config(
     ignores: [
       'out/**',
       'release/**',
-      'storybook-static/**',
       'node_modules/**',
       'ios/**',
       'resources/**',
@@ -39,9 +38,9 @@ export default tseslint.config(
       ],
     },
   },
-  // Build/packaging scripts run under plain Node.
+  // Build/packaging scripts and server infrastructure run under plain Node.
   {
-    files: ['scripts/**/*.mjs', '*.mjs'],
+    files: ['scripts/**/*.mjs', 'infra/**/*.mjs', '*.mjs'],
     languageOptions: { globals: globals.node },
   },
   // React renderers (desktop + mobile): the hooks rules catch real stale-closure bugs.

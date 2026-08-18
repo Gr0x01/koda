@@ -63,19 +63,25 @@
   // (willShow fires PRE-animation, so the padding tracks the keys like a native view). safeBottom arrives
   // as 0 while the keyboard is up — the keys already cover the home indicator — so the composer calc()
   // pads by exactly the keyboard and never double-counts.
+  var sawShell = false
   window.addEventListener('message', function (e) {
     if (e.source !== window.parent || !e.data || e.data.type !== 'koda:viewport') return
+    sawShell = true
     setPx('--kb', e.data.keyboard)
     setPx('--inset-top', e.data.safeTop)
     setPx('--inset-bottom', e.data.safeBottom)
   })
 
-  // Top-level (home-screen web app / plain browser tab): there is no parent shell, so the page hears the
-  // keyboard itself via visualViewport. env() already covers the safe-area insets here; we only track the
-  // keyboard, and zero --inset-bottom while it is up so the calc() matches the bridge's behavior above.
-  if (window.parent === window && window.visualViewport) {
+  // No shell heard from (home-screen web app / plain browser tab): the page hears the keyboard itself via
+  // visualViewport. env() already covers the safe-area insets here; we only track the keyboard, and zero
+  // --inset-bottom while it is up so the calc() matches the bridge's behavior above. This cannot key on
+  // `window.parent === window` any more: a face inside Koda's phone shell IS a top-level document now, so
+  // the only reliable "inside Koda" signal is a koda:viewport having arrived — once one does, the shell's
+  // measured numbers own the vars and this fallback stands down.
+  if (window.visualViewport) {
     var vv = window.visualViewport
     var onVV = function () {
+      if (sawShell) return
       var kb = Math.max(0, window.innerHeight - vv.height - vv.offsetTop)
       setPx('--kb', kb)
       de.style.setProperty('--inset-bottom', kb > 0 ? '0px' : 'env(safe-area-inset-bottom,0px)')

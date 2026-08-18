@@ -4,6 +4,7 @@ import './monaco-setup' // wires the bundled, CSP-safe workers + the local (non-
 import { languageFor, MONO_FONT } from './monaco-lang'
 import { useTheme } from '../theme'
 import { useTextSize } from '../text-size'
+import { createSerialFlush, registerFileWriter } from '../workspace/file-writer-registry'
 
 /**
  * The editable file surface body (ui-workspace.md §4). Lazy-loaded so `monaco-editor` stays out of
@@ -15,13 +16,17 @@ import { useTextSize } from '../text-size'
 
 export function MonacoFileEditor({
   path,
+  surfacePath,
   initialContent,
   readOnly = false,
   gotoLine,
   gotoNonce,
   className = '',
 }: {
+  /** Main's resolved path: the one identity used for writes and destructive-boundary matching. */
   path: string
+  /** The lexical path that keys this open Stage surface. */
+  surfacePath: string
   initialContent: string
   readOnly?: boolean
   /** Reveal + select this 1-based line on mount (a search hit opened the file here). */
@@ -39,6 +44,9 @@ export function MonacoFileEditor({
   const [dirty, setDirty] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // Ordinary save controls report inline instead of throwing. The registered destructive-boundary
+  // flush reads this ref after the serial queue drains and turns the same failure into a hard stop.
+  const lastSaveErrorRef = useRef<unknown>(null)
   // The last save landed but main couldn't take a recovery point for it. Silence here would leave the
   // user believing this edit is undoable when it isn't. Cleared by the next save that does get one.
   const [noUndo, setNoUndo] = useState(false)
@@ -48,15 +56,25 @@ export function MonacoFileEditor({
   useEffect(() => setNoUndo(false), [path])
 
   async function save(): Promise<void> {
-    if (readOnly || saving || valueRef.current === baselineRef.current) return
+    if (readOnly) return
+    // Capture the exact payload. The user may keep typing while IPC is in flight; treating the later
+    // buffer as the saved baseline would make those newer characters look durable when they are not.
+    const content = valueRef.current
+    if (content === baselineRef.current) {
+      lastSaveErrorRef.current = null
+      setError(null)
+      return
+    }
     setSaving(true)
     setError(null)
     try {
-      const res = await window.koda.writeFile({ path, content: valueRef.current })
-      baselineRef.current = valueRef.current
-      setDirty(false)
+      const res = await window.koda.writeFile({ path, content })
+      baselineRef.current = content
+      setDirty(valueRef.current !== content)
       setNoUndo(res.checkpointed === false)
+      lastSaveErrorRef.current = null
     } catch (e) {
+      lastSaveErrorRef.current = e
       setError(String(e))
     } finally {
       setSaving(false)
@@ -66,6 +84,23 @@ export function MonacoFileEditor({
   // Keep the latest `save` reachable from Monaco's command (bound once on mount).
   const saveRef = useRef(save)
   saveRef.current = save
+  // Every explicit save joins one tail. A delete arriving during an older IPC write therefore queues
+  // one final pass that reads valueRef only after the older write has landed.
+  const flushSaveRef = useRef<(() => Promise<void>) | null>(null)
+  if (!flushSaveRef.current) flushSaveRef.current = createSerialFlush(() => saveRef.current())
+  const flushSave = flushSaveRef.current
+
+  useEffect(() => {
+    const unregister = registerFileWriter(path, surfacePath, async () => {
+      await flushSave()
+      if (lastSaveErrorRef.current) throw lastSaveErrorRef.current
+    })
+    return () => {
+      // Keep this writer discoverable until its last buffered/in-flight content has settled. Besides
+      // closing the delete race, this prevents a tab switch from silently discarding Monaco's buffer.
+      void flushSave().catch(() => {}).finally(unregister)
+    }
+  }, [path, surfacePath, flushSave])
 
   // The live editor instance, captured on mount so the gotoLine effect can drive it (the editor
   // mounts async, so a line requested before mount is applied here too).
@@ -81,7 +116,7 @@ export function MonacoFileEditor({
 
   const onMount: OnMount = (editor, monaco) => {
     editorRef.current = editor
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => void saveRef.current())
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => void flushSave())
     reveal(gotoLine) // apply a line requested before the editor finished mounting
   }
 
@@ -149,7 +184,7 @@ export function MonacoFileEditor({
           )}
           {(dirty || error) && (
             <button
-              onClick={() => void save()}
+              onClick={() => void flushSave()}
               disabled={saving}
               className="shrink-0 rounded-lg bg-accent px-3 py-1 text-[11px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
             >

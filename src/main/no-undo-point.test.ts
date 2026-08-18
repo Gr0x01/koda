@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { NO_UNDO_POINT, undoPointRefusal } from '@shared/ipc'
 import { IpcChannels } from '@shared/channels'
+import { listCheckpoints, type RequiredCheckpointFile } from './safety-git/checkpoint'
+import { runGit } from './safety-git/repo'
 
 /**
  * A failed safety-git checkpoint must reach the user (debt item 17). `safeCheckpoint` is fail-soft and
@@ -12,8 +14,8 @@ import { IpcChannels } from '@shared/channels'
  *
  * These run the SHIPPED handler bodies: `registerIpcHandlers()` registers into the test electron
  * stub's recording `ipcMain`, and `invokeIpc` calls one the way the renderer would. The checkpoint is
- * forced to fail by stubbing the session manager's `checkpointProjectEdit`, which is exactly what a
- * broken/unwritable safety store produces (`safeCheckpoint` catches and returns false).
+ * forced to fail inside the session manager's external mutation boundary, which is exactly what a
+ * broken/unwritable safety store produces (`safeCheckpoint` catches and reports false to the write).
  *
  * The POSITIVE CONTROL matters as much as the failures: with a healthy checkpoint every one of these
  * paths must succeed silently. A change that warned on every save would otherwise pass the whole file.
@@ -36,7 +38,19 @@ let invokeIpc: (channel: string, sender: unknown, ...args: unknown[]) => Promise
 
 /** Force the pre-edit checkpoint to fail (as an unwritable safety store does) for one call. */
 async function withBrokenCheckpoint<T>(fn: () => Promise<T>): Promise<T> {
-  const spy = vi.spyOn(ipc.getEngineSessions(), 'checkpointProjectEdit').mockResolvedValue(false)
+  const spy = vi
+    .spyOn(ipc.getEngineSessions(), 'withExternalProjectMutation')
+    .mockImplementation(
+      async <R>(
+        _root: string,
+        _options: {
+          checkpointLabel?: string
+          checkpointFile?: RequiredCheckpointFile
+          refreshOwnership?: boolean
+        },
+        mutate: (checkpointed: boolean) => R | Promise<R>,
+      ): Promise<R> => mutate(false),
+    )
   try {
     return await fn()
   } finally {
@@ -46,7 +60,19 @@ async function withBrokenCheckpoint<T>(fn: () => Promise<T>): Promise<T> {
 
 /** The healthy path: a checkpoint that succeeds, without touching real git. */
 async function withGoodCheckpoint<T>(fn: () => Promise<T>): Promise<T> {
-  const spy = vi.spyOn(ipc.getEngineSessions(), 'checkpointProjectEdit').mockResolvedValue(true)
+  const spy = vi
+    .spyOn(ipc.getEngineSessions(), 'withExternalProjectMutation')
+    .mockImplementation(
+      async <R>(
+        _root: string,
+        _options: {
+          checkpointLabel?: string
+          checkpointFile?: RequiredCheckpointFile
+          refreshOwnership?: boolean
+        },
+        mutate: (checkpointed: boolean) => R | Promise<R>,
+      ): Promise<R> => mutate(true),
+    )
   try {
     return await fn()
   } finally {
@@ -205,6 +231,22 @@ describe('positive control: a healthy checkpoint says nothing at all', () => {
       invokeIpc(IpcChannels.guardrailsRemoveItem, sender, { kind: 'skill', name: 'quiet-doomed' }),
     )
     expect(existsSync(file)).toBe(false)
+  })
+})
+
+describe('a document delete protects the exact file behind its undo promise', () => {
+  it('force-captures a project-ignored Library document before unlinking it', async () => {
+    mkdirSync(join(root, 'Documents'), { recursive: true })
+    writeFileSync(join(root, '.gitignore'), '/Documents/ignored-sidebar.md\n')
+    const path = seedFile('Documents/ignored-sidebar.md', 'recover this exact draft\n')
+
+    await invokeIpc(IpcChannels.fsDeletePath, sender, { path, document: true })
+
+    expect(existsSync(path)).toBe(false)
+    const point = (await listCheckpoints(root)).find((entry) => entry.label === 'delete ignored-sidebar.md')
+    expect(point).toBeDefined()
+    const { stdout } = await runGit(root, ['show', `${point!.id}:Documents/ignored-sidebar.md`])
+    expect(stdout).toBe('recover this exact draft\n')
   })
 })
 

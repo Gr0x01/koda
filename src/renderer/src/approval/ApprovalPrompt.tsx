@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 import type { ApprovalMode, ApprovalRequest } from '@shared/ipc'
 import { Markdown } from '../output/Markdown'
 import { Button } from '../ui'
+import { windowHasOpenModal } from '../window-modal'
 
 /**
  * "Ask me" mode — a tool is waiting on the user. Shown above the composer; the engine waits
@@ -33,6 +34,7 @@ export function ApprovalPrompt({
     if (!active) return
     const isPlan = request.toolName === 'ExitPlanMode'
     function onKey(e: KeyboardEvent): void {
+      if (windowHasOpenModal()) return
       if (isEditableTarget(e.target)) return
       const k = e.key.toLowerCase()
       if (k === 'escape' || k === 'd') {

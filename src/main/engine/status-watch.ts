@@ -30,6 +30,7 @@
 import { Notification, powerMonitor } from 'electron'
 import type { ProviderKind, ProviderStatusEvent } from '@shared/ipc'
 import { loadProviderStatusNotify } from '../settings'
+import { isE2EProfile } from '../runtime-profile'
 import { log } from '../logger'
 
 export type { ProviderStatusEvent }
@@ -131,6 +132,7 @@ export function currentProviderStatus(): ProviderStatusEvent[] {
  *  polling so a confirmation that lands minutes later (the page lags) still arms the recovery ping — with
  *  no retrying from the user. A lone blip the page never corroborates is forgotten silently. */
 export function noteProviderError(engine: string): void {
+  if (isE2EProfile()) return
   if (!FEEDS[engine] || watching.has(engine)) return
   enterOutage(engine, undefined, false) // silent until the feed corroborates
   void checkFeed(engine)
@@ -148,6 +150,7 @@ export function noteProviderError(engine: string): void {
  *  ping on wake would be stale. A green feed never arms a bare watch, and provisional watches are left to
  *  their own poll/grace. */
 export async function refreshProviderStatus(engines: string[]): Promise<void> {
+  if (isE2EProfile()) return
   await Promise.all(
     engines
       .filter((e) => FEEDS[e])

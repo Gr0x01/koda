@@ -1,13 +1,5 @@
-import { test, expect, _electron as electron, type ElectronApplication } from '@playwright/test'
-import { mkdtempSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-
-async function launchKoda(): Promise<ElectronApplication> {
-  const userDataDir = mkdtempSync(join(tmpdir(), 'koda-e2e-'))
-  writeFileSync(join(userDataDir, 'koda-settings.json'), JSON.stringify({ hasOnboarded: true }))
-  return electron.launch({ args: ['out/main/index.js', `--user-data-dir=${userDataDir}`] })
-}
+import { test, expect } from '@playwright/test'
+import { launchKoda } from './support/koda'
 
 // The terminal's value is the pty round-trip: spawn a real shell (node-pty, rebuilt for Electron's
 // ABI), feed it a command, and stream output back. Driving the preload API directly exercises the

@@ -43,6 +43,34 @@ export const CodexAuthStatusSchema = z.object({
 })
 export type CodexAuthStatus = z.infer<typeof CodexAuthStatusSchema>
 
+/** UI-neutral model catalog returned for every registered engine. Provider-specific probes are
+ *  normalized here so desktop and phone render the same ready/empty/auth/error state instead of
+ *  independently interpreting Codex-shaped transport fields. */
+export const ProviderCatalogAvailabilitySchema = z.enum([
+  'ready',
+  'checking',
+  'signed-out',
+  'probe-failed',
+  'empty',
+])
+export type ProviderCatalogAvailability = z.infer<typeof ProviderCatalogAvailabilitySchema>
+
+export const ProviderModelSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  isDefault: z.boolean(),
+})
+export type ProviderModel = z.infer<typeof ProviderModelSchema>
+
+export const ProviderModelCatalogSchema = z.object({
+  availability: ProviderCatalogAvailabilitySchema,
+  models: z.array(ProviderModelSchema),
+})
+export type ProviderModelCatalog = z.infer<typeof ProviderModelCatalogSchema>
+
+export const ProviderModelCatalogsSchema = z.record(EngineIdSchema, ProviderModelCatalogSchema)
+export type ProviderModelCatalogs = Record<EngineId, ProviderModelCatalog>
+
 /** engine:codexLoginProgress push — the Codex (ChatGPT OAuth) login state machine's steps. Unlike
  *  Claude's paste-code flow, Codex uses a loopback callback (localhost:1455), so there's no code to
  *  submit: `awaiting-browser` carries the OAuth URL (the manual fallback to the auto-opened browser),
@@ -132,10 +160,74 @@ export const SessionStartedSchema = z.object({
   model: z.string(),
   tools: z.array(z.string()),
   cwd: z.string(),
-  /** The ENGINE's own session/thread id, when it differs from Koda's `sessionId`. Claude reuses the
-   *  same id (`--resume <sessionId>`), so this is absent there; Codex generates its own thread id, which
-   *  Koda persists to resume THAT thread by id on a later reattach. Pass-through only. */
-  engineNativeId: z.string().optional(),
+})
+
+/** Dynamic, per-session capability truth. `engine-capabilities.ts` describes what a DRIVER knows how
+ * to do; this describes what the spawned engine actually loaded in this cwd. Keep the two separate:
+ * configuration is intent, while this snapshot is runtime evidence. */
+export const SessionCapabilityStatusSchema = z.enum(['ready', 'disabled', 'installable', 'degraded'])
+export type SessionCapabilityStatus = z.infer<typeof SessionCapabilityStatusSchema>
+
+export const SessionCapabilitySchema = z.object({
+  id: z.enum(['koda-tools', 'playbooks', 'browser-testing']),
+  label: z.string(),
+  status: SessionCapabilityStatusSchema,
+  /** A short diagnostic, present only when it helps explain a non-ready state. */
+  detail: z.string().optional(),
+})
+export type SessionCapability = z.infer<typeof SessionCapabilitySchema>
+
+export const SessionMcpServerSchema = z.object({
+  name: z.string(),
+  status: z.string(),
+  /** Bare server-local tool names; the snapshot's top-level `tools` list is fully namespaced. */
+  tools: z.array(z.string()),
+})
+export type SessionMcpServer = z.infer<typeof SessionMcpServerSchema>
+
+export const SessionCapabilitySnapshotSchema = z.object({
+  engine: EngineIdSchema,
+  cwd: z.string(),
+  observedAt: z.number().int().nonnegative(),
+  source: z.enum(['engine-init', 'native-probe']),
+  capabilities: z.array(SessionCapabilitySchema),
+  /** Exact runtime inventory, useful for diagnosis and future capability surfaces. */
+  tools: z.array(z.string()),
+  skills: z.array(z.string()),
+  agents: z.array(z.string()),
+  plugins: z.array(z.string()),
+  mcpServers: z.array(SessionMcpServerSchema),
+})
+export type SessionCapabilitySnapshot = z.infer<typeof SessionCapabilitySnapshotSchema>
+
+/** Emitted after startup attestation and again only when native engine evidence changes. */
+export const SessionCapabilitiesUpdatedSchema = z.object({
+  type: z.literal('SessionCapabilitiesUpdated'),
+  sessionId: z.string(),
+  snapshot: SessionCapabilitySnapshotSchema,
+})
+
+/**
+ * How an engine reattaches its own conversation — an OPAQUE, driver-owned blob. Koda stores it,
+ * persists it, and hands it back on a reattach; only the driver that minted it reads or validates
+ * `data` (Claude: its session id + turn count; Codex: its thread id). Two envelope fields are
+ * engine-neutral on purpose: `engine` routes the blob back to its owner, and `resumable` is the
+ * driver's own answer to "is there a conversation here yet" — the shared layer needs that to decide
+ * whether a respawn reattaches or starts clean, and guessing it from disk was never reliable.
+ */
+export const ResumeCursorSchema = z.object({
+  engine: EngineIdSchema,
+  resumable: z.boolean(),
+  data: z.record(z.string(), z.unknown()),
+})
+export type ResumeCursor = z.infer<typeof ResumeCursorSchema>
+
+/** The driver's resume state changed (session start, and after every turn it completes). The renderer
+ *  persists the latest one so a restart can hand it straight back. */
+export const ResumeCursorUpdatedSchema = z.object({
+  type: z.literal('ResumeCursorUpdated'),
+  sessionId: z.string(),
+  cursor: ResumeCursorSchema,
 })
 
 // `parentToolUseId` — set when an event belongs to a SUBAGENT's inner work (the
@@ -234,11 +326,11 @@ export const ContextUsageUpdateSchema = z.object({
 })
 
 /**
- * Per-model usage for ONE turn — the engine's `result.modelUsage` (keyed by model id) flattened to an
- * array. Lists every model the turn touched: the main model plus any aux model (e.g. the haiku titler),
- * each with its own cost + token split (cache called out). `costUsd` sums (≈) to the turn's
- * `total_cost_usd`. Accumulated per-session in the store to drive the Usage view's by-model breakdown.
- * `model` is the engine's raw id, passed through opaquely — display only, never branched on.
+ * Per-model usage for ONE turn, normalized at the provider adapter. Lists every model the turn
+ * identified, each with its own reported cost + token split (cache called out). `costUsd` is zero when
+ * the provider reports tokens but no authoritative dollar cost. Accumulated in the store to drive the
+ * Usage view's by-model breakdown. `model` is the engine's raw id, passed through opaquely — display
+ * only, never branched on.
  */
 export const ModelTurnUsageSchema = z.object({
   model: z.string(),
@@ -281,6 +373,12 @@ export const UsageHistoryDaySchema = z.object({
 })
 export type UsageHistoryDay = z.infer<typeof UsageHistoryDaySchema>
 
+/** Terminal reason paired with a pre-start rejection. New clients use EngineError.category to offer
+ * retry; the companion TurnComplete keeps pre-category clients from leaving busy latched and explicitly
+ * says no turn succeeded. There is no client-version negotiation yet, so those builds may still treat
+ * any TurnComplete as a success haptic — an unavoidable compatibility tradeoff, not a clean guarantee. */
+export const TURN_REJECTED_STOP_REASON = 'turn_rejected' as const
+
 export const TurnCompleteSchema = z.object({
   type: z.literal('TurnComplete'),
   sessionId: z.string(),
@@ -300,10 +398,15 @@ export const EngineErrorSchema = z.object({
   /** Optional coarse classification for account/provider availability. Used for passive status UI;
    *  the raw message stays intact for the transcript/log. */
   providerStatus: z.enum(['down']).optional(),
-  /** A turn-level API failure the CLI surfaced as assistant text (a 5xx/429/auth error), lifted out of
-   *  the transcript into the composer error banner. Non-fatal (the process lives; the turn just failed),
-   *  so this flag — not `fatal` — is what tells the UI to show the retryable banner. */
-  category: z.enum(['apiError']).optional(),
+  /** `apiError`: a turn-level API failure the CLI surfaced as assistant text (a 5xx/429/auth error),
+   *  lifted out of the transcript into the composer error banner. Non-fatal (the process lives; the turn
+   *  just failed), so this flag — not `fatal` — is what tells the UI to show the retryable banner.
+   *  `turnRejected`: the live process rejected this turn before it started; the process remains reusable,
+   *  but the turn is terminal and retryable.
+   *  `resumeMiss`: the driver asked its engine to reattach a conversation the engine no longer holds.
+   *  Consumed by the session manager (it restarts the session clean and posts the recovery notice), so
+   *  it never reaches a surface. */
+  category: z.enum(['apiError', 'turnRejected', 'resumeMiss']).optional(),
 })
 
 /** The severity the provider's status page is reporting, so the chip's word stays honest — a slowdown is
@@ -419,6 +522,15 @@ export const WorkflowCompletedSchema = z.object({
   agentCount: z.number(),
 })
 
+/** Koda stopped observing a workflow before it could confirm completion. One event settles both the
+ * coordinator and every unresolved member so no surface can retain a half-live state. */
+export const WorkflowObservationEndedSchema = z.object({
+  type: z.literal('WorkflowObservationEnded'),
+  sessionId: z.string(),
+  runId: z.string(),
+  unresolvedAgentIds: z.array(z.string()),
+})
+
 // ── Account rate-limit windows (the 5-hour + weekly subscription caps) ───────
 //
 // DISTINCT from context-window usage (ContextUsage, per-conversation token budget).
@@ -470,6 +582,14 @@ export type RemoteUsageSnapshot = {
   /** Account-level windows for EVERY engine (engine → rateLimitType → info, newest wins) — the plan
    *  panel labels each engine's windows, so it carries both plans regardless of the session's engine. */
   rateLimits: Record<string, Record<string, RateLimitInfo>>
+}
+
+/** The latest noteworthy terminal state of one live session, exposed in the phone launcher. Main owns
+ *  the fact; each remote head owns whether it has seen a successful completion. The opaque revision must
+ *  change at every terminal edge so a persisted phone acknowledgement cannot hide later work. */
+export type RemoteTerminalAttention = {
+  kind: 'done' | 'error'
+  revision: string
 }
 
 /** A rate-limit window update (account-level, not per-session) — surfaced in the status bar.
@@ -536,9 +656,37 @@ const ReplaySequenceSchema = z.object({
   replaySeq: z.number().int().positive().optional(),
 })
 
+/** The native event a normalized one was translated from, plus the engine's own ids for it. Koda's
+ *  typed vocabulary stays deliberately small, so this is what keeps it from being LOSSY: whatever the
+ *  engine said is still attached when a later question needs an unmapped field, without a new spike
+ *  into the wire format. Drivers stamp it; `stripRawEnvelope` drops it at the serialization doors (see
+ *  sessions.ts `forward`), so it is a main-process diagnostic, not renderer/phone/disk payload.
+ *
+ *  Present on every event translated from an engine message. Events Koda MINTS itself (a resume
+ *  cursor, a spawn failure, a workflow watcher's progress) have no native message and carry none —
+ *  absent means "Koda said this", not "the engine's words were lost". */
+export const RawEngineEventSchema = z.object({
+  /** Which engine's wire this came off. */
+  source: EngineIdSchema,
+  /** The engine's own name for the message — Claude's `type`/`subtype`, Codex's JSON-RPC method. */
+  method: z.string(),
+  /** The engine's ids for this message (Claude: tool_use_id/task_id; Codex: itemId/turnId/threadId),
+   *  kept flat so a fold over events can join children to parents without reparsing the payload. */
+  ids: z.record(z.string(), z.string()).optional(),
+  /** The native message verbatim. Unknown by design — nothing above the driver interprets it. */
+  payload: z.unknown().optional(),
+})
+export type RawEngineEvent = z.infer<typeof RawEngineEventSchema>
+
+const RawEnvelopeSchema = z.object({
+  raw: RawEngineEventSchema.optional(),
+})
+
 export const EngineEventSchema = z
   .discriminatedUnion('type', [
     SessionStartedSchema,
+    SessionCapabilitiesUpdatedSchema,
+    ResumeCursorUpdatedSchema,
     AssistantDeltaSchema,
     ThinkingDeltaSchema,
     AssistantBlockSchema,
@@ -556,12 +704,89 @@ export const EngineEventSchema = z
     WorkflowStartedSchema,
     WorkflowAgentSchema,
     WorkflowCompletedSchema,
+    WorkflowObservationEndedSchema,
     RateLimitUpdateSchema,
     ApprovalModeChangedSchema,
     ModelEffortChangedSchema,
   ])
   .and(ReplaySequenceSchema)
+  .and(RawEnvelopeSchema)
 export type EngineEvent = z.infer<typeof EngineEventSchema>
+
+/** Drop the native envelope before an event is serialized to disk or sent to another process. The
+ *  payload roughly doubles every event, and no surface outside main reads it — losslessness is for
+ *  answering "what did the engine actually say", which is a main-process question. */
+export function stripRawEnvelope<T extends { raw?: RawEngineEvent }>(event: T): T {
+  if (!event.raw) return event
+  const { raw: _raw, ...rest } = event
+  return rest as T
+}
+
+/** Passive completion truth for one live session. `none` means this task has no known loose work,
+ * not that the aggregate worktree is clean. `mixedPaths` were already dirty at the turn boundary;
+ * Koda knows this task changed them but cannot claim ownership of the earlier hunks. */
+export const TaskCompletionStateSchema = z.object({
+  sessionId: z.string(),
+  state: z.enum(['none', 'loose-ends', 'needs-check', 'unversioned']),
+  paths: z.array(z.string()).max(500),
+  mixedPaths: z.array(z.string()).max(500).default([]),
+  // Only real evidence failures. Concurrent writers in one tree are ordinary parallel work, not a
+  // user-facing warning: that reason fired on every multi-session day and could not be resolved from
+  // the UI, so it read as permanent decoration. The overlap signal still exists as internal
+  // attribution evidence (`CompletionTurnBoundary.overlappingWriters`); it just never reaches a badge.
+  // The structural fix is separate workspaces — Documents/architecture/session-workstream-isolation.md.
+  reason: z.enum(['checkpoint-failed', 'git-probe-failed']).optional(),
+})
+export type TaskCompletionState = z.infer<typeof TaskCompletionStateSchema>
+export const TaskCompletionStatesSchema = z.array(TaskCompletionStateSchema)
+
+/** An inline image attached to a turn — base64 + its media type. `name` is present for a phone-side
+ * document attachment that uses the same transport envelope. */
+export const ImageAttachmentSchema = z.object({
+  mediaType: z.string(), // image/png | image/jpeg | image/gif | image/webp
+  dataBase64: z.string(),
+  name: z.string().optional(),
+})
+export type ImageAttachment = z.infer<typeof ImageAttachmentSchema>
+
+/** Lightweight attachment identity safe to retain after a successful turn. Exact base64 bytes are
+ * bounded, temporary retry material; replay keeps only this provenance unless the turn is unresolved. */
+export const AttachmentProvenanceSchema = z.object({
+  mediaType: z.string(),
+  name: z.string().optional(),
+})
+export type AttachmentProvenance = z.infer<typeof AttachmentProvenanceSchema>
+
+/** The phone's transport attempt and the human's logical turn are deliberately separate identities.
+ * A lost ack retries the same attempt; an engine failure creates a new attempt for the same client turn. */
+export const RemoteTurnIdentitySchema = z.object({
+  attemptId: z.string().min(1).max(160).optional(),
+  clientTurnId: z.string().min(1).max(160).optional(),
+})
+export type RemoteTurnIdentity = z.infer<typeof RemoteTurnIdentitySchema>
+
+/** Main's admission receipt lets a recovering phone distinguish a resend that is still running from
+ * one whose completion happened while the app was gone. Older Macs omit it; clients treat that as a
+ * fresh acceptance and continue listening for the ordinary terminal event. */
+export const RemoteTurnReceiptSchema = z.object({
+  status: z.enum(['accepted', 'already-running', 'already-complete']),
+})
+export type RemoteTurnReceipt = z.infer<typeof RemoteTurnReceiptSchema>
+
+/** Total exact attachment payload retained for one unresolved retry. Larger turns keep provenance and
+ * require reattachment, rather than growing replay/localStorage without bound. */
+export const MAX_DURABLE_TURN_ATTACHMENT_BASE64_CHARS = 2_000_000
+
+/** Exact bytes admitted to durable replay/failure state. Turn transport keeps its existing independent
+ * request limits; this cap protects sidecar/local hydration even when data bypasses normal intake. */
+export const DurableAttachmentPayloadSchema = z
+  .array(ImageAttachmentSchema)
+  .min(1)
+  .superRefine((attachments, ctx) => {
+    const total = attachments.reduce((chars, attachment) => chars + attachment.dataBase64.length, 0)
+    if (total > MAX_DURABLE_TURN_ATTACHMENT_BASE64_CHARS)
+      ctx.addIssue({ code: 'custom', message: 'durable attachment payload exceeds the retry cap' })
+  })
 
 /** The user's own turn text, captured for the replay log. The engine event stream never carries the
  *  human's prompts (each renderer adds them optimistically when it sends) — so a phone session's
@@ -571,20 +796,84 @@ export const RemoteUserTurnSchema = z.object({
   type: z.literal('RemoteUserTurn'),
   sessionId: z.string(),
   text: z.string(),
+  /** Stable logical phone bubble. Repeated engine attempts may emit another replay boundary with the
+   * same id; transcript reducers reconcile those boundaries to one visible user row. */
+  clientTurnId: z.string().min(1).max(160).optional(),
+  hadAttachments: z.boolean().optional(),
+  attachments: z.array(AttachmentProvenanceSchema).min(1).optional(),
+  /** True when the original send included an image even if its bytes were not retained in this replay.
+   * Optional for older replay sidecars; consumers treat the legacy `(image)` sentinel conservatively. */
+  hadImages: z.boolean().optional(),
+  /** Exact retry bytes when the owning surface durably retained them. A missing array with hadImages=true
+   * means "ask for the images again", never "send the caption by itself". */
+  images: DurableAttachmentPayloadSchema.optional(),
   replaySeq: z.number().int().positive().optional(),
 })
 export type RemoteUserTurn = z.infer<typeof RemoteUserTurnSchema>
+
+/** Stable identity + exact send material for one failed user turn. Transcript ids survive ordinary
+ * persistence; replay ids survive reconstruction. At least one is required so a retry never falls back
+ * to whichever user row happens to be newest after pagination or reconnect. */
+export const TurnFailureTargetSchema = z
+  .object({
+    userId: z.number().int().positive().optional(),
+    replaySeq: z.number().int().positive().optional(),
+    clientTurnId: z.string().min(1).max(160).optional(),
+    text: z.string(),
+    hadImages: z.boolean(),
+    hadAttachments: z.boolean().optional(),
+    attachments: z.array(AttachmentProvenanceSchema).min(1).optional(),
+    images: DurableAttachmentPayloadSchema.optional(),
+  })
+  .superRefine((target, ctx) => {
+    if (
+      target.userId === undefined &&
+      target.replaySeq === undefined &&
+      target.clientTurnId === undefined
+    )
+      ctx.addIssue({ code: 'custom', message: 'a failed turn needs a stable user identity' })
+    const exactHasImage = target.images?.some((item) => item.mediaType.startsWith('image/')) === true
+    const exactHasDocument = target.images?.some((item) => !item.mediaType.startsWith('image/')) === true
+    if (exactHasImage && !target.hadImages)
+      ctx.addIssue({ code: 'custom', message: 'retained image bytes require hadImages=true' })
+    if (exactHasDocument && target.hadAttachments !== true)
+      ctx.addIssue({ code: 'custom', message: 'retained document bytes require hadAttachments=true' })
+    if (target.attachments?.length && target.hadAttachments !== true)
+      ctx.addIssue({ code: 'custom', message: 'attachment provenance requires hadAttachments=true' })
+  })
+export type TurnFailureTarget = z.infer<typeof TurnFailureTargetSchema>
+
+/** One canonical, raw-free durable terminal failure. The same envelope can ride its user transcript row
+ * and the top level of a transcript response, so a relay page cut cannot separate retry semantics from
+ * the target. `target` is absent only when the engine failed before any user turn existed. */
+export const TurnFailureEnvelopeSchema = z
+  .object({
+    error: EngineErrorSchema.and(ReplaySequenceSchema),
+    target: TurnFailureTargetSchema.optional(),
+  })
+  .superRefine(({ error }, ctx) => {
+    if (!error.fatal && error.category !== 'apiError' && error.category !== 'turnRejected')
+      ctx.addIssue({ code: 'custom', message: 'only retryable terminal failures are durable' })
+  })
+export type TurnFailureEnvelope = z.infer<typeof TurnFailureEnvelopeSchema>
 
 /** One item in a headless session's replay log — either a normalized engine event or a captured user
  *  turn. Replayed in order to rebuild the transcript. */
 export const ReplayEntrySchema = z.union([EngineEventSchema, RemoteUserTurnSchema])
 export type ReplayEntry = z.infer<typeof ReplayEntrySchema>
 
-/** A live headless (phone-started, windowless) session the desktop is adopting: its identity plus the
- *  full replay log (engine events + user turns) to feed through the reducer so the transcript
- *  materializes like a local session's. `model` is the user's chosen model (undefined ⇒ engine
- *  default); the label comes from the persisted store when main already settled one, and is derived
- *  from the replayed content otherwise. See EngineSessionManager.adoptHeadlessForWindow. */
+/** Main-owned workflow observation that survives a renderer reload. Unlike transcript status, this is
+ * ephemeral runtime truth: the run id identifies the watcher and the member ids are its unresolved set. */
+export const ActiveWorkflowSnapshotSchema = z.object({
+  runId: z.string(),
+  runningAgentIds: z.array(z.string()),
+})
+export type ActiveWorkflowSnapshot = z.infer<typeof ActiveWorkflowSnapshotSchema>
+
+/** A live session the renderer is adopting: either a phone-started/windowless engine or one this same
+ *  BrowserWindow still owns after its renderer reloaded. Its replay log rebuilds any missing live
+ *  transcript state. `model` is the user's chosen model (undefined ⇒ engine default); the label comes
+ *  from the persisted store when main already settled one, and is derived from replay otherwise. */
 export const AdoptedHeadlessSessionSchema = z.object({
   id: z.string(),
   cwd: z.string(),
@@ -595,6 +884,9 @@ export const AdoptedHeadlessSessionSchema = z.object({
    *  of regenerating, so a name the user has seen never changes on open. */
   label: z.string().optional(),
   userNamed: z.boolean().optional(),
+  /** True only when the live engine was started or resumed from the phone. Optional so a renderer can
+   *  survive a mixed-version development reload while main and preload restart at different times. */
+  fromRemote: z.boolean().optional(),
   /** The gate's ACTUAL posture for this session (not the window's default) — a phone-started session
    *  may have had its mode changed before any window ever opened. The tab must display what's really
    *  enforced, never a guessed default that could silently show a looser posture than the gate has. */
@@ -604,6 +896,10 @@ export const AdoptedHeadlessSessionSchema = z.object({
    *  live parent/child from transcript-only states that hydration correctly settled as inactive. */
   working: z.boolean().optional(),
   activeSubagentToolUseIds: z.array(z.string()).optional(),
+  activeWorkflows: z.array(ActiveWorkflowSnapshotSchema).optional(),
+  /** Latest main-owned runtime capability evidence. Ephemeral: adoption carries it across renderer
+   *  ownership changes, but it never enters transcript persistence or replay. */
+  capabilities: SessionCapabilitySnapshotSchema.optional(),
   events: z.array(ReplayEntrySchema),
 })
 export type AdoptedHeadlessSession = z.infer<typeof AdoptedHeadlessSessionSchema>
@@ -632,6 +928,16 @@ export type RenameRequested = z.infer<typeof RenameRequestedSchema>
 export const RemoteUserTurnLiveSchema = z.object({
   sessionId: z.string(),
   text: z.string(),
+  clientTurnId: z.string().min(1).max(160).optional(),
+  hadAttachments: z.boolean().optional(),
+  attachments: z.array(AttachmentProvenanceSchema).min(1).optional(),
+  /** True when the original turn included inline image bytes. Optional only for an older main process;
+   * current senders include it even when false so a renderer never has to infer from display text. */
+  hadImages: z.boolean().optional(),
+  /** Exact retry bytes. The initial live publish carries inline images; if the attempt fails, main may
+   * update the same row with its bounded whole attachment set, including documents. Missing bytes with
+   * attachment provenance means the user must reattach rather than silently retrying partial work. */
+  images: z.array(ImageAttachmentSchema).min(1).optional(),
   replaySeq: z.number().int().positive().optional(),
   /** Remote turns append a bubble; a local turn already has an optimistic bubble and only needs its
    *  durable replay identity stamped onto that row. Optional defaults to append for older senders. */
@@ -644,13 +950,15 @@ export type RemoteUserTurnLive = z.infer<typeof RemoteUserTurnLiveSchema>
 export const StartSessionRequestSchema = z.object({
   /** Project working directory; defaults to the engine's launch cwd if omitted. */
   cwd: z.string().optional(),
-  /** Reattach a persisted session by id (spawns `claude --resume <id>`) instead of starting fresh.
-   *  Must pair with the same `cwd` the session was created in (resume is cwd-scoped; spike/resume). */
-  resumeSessionId: z.string().optional(),
-  /** Spawn a FRESH session with this exact id (`claude --session-id <id>`, no --resume). Used when a
-   *  session's engine was dropped before its first turn (e.g. a Plan-mode switch) — there's no prior
-   *  conversation to resume, so respawn clean under the same id. Mutually exclusive with resumeSessionId. */
+  /** Spawn under this exact session id (a restart, a posture respawn, or the phone's chosen id).
+   *  Omitted ⇒ a fresh id is minted. Whether the engine REATTACHES its conversation is `resumeCursor`'s
+   *  job, not this field's. */
   sessionId: z.string().optional(),
+  /** The driver-owned resume blob this session last reported (`ResumeCursorUpdated`), handed straight
+   *  back so the engine reattaches its own conversation. Opaque here; the owning driver validates it and
+   *  starts clean if it can't. Absent ⇒ a fresh conversation. Pair with the same `cwd` the session was
+   *  created in (resume is cwd-scoped; spike/resume). */
+  resumeCursor: ResumeCursorSchema.optional(),
   /** Start in plan mode (--permission-mode plan): the agent researches read-only and presents a
    *  plan via ExitPlanMode before it's allowed to build. Approving the plan transitions the same
    *  session out of plan mode (spike/capture). Honored only with the broker wired. */
@@ -669,37 +977,30 @@ export const StartSessionRequestSchema = z.object({
    *  the env/binary profile. Immutable once the conversation starts — switching engine respawns a
    *  fresh session (the UI only allows it before the first turn). */
   engineId: EngineIdSchema.optional(),
-  /** The engine's own native session/thread id to resume (Codex thread id, from a prior
-   *  `SessionStarted.engineNativeId`). Only meaningful with `resumeSessionId` + `engineId:'codex'` —
-   *  lets the Codex driver resume THAT thread by id (context preserved) instead of starting fresh. */
-  engineNativeId: z.string().optional(),
   /** Highest durable replay identity already rendered for this restored session. Carries the cursor
    *  across archive→resume even if the renderer's debounced project save has not landed yet. */
   replaySeq: z.number().int().nonnegative().optional(),
-}).refine((a) => !(a.resumeSessionId && a.sessionId), {
-  message: 'resumeSessionId (--resume) and sessionId (--session-id) are mutually exclusive',
-  path: ['sessionId'],
 })
 export type StartSessionRequest = z.infer<typeof StartSessionRequestSchema>
 
-/** cwd is echoed back so the renderer can persist it and pass it on a later resume. */
-export const StartSessionResponseSchema = z.object({ sessionId: z.string(), cwd: z.string() })
-export type StartSessionResponse = z.infer<typeof StartSessionResponseSchema>
-
-/** An inline image attached to a turn — base64 + its media type. The engine accepts these as
- *  Anthropic image content blocks over stream-json input (verified spike/capture). Lets a
- *  non-coder paste/drag a screenshot or mockup, which a text-only composer couldn't carry. */
-export const ImageAttachmentSchema = z.object({
-  mediaType: z.string(), // image/png | image/jpeg | image/gif | image/webp
-  dataBase64: z.string(),
+/** cwd + the resolved fresh-session posture are echoed back so main remains the one durable owner of
+ *  what the next chat starts on. Posture stays optional for compatibility with an older main. */
+export const StartSessionResponseSchema = z.object({
+  sessionId: z.string(),
+  cwd: z.string(),
+  engineId: EngineIdSchema.optional(),
+  model: z.string().optional(),
+  effort: z.string().optional(),
 })
-export type ImageAttachment = z.infer<typeof ImageAttachmentSchema>
+export type StartSessionResponse = z.infer<typeof StartSessionResponseSchema>
 
 export const SendTurnRequestSchema = z
   .object({
     sessionId: z.string(),
     text: z.string(), // may be empty when images are attached
     images: z.array(ImageAttachmentSchema).optional(),
+    attemptId: z.string().min(1).max(160).optional(),
+    clientTurnId: z.string().min(1).max(160).optional(),
   })
   // A turn must carry SOMETHING — text or at least one image.
   .refine((r) => r.text.trim().length > 0 || (r.images?.length ?? 0) > 0, {
@@ -823,20 +1124,34 @@ export type RendererLog = z.infer<typeof RendererLogSchema>
 export const AttentionCountSchema = z.object({ count: z.number().int().min(0) })
 export type AttentionCount = z.infer<typeof AttentionCountSchema>
 
-// ── Local-assist: on-device QoL micro-tasks ──────────────────────────────────
+// ── Session naming: the sessions map's title + overview ──────────────────────
 //
-// assist:title — turn a first prompt into a clean session title via the on-device model, or a
-// deterministic first-words fallback. Always resolves to a usable string (main never throws here).
+// sessions:name — name a thread through the app-global generated-text choice. A selected Claude or
+// Codex model uses the schema-constrained initial/regenerate split; Apple Intelligence or plain local
+// text supplies the safe initial-title floor. Main never throws, and `overview` may be empty when only
+// the floor answered.
 
-export const AssistTitleRequestSchema = z.object({
-  text: z.string(),
+export const SessionNameKindSchema = z.enum(['initial', 'regenerate'])
+export type SessionNameKind = z.infer<typeof SessionNameKindSchema>
+
+export const SessionNameRequestSchema = z.object({
+  /** Which flavour of the prompt split to run. */
+  kind: SessionNameKindSchema,
+  /** The evidence to name from: the user's own messages first, then what the agent did. */
+  evidence: z.string(),
+  /** The title the session carries now — a regenerate keeps it when the subject hasn't moved. */
+  currentTitle: z.string().optional(),
   /** Sibling-session names — an exactly-colliding answer gets a date suffix so names stay distinct. */
   avoid: z.array(z.string()).max(24).optional(),
 })
-export type AssistTitleRequest = z.infer<typeof AssistTitleRequestSchema>
+export type SessionNameRequest = z.infer<typeof SessionNameRequestSchema>
 
-export const AssistTitleResponseSchema = z.object({ title: z.string() })
-export type AssistTitleResponse = z.infer<typeof AssistTitleResponseSchema>
+export const SessionNameResponseSchema = z.object({
+  title: z.string(),
+  /** One plain sentence for the map's second line. Empty when only the floor could answer. */
+  overview: z.string(),
+})
+export type SessionNameResponse = z.infer<typeof SessionNameResponseSchema>
 
 // ── Approval gate: the permission broker's decision surface ───────────────────
 //
@@ -992,13 +1307,45 @@ export type BillingMode = z.infer<typeof BillingModeSchema>
 export const CodexBillingModeSchema = z.enum(['subscription', 'api'])
 export type CodexBillingMode = z.infer<typeof CodexBillingModeSchema>
 
+/** Reasoning budget for a generated-text turn. `off` preserves Claude's fast, zero-thinking path;
+ *  engines without a true off mode interpret it as their default budget. Other values remain the
+ *  engine's own terms and are mapped only inside its structured-generation adapter. */
+export const TextGenerationEffortSchema = z.enum(['off', 'low', 'medium', 'high', 'xhigh', 'max'])
+export type TextGenerationEffort = z.infer<typeof TextGenerationEffortSchema>
+
+/** The app-global writer for small generated-text jobs. Apple stays the default because it is local
+ *  and spends no provider usage. Cloud choices use the same provider model catalog as session chat
+ *  and run through one ephemeral, non-mutating structured-generation boundary. `plain` preserves a
+ *  real no-AI choice. */
+export const TextGenerationModelSchema = z.discriminatedUnion('provider', [
+  z.object({ provider: z.literal('apple') }),
+  z.object({ provider: z.literal('plain') }),
+  z.object({
+    provider: z.literal('claude'),
+    model: z.enum(['fable', 'haiku', 'sonnet', 'opus']),
+    // Stored choices from before effort was exposed keep their exact fast behavior.
+    effort: TextGenerationEffortSchema.default('off'),
+  }),
+  z.object({
+    provider: z.literal('codex'),
+    model: z.string().trim().min(1),
+    effort: TextGenerationEffortSchema.default('medium'),
+  }),
+])
+export type TextGenerationModel = z.infer<typeof TextGenerationModelSchema>
+
 export const KodaSettingsSchema = z.object({
   /** The posture new sessions start at. `plan` is per-session only (spawn-time --permission-mode), so
    *  it's never a valid default — main clamps it to 'auto' on both read and write. */
   defaultApprovalMode: ApprovalModeSchema,
-  /** On-device assist (Apple Foundation Models): clean session titles + humanized recovery labels.
-   *  Default-on; the engine falls back to a deterministic floor when off or unavailable. */
+  /** On-device assist for humanized recovery labels. Session titles have their own generated-text
+   *  choice below. Default-on; labels fall back to their deterministic text when off or unavailable. */
   assistEnabled: z.boolean(),
+  /** Default writer for session names and saved-version descriptions. Apple runs on-device; a
+   *  selected Claude or Codex model uses that provider account in a tiny ephemeral, non-mutating turn;
+   *  plain uses the deterministic floor. Default Apple, with a one-time compatibility read for the
+   *  former combined on-device-assist toggle. */
+  textGenerationModel: TextGenerationModelSchema,
   /** Native notification when a BACKGROUNDED session finishes / errors / needs approval. Default-on;
    *  still requires OS notification permission. The in-app tab ring + dock badge are unaffected. */
   notificationsEnabled: z.boolean(),
@@ -1017,8 +1364,9 @@ export const KodaSettingsSchema = z.object({
    *  re-encoding to WebP — a real token saving on big screenshots, and it keeps the payload under the
    *  API's per-image limit. Default 'balanced'. See IMAGE_DETAIL_CAPS for the pixel caps. */
   imageDetail: ImageDetailSchema,
-  /** How many days a saved scratch image (the on-disk copy of a pasted/dropped image, in
-   *  `.koda/scratch/`) is kept before it's pruned. `0` means keep forever. Default 7. */
+  /** How many days a top-level scratch attachment (the on-disk copy of a pasted/dropped image or
+   *  document, in `.koda/scratch/`) is kept before it's pruned. Nested work artifacts are outside this
+   *  bucket. `0` means keep forever. Default 7. */
   scratchRetentionDays: z.number(),
   /** How many days an archived session is kept before it's auto-deleted. `0` (the default) means keep
    *  forever — the safe posture, since archives live outside the safety-git undo net (a purge is
@@ -1063,13 +1411,14 @@ export const KodaSettingsSchema = z.object({
    *  app's history browsable by date, and it keeps every turn from re-reading weeks of unrelated
    *  logging. Off restores the single forever-thread per app. Read live by both heads at dispatch. */
   appDaySessions: z.boolean(),
-  /** Whether a finished mini-app slice gets a critique pass before it's called done: a fresh agent
-   *  with no build context opens the running face and compares it against the quality bar written
-   *  into the build plan during shaping, then the builder fixes the single biggest gap. Default-ON —
-   *  the builder grading its own work is the failure mode this exists to break. Off trades that for a
-   *  smaller share of the usage window, which is the only reason to want it off. Read at spawn (it
-   *  gates a pack rule), so a change applies to the next session. */
+  /** Whether finishing may invoke one proportional fresh-review pass for work whose risk or visible
+   *  quality bar earns the extra usage. Default-OFF; explicit review requests still work either way.
+   *  Read at spawn (it gates a pack rule), so a change applies to the next session. */
   critiquePass: z.boolean(),
+  /** Whether save composers improve the deterministic file-count description with the app-global
+   *  generated-text choice. Default-ON. Off spawns nothing and spends no usage. Read live when a
+   *  composer opens, so flipping it applies to the very next save. */
+  suggestVersionMessage: z.boolean(),
   /** Persisted workspace pane sizes — the resizable dividers (everything but the fixed rail). Widths
    *  in px; fracs are 0–1 shares. Global (not per-project): pane sizes are a layout preference. Main
    *  clamps on read, so a hand-edited file can't produce an unusable layout. */
@@ -1158,6 +1507,89 @@ export type RemoteRelayPairing = z.infer<typeof RemoteRelayPairingSchema>
 export const RemoteActivitySchema = z.object({ running: z.boolean(), connectedClients: z.number() })
 export type RemoteActivity = z.infer<typeof RemoteActivitySchema>
 
+// ── Connect tier (embedded tailnet node — connect-embedded-tailscale.md Build A) ──
+
+/** The one lifecycle owner's state, plus whether this build/machine can run it at all. `path` is the
+ *  peer route: 'relayed' is DERP, which is a WORKING connection and must never render as an error. */
+export const ConnectStateSchema = z.object({
+  /** False in the open-source build (no phone-control stack) or on a non-Mac. */
+  available: z.boolean(),
+  /** The dogfood flag (settings `connectNode`). Off = the whole surface stays hidden. */
+  enabled: z.boolean(),
+  state: z.enum(['idle', 'connecting', 'connected', 'reconnecting', 'failed']),
+  reason: z
+    .enum(['off', 'unavailable', 'signed-out', 'no-key', 'needs-approval', 'denied', 'helper-failed'])
+    .optional(),
+  /** The node's name ON THE TAILNET (from the helper's ready event, not the hostname we asked for). */
+  nodeName: z.string().nullable(),
+  path: z.enum(['direct', 'relayed']).nullable(),
+})
+export type ConnectState = z.infer<typeof ConnectStateSchema>
+
+/** One device in the account's tailnet, as the Settings list renders it. */
+export const ConnectDeviceSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  lastSeenAt: z.number().nullable(),
+  online: z.boolean(),
+  isThisMac: z.boolean(),
+})
+export type ConnectDevice = z.infer<typeof ConnectDeviceSchema>
+
+/** Device list + why it may be empty, so the row can say something true instead of nothing. */
+export const ConnectDevicesResultSchema = z.object({
+  devices: z.array(ConnectDeviceSchema),
+  error: z.string().optional(),
+  pendingReset: z.object({ nodeId: z.string(), requestId: z.string().uuid() }).optional(),
+})
+export type ConnectDevicesResult = z.infer<typeof ConnectDevicesResultSchema>
+
+/** One device asking to join this account's private network, as the Mac's prompt renders it. */
+export const ConnectEnrollmentRequestSchema = z.object({
+  requestId: z.string(),
+  deviceName: z.string(),
+  platform: z.string(),
+  requestedAt: z.number().nullable(),
+  expiresAt: z.number().nullable(),
+  status: z.enum(['pending', 'approved', 'denied']),
+})
+export type ConnectEnrollmentRequest = z.infer<typeof ConnectEnrollmentRequestSchema>
+
+/** The waiting devices, plus why the list may be empty. `available` is false when this Mac holds no
+ *  approver credential: it cannot prove it is already on the network, so it cannot decide anything,
+ *  and the row has to say that rather than render "nothing is waiting". */
+export const ConnectEnrollmentsResultSchema = z.object({
+  requests: z.array(ConnectEnrollmentRequestSchema),
+  available: z.boolean(),
+  error: z.string().optional(),
+})
+export type ConnectEnrollmentsResult = z.infer<typeof ConnectEnrollmentsResultSchema>
+
+export const ConnectEnrollmentDecideSchema = z.object({
+  requestId: z.string().min(1),
+  decision: z.enum(['approve', 'deny']),
+})
+export type ConnectEnrollmentDecide = z.infer<typeof ConnectEnrollmentDecideSchema>
+
+export const ConnectEnrollmentDecideResultSchema = z.object({
+  ok: z.boolean(),
+  error: z.string().optional(),
+})
+export type ConnectEnrollmentDecideResult = z.infer<typeof ConnectEnrollmentDecideResultSchema>
+
+export const ConnectRevokeSchema = z.object({ nodeId: z.string().min(1), requestId: z.string().uuid().optional() })
+export type ConnectRevoke = z.infer<typeof ConnectRevokeSchema>
+
+/** Account-wide reset crosses three planes; a partial failure names the ones that did not clear. */
+export const ConnectRevokeResultSchema = z.object({
+  ok: z.boolean(),
+  failed: z.array(z.enum(['tailnet', 'pairing', 'account', 'local'])),
+  message: z.string().optional(),
+  requestId: z.string().uuid().optional(),
+  requiresReauth: z.boolean().optional(),
+})
+export type ConnectRevokeResult = z.infer<typeof ConnectRevokeResultSchema>
+
 /** Default pane sizes. `sidebarWidth` is the shared width of every left panel/nav (Sessions+Files,
  *  Source Control, Settings) — they read and resize one value so the panels stay a family. The single
  *  source of truth, shared by the renderer store and main's settings loader. */
@@ -1175,6 +1607,13 @@ const clamp = (n: number, lo: number, hi: number): number => Math.max(lo, Math.m
  *  stale persisted value (written before this floor existed) can't render sub-floor via inline width. */
 export const SIDEBAR_MIN_WIDTH = 180
 
+/** Bounds for the Stage's persisted px width (`conversationWidth`, see below). Absolute and
+ *  window-independent, so they are only half the story: what the Stage may be DRAWN at also depends on
+ *  the room the window has, which is `fitStage` in src/renderer/src/surface/stage-layout.ts. Named here
+ *  so that seam reads the same numbers this clamp writes. */
+export const STAGE_MIN_WIDTH = 320
+export const STAGE_MAX_WIDTH = 1100
+
 /** Clamp pane sizes to a usable range, falling back to the default for any non-finite value. Applied
  *  on every set (renderer) and on read (main) so neither a drag nor a hand-edited file can wedge the UI. */
 export function clampLayout(p: Partial<WorkspaceLayoutSizes> | undefined): WorkspaceLayoutSizes {
@@ -1184,9 +1623,13 @@ export function clampLayout(p: Partial<WorkspaceLayoutSizes> | undefined): Works
     sidebarWidth: clamp(fin(v.sidebarWidth, DEFAULT_LAYOUT.sidebarWidth), SIDEBAR_MIN_WIDTH, 600),
     sessionsFrac: clamp(fin(v.sessionsFrac, DEFAULT_LAYOUT.sessionsFrac), 0.15, 0.85),
     // Despite the name this is the DOCK's width (SurfaceHost); the conversation is flex-1 and fills the
-    // rest, so the dock's MAX is what floors how small the conversation can get. 1100 lets the
-    // conversation shrink well under its old ~600 wall (e.g. to give Preview most of the room).
-    conversationWidth: clamp(fin(v.conversationWidth, DEFAULT_LAYOUT.conversationWidth), 320, 1100),
+    // rest. The wide ceiling is the user's PREFERENCE, kept intact through a narrow window so widening
+    // it gives them back what they chose; `fitStage` is what holds that preference inside the room.
+    conversationWidth: clamp(
+      fin(v.conversationWidth, DEFAULT_LAYOUT.conversationWidth),
+      STAGE_MIN_WIDTH,
+      STAGE_MAX_WIDTH,
+    ),
     artifactSplitFrac: clamp(fin(v.artifactSplitFrac, DEFAULT_LAYOUT.artifactSplitFrac), 0.2, 0.8),
   }
 }
@@ -1209,9 +1652,23 @@ export const PersistedSessionSchema = z.object({
   id: z.string(),
   label: z.string(),
   cwd: z.string(),
-  /** True once the user manually renamed the session — locks out the local-assist auto-title.
+  /** True once the user manually renamed the session — locks out the generated title.
    *  Optional for backward-compat with blobs saved before this field existed. */
   userNamed: z.boolean().optional(),
+  /** One plain sentence saying what this thread is about — the sessions map's second line, generated
+   *  beside the title (sessions:name). Absent ⇒ the row shows only its title. */
+  overview: z.string().optional(),
+  /** Epoch ms of this session's last OBSERVED activity (a turn sent, a turn finished, an approval
+   *  asked). The sessions map settles a thread out of the list from this, and any new activity
+   *  un-settles it — done-ness is never filed by hand. Absent ⇒ never settles (an older blob has no
+   *  observation to age). */
+  lastActivityAt: z.number().optional(),
+  /** The user-message count this thread was last re-named at. Regeneration fires at fixed crossings
+   *  (2, 5, then every 10), so the count alone says "we are AT a crossing", never "we just reached
+   *  one" — and turns that add no user message (a doc edit, the handoff prompt, an image-only turn)
+   *  would re-fire naming at the same count for as long as the thread sits there. Persisted so the
+   *  crossing stays spent across a restart. Absent ⇒ never named by a crossing. */
+  namedAtTurns: z.number().int().nonnegative().optional(),
   /** This session's approval posture (per-session, ui-workspace.md §7a). Optional for back-compat;
    *  absent ⇒ falls back to the default when restored. */
   approvalMode: ApprovalModeSchema.optional(),
@@ -1224,9 +1681,9 @@ export const PersistedSessionSchema = z.object({
   /** Which engine drives this session (`claude` | `codex`). Absent ⇒ 'claude' (back-compat with blobs
    *  saved before multi-engine). Immutable once the conversation started, so it restores exactly. */
   engineId: EngineIdSchema.optional(),
-  /** The engine's native thread id (Codex), so a restored session resumes THAT thread by id (context
-   *  preserved). Absent for Claude / pre-multi-engine blobs. */
-  engineNativeId: z.string().optional(),
+  /** The driver-owned resume blob (see `ResumeCursorSchema`), so a restored session hands its engine
+   *  back exactly what that engine needs to reattach. Absent ⇒ the session restarts clean. */
+  resumeCursor: ResumeCursorSchema.optional(),
   /** The renderer's rendered transcript (Entry[]); opaque to main. */
   items: z.array(z.unknown()),
   /** Highest durable replay row this renderer applied. Main filters an adoption/phone replay after
@@ -1244,6 +1701,10 @@ export const PersistedSessionSchema = z.object({
   /** How to restore the session's last preview after restart. Optional for back-compat with blobs
    *  saved before preview restart persistence existed. */
   lastPreview: PreviewRestartSchema.optional(),
+  /** Legacy session-scoped document stars. New builds migrate these paths into the project's
+   *  `starredDocs` list below and never write this field. It remains readable so a star held only by an
+   *  old live or archived session is not lost during the upgrade. */
+  keptDocs: z.array(z.string()).optional(),
 })
 export type PersistedSession = z.infer<typeof PersistedSessionSchema>
 
@@ -1280,15 +1741,39 @@ export const ArchivedSessionMetaSchema = ArchivedSessionSchema.omit({ items: tru
 })
 export type ArchivedSessionMeta = z.infer<typeof ArchivedSessionMetaSchema>
 
-// version 2: per-project persistence (one project per window). The payload shape is unchanged from
-// v1 (activeId + sessions) — the split is in main (a file per project, keyed by the window's root);
-// main stamps the project path on disk, so it stays OUT of this renderer-facing payload. v1's single
-// global blob is migrated on first boot (session-store.ts migrateV1IfPresent).
+/** One Koda-observed rename/move/delete that must also be applied to legacy star sources which were
+ *  unavailable when the filesystem change happened. Paths are project-relative prefixes; `to: null`
+ *  is a tombstone, while a string rebases that prefix and all descendants. */
+export const LegacyKeptDocPathChangeSchema = z.object({
+  from: z.string(),
+  to: z.string().nullable(),
+})
+export type LegacyKeptDocPathChange = z.infer<typeof LegacyKeptDocPathChangeSchema>
+
+// version 3: project-wide document stars. Version 2 introduced per-project persistence (one project
+// per window); version 3 changes the payload so an older build refuses it instead of Zod-stripping the
+// project-level star fields and rewriting the file. Main reads and migrates v2 explicitly.
 export const PersistedSessionsSchema = z.object({
-  version: z.literal(2),
+  version: z.literal(3),
   /** The tab that was active at save time (restored on next launch). */
   activeId: z.string().nullable(),
   sessions: z.array(PersistedSessionSchema),
+  /** Project-wide document stars — normalized project-relative POSIX paths, in the user's order.
+   *  Paths only: titles and other metadata are re-read from `library:query`. Optional for back-compat
+   *  with stores written while stars still lived on individual sessions. */
+  starredDocs: z.array(z.string()).optional(),
+  /** Paths already imported from legacy per-session `keptDocs` fields. Keeping this small migration
+   *  ledger prevents a delayed archived-session read from resurrecting a document the user has since
+   *  unstarred, while still allowing an archive unavailable on the first upgraded launch to contribute
+   *  its unique paths later. */
+  legacyKeptDocsImported: z.array(z.string()).optional(),
+  /** Append-only path repairs for legacy star sources that may arrive after a Koda rename/move/delete
+   *  (an archive index that could not be read that launch, or retired local pins awaiting a save ack). */
+  legacyKeptDocPathChanges: z.array(LegacyKeptDocPathChangeSchema).optional(),
+  /** True only after a successful archive-index read was hydrated and the resulting project stars were
+   *  acknowledged in this same hot-store write. Retention protects expired archive-only legacy stars
+   *  until this marker lands. */
+  legacyKeptDocsMigrationComplete: z.boolean().optional(),
   /** Archived sessions, restorable from Settings. Optional for back-compat with blobs saved before
    *  archiving existed. */
   archived: z.array(ArchivedSessionSchema).optional(),
@@ -1311,7 +1796,14 @@ export type PersistedSessions = z.infer<typeof PersistedSessionsSchema>
 export type BackupKept = boolean | null
 
 export type SessionsLoadResult =
-  | { ok: true; data: PersistedSessions | null; droppedSessions: number }
+  | {
+      ok: true
+      data: PersistedSessions | null
+      droppedSessions: number
+      /** A cold metadata row matched a hot chat, but its body was not readable, so the hot fallback
+       * stayed live. Optional for mixed-version renderer/main reloads. */
+      unreadableArchiveBodyIds?: string[]
+    }
   | { ok: false; backupKept: BackupKept }
 
 export type ArchivedLoadResult =
@@ -1400,6 +1892,12 @@ export function undoPointRefusal(err: unknown): string | null {
 export const CreateFileRequestSchema = z.object({
   name: z.string().optional(),
   parent: z.string().optional(),
+  /** The session this document is being made out of, written straight into the new file's `source:`
+   *  frontmatter (`ProjectDoc.source`). Optional because a document can be made with no conversation
+   *  in front of it, and an absent provenance is honest where a guessed one is not. Written ONCE, at
+   *  creation: it records where the document came from, so a later edit from a different chat must
+   *  not overwrite it. */
+  source: z.string().optional(),
 })
 export type CreateFileRequest = z.infer<typeof CreateFileRequestSchema>
 
@@ -1412,6 +1910,18 @@ export type CreateFileResult = z.infer<typeof CreateFileResultSchema>
 export const ListDocsRequestSchema = z.object({})
 export type ListDocsRequest = z.infer<typeof ListDocsRequestSchema>
 
+/**
+ * What a document is FOR — the Library's filter row. Closed at six by decision (RB, 2026-08-13):
+ * each answers "what is this for" instead of "where does it live", and `note` is the honest catch-all
+ * so nothing gets mis-filed to make the list work. Deliberately NOT derived from the folder: folders
+ * under `Documents/` are topics by shipped instruction, and this repository already has the two
+ * taxonomies disagreeing (`Documents/site/` holds research, a plan, a reference list and a design
+ * brief). Authored in the file's own frontmatter, which is then the only source of truth.
+ * Do not extend this list without re-reading Documents/architecture/document-workspace.md.
+ */
+export const DocKindSchema = z.enum(['plan', 'decision', 'research', 'guide', 'reference', 'note'])
+export type DocKind = z.infer<typeof DocKindSchema>
+
 export const ProjectDocSchema = z.object({
   /** Absolute, realpath-resolved path (the open/tab identity). */
   path: z.string(),
@@ -1421,6 +1931,28 @@ export const ProjectDocSchema = z.object({
   name: z.string(),
   /** Last-modified epoch ms — the recency sort key. */
   mtimeMs: z.number(),
+  // The four authored fields below all come from the file's own YAML frontmatter, which both editors
+  // already round-trip byte-for-byte. Every one is optional and every one stays optional: most
+  // documents in an existing project predate the convention, and a doc list that throws (or hides a
+  // file) because nobody wrote frontmatter is worse than one with gaps.
+  /** Authored `title:` — what the Library shows instead of the filename. Absent ⇒ fall back to `name`. */
+  title: z.string().optional(),
+  /** Authored `description:` — the Library's one-line subtitle, and the field that makes a library
+   *  browsable at all. Never derive it: a scraped first paragraph is an excerpt, and putting one in
+   *  this slot is exactly what makes the surface read as the file tree it replaced. Absent ⇒ render
+   *  `LibraryDoc.excerpt` instead. */
+  description: z.string().optional(),
+  /** Authored `kind:` — one of the closed six. Absent means unwritten OR unrecognized: `.catch()`
+   *  degrades a typo'd kind to absent rather than failing the whole listing, since one bad file must
+   *  not blank the user's Library. Readers wanting a kind for EVERY document use
+   *  `LibraryDoc.resolvedKind`, which applies the folder fallback once, in main. */
+  kind: DocKindSchema.optional().catch(undefined),
+  /** Authored `source:` — the id of the session this document came out of, written once at creation.
+   *  Provenance lives in the file rather than the `docmeta` sidecar because the sidecar is keyed by a
+   *  hash of the relative path, so it dies on a rename or a move, which is precisely when "where did
+   *  this come from" is worth the most. The id outlives the session (sessions archive and delete), so
+   *  anything that turns this into a door must define what a dead pointer does. */
+  source: z.string().optional(),
 })
 export type ProjectDoc = z.infer<typeof ProjectDocSchema>
 
@@ -1429,6 +1961,22 @@ export const ListDocsResultSchema = z.object({
   docs: z.array(ProjectDocSchema),
 })
 export type ListDocsResult = z.infer<typeof ListDocsResultSchema>
+
+/** library:resolve — refresh an exact set of remembered document paths without depending on the
+ *  recency-sorted discovery list's 300-row display cap. Missing, moved, or no-longer-eligible paths
+ *  are omitted so the renderer can keep their shortcuts visibly stale without granting them file
+ *  actions. The batch is bounded at the IPC edge; 1,000 is comfortably above the discovery cap while
+ *  preventing one renderer request from opening an unbounded number of files. */
+export const LibraryResolveRequestSchema = z.object({
+  rels: z.array(z.string().min(1).max(4096)).max(1000),
+})
+export type LibraryResolveRequest = z.infer<typeof LibraryResolveRequestSchema>
+
+export const LibraryResolveResultSchema = z.object({
+  root: z.string(),
+  docs: z.array(ProjectDocSchema),
+})
+export type LibraryResolveResult = z.infer<typeof LibraryResolveResultSchema>
 
 /** guardrails:list — the behavior layer shaping the agent, for Settings → Guardrails. A Koda rule row
  *  is a *principle* — a human-scale grouping of several underlying pack rules (presentation only; the
@@ -1490,11 +2038,11 @@ export const GuardrailsLayerSchema = z.object({
 })
 export type GuardrailsLayer = z.infer<typeof GuardrailsLayerSchema>
 
-/** memory:weight — how heavy the project's always-injected memory pair is (engine/pack.ts injects
- *  MEMORY.md + active-context.md into every session's system prompt). `heavy` drives the status-bar
- *  tidy pill; `chars` gives Settings → Memory a concrete size to show. */
+/** memory:weight — how heavy the project's memory navigation pair is. The pair is retrieved on demand,
+ *  while `project-card.md` is the bounded ambient summary. `heavy` drives the status-bar tidy pill;
+ *  `chars` gives Settings → Memory a concrete size to show. */
 export const MemoryWeightSchema = z.object({
-  /** Whether the project has a memory index at all (no `.koda/memory/MEMORY.md` ⇒ nothing injected). */
+  /** Whether the project has a memory index at all. */
   present: z.boolean(),
   chars: z.number(),
   heavy: z.boolean(),
@@ -1894,8 +2442,9 @@ export type RenamePathResult = z.infer<typeof RenamePathResultSchema>
 
 /** fs:deletePath — delete a file or folder (recursive). Contained to the project root; the root
  *  itself can't be deleted. Main checkpoints the pre-delete tree first, so a delete is undoable from
- *  the recovery timeline like any other change. */
-export const DeletePathRequestSchema = z.object({ path: z.string() })
+ *  the recovery timeline like any other change. `document` selects the stricter sidebar path: one
+ *  regular Library document, force-captured even when project ignore rules hide it. */
+export const DeletePathRequestSchema = z.object({ path: z.string(), document: z.literal(true).optional() })
 export type DeletePathRequest = z.infer<typeof DeletePathRequestSchema>
 
 /** fs:revealPath — reveal a file/folder in Finder. fs:openPath — open it in the OS default app.
@@ -2029,6 +2578,174 @@ export const ReplaceResultSchema = z.object({
 })
 export type ReplaceResult = z.infer<typeof ReplaceResultSchema>
 
+// ── The Library: documents as objects, not paths ──────────────────────────────
+//
+// One surface over machinery that already ships (`listProjectDocs` + `searchProject`), NOT a second
+// index and NOT a second doc list. Both calls below live in main for one specific reason: the doc walk
+// and the search walk use DIFFERENT exclusion sets. `listProjectDocs` skips DOCS_EXCLUDE_DIRS, skill
+// and plugin marker dirs, and non-user files like CLAUDE.md; `searchProject` only skips `.git`,
+// `node_modules` and `.koda`. A renderer that reached for `fs:search` directly would list vendored
+// skill files and dependency READMEs the Documents pane correctly hides, and look broken to exactly
+// the user this surface exists for. Main reconciles the two once so no caller can forget to.
+// See Documents/architecture/document-workspace.md.
+
+/** library:query — the Library's one read. An absent or empty `query` lists the whole library
+ *  (recency-sorted) rather than nothing, because the surface opens before the user types. */
+export const LibraryQueryRequestSchema = z.object({
+  query: z.string().optional(),
+  /** Absent or empty ⇒ every kind. Matched against `LibraryDoc.resolvedKind`, so a document with no
+   *  authored `kind` is still reachable through its folder fallback instead of vanishing from a
+   *  filtered list. */
+  kinds: z.array(DocKindSchema).optional(),
+  /** Max rows to return; absent ⇒ main's own cap. */
+  limit: z.number().int().positive().optional(),
+})
+export type LibraryQueryRequest = z.infer<typeof LibraryQueryRequestSchema>
+
+/** One Library row: the document's authored metadata plus everything the list needs to rank, filter
+ *  and preview it without a second read per file. */
+export const LibraryDocSchema = ProjectDocSchema.extend({
+  /** The kind to render and filter on, always present: the authored `kind`, else inferred from the
+   *  containing folder, else `note`. Resolved in main so the fallback exists exactly once — a
+   *  renderer re-deriving it becomes the second source of truth this whole design removes. Compare
+   *  with `kind` (inherited, optional) to tell an authored kind from an inferred one. */
+  resolvedKind: DocKindSchema,
+  /** First ~600 chars of the file (`docExcerpt`) — the preview shown when `description` is absent,
+   *  never instead of it. Absent when the file could not be read: a preview is decoration and is
+   *  never worth failing the listing over. */
+  excerpt: z.string().optional(),
+  /** The filename itself matched the query (the row is listed even with no content hits). Mirrors
+   *  `SearchFileResult` so ranking behaves identically to the Find overlay. */
+  nameMatch: z.boolean(),
+  /** Fuzzy filename-match score (higher = better); 0 when `!nameMatch`. */
+  score: z.number(),
+  /** Content-line hits backing this row, for the preview. Empty for an unfiltered listing. */
+  matches: z.array(SearchLineMatchSchema),
+})
+export type LibraryDoc = z.infer<typeof LibraryDocSchema>
+
+export const LibraryQueryResultSchema = z.object({
+  /** The project root the walk was contained to. */
+  root: z.string(),
+  /** Echoed back, so a response that lands after a newer keystroke can be dropped instead of shown. */
+  query: z.string(),
+  /** A cap was hit (files walked / matches collected) — results are partial, same meaning as
+   *  `SearchResult.truncated`. */
+  truncated: z.boolean(),
+  docs: z.array(LibraryDocSchema),
+})
+export type LibraryQueryResult = z.infer<typeof LibraryQueryResultSchema>
+
+/** Where an ask looks. Documents alone is table stakes (Notion Q&A has done it since 2023); the
+ *  differentiating half is `sessions`, because most decisions happened in a conversation and were
+ *  never written down, and only Koda was present for them. */
+export const LibraryAskScopeSchema = z.enum(['all', 'documents', 'sessions'])
+export type LibraryAskScope = z.infer<typeof LibraryAskScopeSchema>
+
+/** library:ask — a question answered across the project's documents AND its session transcripts.
+ *  File-first agentic search: no index, no embedding service. A hosted embedding API is named in
+ *  `.koda/memory/memory-system.md` as the one choice that would break "nothing leaves your machine",
+ *  and any index that does get built later is a derived, rebuildable projection of the markdown. */
+export const LibraryAskRequestSchema = z.object({
+  question: z.string(),
+  scope: LibraryAskScopeSchema.optional(), // default 'all'
+  /** Correlates one renderer request with `library:askCancel`; optional for older preloads. */
+  requestId: z.string().min(1).max(128).optional(),
+  /** Renderer proof that it synchronously wrote an IDLE hot-session snapshot immediately before this
+   *  request. Main compares the stamp with live engine activity; absent/stale means session retrieval
+   *  is partial, never that the debounced file is current by assumption. */
+  hotStoreSavedAt: z.number().finite().nonnegative().optional(),
+  /** The chat this ask was launched from, when there is one. An ask runs on THAT chat's engine, which
+   *  is what the refusal copy says out loud, so the surface names the session and main reads the engine
+   *  off it — the renderer never names an engine, because that would be a surface choosing a billing
+   *  path. Absent (the Library opened with no chat in front) falls back to the last engine the user
+   *  explicitly ran on. */
+  sessionId: z.string().optional(),
+})
+export type LibraryAskRequest = z.infer<typeof LibraryAskRequestSchema>
+
+/** A citation into a document. */
+export const LibraryDocCitationSchema = z.object({
+  kind: z.literal('document'),
+  /** Absolute path — the open target. */
+  path: z.string(),
+  /** Project-relative POSIX path — what the chip's breadcrumb shows. */
+  rel: z.string(),
+  /** What the chip reads: the authored `title`, else the filename. */
+  label: z.string(),
+  /** Legacy/back-compat only. New answers cite the source as a whole because substring retrieval does
+   *  not prove one preview line is the precise support for model-composed prose. */
+  line: z.number().int().positive().optional(),
+  /** Legacy/back-compat only; production no longer presents a first-match preview as an exact quote. */
+  quote: z.string().optional(),
+})
+export type LibraryDocCitation = z.infer<typeof LibraryDocCitationSchema>
+
+/** A citation into a conversation — the door no document tool can offer. That session may be archived
+ *  or deleted, because a citation outlives the thread it names, and "nothing happens when you click"
+ *  is not an answer to a dead pointer.
+ *
+ *  It is answered: renderer-side, follow this through `workspace/session-href.ts`
+ *  (`resolveSessionDoor` for the live/archived/gone state, `followSession` to navigate,
+ *  `followRefusalCopy` for what to say when it can't). Do not call `selectSession` on a stored id
+ *  directly — that treats an archived chat, which is still nameable and still restorable, as dead. */
+export const LibrarySessionCitationSchema = z.object({
+  kind: z.literal('session'),
+  sessionId: z.string(),
+  /** What the chip reads: the session's label as it stood when the answer was formed. Stale by
+   *  design; `resolveSessionDoor` re-reads the CURRENT label when the chip is drawn. */
+  label: z.string(),
+  /** Legacy/back-compat only; production citations are source-level. */
+  quote: z.string().optional(),
+})
+export type LibrarySessionCitation = z.infer<typeof LibrarySessionCitationSchema>
+
+export const LibraryCitationSchema = z.discriminatedUnion('kind', [
+  LibraryDocCitationSchema,
+  LibrarySessionCitationSchema,
+])
+export type LibraryCitation = z.infer<typeof LibraryCitationSchema>
+
+export const LibraryAskResultSchema = z.object({
+  /** Echoed back, so a late answer can be matched against the question still on screen. */
+  question: z.string(),
+  /** The prose answer. An EMPTY answer is a legitimate result and renders as "nothing found" — never
+   *  as an error, and never padded into a manufactured summary (the editorial bar in
+   *  `Documents/Goal sessions.md`: an empty result is a valid result; filling it is the failure). */
+  answer: z.string(),
+  /** What the answer rests on. An answer with zero citations is an unbacked claim about the user's own
+   *  work, so a surface either shows where it came from or says it found nothing. */
+  citations: z.array(LibraryCitationSchema),
+  /** A search cap was hit before the answer was formed — it may be partial. */
+  truncated: z.boolean().optional(),
+})
+export type LibraryAskResult = z.infer<typeof LibraryAskResultSchema>
+
+/**
+ * The marker on a `library:ask` rejection that is a deliberate REFUSAL rather than a failure: the
+ * engine the user chose cannot satisfy Koda's ephemeral, non-mutating structured-generation
+ * contract, so the ask never ran and nothing was billed (`library-ask.ts` → `engineAskRunner`).
+ * Answering it on the other engine anyway would bill an account the user did not choose for this.
+ *
+ * It rides the error message because that is all an IPC rejection carries across the boundary (the
+ * same reason `LibraryAsk.tsx` reads "no handler registered" off one). Main names the ENGINE and the
+ * renderer owns the sentence, the same split `followRefusalCopy` uses: a refusal shown as "that
+ * question could not be answered just now" describes a permanent answer as a transient one, and
+ * leaves a user retrying an engine that cannot support this surface.
+ */
+export const ASK_ENGINE_REFUSAL = 'koda-ask-engine-refusal:'
+
+/** The engine a `library:ask` rejection is refusing on, or `null` when the rejection is an ordinary
+ *  failure. Shared so main and the renderer agree on one contract instead of two regexes. */
+export function askRefusedEngine(error: unknown): EngineId | null {
+  const message = error instanceof Error ? error.message : String(error)
+  const at = message.indexOf(ASK_ENGINE_REFUSAL)
+  if (at < 0) return null
+  const id = message.slice(at + ASK_ENGINE_REFUSAL.length).trim().split(/\s/)[0]
+  const parsed = EngineIdSchema.safeParse(id)
+  return parsed.success ? parsed.data : null
+}
+
 // ── User-git: the Source Control panel ────────────────────────────────────────
 //
 // The user's REAL `.git` (dual-git.md §3) — separate from safety-git's invisible undo store. Lean
@@ -2089,6 +2806,8 @@ export const GitGraphRowSchema = z.object({
   sha: z.string(),
   subject: z.string(),
   relativeDate: z.string(),
+  /** Commit time in epoch ms. The rail groups by calendar day; "23 hours ago" cannot name one. */
+  committedAt: z.number(),
   authorName: z.string(),
   parents: z.array(z.string()),
   lane: z.number().int(),
@@ -2113,6 +2832,16 @@ export const GitCommitGraphResultSchema = z.object({
       /** Commits this side line has that the current branch does not. */
       ahead: z.number().int().nonnegative(),
     }),
+  ),
+  /**
+   * Merge SHA → the commits it brought in, newest-first. The rail draws HEAD's first-parent chain,
+   * so without this the work a merge carried in is fetched and laid out but never rendered, and the
+   * merge can only be drawn as a curve around nothing. `partial` means the fetch window ended before
+   * the walk reached the trunk, so the list is what we hold rather than everything that exists.
+   */
+  mergeInflows: z.record(
+    z.string(),
+    z.object({ shas: z.array(z.string()), partial: z.boolean() }),
   ),
   headBranch: z.string().nullable(),
   truncated: z.boolean(),
@@ -2153,6 +2882,20 @@ export const GitCommitPathsRequestSchema = z.object({
   paths: z.array(z.string()).min(1).max(5000),
 })
 export type GitCommitPathsRequest = z.infer<typeof GitCommitPathsRequestSchema>
+
+/** git:proposeMessage — a description for the save the user is about to make, written from the diff
+ *  by the app-global generated-text choice or its deterministic floor. Read-only: it never touches the
+ *  index or the tree, and the returned text is a proposal the user edits. */
+export const GitProposeMessageRequestSchema = z.object({})
+export type GitProposeMessageRequest = z.infer<typeof GitProposeMessageRequestSchema>
+
+export const GitProposeMessageResultSchema = z.object({
+  /** Ready for the composer: a subject, or a subject and a short body. Never empty. */
+  message: z.string(),
+  /** Which route wrote it. `fallback` is the floor doing its job, never an error to surface. */
+  source: z.enum(['engine', 'on-device', 'fallback']),
+})
+export type GitProposeMessageResult = z.infer<typeof GitProposeMessageResultSchema>
 
 /** A git commit/short SHA — pinned so it can't be smuggled in as a positional git flag. */
 const GitShaSchema = z.string().regex(/^[0-9a-f]{7,40}$/)
@@ -2327,7 +3070,9 @@ export const ProjectCreateRequestSchema = z.object({
 })
 export type ProjectCreateRequest = z.infer<typeof ProjectCreateRequestSchema>
 
-/** Per-engine agent-guidance files (engine-keyed: Claude reads CLAUDE.md, Codex reads AGENTS.md). A
+/** The agent-guidance pair (Claude reads CLAUDE.md, Codex reads AGENTS.md) — ONE guide, two names:
+ *  intake authors a canonical AGENTS.md and symlinks CLAUDE.md to it, and main's healGuidelinesPair
+ *  links whichever name a project is missing at open, so both engines always read the same file. A
  *  project "already has guidelines" if ANY of these exists — so a project set up for one engine isn't
  *  re-intaked by another. Add the next engine's file here when it lands. */
 export const GUIDELINES_FILES = ['CLAUDE.md', 'AGENTS.md'] as const
@@ -2465,7 +3210,7 @@ export const MiniAppBridgeConsentRequestSchema = z.object({
 export type MiniAppBridgeConsentRequest = z.infer<typeof MiniAppBridgeConsentRequestSchema>
 
 /** The shape exposed on `window.koda` — implemented in preload, consumed in the renderer. */
-export type FileMenuCommand = 'newDocument' | 'newFolder' | 'filesImported' | 'exportPdf'
+export type FileMenuCommand = 'newDocument' | 'newFolder' | 'importFiles' | 'filesImported' | 'exportPdf'
 
 export interface KodaApi {
   getAppInfo: () => Promise<AppInfo>
@@ -2488,8 +3233,9 @@ export interface KodaApi {
   /** Load persisted sessions on boot. `ok: true` with `data: null` means this project has nothing saved
    *  yet; `ok: false` means the store exists and could not be read, which must NOT hydrate. */
   loadSessions: () => Promise<SessionsLoadResult>
-  /** Fire-and-forget: persist the open sessions + transcripts (debounced in the renderer). */
-  saveSessions: (data: PersistedSessions) => void
+  /** Persist the open sessions + transcripts (debounced in the renderer). True only once the exact
+   *  blob is on disk; migrations that would delete their old copy gate on this acknowledgement. */
+  saveSessions: (data: PersistedSessions) => Promise<boolean>
   /** Archived sessions ride a separate COLD store (never the hot blob above — the 53MB-freeze bug).
    *  Split further: this loads/saves only the LIGHT metadata index (transcript bodies live in per-session
    *  files, fetched on restore) so boot and every archive/delete stay small regardless of history size.
@@ -2505,8 +3251,9 @@ export interface KodaApi {
    *  means the read failed (so restore keeps the archive instead of destroying it); `[]` is a clean but
    *  genuinely empty transcript. */
   loadArchivedBody: (id: string) => Promise<unknown[] | null>
-  /** Persist one archived session's transcript body to its own file (called when archiving). */
-  writeArchivedBody: (id: string, items: unknown[]) => Promise<void>
+  /** Persist one archived session's transcript body. True only once the exact body is on disk; archive
+   *  metadata and hot-session removal must not proceed on a failed body write. */
+  writeArchivedBody: (id: string, items: unknown[]) => Promise<boolean>
   /** Delete one archived session's body file (called when the archive is restored or deleted). */
   deleteArchivedBody: (id: string) => Promise<void>
   /** Claim this window's project's live headless (phone-started) sessions + get their replayable
@@ -2524,6 +3271,10 @@ export interface KodaApi {
   onScratchChanged: (listener: () => void) => () => void
   /** Subscribe to the normalized event stream; returns an unsubscribe fn. */
   onEngineEvent: (listener: (event: EngineEvent) => void) => () => void
+  /** Subscribe to passive, main-owned completion state (not part of transcript/replay). */
+  onCompletionState: (listener: (state: TaskCompletionState) => void) => () => void
+  /** Catch up after a renderer reload without persisting stale completion claims across app restarts. */
+  listCompletionStates: () => Promise<TaskCompletionState[]>
   // Side questions ("btw" / aside) — answered from the live conversation without entering it.
   askAside: (args: AskAsideRequest) => Promise<void>
   cancelAside: (args: CancelAsideRequest) => Promise<void>
@@ -2540,13 +3291,15 @@ export interface KodaApi {
   logFromRenderer: (entry: RendererLog) => void
   /** Fire-and-forget: set the macOS dock badge to the number of sessions needing attention. */
   setAttentionCount: (count: number) => void
-  /** On-device clean session title from the first prompt (deterministic fallback; never rejects). */
-  assistTitle: (args: AssistTitleRequest) => Promise<AssistTitleResponse>
+  /** Engine-generated session title + overview line (falls back to the local-assist floor; never rejects). */
+  nameSession: (args: SessionNameRequest) => Promise<SessionNameResponse>
   // Project Files browser (read-only, contained to the project root in main).
   /** List a directory (path omitted ⇒ project root). */
   readDir: (args: ReadDirRequest) => Promise<ReadDirResult>
   /** Flat recency-sorted list of every prose doc under the project (the doc-first sidebar). */
   listDocs: (args: ListDocsRequest) => Promise<ListDocsResult>
+  /** Resolve remembered Library-relative paths exactly, independent of the discovery list cap. */
+  libraryResolve: (args: LibraryResolveRequest) => Promise<LibraryResolveResult>
   /** Read a text file's contents (size-capped; binary refused). */
   readFile: (args: ReadFileRequest) => Promise<ReadFileResult>
   /** Save the editor's contents to a file (safety-git checkpoints the pre-edit tree first). */
@@ -2573,6 +3326,8 @@ export interface KodaApi {
   duplicatePath: (args: DuplicatePathRequest) => Promise<DuplicatePathResult>
   /** Import Finder-dragged files into a folder (or Documents/), checkpointed first. Returns new paths. */
   importFiles: (args: ImportFilesRequest) => Promise<ImportFilesResult>
+  /** Open the native File-menu picker, then import into Documents/. Null when the picker is cancelled. */
+  importFilesFromMenu: () => Promise<ImportFilesResult | null>
   /** Reveal a file/folder in Finder. */
   revealPath: (args: RevealPathRequest) => Promise<void>
   /** Open a file/folder in the OS default app. */
@@ -2587,6 +3342,15 @@ export interface KodaApi {
   search: (args: SearchRequest) => Promise<SearchResult>
   /** Project-wide replace (safety-git-checkpointed first; undoable as one step). Returns the counts. */
   replaceAll: (args: ReplaceRequest) => Promise<ReplaceResult>
+  // The Library — the document surface.
+  /** The Library's one read: the project's documents, narrowed by text and kind, already filtered
+   *  through the doc list's own exclusion rules in main. */
+  libraryQuery: (args: LibraryQueryRequest) => Promise<LibraryQueryResult>
+  /** Ask a question across the project's documents AND its session transcripts; the answer carries
+   *  citations into both. */
+  libraryAsk: (args: LibraryAskRequest) => Promise<LibraryAskResult>
+  /** Cancel an in-flight one-shot whose result no longer has a surface to land on. */
+  cancelLibraryAsk: (requestId: string) => void
   // Source Control (user-git — the real `.git`).
   /** Is the project a git repo, and is it the root or a subdir of one? */
   gitDetect: () => Promise<GitRepoInfo>
@@ -2600,6 +3364,8 @@ export interface KodaApi {
   gitCommit: (args: GitCommitRequest) => Promise<GitCommitResult>
   /** Commit only the given paths (per-session save); other dirty files stay uncommitted. */
   gitCommitPaths: (args: GitCommitPathsRequest) => Promise<GitCommitResult>
+  /** A proposed description for the save about to happen. Read-only; never blocks the save. */
+  gitProposeMessage: (args: GitProposeMessageRequest) => Promise<GitProposeMessageResult>
   gitRenameHead: (args: GitRenameHeadRequest) => Promise<GitCommitResult>
   /** Make the files match a past version, saved as a new version on top (never a history rewrite). */
   gitRestoreVersion: (args: GitRestoreRequest) => Promise<GitCommitResult>
@@ -2686,6 +3452,9 @@ export interface KodaApi {
   getCodexModels: () => Promise<CodexModel[]>
   /** Codex sign-in state (for the picker + Settings → AI providers). */
   getCodexAuthStatus: () => Promise<CodexAuthStatus>
+  /** Provider-keyed model catalogs for picker surfaces. Adding a provider extends this DTO rather than
+   *  adding another provider-specific desktop/phone transport pair. */
+  getProviderModelCatalogs: () => Promise<ProviderModelCatalogs>
   /** Start Codex (ChatGPT OAuth) sign-in — spawns `codex login`, opens the browser, completes on the
    *  loopback callback. Watch onCodexLoginProgress for steps. `ok:false` if one's already in flight. */
   startCodexLogin: () => Promise<AuthLoginStartResult>
@@ -2730,6 +3499,10 @@ export interface KodaApi {
    *  the editor of the session that triggered it (`sessionId`) — not whichever session is focused when
    *  it lands — and remembers `restart` so the preview can be brought back after it's gone. */
   onPreviewShow: (listener: (url: string, sessionId: string, restart: PreviewRestart) => void) => () => void
+  /** Subscribe to "that dev server stopped serving" pushes (it exited, crashed, or was replaced). The
+   *  renderer drops the live mark on any preview surface pointed at `url`, so the tab stops showing a
+   *  running app that isn't. Returns an unsubscribe fn. */
+  onPreviewStopped: (listener: (url: string) => void) => () => void
   /** Subscribe to main's "measure the preview iframe" requests (the agent called view_preview):
    *  reply via respondPreviewCapture with the iframe's rect, or null if no preview is showing.
    *  Returns an unsubscribe fn. */
@@ -2749,7 +3522,7 @@ export interface KodaApi {
   getDocMeta: (args: DocMetaGetRequest) => Promise<DocMeta>
   /** Persist a doc's presentation sidecar. Best-effort (a lost column width never breaks anything). */
   setDocMeta: (args: DocMetaSetRequest) => Promise<void>
-  /** How heavy this project's always-injected memory pair is (status-bar pill + Settings → Memory). */
+  /** How heavy this project's memory navigation pair is (status-bar pill + Settings → Memory). */
   getMemoryWeight: () => Promise<MemoryWeight>
   /** Cloud-backup status for THIS project (Settings → Backup). Cheap; safe to poll on section open. */
   getBackupStatus: () => Promise<BackupStatus>
@@ -2839,6 +3612,24 @@ export interface KodaApi {
   revokeRemoteDevice: (args: RemoteRevoke) => Promise<RemoteState>
   /** Subscribe to remote-connection activity (the "remote session active" indicator); unsubscribe fn. */
   onRemoteActivity: (listener: (activity: RemoteActivity) => void) => () => void
+
+  // Connect tier (connect-embedded-tailscale.md Build A) — the embedded tailnet node.
+  /** The node's live state for the "reachable from your phone" row. */
+  getConnectState: () => Promise<ConnectState>
+  /** The account's devices from the coordination plane (network call; may return an error string). */
+  getConnectDevices: () => Promise<ConnectDevicesResult>
+  /** Reset all remote access; nodeId is an ownership/retry handle, not per-device scope. */
+  revokeConnectDevice: (args: ConnectRevoke) => Promise<ConnectRevokeResult>
+  /** Force a full rejoin (leave + the one door) when the row says this Mac is not reachable. */
+  reconnectConnectNode: () => Promise<ConnectState>
+  /** main→renderer push: the node's state or peer path changed. */
+  onConnectActivity: (listener: (state: ConnectState) => void) => () => void
+  /** The devices waiting to join this account's private network. Empty with `available:false` when
+   *  this Mac cannot prove it is already on it. */
+  getConnectEnrollments: () => Promise<ConnectEnrollmentsResult>
+  /** Allow or refuse one waiting device. Approval mints nothing here: the waiting device asks again
+   *  and gets its own key, so no credential is ever parked anywhere waiting to be collected. */
+  decideConnectEnrollment: (args: ConnectEnrollmentDecide) => Promise<ConnectEnrollmentDecideResult>
   // Provider-outage watch (engine/status-watch.ts) — the status-bar pill.
   /** Subscribe to provider outage/recovery pushes; unsubscribe fn. */
   onProviderStatus: (listener: (e: ProviderStatusEvent) => void) => () => void

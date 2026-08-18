@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, type ReactNode } from 'react'
+import { createContext, memo, useContext, useState, type ReactNode } from 'react'
 import ReactMarkdown, { defaultUrlTransform, type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
@@ -18,8 +18,15 @@ export const LocalLinkContext = createContext<((href: string) => boolean) | null
  * buffer) and finalized (AssistantBlock). Holds nothing; the source string is
  * the copy source of truth (kept by the caller). Component overrides map to the
  * design tokens so prose + code switch with the app theme.
+ *
+ * Memoized on the source string, which is the load-bearing part: remark-gfm +
+ * rehype-highlight re-parse and re-tokenize from scratch on every render, and a
+ * finalized block's markdown never changes again. Without this, one store patch
+ * (a subagent forwarding a line of text during a fan-out) re-highlights every
+ * block in the whole conversation — cost per event scales with transcript
+ * length, which is what made long fan-out sessions crawl.
  */
-export function Markdown({ children }: { children: string }) {
+export const Markdown = memo(function Markdown({ children }: { children: string }) {
   return (
     <div className="koda-prose text-text/90">
       <ReactMarkdown
@@ -35,7 +42,7 @@ export function Markdown({ children }: { children: string }) {
       </ReactMarkdown>
     </div>
   )
-}
+})
 
 function MarkdownLink({ href, children }: { href?: string; children: ReactNode }) {
   const openLocal = useContext(LocalLinkContext)

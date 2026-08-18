@@ -6,7 +6,8 @@
  * The folder is excluded from BOTH the safety store (repo.ts EXCLUDE) and the user's git, so a binary
  * image never bloats a recovery checkpoint or shows up in the user's commits. Files auto-prune by age
  * (a user setting); everything here is best-effort — a failure means no durable copy, never a blocked
- * turn (the image still goes inline).
+ * turn (the image still goes inline). Pruning runs before a save, before the first Recent images
+ * page is listed, and when the retention setting changes for an open project.
  */
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
@@ -76,48 +77,61 @@ export async function listScratchImages(
   limit = 30,
 ): Promise<ScratchListPage> {
   const dir = scratchDir(projectDir)
-  let names: string[]
-  try {
-    names = await readdir(dir)
-  } catch {
-    return { images: [], total: 0 } // no folder yet (nothing saved) — normal
+  // A settings-triggered prune can overlap a list that already collected metadata. If one of those
+  // files vanishes before its bytes are read, rebuild the page once from the post-prune directory
+  // instead of rejecting the whole Recent images strip. A second failure stays fail-soft.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let names: string[]
+    try {
+      names = await readdir(dir)
+    } catch {
+      return { images: [], total: 0 } // no folder yet (nothing saved) — normal
+    }
+    const entries = await Promise.all(
+      names.map(async (name) => {
+        const mediaType = MIME[extensionOf(name)]
+        if (!mediaType) return null
+        try {
+          const s = await stat(join(dir, name))
+          return s.isFile() ? { name, mtime: s.mtimeMs, mediaType } : null
+        } catch {
+          return null // vanished mid-list — ignore
+        }
+      }),
+    )
+    const sorted = entries
+      .filter((e): e is { name: string; mtime: number; mediaType: string } => e !== null)
+      .sort((a, b) => b.mtime - a.mtime)
+    const page = sorted.slice(offset, offset + limit)
+    try {
+      const images = await Promise.all(
+        page.map(async (f) => ({
+          name: f.name,
+          relPath: `.koda/scratch/${f.name}`,
+          mediaType: f.mediaType,
+          dataBase64: (await readFile(join(dir, f.name))).toString('base64'),
+          mtime: f.mtime,
+        })),
+      )
+      return { images, total: sorted.length }
+    } catch (err) {
+      if (attempt === 0 && (err as NodeJS.ErrnoException)?.code === 'ENOENT') continue
+      return { images: [], total: offset }
+    }
   }
-  const entries = await Promise.all(
-    names.map(async (name) => {
-      const mediaType = MIME[extensionOf(name)]
-      if (!mediaType) return null
-      try {
-        const s = await stat(join(dir, name))
-        return s.isFile() ? { name, mtime: s.mtimeMs, mediaType } : null
-      } catch {
-        return null // vanished mid-list — ignore
-      }
-    }),
-  )
-  const sorted = entries
-    .filter((e): e is { name: string; mtime: number; mediaType: string } => e !== null)
-    .sort((a, b) => b.mtime - a.mtime)
-  const page = sorted.slice(offset, offset + limit)
-  const images = await Promise.all(
-    page.map(async (f) => ({
-      name: f.name,
-      relPath: `.koda/scratch/${f.name}`,
-      mediaType: f.mediaType,
-      dataBase64: (await readFile(join(dir, f.name))).toString('base64'),
-      mtime: f.mtime,
-    })),
-  )
-  return { images, total: sorted.length }
+  return { images: [], total: offset }
 }
 
 /**
  * Delete scratch files whose mtime is older than `retentionDays`. `retentionDays <= 0` means keep
- * forever (pruning off). Fail-soft: logged, never thrown — pruning must not block a save.
+ * forever (pruning off). Returns the number removed. Fail-soft: logged, never thrown — pruning must
+ * not block a save.
  */
-export async function pruneScratch(projectDir: string, retentionDays: number): Promise<void> {
-  if (!Number.isFinite(retentionDays) || retentionDays <= 0) return
+export async function pruneScratch(projectDir: string, retentionDays: number): Promise<number> {
+  if (!Number.isFinite(retentionDays) || retentionDays <= 0) return 0
   const dir = scratchDir(projectDir)
   const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000
+  let removed = 0
   try {
     const names = await readdir(dir)
     await Promise.all(
@@ -125,7 +139,10 @@ export async function pruneScratch(projectDir: string, retentionDays: number): P
         const full = join(dir, name)
         try {
           const s = await stat(full)
-          if (s.isFile() && s.mtimeMs < cutoff) await unlink(full)
+          if (s.isFile() && s.mtimeMs < cutoff) {
+            await unlink(full)
+            removed += 1
+          }
         } catch {
           /* file vanished mid-prune (a concurrent save/prune) — ignore */
         }
@@ -137,4 +154,5 @@ export async function pruneScratch(projectDir: string, retentionDays: number): P
       log.warn('scratch', 'prune failed', err instanceof Error ? err.message : err)
     }
   }
+  return removed
 }

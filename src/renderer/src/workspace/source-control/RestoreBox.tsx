@@ -47,7 +47,7 @@ export function RestoreBox({ sha, onRestored }: { sha: string; onRestored: () =>
           Restore this version
         </Button>
       ) : (
-        <div className="rounded-lg border border-accent/25 bg-accent/[0.07] p-2.5">
+        <div className="rounded-lg bg-accent/[0.09] p-2.5">
           <p className="text-[11px] leading-relaxed text-text-muted">
             Your files go back to how they were at this version, saved as a{' '}
             <b className="text-text">new version on top</b> — nothing is lost, and you can restore

@@ -24,15 +24,11 @@ export function PreviewSurfaceView({
   url,
   rev,
   className = '',
-  expanded = false,
-  onExpandedChange,
   onViewportChange,
 }: {
   url?: string
   rev: number
   className?: string
-  expanded?: boolean
-  onExpandedChange?: (expanded: boolean) => void
   onViewportChange?: (viewport: PreviewViewport) => void
 }) {
   // A manual reload bumps this; combined with `url` + `rev` (bumped when the surface is re-pointed) it
@@ -92,14 +88,12 @@ export function PreviewSurfaceView({
         <PreviewHeader
           url={url}
           viewport={viewport}
-          expanded={expanded}
           canGoBack={false}
           canGoForward={false}
           onBack={goBack}
           onForward={goForward}
           onReload={() => setReloadNonce((n) => n + 1)}
           onViewportChange={selectViewport}
-          onExpandedChange={onExpandedChange}
         />
         <div className="flex flex-1 items-center justify-center bg-bg px-6 text-center text-sm text-text-muted">
           Nothing to preview yet. The agent can start a live preview, or write an{' '}
@@ -114,14 +108,12 @@ export function PreviewSurfaceView({
       <PreviewHeader
         url={url}
         viewport={viewport}
-        expanded={expanded}
         canGoBack={canGoBack}
         canGoForward={canGoForward}
         onBack={goBack}
         onForward={goForward}
         onReload={() => setReloadNonce((n) => n + 1)}
         onViewportChange={selectViewport}
-        onExpandedChange={onExpandedChange}
       />
       <div className={`min-h-0 flex-1 overflow-auto ${framed ? 'bg-surface/50 p-3' : 'bg-white'}`}>
         <div
@@ -154,25 +146,21 @@ export function PreviewSurfaceView({
 function PreviewHeader({
   url,
   viewport,
-  expanded,
   canGoBack,
   canGoForward,
   onBack,
   onForward,
   onReload,
   onViewportChange,
-  onExpandedChange,
 }: {
   url?: string
   viewport: PreviewViewport
-  expanded: boolean
   canGoBack: boolean
   canGoForward: boolean
   onBack: () => void
   onForward: () => void
   onReload: () => void
   onViewportChange: (viewport: PreviewViewport) => void
-  onExpandedChange?: (expanded: boolean) => void
 }) {
   const navBtn =
     'grid h-7 w-7 shrink-0 place-items-center rounded-md text-text-muted transition-colors hover:bg-surface hover:text-text disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-text-muted'
@@ -225,17 +213,6 @@ function PreviewHeader({
         })}
       </div>
       <span className="truncate font-mono text-[11px] text-text-muted">{url ?? 'Preview'}</span>
-      <button
-        onClick={() => onExpandedChange?.(!expanded)}
-        title={expanded ? 'Show session' : 'Hide session'}
-        aria-label={expanded ? 'Show session' : 'Hide session'}
-        aria-pressed={expanded}
-        className={`ml-auto grid h-7 w-7 shrink-0 place-items-center rounded-md transition-colors hover:bg-surface hover:text-text ${
-          expanded ? 'text-text' : 'text-text-muted'
-        }`}
-      >
-        {expanded ? <IconCollapse /> : <IconExpand />}
-      </button>
     </div>
   )
 }
@@ -283,19 +260,4 @@ function ViewportIcon({ viewport }: { viewport: PreviewViewport }) {
   )
 }
 
-function IconExpand() {
-  return (
-    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" />
-      <path d="M3 3l6 6M21 3l-6 6M3 21l6-6M21 21l-6-6" />
-    </svg>
-  )
-}
 
-function IconCollapse() {
-  return (
-    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M9 3v6H3M15 3v6h6M9 21v-6H3M15 21v-6h6" />
-    </svg>
-  )
-}

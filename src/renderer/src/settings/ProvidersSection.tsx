@@ -6,17 +6,24 @@ import type {
   CodexBillingMode,
   EngineId,
   MiniAppBridgeInfo,
-  ModelSpend,
   RateLimitInfo,
   UsageHistoryDay,
 } from '@shared/ipc'
+import {
+  buildUsageValue,
+  type EngineValue,
+  type ModelValue,
+  type UsageValue,
+} from '@shared/usage-value'
 import { Collapse, motion, spring } from '../motion'
 import { Caret } from '../Caret'
 import { useWorkspace } from '../workspace/store'
-import { engineLabel, engineOrder, engineAccent } from '../workspace/models'
-import { SegmentedControl, SettingsRow, SettingsSection, Toggle } from './controls'
-import { BusyText, Button, Card, PixelGlyph, cx } from '../ui'
+import { SegmentedControl, SettingsNote, SettingsRow, SettingsSection, Toggle } from './controls'
+import { BusyText, Button, PixelGlyph, cx } from '../ui'
 import { liveRateLimitWindows } from '@shared/rate-limits'
+import { UsageChart } from './UsageChart'
+import { fmtTokens, fmtUsd, prettyModel } from './usage-format'
+import { engineCapabilities } from '@shared/engine-capabilities'
 
 // ── AI providers (engine billing, one tab per provider) ─────────────────────────────
 // How the LLM that powers each session is authenticated and paid for. Each provider (Anthropic → Claude,
@@ -63,36 +70,19 @@ export function ProvidersSection() {
   const apiAlways = billing?.mode === 'api'
   const apiActive = billing?.apiActive ?? false
 
-  // Per-engine spend + by-model breakdown from the PERSISTED history, not just the sessions open right
-  // now — so Usage shows every model you've used lately (e.g. one from a session you've since closed),
-  // which the old open-sessions-only aggregate silently dropped. Model → engine by id (Claude reports
-  // `claude-*` ids or a Claude alias; everything else is Codex) — the same two-brand split the history
-  // bars use, extended when a third engine lands. Snapshotted at mount, which is fine for a settings pane.
-  const byEngine = useMemo(() => {
-    const agg: Record<string, { spend: number; byModel: Record<string, ModelSpend> }> = {}
-    for (const day of history) {
-      for (const [eid, cost] of Object.entries(day.byEngine ?? {})) {
-        ;(agg[eid] ??= { spend: 0, byModel: {} }).spend += cost
-      }
-      for (const [model, m] of Object.entries(day.byModel ?? {})) {
-        const e = (agg[engineOfModel(model)] ??= { spend: 0, byModel: {} })
-        const a = e.byModel[model]
-        e.byModel[model] = {
-          costUsd: (a?.costUsd ?? 0) + m.costUsd,
-          inputTokens: (a?.inputTokens ?? 0) + m.inputTokens,
-          outputTokens: (a?.outputTokens ?? 0) + m.outputTokens,
-          cacheReadTokens: (a?.cacheReadTokens ?? 0) + m.cacheReadTokens,
-          cacheCreationTokens: (a?.cacheCreationTokens ?? 0) + m.cacheCreationTokens,
-        }
-      }
-    }
-    return agg
-  }, [history])
+  // Every Usage number comes from the PERSISTED daily history, not just the sessions open right now —
+  // so it shows every model you've used lately (e.g. one from a session you've since closed), which the
+  // old open-sessions-only aggregate silently dropped. `buildUsageValue` owns the arithmetic (and the
+  // model → engine split) so the view and its reconciliation test read the history identically.
+  // Snapshotted at mount, which is fine for a settings pane.
+  const value = useMemo(() => buildUsageValue(history), [history])
+  const byEngine = value.byEngine
 
-  // OpenAI's usage card + the history-bar engine split appear once there's any Codex usage on record.
+  // OpenAI's usage card + the chart's engine split appear once there's any Codex usage on record.
   const codexHasUsage =
-    (byEngine.codex?.spend ?? 0) > 0 || Object.keys(rateLimits.codex ?? {}).length > 0
-  const multi = new Set(['claude', ...Object.keys(byEngine), ...Object.keys(rateLimits)]).size > 1
+    (byEngine.codex?.totalTokens ?? 0) > 0 ||
+    (byEngine.codex?.costUsd ?? 0) > 0 ||
+    Object.keys(rateLimits.codex ?? {}).length > 0
 
   // Hide a provider's advanced (API key) + usage rows until it's actually signed in — a logged-out pane
   // should read as one clean "sign in" card, not a wall of empty usage. Claude is ready on a subscription
@@ -111,16 +101,21 @@ export function ProvidersSection() {
   ]
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-8">
       <ProviderTabs tabs={tabs} activeId={active} onSelect={setActive} />
 
       {/* Both panels stay MOUNTED (only the active one is shown) so a sign-in listener isn't torn down
           mid-login when you switch tabs — the in-flight paste UI and the completion refresh survive the
           switch. Only one is ever visible, so a plain hidden toggle is enough. */}
       <div>
-        <div className={active === 'anthropic' ? undefined : 'hidden'}>
+        <div
+          id="provider-panel-anthropic"
+          role="tabpanel"
+          aria-label="Anthropic"
+          className={active === 'anthropic' ? undefined : 'hidden'}
+        >
           <ProviderPanel brand="Anthropic" sub="Claude" status={claudeStatus}>
-            <ClaudeAccountCard
+            <ClaudeAccount
               billing={billing}
               onChanged={refresh}
               showKey={claudeReady}
@@ -131,8 +126,7 @@ export function ProvidersSection() {
                 title="Usage"
                 engineId="claude"
                 windows={rateLimits.claude ?? {}}
-                spend={byEngine.claude?.spend ?? 0}
-                byModel={byEngine.claude?.byModel ?? {}}
+                value={byEngine.claude}
                 // Plan windows are meaningless under always-API billing; hide just that block.
                 showPlanLimits={!apiAlways}
                 apiActive={apiActive}
@@ -142,9 +136,14 @@ export function ProvidersSection() {
           </ProviderPanel>
         </div>
 
-        <div className={active === 'openai' ? undefined : 'hidden'}>
+        <div
+          id="provider-panel-openai"
+          role="tabpanel"
+          aria-label="OpenAI"
+          className={active === 'openai' ? undefined : 'hidden'}
+        >
           <ProviderPanel brand="OpenAI" sub="Codex" status={codexStatus}>
-            <OpenAiAccountCard
+            <OpenAiAccount
               auth={codexAuth}
               billing={billing}
               onChangedAuth={refreshCodex}
@@ -158,8 +157,7 @@ export function ProvidersSection() {
                 title="Usage"
                 engineId="codex"
                 windows={rateLimits.codex ?? {}}
-                spend={byEngine.codex?.spend ?? 0}
-                byModel={byEngine.codex?.byModel ?? {}}
+                value={byEngine.codex}
                 // Plan windows are meaningless when Codex bills the API key; hide just that block.
                 showPlanLimits={!(billing?.codexApiActive ?? false)}
                 apiActive={billing?.codexApiActive ?? false}
@@ -169,8 +167,8 @@ export function ProvidersSection() {
         </div>
       </div>
 
-      {anyReady && history.length > 0 && (
-        <HistorySection history={history} multi={multi} apiActive={apiActive} />
+      {anyReady && value.daily.length > 0 && (
+        <HistorySection value={value} apiActive={apiActive} />
       )}
     </div>
   )
@@ -204,6 +202,7 @@ function ProviderTabs({
             key={t.id}
             role="tab"
             aria-selected={active}
+            aria-controls={`provider-panel-${t.id}`}
             onClick={() => onSelect(t.id)}
             className={cx(
               'relative rounded-md px-3.5 py-2 text-left transition-colors',
@@ -254,8 +253,8 @@ function ProviderPanel({
   children: ReactNode
 }) {
   return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between gap-3 px-1">
+    <div className="space-y-8">
+      <div className="flex items-center justify-between gap-3">
         <div className="flex items-baseline gap-2">
           <h2 className="font-display text-[15px] font-semibold text-text">{brand}</h2>
           <span className="text-[12.5px] text-text-muted">{sub}</span>
@@ -305,7 +304,7 @@ function ApiKeyDisclosure({
       <button
         onClick={onToggle}
         aria-expanded={open}
-        className="group flex w-full items-center justify-between gap-4 px-4 py-3.5 text-left"
+        className="group flex w-full items-center justify-between gap-4 py-3 text-left"
       >
         <span className="text-[13.5px] font-medium text-text-muted transition-colors group-hover:text-text">
           Use your own API key
@@ -315,9 +314,7 @@ function ApiKeyDisclosure({
           className="text-text-muted transition-colors group-hover:text-text"
         />
       </button>
-      <Collapse open={open}>
-        <div className="divide-y divide-border">{children}</div>
-      </Collapse>
+      <Collapse open={open}>{children}</Collapse>
     </div>
   )
 }
@@ -325,7 +322,7 @@ function ApiKeyDisclosure({
 // ── Anthropic (Claude) ────────────────────────────────────────────────────────────────
 /** The Claude account card: subscription sign-in on top, the BYO-key path folded into a disclosure below.
  *  One card so the advanced path reads as a sub-option of the same account, not a rival section. */
-function ClaudeAccountCard({
+function ClaudeAccount({
   billing,
   onChanged,
   showKey,
@@ -344,14 +341,14 @@ function ClaudeAccountCard({
   }, [apiActive])
 
   return (
-    <Card divide>
+    <SettingsSection title="Account">
       <ClaudeSignIn billing={billing} onChanged={onChanged} />
       {showKey && (
         <ApiKeyDisclosure open={keyOpen} onToggle={() => setKeyOpen((v) => !v)}>
           <ApiKeyBody billing={billing} onChanged={onChanged} />
         </ApiKeyDisclosure>
       )}
-    </Card>
+    </SettingsSection>
   )
 }
 
@@ -405,14 +402,14 @@ function ClaudeSignIn({ billing, onChanged }: { billing: BillingState | null; on
   return (
     <>
       {billing?.verdict?.apiKeyTrap && (
-        <div className="mx-4 mt-3 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[12px] text-text-muted">
+        <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[12px] text-text-muted">
           An API key in your environment is shadowing your subscription, so turns are billing at API rates.
           Remove it from your shell, or choose API billing below to make it deliberate.
         </div>
       )}
       <SettingsRow
         label="Claude subscription"
-        description="Bills against your Pro or Max plan. This is the default, free at the point of use. Sign in once; the login is shared with the bundled engine."
+        description="Bill your turns against your Pro or Max plan, free at the point of use."
         control={
           phase === 'awaiting-code' ? (
             <BusyText className="text-[13px] text-text-muted">Waiting for the code…</BusyText>
@@ -426,7 +423,7 @@ function ClaudeSignIn({ billing, onChanged }: { billing: BillingState | null; on
         }
       />
       {phase === 'awaiting-code' && (
-        <div className="space-y-2.5 px-4 pb-4">
+        <div className="space-y-2.5 pb-4">
           <p className="text-[12.5px] leading-snug text-text-muted">
             A browser opened for you to approve. Copy the code it shows and paste it here.{' '}
             <a href={url} target="_blank" rel="noreferrer" className="text-accent hover:underline">
@@ -451,7 +448,7 @@ function ClaudeSignIn({ billing, onChanged }: { billing: BillingState | null; on
           </div>
         </div>
       )}
-      {phase === 'failed' && msg && <div className="px-4 pb-3 text-[12px] text-red-500">{msg}</div>}
+      {phase === 'failed' && msg && <div className="pb-3 text-[12px] text-red-500">{msg}</div>}
     </>
   )
 }
@@ -466,9 +463,9 @@ const BILLING_MODE_OPTIONS: { value: BillingMode; label: string; title: string }
 
 const MODE_BLURB: Record<BillingMode, string> = {
   subscription:
-    'Your key is stored but unused. Turns bill your plan and stop when you hit its limit.',
-  auto: 'Turns bill your plan. When you hit the limit, Koda asks once, then continues on your API key until your plan resets.',
-  api: 'Every turn bills your Anthropic API account: real per-token dollars, no plan window. Track it under Usage.',
+    'Your key is stored but unused, so turns bill your plan and stop when you hit its limit.',
+  auto: 'Turns bill your plan until you hit the limit, then Koda asks once and continues on your key until the plan resets.',
+  api: 'Every turn bills your Anthropic API account in real per-token dollars, with no plan window.',
 }
 
 /** Paste / replace / remove the BYO API key, and — once a key is stored — choose WHEN it's used
@@ -525,32 +522,27 @@ function ApiKeyBody({ billing, onChanged }: { billing: BillingState | null; onCh
     <>
       {hasKey ? (
         <>
-          {/* Row + its warning live in one band so the divider sits below the pair, not crashing into
-              the inset amber box. */}
-          <div>
-            <SettingsRow
-              label="When to use your API key"
-              description={MODE_BLURB[mode]}
-              control={
-                <SegmentedControl
-                  ariaLabel="When to use your API key"
-                  value={mode}
-                  options={BILLING_MODE_OPTIONS}
-                  onChange={(v) => changeMode(v as BillingMode)}
-                />
-              }
-            />
+          <SettingsRow
+            label="When to use your API key"
+            description={MODE_BLURB[mode]}
+            control={
+              <SegmentedControl
+                ariaLabel="When to use your API key"
+                value={mode}
+                options={BILLING_MODE_OPTIONS}
+                onChange={(v) => changeMode(v as BillingMode)}
+              />
+            }
+          >
             {mode === 'api' && (
-              <div className="px-4 pb-4 text-[12px] text-text-muted">
-                <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2">
-                  “Always” spends real money on your Anthropic account on every turn, until you change it.
-                </div>
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[12px] text-text-muted">
+                “Always” spends real money on your Anthropic account on every turn, until you change it.
               </div>
             )}
-          </div>
+          </SettingsRow>
           <SettingsRow
             label="Stored key"
-            description="Saved encrypted on this Mac. Never leaves your machine except as the engine’s credential."
+            description="Kept encrypted on this Mac and handed to the engine as its credential, never anywhere else."
             control={
               <div className="flex items-center gap-2">
                 <Button variant="secondary" onClick={() => setReplacing(true)}>Replace</Button>
@@ -560,14 +552,14 @@ function ApiKeyBody({ billing, onChanged }: { billing: BillingState | null; onCh
           />
         </>
       ) : (
-        <div className="px-4 pt-3.5 text-[12.5px] leading-snug text-text-muted">
-          Spend your own Anthropic API credits instead of your subscription. Pay per token, with no 5-hour
-          or weekly plan limit. Create a key at console.anthropic.com. After saving, choose whether to use it
-          only past your plan limit or always.
-        </div>
+        <SettingsNote>
+          Spend your own Anthropic API credits instead of your subscription, per token and with no 5-hour
+          or weekly plan limit. Create a key at console.anthropic.com, and after saving choose whether it
+          runs only past your plan limit or always.
+        </SettingsNote>
       )}
       <Collapse open={showInput}>
-        <div className="space-y-2.5 px-4 pb-4 pt-3">
+        <div className="space-y-2.5 pb-4">
           <div className="flex items-center gap-2">
             <input
               type="password"
@@ -599,7 +591,7 @@ function ApiKeyBody({ billing, onChanged }: { billing: BillingState | null; onCh
 // ── OpenAI (Codex) ────────────────────────────────────────────────────────────────────
 /** The OpenAI account card: ChatGPT-plan sign-in on top, the BYO-key path folded into a disclosure below.
  *  Mirrors the Claude card; the key path is always available (either credential can drive Codex). */
-function OpenAiAccountCard({
+function OpenAiAccount({
   auth,
   billing,
   onChangedAuth,
@@ -617,12 +609,12 @@ function OpenAiAccountCard({
   }, [codexApiActive])
 
   return (
-    <Card divide>
+    <SettingsSection title="Account">
       <OpenAiSignIn auth={auth} onChanged={onChangedAuth} />
       <ApiKeyDisclosure open={keyOpen} onToggle={() => setKeyOpen((v) => !v)}>
         <OpenAiApiKeyBody billing={billing} onChanged={onChangedBilling} />
       </ApiKeyDisclosure>
-    </Card>
+    </SettingsSection>
   )
 }
 
@@ -682,7 +674,7 @@ function OpenAiSignIn({
     <>
       <SettingsRow
         label="ChatGPT plan"
-        description="Bills OpenAI's Codex engine against your ChatGPT plan. Pick an OpenAI model from the model menu to use it."
+        description="Bill Codex against your ChatGPT plan, then pick an OpenAI model from the model menu to use it."
         control={
           phase === 'awaiting-browser' ? (
             <BusyText className="text-[13px] text-text-muted">Waiting for the browser…</BusyText>
@@ -696,12 +688,12 @@ function OpenAiSignIn({
         }
       />
       {inFlight && (
-        <div className="space-y-2.5 px-4 pb-4">
+        <div className="space-y-2.5 pb-4">
           <p className="text-[12.5px] leading-snug text-text-muted">
             {phase === 'awaiting-browser' ? (
               <>
-                A browser opened to sign in to ChatGPT. Approve there and this finishes on its own —
-                nothing to paste back.{' '}
+                A browser opened to sign in to ChatGPT. Approve there and this finishes on its own,
+                with nothing to paste back.{' '}
                 <a href={url} target="_blank" rel="noreferrer" className="text-accent hover:underline">
                   Reopen the page
                 </a>
@@ -719,17 +711,17 @@ function OpenAiSignIn({
         </div>
       )}
       {phase === 'idle' && checkFailed && (
-        <div className="px-4 pb-3.5 pt-0.5 text-[12.5px] leading-snug text-text-muted">
+        <SettingsNote>
           Koda couldn’t check the current ChatGPT sign-in. Your account may still be connected.
-        </div>
+        </SettingsNote>
       )}
       {phase === 'idle' && auth && !signedIn && !checkFailed && (
-        <div className="px-4 pb-3.5 pt-0.5 text-[12.5px] leading-snug text-text-muted">
-          Sign in with your ChatGPT plan to use OpenAI models. Koda reads the login — it never stores your
+        <SettingsNote>
+          Sign in with your ChatGPT plan to use OpenAI models. Koda reads that login and never stores your
           OpenAI credentials.
-        </div>
+        </SettingsNote>
       )}
-      {phase === 'failed' && msg && <div className="px-4 pb-3 text-[12px] text-red-500">{msg}</div>}
+      {phase === 'failed' && msg && <div className="pb-3 text-[12px] text-red-500">{msg}</div>}
     </>
   )
 }
@@ -792,34 +784,31 @@ function OpenAiApiKeyBody({ billing, onChanged }: { billing: BillingState | null
     <>
       {hasKey ? (
         <>
-          <div>
-            <SettingsRow
-              label="Bill Codex to"
-              description={
-                mode === 'api'
-                  ? 'Every Codex turn bills your OpenAI API account: real per-token dollars, no plan window.'
-                  : 'Your key is stored but unused. Codex bills your ChatGPT plan.'
-              }
-              control={
-                <SegmentedControl
-                  ariaLabel="Bill Codex to"
-                  value={mode}
-                  options={CODEX_MODE_OPTIONS}
-                  onChange={(v) => changeMode(v as CodexBillingMode)}
-                />
-              }
-            />
+          <SettingsRow
+            label="Bill Codex to"
+            description={
+              mode === 'api'
+                ? 'Every Codex turn bills your OpenAI API account in real per-token dollars, with no plan window.'
+                : 'Your key is stored but unused, so Codex bills your ChatGPT plan.'
+            }
+            control={
+              <SegmentedControl
+                ariaLabel="Bill Codex to"
+                value={mode}
+                options={CODEX_MODE_OPTIONS}
+                onChange={(v) => changeMode(v as CodexBillingMode)}
+              />
+            }
+          >
             {mode === 'api' && (
-              <div className="px-4 pb-4 text-[12px] text-text-muted">
-                <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2">
-                  “API key” spends real money on your OpenAI account on every Codex turn, until you change it.
-                </div>
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[12px] text-text-muted">
+                “API key” spends real money on your OpenAI account on every Codex turn, until you change it.
               </div>
             )}
-          </div>
+          </SettingsRow>
           <SettingsRow
             label="Stored key"
-            description="Saved encrypted on this Mac. Written into Codex’s login; never leaves your machine otherwise."
+            description="Kept encrypted on this Mac and written into Codex’s own login, never anywhere else."
             control={
               <div className="flex items-center gap-2">
                 <Button variant="secondary" onClick={() => setReplacing(true)}>Replace</Button>
@@ -829,13 +818,13 @@ function OpenAiApiKeyBody({ billing, onChanged }: { billing: BillingState | null
           />
         </>
       ) : (
-        <div className="px-4 pt-3.5 text-[12.5px] leading-snug text-text-muted">
-          Spend your own OpenAI API credits instead of a ChatGPT plan. Pay per token, with no plan limit.
-          Create a key at platform.openai.com. Saving switches Codex to bill your API key.
-        </div>
+        <SettingsNote>
+          Spend your own OpenAI API credits instead of a ChatGPT plan, per token and with no plan limit.
+          Create a key at platform.openai.com, and saving it switches Codex to bill that key.
+        </SettingsNote>
       )}
       <Collapse open={showInput}>
-        <div className="space-y-2.5 px-4 pb-4 pt-3">
+        <div className="space-y-2.5 pb-4">
           <div className="flex items-center gap-2">
             <input
               type="password"
@@ -897,38 +886,32 @@ function codexStatusOf(auth: CodexAuthStatus | null, billing: BillingState | nul
 
 // Attribute a recorded model id to its provider so the persisted history (a flat model→spend map) can be
 // split per tab. Claude reports `claude-*` ids or, rarely, a bare Claude alias; every other id is Codex.
-// A two-brand heuristic, NOT a model-version assertion — extend the Claude set when a third engine lands.
-const CLAUDE_ALIASES = new Set(['opus', 'sonnet', 'haiku', 'fable', 'opusplan', 'default', 'best'])
-function engineOfModel(id: string): 'claude' | 'codex' {
-  const low = id.toLowerCase()
-  return low.startsWith('claude-') || CLAUDE_ALIASES.has(low) ? 'claude' : 'codex'
-}
-
-// ── Usage history (cross-engine daily rollup) ─────────────────────────────────────────
-// The one usage card that spans both providers — daily estimated $ over the last two weeks, segmented
-// by engine when more than one ran. Per-provider plan windows + spend live in each provider's own block
-// above (EngineUsage). NO precise plan % anywhere — that needs the OAuth usage endpoint, which the ToS
-// bars; Anthropic's plan limits / usage credits do the actual capping, this is a read-only mirror.
-function HistorySection({
-  history,
-  multi,
-  apiActive,
-}: {
-  history: UsageHistoryDay[]
-  multi: boolean
-  apiActive: boolean
-}) {
-  const recent = history.slice(0, 14)
-  const max = Math.max(...recent.map((d) => d.costUsd), 0)
+// ── Usage history (cross-engine daily chart) ──────────────────────────────────────────
+// The one usage card that spans both providers — the last two weeks of measured daily usage, read as
+// dollars or as tokens, segmented by engine when more than one ran. Per-provider plan windows + totals
+// live in each provider's own block above (EngineUsage). NO precise plan % anywhere — that needs the
+// OAuth usage endpoint, which the ToS bars; Anthropic's plan limits / usage credits do the actual
+// capping, this is a read-only mirror.
+function HistorySection({ value, apiActive }: { value: UsageValue; apiActive: boolean }) {
+  const recent = value.daily.slice(-14)
+  const engines = [...new Set(recent.flatMap((d) => d.byEngine.map((e) => e.engineId)))]
+  const anyUnpriced = Object.values(value.byEngine).some((e) => !e.priced && e.totalTokens > 0)
   return (
-    <SettingsSection title="History">
-      {recent.map((d) => (
-        <HistoryRow key={d.date} day={d} max={max} multi={multi} />
-      ))}
-      <div className="px-4 pb-3 pt-1 text-[12px] leading-snug text-text-muted">
-        Daily usage over the last two weeks{multi ? ', split by engine' : ''}.{' '}
-        {apiActive ? 'Anthropic turns show real billed amounts.' : 'Estimated value — your plan covers it.'}
-      </div>
+    <SettingsSection
+      title="History"
+      note={
+        <>
+          Every figure is measured: the tokens each turn actually used, and what the engine billed for
+          them.{' '}
+          {apiActive
+            ? 'Anthropic turns show real billed amounts.'
+            : 'Your plan covers this, so nothing here is charged to you.'}
+          {anyUnpriced &&
+            ' A provider Koda has no published price for appears in tokens and stays out of the money view.'}
+        </>
+      }
+    >
+      <UsageChart daily={recent} engines={engines} />
     </SettingsSection>
   )
 }
@@ -940,16 +923,15 @@ function EngineUsage({
   title,
   engineId,
   windows,
-  spend,
-  byModel,
+  value,
   showPlanLimits,
   apiActive,
 }: {
   title: string
-  engineId: EngineId | string
+  engineId: EngineId
   windows: Record<string, RateLimitInfo>
-  spend: number
-  byModel: Record<string, ModelSpend>
+  /** Absent until this engine has recorded a turn — the card then shows plan windows only. */
+  value?: EngineValue
   showPlanLimits: boolean
   apiActive: boolean
 }) {
@@ -962,138 +944,151 @@ function EngineUsage({
   const five = liveWindows['five_hour']
   // Claude's stream names the weekly cap 'seven_day'; Codex names it 'weekly'. Same row.
   const weekly = liveWindows['weekly'] ?? liveWindows['seven_day']
-  const models = Object.entries(byModel).sort((a, b) => b[1].costUsd - a[1].costUsd)
-  // Anchor the 5-hour row for Anthropic (always-present empty state); for any other engine only show a
-  // window once it actually reports one (never fabricate a gauge we can't see).
-  const anchorFiveHour = engineId === 'claude'
+  // Anchor the 5-hour row for an engine whose plan always has one (always-present empty state); for
+  // any other engine only show a window once it actually reports one (never fabricate a gauge).
+  const anchorFiveHour = engineCapabilities(engineId).anchorsFiveHourWindow
   return (
-    <SettingsSection title={title}>
+    <SettingsSection
+      title={title}
+      note={
+        showPlanLimits
+          ? 'These are your subscription usage windows as the engine reports them, so the provider’s own side enforces the exact limit.'
+          : 'Per-token spend as the engine reports it, while your real invoice lives in the provider’s console.'
+      }
+    >
       {showPlanLimits && (anchorFiveHour || five) && <PlanWindowRow label="5-hour limit" info={five} />}
       {showPlanLimits && weekly && <PlanWindowRow label="Weekly limit" info={weekly} />}
-      {spend > 0 && (
-        <SettingsRow
-          label="Estimated spend"
-          description={
-            apiActive
-              ? 'Billed to your API account across your recent usage.'
-              : 'What your recent turns would cost on the API. Your plan covers it.'
-          }
-          control={<span className="font-mono text-[13px] text-text">{fmtUsd(spend)}</span>}
-        />
-      )}
-      {models.map(([model, m]) => (
-        <ModelUsageRow key={model} model={model} spend={m} />
-      ))}
-      <div className="px-4 pb-3 pt-1 text-[12px] leading-snug text-text-muted">
-        {showPlanLimits
-          ? 'These are your subscription usage windows as the engine reports them, so they are approximate. The exact limit is enforced on the provider’s side.'
-          : 'Per-token spend from the engine. Your real invoice lives in the provider’s console.'}
-      </div>
+      {value && <EngineUsageBody value={value} apiActive={apiActive} />}
     </SettingsSection>
   )
 }
 
-/** One day in the usage history: date + turns + cost, with a bar sized against the busiest day in the
- *  window so the "where did my month go" shape reads at a glance. When more than one engine ran AND the
- *  day carries an engine split, the bar is segmented (Anthropic accent + OpenAI emerald) so two
- *  subscriptions' dollars don't read as one. */
-function HistoryRow({ day, max, multi }: { day: UsageHistoryDay; max: number; multi: boolean }) {
-  const pct = max > 0 ? Math.max(2, Math.round((day.costUsd / max) * 100)) : 0
-  // Engine split for the colored portion: include even a single engine (so a Codex-only day reads in
-  // OpenAI's color, not Anthropic's). Segment widths are relative to the split's OWN total, so they
-  // always fill the bar — a legacy day whose byEngine sum is below costUsd (turns recorded before
-  // engine-tagging) won't leave a gap.
-  const split =
-    multi && day.byEngine
-      ? Object.entries(day.byEngine)
-          .filter(([, c]) => c > 0)
-          .sort((a, b) => engineOrder(a[0]) - engineOrder(b[0]))
-      : null
-  const splitTotal = split ? split.reduce((sum, [, c]) => sum + c, 0) : 0
+/** The exact rendered usage body, kept stateless so the published-price invariant can be asserted in
+ *  the ordinary Node test lane without a second browser harness. */
+export function EngineUsageBody({ value, apiActive }: { value: EngineValue; apiActive: boolean }) {
   return (
-    <div className="px-4 py-3">
-      <div className="flex items-center justify-between gap-6">
-        <div className="text-[13.5px] font-medium text-text">{fmtDay(day.date)}</div>
-        <div className="flex items-center gap-3 text-[12.5px] text-text-muted">
-          <span>{day.turns === 1 ? '1 turn' : `${day.turns} turns`}</span>
-          <span className="font-mono text-[13px] text-text">{fmtUsd(day.costUsd)}</span>
-        </div>
+    <>
+      <ValueHeadline value={value} apiActive={apiActive} />
+      {value.models.map((model) => (
+        <ModelUsageRow key={model.model} model={model} />
+      ))}
+    </>
+  )
+}
+
+/**
+ * What this engine's usage is worth, as three measured facts side by side: the total at full API rate,
+ * what the cache took off that total, and the same total divided by the days you actually ran turns.
+ *
+ * The headline is the engine's own per-turn cost summed — the number the provider would have billed at
+ * published rates — so on a subscription it reads as the value the plan absorbed. The cache line is the
+ * one derived figure: measured cache tokens priced at the published input rate against what those same
+ * tokens would have cost uncached. Neither is a forecast, and per-active-day divides by days that
+ * happened, never by a calendar span (which would quietly halve the number over a quiet week).
+ */
+function ValueHeadline({ value, apiActive }: { value: EngineValue; apiActive: boolean }) {
+  const saved = value.priced ? value.cacheSavingsUsd : null
+  // `value.priced`, never a recorded cost: the Codex driver reports a cost estimate the tracker stores
+  // faithfully, so a cost-based branch would print dollars for a provider we have no published rate
+  // for. Unpriced ⇒ the whole card is tokens, headline and average alike.
+  const priced = value.priced
+  return (
+    <div className="py-4">
+      <div className="text-[11px] font-medium uppercase tracking-wider text-text-muted">
+        {priced ? (apiActive ? 'Billed to your API account' : 'At full API rate') : 'Tokens used'}
       </div>
-      <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-border/60">
-        <div className="flex h-full gap-px" style={{ width: `${pct}%` }}>
-          {split && splitTotal > 0 ? (
-            split.map(([eid, c]) => (
-              <div
-                key={eid}
-                className={`h-full ${engineAccent(eid)}`}
-                style={{ width: `${(c / splitTotal) * 100}%` }}
-                title={`${engineLabel(eid)}: ${fmtUsd(c)}`}
-              />
-            ))
-          ) : (
-            <div className="h-full w-full bg-accent/70" />
-          )}
-        </div>
+      <div className="mt-1 flex flex-wrap items-baseline gap-x-6 gap-y-1">
+        {/* This value also appears in a model row, so the rendered-price guard needs to identify the
+            headline rather than pass because the same number appeared somewhere else. */}
+        <span
+          data-testid="usage-headline"
+          className="font-mono text-[30px] font-semibold leading-none text-text"
+        >
+          {/* pricedCostUsd, not costUsd: on an engine that mixed a citable model with an alias we
+              cannot price, the recorded total carries money this card must not put a dollar on. */}
+          {priced ? fmtUsd(value.pricedCostUsd) : `${fmtTokens(value.totalTokens)} tokens`}
+        </span>
+        {saved != null && saved !== 0 && (
+          <span className="text-[12.5px] text-text-muted">
+            {saved > 0 ? (
+              <>
+                Caching kept{' '}
+                <span className="font-mono text-text">{fmtUsd(saved)}</span> off that
+              </>
+            ) : (
+              <>
+                Cache writes added{' '}
+                <span className="font-mono text-text">{fmtUsd(-saved)}</span> to that
+              </>
+            )}
+          </span>
+        )}
+      </div>
+      <div className="mt-2 text-[12.5px] leading-snug text-text-muted">
+        {priced ? (
+          <>
+            <span className="font-mono text-text">{fmtUsd(value.pricedCostPerActiveDayUsd)}</span> and{' '}
+            <span className="font-mono text-text">{fmtTokens(value.tokensPerActiveDay)}</span> tokens
+            on a day you use it, across{' '}
+            {value.activeDays === 1 ? '1 such day' : `${value.activeDays} such days`}.
+          </>
+        ) : (
+          <>
+            <span className="font-mono text-text">{fmtTokens(value.tokensPerActiveDay)}</span> tokens
+            on a day you use it, across{' '}
+            {value.activeDays === 1 ? '1 such day' : `${value.activeDays} such days`}. This provider
+            reports no per-turn price, so Koda shows what it counted rather than a rate it made up.
+          </>
+        )}
       </div>
     </div>
   )
 }
 
-/** Local `YYYY-MM-DD` → "Today" / "Yesterday" / "Mon, Jun 23". */
-function fmtDay(date: string): string {
-  const iso = (d: Date) =>
-    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-  const today = new Date()
-  if (date === iso(today)) return 'Today'
-  const yesterday = new Date(today)
-  yesterday.setDate(today.getDate() - 1)
-  if (date === iso(yesterday)) return 'Yesterday'
-  const [y, m, d] = date.split('-').map(Number)
-  if (!y || !m || !d) return date
-  return new Date(y, m - 1, d).toLocaleDateString(undefined, {
-    weekday: 'short',
-    month: 'short',
-    day: 'numeric',
-  })
-}
-
-/** One model's accumulated cost + token split. The description calls out the cache share — the single
- *  most useful token fact (cache reads dominate counts and cost a fraction of fresh input). */
-function ModelUsageRow({ model, spend }: { model: string; spend: ModelSpend }) {
-  const promptTokens = spend.inputTokens + spend.cacheReadTokens + spend.cacheCreationTokens
-  const cachedPct = promptTokens > 0 ? Math.round((spend.cacheReadTokens / promptTokens) * 100) : null
-  const parts = [`${fmtTokens(spend.inputTokens)} in`, `${fmtTokens(spend.outputTokens)} out`]
+/**
+ * One model's measured cost, its share of this engine's spend, and its token split. The share bar is
+ * the "which model is eating the plan" answer at a glance; the description calls out the cache share,
+ * the single most useful token fact (cache reads dominate counts and cost a fraction of fresh input).
+ * A model Koda has no published rate for shows its tokens and says so, rather than a made-up dollar.
+ */
+function ModelUsageRow({ model }: { model: ModelValue }) {
+  const promptTokens = model.inputTokens + model.cacheReadTokens + model.cacheCreationTokens
+  const cachedPct = promptTokens > 0 ? Math.round((model.cacheReadTokens / promptTokens) * 100) : null
+  const parts = [`${fmtTokens(model.inputTokens)} in`, `${fmtTokens(model.outputTokens)} out`]
   if (cachedPct !== null) parts.push(`${cachedPct}% cached`)
+  const sharePct = Math.round(model.costShare * 100)
   return (
     <SettingsRow
-      label={prettyModel(model)}
-      description={parts.join(' · ')}
-      control={<span className="font-mono text-[13px] text-text">{fmtUsd(spend.costUsd)}</span>}
+      label={prettyModel(model.model)}
+      description={
+        <>
+          <span>{parts.join(' · ')}</span>
+          {/* Share is a share OF SPEND, so it only exists where spend does — `priced`, not a recorded
+              cost the engine estimated for a model we refuse to price. */}
+          {model.priced && (
+            <span className="mt-1.5 flex items-center gap-2">
+              <span className="h-1 w-24 overflow-hidden rounded-full bg-border/60">
+                <span
+                  className="block h-full rounded-full bg-accent/70"
+                  style={{ width: `${Math.max(2, sharePct)}%` }}
+                />
+              </span>
+              <span>{sharePct}% of spend</span>
+            </span>
+          )}
+        </>
+      }
+      control={
+        <span className="font-mono text-[13px] text-text">
+          {model.priced ? (
+            fmtUsd(model.costUsd)
+          ) : (
+            <span className="text-text-muted">{fmtTokens(model.totalTokens)} tokens</span>
+          )}
+        </span>
+      }
     />
   )
-}
-
-/** Engine model id → a friendly label for non-engineers, derived generically (never a hardcoded
- *  lookup — the no-model-names rule). `claude-opus-4-8[1m]` → "Opus 4.8 · 1M context";
- *  `claude-haiku-4-5-20251001` → "Haiku 4.5". Falls back to the raw id if it doesn't parse. */
-function prettyModel(id: string): string {
-  const ctx = /\[(\d+)m\]$/i.exec(id)?.[1]
-  const stripped = id
-    .replace(/^claude-/, '')
-    .replace(/\[\d+m\]$/i, '')
-    .replace(/-\d{6,}$/, '') // trailing date stamp
-  const [family, ...rest] = stripped.split('-')
-  if (!family) return id
-  const cap = (w: string) => w.charAt(0).toUpperCase() + w.slice(1)
-  const label = rest.length ? `${cap(family)} ${rest.join('.')}` : cap(family)
-  return ctx ? `${label} · ${ctx}M context` : label
-}
-
-/** Compact token count: 1.2K / 3.4M. */
-function fmtTokens(n: number): string {
-  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`
-  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`
-  return String(n)
 }
 
 /** One subscription window — the exact `usedPercent` when the engine reports one (a measured fill),
@@ -1131,11 +1126,6 @@ function PlanWindowRow({ label, info }: { label: string; info?: RateLimitInfo })
   )
 }
 
-/** USD with cents — small amounts still read as a number, not "$0". */
-function fmtUsd(n: number): string {
-  return `$${n.toFixed(n < 1 ? 4 : 2)}`
-}
-
 /** Absolute reset time; includes the weekday when it's not today. */
 function fmtReset(resetsAt: number): string {
   const d = new Date(resetsAt * 1000)
@@ -1169,12 +1159,16 @@ function AppKeyAccess({ hasKey }: { hasKey: boolean }) {
   }
 
   return (
-    <SettingsSection title="App AI calls">
-      <div className="px-4 py-3 text-[12.5px] leading-snug text-text-muted">
-        An app with AI built into its own screens pays for those calls with your API key, never your
-        subscription. Each app needs your permission first.
-        {!hasKey && ' No API key is connected yet, so allowed apps still can’t call until you add one above.'}
-      </div>
+    <SettingsSection
+      title="App AI calls"
+      note={
+        <>
+          An app with AI built into its own screens pays for those calls with your API key rather than
+          your subscription, and each app needs your permission first.
+          {!hasKey && ' No API key is connected yet, so an allowed app still can’t call until you add one above.'}
+        </>
+      }
+    >
       {apps.map((a) => (
         <SettingsRow
           key={a.dir}
@@ -1182,7 +1176,7 @@ function AppKeyAccess({ hasKey }: { hasKey: boolean }) {
           description={
             a.spend.usd > 0
               ? `${fmtUsd(a.spend.usd)} so far · ${a.spend.inputTokens.toLocaleString()} in / ${a.spend.outputTokens.toLocaleString()} out`
-              : 'No AI calls yet'
+              : 'No AI calls yet.'
           }
           control={
             <Toggle

@@ -25,10 +25,13 @@ export function AppearanceSection() {
   const resetLayout = useWorkspace((s) => s.resetLayout)
   return (
     <>
-      <SettingsSection title="Theme">
+      <SettingsSection
+        title="Theme"
+        note="Koda keeps a light pack and a dark pack, and switches between them with the mode."
+      >
         <SettingsRow
           label="Appearance"
-          description="Light, dark, or follow your Mac's system setting."
+          description="Follow your Mac's system setting, or pin Koda to light or dark."
           control={
             <SegmentedControl
               ariaLabel="Theme"
@@ -40,7 +43,7 @@ export function AppearanceSection() {
         />
         <SettingsRow
           label="Light theme"
-          description="The pack used in light mode."
+          description="The appearance pack Koda uses whenever it is in light mode."
           control={
             <ThemeSelect
               ariaLabel="Light theme"
@@ -52,7 +55,7 @@ export function AppearanceSection() {
         />
         <SettingsRow
           label="Dark theme"
-          description="The pack used in dark mode."
+          description="The appearance pack Koda uses whenever it is in dark mode."
           control={
             <ThemeSelect
               ariaLabel="Dark theme"
@@ -64,10 +67,13 @@ export function AppearanceSection() {
         />
       </SettingsSection>
 
-      <SettingsSection title="Text size">
+      <SettingsSection
+        title="Text size"
+        note="The conversation stays a touch denser than documents at every size."
+      >
         <SettingsRow
           label="Reading text size"
-          description="Scales the text in conversations and documents. The conversation stays a touch denser than documents by design."
+          description="Scale the text in conversations and documents together."
           control={
             <SegmentedControl
               ariaLabel="Text size"
@@ -82,7 +88,7 @@ export function AppearanceSection() {
       <SettingsSection title="Layout">
         <SettingsRow
           label="Reset to default layout"
-          description="Restore the sidebar, the Sessions/Files split, and the conversation and preview panes to their default sizes."
+          description="Put the sidebar, the Sessions and Files split, and the conversation and preview panes back to their default sizes."
           control={<Button variant="secondary" onClick={resetLayout}>Reset</Button>}
         />
       </SettingsSection>

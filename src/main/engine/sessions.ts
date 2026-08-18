@@ -10,36 +10,50 @@
  * checkpoint. The manager is where the gate's deps (safety-git checkpoint, renderer
  * push) are injected, and where the broker's lifecycle is tied to a session's.
  */
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import { basename, relative } from 'node:path'
 import { app, BrowserWindow } from 'electron'
 import { IpcChannels } from '@shared/channels'
 import {
   EngineEventSchema,
+  TaskCompletionStateSchema,
   ApprovalRequestSchema,
   ApprovalCancelledSchema,
   ApprovalResolvedSchema,
   AsideEventSchema,
   type EngineEvent,
+  type TaskCompletionState,
   type ApprovalMode,
   type ApprovalRequest,
   type ToolDecision,
   type PersistedSessions,
   type EngineId,
+  type ResumeCursor,
   type CodexModel,
   type CodexAuthStatus,
+  type ProviderModelCatalogs,
   type AdoptedHeadlessSession,
+  type SessionCapabilitySnapshot,
   type ReplayEntry,
   type RateLimitInfo,
+  type RemoteTerminalAttention,
   type RemoteUsageSnapshot,
+  type RemoteTurnReceipt,
+  type AttachmentProvenance,
   IMAGE_DETAIL_CAPS,
+  MAX_DURABLE_TURN_ATTACHMENT_BASE64_CHARS,
+  TURN_REJECTED_STOP_REASON,
   attachedFilesNote,
+  stripRawEnvelope,
 } from '@shared/ipc'
+import { engineCapabilities } from '@shared/engine-capabilities'
+import { providerModelCatalogs } from '@shared/model-catalog'
+import { engineProfile } from './profile'
 import { startClaudeSession, type EngineSession, type SessionOpts, type TurnImage } from './adapter'
-import { startCodexSession } from './codex-driver'
-import { ensureCodexHome, reconcileCodexAuth } from './codex-home'
-import { assembleGuardrailText, resolveStagingPack } from './pack'
+import { codexThreadId, startCodexSession } from './codex-driver'
+import { codexSkillConfig, ensureCodexHome, reconcileCodexAuth } from './codex-home'
+import { assembleGuardrailText, kodaPlaybooksExpected, resolveDeepReviewPlugin, resolveStagingPack } from './pack'
 import { getCodexAuthStatus, listCodexModels } from './codex-auth'
 import { askCodexSideQuestion, askSideQuestion, type SideQuestionHandle } from './side-question'
 import { WorkflowWatcher } from './workflow-watch'
@@ -49,38 +63,67 @@ import {
   detectRepo,
   diffTextOf,
   getStatus,
+  type ChangeEvidence,
+  type StatusResult,
   getSyncState,
   getVersionList,
   pushToRemote,
   restoreVersion,
   UserGitError,
+  completionGitSnapshot,
 } from '../user-git'
+import {
+  reconcileCompletionState,
+  type CompletionTurnBoundary,
+  type CompletionUncertainty,
+} from '../completion-state'
 import { browseDir, containedReal, docExcerpt, listProjectDocs, readProjectFile, readProjectImage, writeProjectFile } from '../fs-browse'
 import { installApp, startApp, stopApp, appStatus, projectHasMiniApp } from '../mini-apps'
+import { keepDocument } from '../keep-document'
 import { encodeWebp } from '../backup/webp'
 import { noteRateLimit } from './usage-reset-notifier'
 import { authoritativeUsageTypes, pollAccountUsage } from './usage-poll'
+import { isE2EProfile, isHermeticE2EProfile, requireRealAccountAccess } from '../runtime-profile'
 import { noteProviderError, noteTurnOk } from './status-watch'
 import { friendlyEngineError } from '@shared/engine-error'
+import { compactTranscriptToolOutput } from '@shared/tool-output'
 import {
   isTopLevelTurnActivity,
   mergeReplayIntoTranscript,
   normalizeReplaySequence,
   settleRestoredDelegationReplay,
   settleRestoredTranscriptItems,
+  terminalAttentionKind,
+  terminalAttentionRevision,
   transcriptFromReplay,
 } from '@shared/delegation'
 import { reconcileRateLimitWindows } from '@shared/rate-limits'
 import { track } from '../telemetry'
 import { resolveGlobalSkillsPlugin } from './skills-catalog'
+import { projectSkillCollisionNames } from '../project-skills'
 import { noteMomentCheckpoint } from '../backup'
 import { publishNeuralEvent } from '../neural-view'
 import { ensureRepo } from '../safety-git/repo'
-import { checkpoint, checkpointKind, headSha, listCheckpoints, type Checkpoint } from '../safety-git/checkpoint'
+import {
+  checkpoint,
+  checkpointKind,
+  listCheckpoints,
+  readCheckpoint,
+  type Checkpoint,
+  type CheckpointResult,
+  type RequiredCheckpointFile,
+} from '../safety-git/checkpoint'
 import { restore } from '../safety-git/restore'
+import { restoreNotice } from '../safety-git/restore-notice'
 import { maintainStore } from '../safety-git/prune'
 import { humanizeCheckpointLabel, applyHumanizedLabels } from '../assist/labels'
-import { assistTitle } from '../assist'
+import { assistTitle, assistVersionMessage } from '../assist'
+import { deterministic, disambiguate } from '../assist/engine'
+import { generateSessionName, type GeneratedName, type NamingKind } from './naming'
+import { buildVersionMessagePrompt, generateVersionMessage, type VersionMessage } from './version-message'
+import { fallbackVersionMessage } from '@shared/version-message'
+import { isProvisionalSessionTitle, titleFromPrompt } from '@shared/session-title'
+import { engineAskRunner, type AskRunner } from '../library-ask'
 import { PermissionBroker, BROKER_TOKEN_ENV, SERVER_NAME as BROKER_NAME } from '../broker/server'
 import { ApprovalGate } from '../broker/gate'
 import { ensureTool } from '../runtime/provision'
@@ -94,9 +137,11 @@ import {
   saveLastPosture,
   loadCritiquePass,
   loadMiniAppsEnabled,
-  loadScratchRetentionDays,
+  loadSessionAgentRole,
+  loadSuggestVersionMessage,
+  loadTextGenerationModel,
 } from '../settings'
-import { saveScratchImage } from '../scratch'
+import { saveScratchWithRetention } from '../scratch-retention'
 import { getApiKey } from '../api-key'
 import {
   applyPlaywrightToMcpConfig,
@@ -107,11 +152,13 @@ import {
 import { startDevServer, captureWindowPreview, showStaticPreview, getSessionPreview, clearSessionPreview } from '../preview'
 import { showTerminal } from '../terminal'
 import { stopLanForward, stopAllLanForwards } from '../lan-forward'
+import { governProbe, type GovernedProbe } from '../probe-governor'
 import {
   archiveSession,
-  claudeConversationExists,
-  claudeConversationMtime,
-  readClaudeConversationReplay,
+  engineConversationExists,
+  engineConversationHasContent,
+  engineConversationMtime,
+  readEngineConversationReplay,
   loadProjectSessions,
   readPersistedSession,
   saveProjectSessions,
@@ -147,6 +194,14 @@ const BROKER_RECOVERY_WINDOW_MS = 5 * 60_000
 const USAGE_POLL_STARTUP_MS = 3_000
 const USAGE_POLL_INTERVAL_MS = 5 * 60_000
 const USAGE_POLL_MIN_GAP_MS = 60_000
+/** Interrupt discipline: stop delegated children before the parent turn, but never let one hold the
+ *  user's stop button. A child gets this long to confirm it ended… */
+const CHILD_STOP_TIMEOUT_MS = 3_000
+/** …and the whole sweep gets this long, however many children are live, before the parent is
+ *  interrupted anyway. Bounds carried from the T3 pattern (research doc, harness verdict). */
+const CHILD_STOP_TOTAL_MS = 10_000
+const REMOTE_ATTEMPT_HISTORY_PER_SESSION = 64
+const REMOTE_ATTACHMENT_PAYLOAD_SESSIONS = 16
 /** Stand-in session id on a poll-derived RateLimitUpdate. The windows are an ACCOUNT fact with no
  *  owning session; receivers key them by `rateLimitType` + the stamped engine, never by this id. */
 const ACCOUNT_USAGE_SESSION_ID = 'account-usage'
@@ -160,8 +215,118 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const BROKER_RESUME_NUDGE =
   "Koda's connection to its tools dropped for a moment and is now restored — any tool errors just above were from that, not real failures. Please pick up where you left off and finish what I was asking."
 
+/** Hash exact remote send material incrementally. The accepted-attempt ledger retains only this fixed
+ * digest, never a second text/base64 copy, while still making field boundaries and attachment order
+ * unambiguous. */
+function remoteTurnFingerprint(
+  text: string,
+  attachments?: readonly (TurnImage & { name?: string })[],
+): string {
+  const hash = createHash('sha256')
+  const update = (value: string): void => {
+    hash.update(String(Buffer.byteLength(value, 'utf8')))
+    hash.update(':')
+    hash.update(value, 'utf8')
+  }
+  update(text)
+  update(String(attachments?.length ?? 0))
+  for (const attachment of attachments ?? []) {
+    update(attachment.mediaType)
+    update(attachment.name === undefined ? '0' : '1')
+    if (attachment.name !== undefined) update(attachment.name)
+    update(attachment.dataBase64)
+  }
+  return hash.digest('hex')
+}
+
+/** Delegation lifecycle events mutate the persisted transcript independently of the parent turn. */
+function isDelegationLifecycleEvent(event: EngineEvent): boolean {
+  return (
+    event.type === 'SubagentStarted' ||
+    event.type === 'SubagentProgress' ||
+    event.type === 'SubagentCompleted' ||
+    event.type === 'WorkflowStarted' ||
+    event.type === 'WorkflowAgent' ||
+    event.type === 'WorkflowCompleted' ||
+    event.type === 'WorkflowObservationEnded'
+  )
+}
+
+/** Opaque scheduler finalization boundary. It keeps the tidy's completion turn open through its
+ * digest write and records Koda-observed overlap; it never authorizes destructive tree cleanup. */
+export interface ProjectMutationScope {
+  readonly cwd: string
+  readonly sessionId: string
+  readonly checkpointId: string
+}
+
+interface LiveProjectMutationScope extends ProjectMutationScope {
+  ambiguous: boolean
+  turnStarted: boolean
+}
+
+interface TurnAdmission {
+  /** Monotonic identity prevents a stopped predecessor from cancelling or releasing its successor. */
+  generation: number
+  cancelled: boolean
+}
+
+interface AcceptedTurn {
+  /** The admission generation that actually crossed the driver's synchronous acceptance boundary. */
+  generation: number
+  /** Stop belongs to the logical turn, not to whichever process incarnation currently carries it. */
+  cancelled: boolean
+  /** The exact warm process that accepted it; a respawn must never inherit an old Stop. */
+  session: EngineSession
+}
+
+type TurnAttachment = TurnImage & { name?: string }
+
+/** The human-owned half of a turn held across infrastructure recovery. `engineText` below may contain
+ * workflow context or scratch-file notes, so retry/replay identity must never be reconstructed from it. */
+interface PendingVisibleTurn {
+  text: string
+  attachments?: TurnAttachment[]
+  origin: 'local' | 'remote'
+  attemptId?: string
+  clientTurnId?: string
+}
+
+interface PendingTurn {
+  /** Exact text handed to the engine after workflow-result and document-path expansion. */
+  engineText: string
+  /** Only image/* attachments ride inline after document material has become scratch paths. */
+  inlineImages?: TurnAttachment[]
+  /** Untouched user payload and transport identity for replay/failure ownership. */
+  visible: PendingVisibleTurn
+}
+
+interface ProcessReplacementClaim {
+  /** One owner across every await from replacement intent through child installation. */
+  generation: number
+}
+
+interface AcceptedRemoteAttempt {
+  clientTurnId?: string
+  /** Fixed-size proof of immutable text + ordered exact attachment payload. */
+  fingerprint: string
+  state: 'running' | 'complete'
+}
+
+interface RemoteTurnPayload {
+  replaySeq?: number
+  attemptId?: string
+  clientTurnId?: string
+  attachments?: (TurnImage & { name?: string })[]
+  failed: boolean
+}
+
 export class EngineSessionManager {
   private readonly sessions = new Map<string, EngineSession>()
+  /** Exact process incarnation behind each installed session id. A bounded driver dispose can return
+   *  before its child emits `close`; the token keeps that stale callback from deleting a successor
+   *  process or unregistering the successor's freshly minted broker route. */
+  private readonly sessionGenerations = new Map<string, symbol>()
   /** sessionId → project dir. Outlives the session handle (kept until dispose) so
    *  recovery works even after the engine crashes — exactly when it's needed most. */
   private readonly projectDirs = new Map<string, string>()
@@ -179,6 +344,16 @@ export class EngineSessionManager {
    *  agent's context (a workflow the agent launched returns async, after its turn already ended). Keyed
    *  by sessionId; drained in sendTurn. Human-steered by design — no unprompted machine turn. */
   private readonly pendingWorkflowResults = new Map<string, string[]>()
+  /** sessionId → the notice a safety-git restore left for that session's NEXT turn. A restore moves the
+   *  working tree under a live conversation, which otherwise keeps editing files as it last read them.
+   *  Latest restore wins: only the last one describes what is actually on disk. Drained in sendTurn. */
+  private readonly pendingRestoreNotices = new Map<string, string>()
+  /** The exact notice text the running turn carried, set when the engine accepts a send. Delivery is
+   *  at-least-once by construction: the notice stays in `pendingRestoreNotices` — so every send and
+   *  every recovery resend re-injects it — and is discharged only by a genuine TurnComplete whose
+   *  armed text still matches pending. Failed turns need no handling; nothing was removed. A
+   *  duplicate re-read instruction is harmless; a silently lost one is the A1 bug. */
+  private readonly armedRestoreNotices = new Map<string, string>()
   /** In-flight side questions (btw/aside), keyed `${sessionId}:${asideId}` — so a dismiss can cancel
    *  the throwaway fork, and a session dispose can tear down any aside still streaming. */
   private readonly sideQuestions = new Map<string, SideQuestionHandle>()
@@ -186,20 +361,43 @@ export class EngineSessionManager {
    *  as a PINNED baseline so each edited file shows its cumulative change *this turn* — reading live
    *  HEAD instead would drift forward as later whole-tree checkpoints land (see fs-browse diffFile). */
   private readonly diffBaselines = new Map<string, string>()
+  /** One live turn's completion boundary. Safety-git owns the exact pre-turn tree; user-git records
+   *  which paths were already loose so a same-file edit can be labelled mixed instead of claimed. */
+  private readonly completionTurns = new Map<string, CompletionTurnBoundary>()
+  /** Sessions whose turn-boundary checkpoints overlapped before both CompletionTurn records existed.
+   *  This closes the small sendTurn race between `working.add` and the serialized baseline result. */
+  private readonly completionOverlaps = new Set<string>()
+  /** Session → paths a completed turn positively changed and that may still need task-specific
+   *  attention. Reconciled against user Git after every turn; unrelated aggregate dirt never enters. */
+  private readonly completionPaths = new Map<string, Map<string, { mixed: boolean }>>()
+  /** An evidence failure cannot evaporate on the next read-only turn. It stays attached to the session
+   * until a whole-project Git probe proves there is no loose work left to attribute. */
+  private readonly completionUncertainty = new Map<string, CompletionUncertainty>()
+  private readonly completionStates = new Map<string, TaskCompletionState>()
+  /** Scheduler-owned project passes that span an engine turn. They never hold checkpointChains while
+   *  the engine runs; noteProjectMutation + sendTurn turn-start detection mark competing ownership. */
+  private readonly projectMutationScopes = new Set<LiveProjectMutationScope>()
   /** sessionId → which engine drives it, so the daily usage rollup can attribute each turn to the right
    *  subscription (Anthropic vs OpenAI). Set at start, cleared on dispose. */
   private readonly sessionEngines = new Map<string, EngineId>()
-  /** sessionId → engine-native conversation id. Codex uses a thread id distinct from Koda's session id;
-   *  storing it main-side lets session-adjacent features such as aside fork the live Codex thread
-   *  without asking the renderer to echo private routing state back over IPC. */
-  private readonly engineNativeIds = new Map<string, string>()
-  /** A posture/engine pick made before the first turn needs a FRESH same-id respawn, never --resume:
-   *  there is no conversation yet on either engine to resume. */
-  private readonly freshPostureStale = new Set<string>()
+  /** sessionId → the driver's own resume blob, stored verbatim (see `ResumeCursorSchema`). This layer
+   *  never reads `data`: it hands the blob back on a respawn and reads only the envelope's `resumable`
+   *  flag, which is the driver's own answer to "is there a conversation here yet". */
+  private readonly resumeCursors = new Map<string, ResumeCursor>()
+  /** Sessions whose engine lost the conversation we asked it to reattach, with a clean restart in
+   *  flight. Single-flight: a second miss for the same session must not spawn a second replacement. */
+  private readonly resumeMissRecovery = new Set<string>()
+  /** The turn a resume miss swallowed, replayed once the clean session is up so the user's message is
+   * answered instead of vanishing. The engine-expanded send material and untouched visible payload live
+   * side by side: recovery may resend the former, but durable replay/failure identity always owns the latter. */
+  private readonly pendingTurns = new Map<string, PendingTurn>()
   /** sessionId → tools the engine advertised at session start (system/init). An aside fork denies exactly
    *  this set (by bare name) so it inherits no tool it could attempt or execute — version-proof, unlike a
    *  hand-maintained denylist that rots on an engine bump. */
   private readonly advertisedTools = new Map<string, string[]>()
+  /** Latest live capability truth for renderer adoption/reload. Deliberately memory-only: this is
+   *  runtime evidence, not transcript or durable replay state. */
+  private readonly sessionCapabilities = new Map<string, SessionCapabilitySnapshot>()
   private readonly resourcesPath?: string
 
   /** 'auto' billing only: API-key fallback is effective until this unix-second timestamp (the rejected
@@ -220,6 +418,10 @@ export class EngineSessionManager {
    *  "session outlives the window". Sticky for Phase 0 (attach once → survives until app quit or the
    *  remote tier is disabled); refcounting/auto-teardown-on-disconnect is a later refinement. */
   private readonly remoteAttached = new Set<string>()
+  /** Sessions whose live engine was actually started or resumed from the phone. Kept separate from
+   *  `remoteAttached`: a phone may join a desktop-origin session, and Dreams also use remote-style
+   *  headless survival, but neither should ever receive the “From your phone” fallback title. */
+  private readonly startedFromRemote = new Set<string>()
   /** In-flight startNewRemote calls, keyed by the caller's chosen session id. A re-send that arrives
    *  while the first start is still spawning rides the same promise instead of racing it — the id isn't
    *  remote-attached yet at that point, so the ownership check alone would let it start a second one. */
@@ -232,6 +434,16 @@ export class EngineSessionManager {
   /** Last stable replay identity issued per live session. Loaded from the durable sidecar on attach so
    *  a window close/reopen never reuses an id that is already stamped into a persisted transcript. */
   private readonly remoteReplaySeq = new Map<string, number>()
+  /** Accepted phone transport attempts. A lost ack may resend the exact id; answering it from this
+   * bounded session-scoped ledger must never run the engine twice. Cleared only at true session end. */
+  private readonly acceptedRemoteAttempts = new Map<string, Map<string, AcceptedRemoteAttempt>>()
+  /** The accepted attempt currently owning this session's logical terminal. Kept independent from
+   * attachment retry bytes so global payload eviction can never strand an `already-running` receipt. */
+  private readonly activeRemoteAttemptIds = new Map<string, string>()
+  /** Exact attachment bytes for at most one currently active remote attempt per bounded set of sessions.
+   * Successful replay rows keep provenance only; a retryable failure promotes these bytes into that
+   * unresolved row when the whole payload fits the shared cap. */
+  private readonly remoteTurnPayloads = new Map<string, RemoteTurnPayload>()
   /** Live delegated leaves owned by each engine process. This is main-process authority for the one
    *  operation that can destroy them: replacing that process. Keyed by launch id, with task id added
    *  once Claude reports it so targeted Stop can reject stale/non-running cards. */
@@ -256,6 +468,10 @@ export class EngineSessionManager {
    *  substance retitle at first TurnComplete (mirrors the renderer's). Both cleared when it fires. */
   private readonly remoteFirstPrompt = new Map<string, { prompt: string; cwd: string }>()
   private readonly remoteLastReply = new Map<string, string>()
+  /** First accepted human prompt for each live session. Unlike remote replay, this covers Mac-created
+   *  sessions before the phone ever opens them, so the launcher never has to identify every row by the
+   *  same project-folder placeholder while renderer persistence catches up. Cleared only at true end. */
+  private readonly sessionFirstPrompts = new Map<string, string>()
   /** Titling epoch per headless session — a newer titling call invalidates any still-in-flight
    *  predecessor, so a slow birth-title can't resolve late and overwrite the settled substance name. */
   private readonly remoteTitleGen = new Map<string, number>()
@@ -286,14 +502,29 @@ export class EngineSessionManager {
    *  launcher polls, it doesn't subscribe) read this to show a live working/idle glyph per session. Kept
    *  in lockstep with the client-side `busy` reducer: set on a turn's send, cleared when the turn ends. */
   private readonly working = new Set<string>()
+  /** Latest noteworthy terminal edge for each live session. Main owns only the event fact; a phone keeps
+   *  its own seen-completion revision so opening work on one head cannot clear another head's attention. */
+  private readonly terminalAttention = new Map<string, RemoteTerminalAttention>()
+  /** Same-session admission claims that span model realignment and every awaited pre-send step. Without
+   *  this seam, two heads could both pass `working`, or Stop could hit an idle child during checkpointing
+   *  only for the prepared turn to start afterward. Process teardown preserves the exact generation;
+   *  the admitting send, Stop, or a true session end releases it. */
+  private readonly turnAdmissions = new Map<string, TurnAdmission>()
+  private nextTurnAdmissionGeneration = 0
+  /** Accepted turns retain their admission identity until a genuine terminal event. Stop can therefore
+   *  wait for delegated children without accidentally interrupting a successor on the same warm child. */
+  private readonly acceptedTurns = new Map<string, AcceptedTurn>()
+  /** Session-scoped process replacement ownership. A posture respawn and a turn-driven reattach are both
+   *  destructive to the old child, so they serialize with sends and with each other across every await. */
+  private readonly processReplacements = new Map<string, ProcessReplacementClaim>()
+  private nextProcessReplacementGeneration = 0
   /** sessionId → the first line of the agent's latest reply, so the phone's project screen can show
    *  what a live session is doing ("Wiring the date picker…") without an event stream at browse level.
    *  In-memory, live sessions only — decoration, never persisted. */
   private readonly lastLines = new Map<string, string>()
-  /** sessionId → epoch ms of the last ENGINE event (deltas, blocks, tool calls) — engine liveness, as
-   *  opposed to lastActivityAt's human liveness. Lets an unattended supervisor (the dream) tell a
-   *  stalled turn (working but silent) from a busy one, so it interrupts on real inactivity instead
-   *  of burning its whole wall-clock cap on a hang (the Hermes-cron lesson: idle-based, not elapsed). */
+  /** sessionId → epoch ms of the last transcript-bearing engine activity. It lets unattended work
+   *  distinguish a busy turn from a silent stall, and prevents corpus certification from accepting a
+   *  renderer snapshot that predates a delegated lifecycle change. */
   private readonly engineEventAt = new Map<string, number>()
   /** sessionId → the current turn's top-level reply, ACCUMULATED across blocks (same reason the loop
    *  driver accumulates: a final message can arrive as several AssistantBlocks, and last-write-wins
@@ -307,18 +538,28 @@ export class EngineSessionManager {
   /** sessionId → recovery streak: how many reconnects we've done and when the last one settled. Rate-
    *  limits repeats (cooldown) and caps a flapping broker at BROKER_RECOVERY_MAX before giving up. */
   private readonly brokerRecovery = new Map<string, { count: number; at: number }>()
-  /** Sessions awaiting an auto-resume turn after a broker reconnect. The nudge is sent when the fresh
-   *  session's SessionStarted lands (engine initialized), so the interrupted turn continues on its own. */
-  private readonly resumeAfterReconnect = new Set<string>()
+  /** Session → logical admission generation awaiting an auto-resume turn after a broker reconnect.
+   *  The generation keeps a delayed recovery signal from ever nudging a successor turn that reused the
+   *  same public session id. `undefined` covers legacy/internal turns with no admitted human boundary. */
+  private readonly resumeAfterReconnect = new Map<string, number | undefined>()
   /** sessionId → resolver for `awaitTurnEnd`, the overnight dream's event-driven "did the turn really
    *  end" signal (W3). Fired only by a genuine TurnComplete or a truly fatal EngineError — NOT by
    *  `working` flipping false, which a benign broker-recovery respawn does too (see `forward`). Must
    *  survive a respawn's `dispose()` for the same reason `resumeAfterReconnect`/`pendingWorkflowResults`
    *  do (dispose() is also the respawn teardown path); cleared on a true end by `forgetSession`. */
   private readonly turnEndWaiters = new Map<string, () => void>()
+  /** `${sessionId}:${toolUseId}` → every stop sweep currently parked on that child. A SET, not one
+   *  resolver: two overlapping stops (the user pressing Stop twice, or a window close racing a remote
+   *  stop) both wait on the same child, and one terminal event has to release both. Each sweep also
+   *  removes only its OWN entry when its bound expires, so a stale timeout can't strand a newer sweep. */
+  private readonly childEndWaiters = new Map<string, Set<() => void>>()
   /** Heartbeat for the account usage poll (see `pollUsage`), and the last poll's start time — the
    *  turn-end trigger debounces against it so a burst of short turns can't spawn a poll per turn. */
   private usageTimer: ReturnType<typeof setInterval> | null = null
+  /** The heartbeat's power-aware gate (probe-governor.ts): the gauge is worth a subprocess when someone
+   *  can see it, not while the Mac is locked or has been in the background all afternoon. The turn-end
+   *  trigger below is deliberately NOT gated — that's real activity, including a phone-driven turn. */
+  private usageProbe: GovernedProbe | null = null
   private lastUsagePoll = 0
 
   constructor(resourcesPath?: string) {
@@ -370,6 +611,12 @@ export class EngineSessionManager {
         },
         status: async (sessionId) => appStatus(this.projectPathFor(sessionId)),
       },
+      // "Keep this as a document" (document-workspace.md, the magic layer §1) — the user asked for the
+      // conversation to become a document, so the agent writes it through Koda's own creation path.
+      // The sessionId is the point: it becomes the document's `source:` provenance, and it is the one
+      // field the agent could never supply itself. No window required — a phone-driven session may keep
+      // a document too, so this resolves the root the same way the mini-app verbs do.
+      (sessionId, args) => keepDocument(this.projectPathFor(sessionId), args, sessionId),
     )
     // Seed the DEFAULT posture new sessions start at (per-session overrides come from the renderer).
     this.gate.setDefaultMode(loadApprovalMode())
@@ -381,8 +628,20 @@ export class EngineSessionManager {
     // Plan gauge: seed it shortly after boot (the disk-restored windows show meanwhile), then keep it
     // fresh on a heartbeat. Independent of whether any session is running — the windows are an account
     // fact, and the gauge should read true the moment a window opens.
-    setTimeout(() => void this.pollUsage(), USAGE_POLL_STARTUP_MS)
-    this.usageTimer = setInterval(() => void this.pollUsage(), USAGE_POLL_INTERVAL_MS)
+    if (!isE2EProfile()) {
+      setTimeout(() => void this.pollUsage(), USAGE_POLL_STARTUP_MS)
+      this.usageProbe = governProbe('account-usage', USAGE_POLL_INTERVAL_MS, {
+        wake: () => void this.pollUsage(), // sitting back down shows a current gauge, not a five-minute-old one
+        // What this writes is not only the desktop gauge: the phone's usage readout reads the same
+        // snapshot back (remote/ops.ts), and the overnight dream refuses to run when it's above 80%.
+        // A locked screen therefore only STRETCHES this poll. Pausing it would pin both of those to
+        // whatever the number happened to be when the lid closed.
+        pauseOnLock: false,
+      })
+      this.usageTimer = setInterval(() => {
+        if (this.usageProbe?.due()) void this.pollUsage()
+      }, USAGE_POLL_INTERVAL_MS)
+    }
   }
 
   /**
@@ -393,26 +652,71 @@ export class EngineSessionManager {
   async start(
     opts: {
       cwd?: string
-      resumeSessionId?: string
+      /** Spawn under this exact id; omitted ⇒ a fresh one is minted. */
       sessionId?: string
+      /** The driver's own resume blob, passed straight through. Present ⇒ the driver reattaches its
+       *  conversation if IT judges the blob resumable; absent ⇒ a clean conversation under this id. */
+      resumeCursor?: ResumeCursor
       planMode?: boolean
       model?: string
       effort?: string
       engineId?: EngineId
-      engineNativeId?: string
       replaySeq?: number
       ownerWindowId?: number
-      /** An infrastructure recovery has no live engine it can preserve. Mark its children unknown before
-       *  replacing it; ordinary posture/model respawns omit this and are refused while children run. */
-      abandonActiveSubagents?: boolean
+      /** An infrastructure recovery has no live engine it can preserve. Mark all delegated work unknown
+       *  before replacing it; ordinary posture/model respawns omit this and are refused while it runs. */
+      abandonActiveDelegation?: boolean
+      /** Internal ownership proofs. A turn-driven realignment carries its admission; an eager posture
+       *  respawn reserves replacement ownership before its first await. */
+      turnAdmissionClaim?: TurnAdmission
+      processReplacementClaim?: ProcessReplacementClaim
     } = {},
   ): Promise<{ sessionId: string; cwd: string }> {
-    const requestedSessionId = opts.resumeSessionId ?? opts.sessionId
+    requireRealAccountAccess()
+    const requestedSessionId = opts.sessionId
     const engineId = opts.engineId ?? (requestedSessionId ? this.sessionEngines.get(requestedSessionId) : undefined) ?? 'claude'
     // A fresh session runs in its OWNING window's project (one-project-per-window); a resumed session
     // passes its stored cwd explicitly. Fall back to process.cwd() only if neither is known.
     const cwd =
       opts.cwd ?? (opts.ownerWindowId != null ? projectPathForWindow(opts.ownerWindowId) : undefined) ?? process.cwd()
+    const sessionId = requestedSessionId ?? randomUUID()
+    let replacementClaim = opts.processReplacementClaim
+    let ownsReplacementClaim = false
+    let processGeneration: symbol | undefined
+    if (requestedSessionId && this.sessions.has(sessionId)) {
+      if (replacementClaim) {
+        if (this.processReplacements.get(sessionId) !== replacementClaim)
+          throw new Error('That session replacement is no longer current.')
+      } else {
+        const admission = this.turnAdmissions.get(sessionId)
+        if (admission && admission !== opts.turnAdmissionClaim)
+          throw new Error('A turn is already starting. Let it finish before replacing this session.')
+        if (this.working.has(sessionId) && !opts.abandonActiveDelegation)
+          throw new Error('A turn is still running. Let it finish or stop it before replacing this session.')
+        replacementClaim = this.reserveProcessReplacement(sessionId)
+        ownsReplacementClaim = true
+      }
+    }
+    const assertReplacementCurrent = (): void => {
+      if (replacementClaim && this.processReplacements.get(sessionId) !== replacementClaim)
+        throw new Error('That session replacement is no longer current.')
+      if (
+        opts.turnAdmissionClaim &&
+        this.turnAdmissions.get(sessionId) !== opts.turnAdmissionClaim
+      )
+        throw new Error('That turn is no longer allowed to replace this session.')
+      if (
+        processGeneration &&
+        this.sessionGenerations.get(sessionId) !== processGeneration
+      )
+        throw new Error('That session process is no longer current.')
+    }
+    // Per-install preference, snapshotted for this engine process so Claude and Codex have the same
+    // contract: changing it affects the next session/reattach, never one live conversation mid-turn.
+    // Dream/REM sessions are unattended system work. They are reserved in dreamSessions before start()
+    // enters, so do not inject human-session delegation pressure or even read that preference here.
+    const orchestratorSession =
+      !this.dreamSessions.has(sessionId) && loadSessionAgentRole() === 'orchestrator'
 
     // Broker up + this session registered (token minted) BEFORE spawn. For Claude it's the permission
     // transport (`--permission-prompt-tool` → in-process MCP) AND the capability tools; for Codex,
@@ -420,24 +724,30 @@ export class EngineSessionManager {
     // tools (preview/recovery/ensure_tool) over its streamable-HTTP MCP endpoint — minus `approve`.
     // A resumed session keeps its original id (`--resume`; spike/resume) so renderer routing + the
     // recovery dir map stay aligned across the restart.
-    await this.broker.ensureListening()
-    // resumeSessionId → reattach (--resume); sessionId → fresh spawn with a caller-chosen id
-    // (--session-id); neither → a fresh minted id. resume is keyed off resumeSessionId only.
-    const sessionId = requestedSessionId ?? randomUUID()
-    if (this.sessions.has(sessionId) && this.hasActiveSubagents(sessionId)) {
-      if (!opts.abandonActiveSubagents)
+    try {
+      await this.broker.ensureListening()
+      assertReplacementCurrent()
+    // sessionId → spawn under that id; omitted ⇒ mint one. Whether the engine reattaches is entirely
+    // `resumeCursor`'s business, and the driver's judgment call.
+    if (this.sessions.has(sessionId) && this.hasOwnedDelegation(sessionId)) {
+      if (!opts.abandonActiveDelegation)
         throw new Error('Delegated work is still running. Let it finish or stop it before changing this session.')
-      this.markActiveSubagentsUnknown(sessionId)
+      this.markActiveDelegationUnknown(sessionId)
     }
-    // A respawn tears down the old process before starting the replacement. Preserve the native
-    // conversation id first: Codex resumes by its own thread id, not Koda's session id, and dispose()
-    // clears the cache as part of normal teardown.
-    const priorEngineNativeId = this.engineNativeIds.get(sessionId)
+    // A respawn tears down the old process before starting the replacement, and dispose() drops the
+    // cursor as normal teardown — so take the caller's blob, or the live one, before that happens.
+    const resumeCursor = opts.resumeCursor ?? this.resumeCursors.get(sessionId)
     // Respawn safety: if a child for this id is still alive (a Plan-mode/engine/model switch drops the
     // engine and reattaches on the next turn without disposing), tear it down BEFORE re-registering.
-    // Otherwise the old child's late 'close' would unregister the NEW child's broker route — two
-    // children, one id, one broken /mcp/<id>. dispose() awaits the old child's exit, so register() is clean.
+    // Otherwise the old child's late 'close' could unregister the NEW child's broker route — two
+    // children, one id, one broken /mcp/<id>. Disposal is bounded; the generation claim immediately
+    // below makes a post-timeout callback stale before the replacement registers its route.
     if (this.sessions.has(sessionId)) await this.dispose(sessionId)
+    assertReplacementCurrent()
+    // Claim this id before any further await. If the old driver's bounded dispose timed out, its late
+    // close now carries the previous token and is ignored even during the replacement's broker setup.
+    processGeneration = Symbol(sessionId)
+    this.sessionGenerations.set(sessionId, processGeneration)
     if (opts.replaySeq !== undefined)
       this.remoteReplaySeq.set(
         sessionId,
@@ -453,80 +763,120 @@ export class EngineSessionManager {
     // A resumed session (restart-reattach or the phone's resume-old) is never on its first turn — its
     // title, if any, belongs to the original conversation. Mark it so headless first-turn titling never
     // recomputes a label from a mid-conversation follow-up. (Fresh sessions title on their first turn.)
-    if (opts.resumeSessionId) this.remoteTitled.add(sessionId)
+    if (resumeCursor?.resumable) this.remoteTitled.add(sessionId)
     // Codex omits the `approve` tool (native approvals); both get the capability tools. The mini-app
     // lifecycle verbs ride the dogfood flag (read per session start — seam ② of the release gate).
-    await this.broker.register(sessionId, {
-      includeApprove: engineId === 'claude',
-      includeMiniApps: loadMiniAppsEnabled(),
+    const miniAppsWired = loadMiniAppsEnabled()
+    const pwWired = playwrightWired()
+    const bundledPlaybooksExpected = kodaPlaybooksExpected(cwd, {
+      includeBrowser: pwWired,
+      includeGated: miniAppsWired,
     })
+    // Resolve Claude's optional gallery delivery once and use that same answer for both argv and the
+    // expected-vs-observed attestation. Codex always gets its Koda plugin's code-review playbook when
+    // isolated-home setup succeeds; a setup failure should therefore read degraded, never disabled.
+    const globalSkillsPlugin = resolveGlobalSkillsPlugin(app.getPath('userData'))
+    const claudePlaybooksExpected = bundledPlaybooksExpected || globalSkillsPlugin !== null
+    const codexPlaybooksExpected = true
+    await this.broker.register(sessionId, {
+      includeApprove: engineCapabilities(engineId).approvals === 'broker',
+      includeMiniApps: miniAppsWired,
+    })
+    // An engine that carries Plan mode as turn text (Codex) has no read-only mode of its own, so the
+    // gate becomes the fence for it. Set from the capability, and cleared for an engine that enforces
+    // its own — the same session id can be respawned onto the other engine.
+    this.gate.setPlanFence(sessionId, engineCapabilities(engineId).planMode === 'turnText')
     // Register window ownership BEFORE spawn so the very first event (system/init → SessionStarted,
     // or a fatal spawn 'error') routes to the owning window instead of falling into a gap and being
     // dropped (adapter emits these as soon as the child starts).
     if (opts.ownerWindowId != null) addSessionToWindow(opts.ownerWindowId, sessionId)
 
+    // DRIVER SELECTION — one of the two places in Koda that names an engine on purpose (the other is
+    // askSideQuestion below). Choosing which driver to launch is what a registry does; every question
+    // ABOUT an engine is answered by `engineCapabilities`/`engineProfile` instead.
+    //
     // Codex: native per-tool approvals (so the gate is wired directly, no `approve` tool), but the
     // broker still serves Koda's capability tools over MCP. Same engine-neutral gate.decide → same
-    // checkpoint-before-mutation + per-cwd mutex + the 3-tier posture. v1 ships subscription-only (no
-    // API-key inject) and no Codex guardrail ruleset yet (see [[codex-engine-selection-ux]]).
+    // checkpoint-before-mutation + per-cwd mutex + the 3-tier posture. The shared behavior pack
+    // reaches Codex through developerInstructions plus its isolated native skills plugin.
     if (engineId === 'codex') {
       const token = this.broker.tokenFor(sessionId)
       // One-time (per app version) setup of Codex's isolated home: seed the login + install Koda's
       // bundled skills/subagents plugin. Single-flight + fail-soft — a setup failure never blocks the
       // session (skills are additive). CODEX_HOME itself is applied per-spawn in buildEngineEnv.
-      const pwWired = playwrightWired()
       await ensureCodexHome({
         appVersion: app.getVersion(),
         resourcesPath: this.resourcesPath,
-        playwrightWired: pwWired,
       })
+      assertReplacementCurrent()
       // Billing: in API mode, write the OpenAI key into the isolated home (Codex ignores the env key for
       // auth); in subscription mode, restore the ChatGPT login. Read live so a mode change applies next
       // session. Runs after ensureCodexHome (which seeds the login) and before the spawn's auth probes.
       const codexApiKey = this.effectiveApiKey('codex')
       await reconcileCodexAuth({ resourcesPath: this.resourcesPath, apiKey: codexApiKey })
+      assertReplacementCurrent()
       try {
-        const session = startCodexSession((e) => this.forward(e), {
-          sessionId,
-          cwd,
-          decide: (sid, req) => this.gate.decide(sid, req),
-          // The SAME guardrail rules Claude gets (memory discipline, hygiene, docs, recovery, code
-          // style) as additive developerInstructions. brokerWired: true — the Codex path always
-          // attaches the broker (brokerUrl below), so the broker-gated preview/ensure-tool rules apply.
-          // '' (nothing to say at all) ⇒ undefined so the driver omits the field. See assembleGuardrailText.
-          developerInstructions:
-            assembleGuardrailText({
-              cwd,
-              resourcesPath: this.resourcesPath,
-              brokerWired: true,
-              miniAppProject: projectHasMiniApp(cwd),
-              // Same condition ensureCodexHome used to materialize the staging skills into the
-              // Codex plugin, so the app-ask routing rule never names a skill that isn't installed.
-              miniAppsWired:
-                loadMiniAppsEnabled() && !!resolveStagingPack({ resourcesPath: this.resourcesPath }),
-              critiqueOff: !loadCritiquePass(),
-              engine: 'codex',
-            }) || undefined,
-          model: opts.model,
-          effort: opts.effort,
-          // Reattaching an existing conversation → resume the persisted Codex thread by id (context
-          // preserved); a fresh session has no native id, so the driver starts a new thread.
-          resumeThreadId: opts.resumeSessionId ? (opts.engineNativeId ?? priorEngineNativeId) : undefined,
-          resourcesPath: this.resourcesPath,
-          // Token rides the env (referenced by name in the mcp_servers bearer_token_env_var), not argv.
-          // apiMode/apiKey re-add the OpenAI credential only in API billing mode (the isolated home was
-          // already logged in with it above); subscription mode passes neither and bills the ChatGPT plan.
-          env: {
-            engineId: 'codex',
-            ...(codexApiKey ? { apiMode: true, apiKey: codexApiKey } : {}),
-            ...(token ? { inject: { [BROKER_TOKEN_ENV]: token } } : {}),
+        const session = startCodexSession(
+          (e) => this.forwardProcessEvent(e, processGeneration),
+          {
+            sessionId,
+            cwd,
+            decide: (sid, req) => this.gate.decide(sid, req),
+            // The SAME compact constitution, routes, and project card Claude gets, delivered as additive
+            // developerInstructions. brokerWired: true — the Codex path always attaches the broker
+            // (brokerUrl below), so any broker-gated routes apply.
+            // '' (nothing to say at all) ⇒ undefined so the driver omits the field. See assembleGuardrailText.
+            developerInstructions:
+              assembleGuardrailText({
+                cwd,
+                resourcesPath: this.resourcesPath,
+                brokerWired: true,
+                miniAppProject: projectHasMiniApp(cwd),
+                // Same condition ensureCodexHome used to materialize the staging skills into the
+                // Codex plugin, so the app-ask routing rule never names a skill that isn't installed.
+                miniAppsWired:
+                  miniAppsWired && !!resolveStagingPack({ resourcesPath: this.resourcesPath }),
+                critiqueOn: loadCritiquePass(),
+                orchestratorSession,
+                engine: 'codex',
+              }) || undefined,
+            // Posture is NOT baked in here — it seeds the driver's per-turn steering block, which is
+            // rebuilt on every turn and updated in place by setSessionApprovalMode (no respawn).
+            approvalMode: this.gate.getSessionMode(sessionId),
+            // The gate judges a running turn by the mode that turn was steered with. Released at
+            // TurnComplete in forward(), and on a process exit by the gate itself.
+            onTurnSteered: (mode) => this.gate.pinTurnMode(sessionId, mode),
+            skillConfig: codexSkillConfig(cwd, app.getVersion(), {
+              playwrightWired: pwWired,
+              miniAppsWired,
+            }),
+            playbooksExpected: codexPlaybooksExpected,
+            model: opts.model,
+            effort: opts.effort,
+            // The driver's own blob, verbatim — it decides whether that thread is worth reattaching.
+            resumeCursor,
+            resourcesPath: this.resourcesPath,
+            // Token rides the env (referenced by name in the mcp_servers bearer_token_env_var), not argv.
+            // apiMode/apiKey re-add the OpenAI credential only in API billing mode (the isolated home was
+            // already logged in with it above); subscription mode passes neither and bills the ChatGPT plan.
+            env: {
+              engineId: 'codex',
+              ...(codexApiKey ? { apiMode: true, apiKey: codexApiKey } : {}),
+              ...(token ? { inject: { [BROKER_TOKEN_ENV]: token } } : {}),
+            },
+            brokerUrl: this.broker.mcpHttpUrl(sessionId),
+            // Browser-verify tools when the optional capability is wired (the Codex analog of Claude's
+            // applyPlaywrightToMcpConfig). Skill materialization is gated on the same flag in ensureCodexHome.
+            playwrightServer: pwWired ? playwrightMcpServerForCodex() ?? undefined : undefined,
+            onClose: (id) => this.handleClose(id, processGeneration),
           },
-          brokerUrl: this.broker.mcpHttpUrl(sessionId),
-          // Browser-verify tools when the optional capability is wired (the Codex analog of Claude's
-          // applyPlaywrightToMcpConfig). Skill materialization is gated on the same flag in ensureCodexHome.
-          playwrightServer: pwWired ? playwrightMcpServerForCodex() ?? undefined : undefined,
-          onClose: (id) => this.handleClose(id),
-        })
+        )
+        try {
+          assertReplacementCurrent()
+        } catch (error) {
+          await session.dispose()
+          throw error
+        }
         this.sessions.set(session.id, session)
         this.projectDirs.set(session.id, cwd)
         this.lastActivityAt.set(session.id, Date.now())
@@ -551,27 +901,40 @@ export class EngineSessionManager {
       // mini-apps dogfood flag is on — that's how a normal release ships without the half-built
       // skill. Resolved once: the same answer wires the --plugin-dir AND the pack's app-ask routing
       // rule, so the rule can never name a skill that didn't load.
-      const stagingPackDir = loadMiniAppsEnabled()
+      const stagingPackDir = miniAppsWired
         ? (resolveStagingPack({ resourcesPath: this.resourcesPath })?.dir ?? null)
         : null
       const sessionOpts: SessionOpts = {
         sessionId,
         cwd,
-        resume: !!opts.resumeSessionId,
+        // The driver's own blob, verbatim — it decides whether there is a conversation to reattach.
+        resumeCursor,
         resourcesPath: this.resourcesPath,
         // Broker MCP config + (when the optional browser-testing capability is wired) the Playwright
         // server merged in. Its tools still route through `--permission-prompt-tool` → our gate.
         mcpConfigJson: applyPlaywrightToMcpConfig(this.broker.mcpConfig(sessionId)),
+        // Intent only. The adapter still waits for Claude's native init inventory before claiming the
+        // browser capability is ready.
+        browserWired: pwWired,
+        playbooksExpected: claudePlaybooksExpected,
         // Deny the browser-verify skill unless Playwright is wired (no guidance for absent tools).
-        extraDisallowedTools: playwrightDisallowedTools(),
+        extraDisallowedTools: [
+          ...playwrightDisallowedTools(),
+          ...projectSkillCollisionNames(cwd).map((name) => `Skill(${name})`),
+        ],
         // Faced project → the pack's summon-pill rule assembles (the agent learns Koda's "Ask or fix
         // this app" pill is claimable over the face bridge instead of designing around it blind).
         miniAppProject: projectHasMiniApp(cwd),
         miniAppsWired: stagingPackDir !== null,
-        critiqueOff: !loadCritiquePass(),
-        // Koda-managed global skills the user turned on in the gallery (null when none active), plus
-        // the staging pack when the dogfood flag is on (stagingPackDir above).
-        extraPluginDirs: [resolveGlobalSkillsPlugin(app.getPath('userData')), stagingPackDir].filter(
+        critiqueOn: loadCritiquePass(),
+        orchestratorSession,
+        // Koda-managed global skills the user turned on in the gallery (null when none active), the
+        // standalone Deep Review plugin, plus the staging pack when the dogfood flag is on.
+        extraPluginDirs: [
+          globalSkillsPlugin,
+          resolveDeepReviewPlugin({ resourcesPath: this.resourcesPath })?.dir ?? null,
+          stagingPackDir,
+        ].filter(
           (d): d is string => d !== null,
         ),
         planMode: opts.planMode,
@@ -585,9 +948,19 @@ export class EngineSessionManager {
             : undefined,
         // Drop the live handle + tear the broker down when the child exits (any cause). projectDirs
         // is NOT cleared here — recovery must survive a crash (cleared only on explicit dispose).
-        onClose: (id) => this.handleClose(id),
+        onClose: (id) => this.handleClose(id, processGeneration),
       }
-      const session = startClaudeSession((e) => this.forward(e), sessionOpts)
+      assertReplacementCurrent()
+      const session = startClaudeSession(
+        (e) => this.forwardProcessEvent(e, processGeneration),
+        sessionOpts,
+      )
+      try {
+        assertReplacementCurrent()
+      } catch (error) {
+        await session.dispose()
+        throw error
+      }
       this.sessions.set(session.id, session)
       this.projectDirs.set(session.id, cwd)
       this.lastActivityAt.set(session.id, Date.now())
@@ -599,20 +972,31 @@ export class EngineSessionManager {
       removeSessionFromWindow(sessionId)
       throw err
     }
+    } finally {
+      // A failed pre-spawn/setup path owns no driver that can reap this claim. Never clear a newer
+      // start's token, and retain the token for a successfully installed child until its exact close.
+      if (
+        processGeneration &&
+        this.sessionGenerations.get(sessionId) === processGeneration &&
+        !this.sessions.has(sessionId)
+      )
+        this.sessionGenerations.delete(sessionId)
+      if (ownsReplacementClaim && replacementClaim)
+        this.releaseProcessReplacement(sessionId, replacementClaim)
+    }
   }
 
   /** The API key to inject for a spawn, or null to bill the subscription. 'api' → always the key;
    *  'auto' → the key only while a confirmed plan-limit fallback window is still open; 'subscription' →
    *  never. A missing key always degrades to subscription (never fails the spawn). */
   private effectiveApiKey(engine: EngineId = 'claude'): string | null {
-    if (engine === 'codex') {
-      // Codex is a simple subscription↔api choice (no plan-limit auto-fallback in v1); its own key slot.
-      return loadSettings().codexBillingMode === 'api' ? getApiKey('codex') : null
-    }
-    const mode = loadSettings().billingMode
-    if (mode === 'subscription') return null
-    if (mode === 'auto' && Date.now() / 1000 >= this.apiFallbackUntil) return null
-    return getApiKey('claude')
+    // Each engine bills its own provider account, so its choice lives in its own setting (the profile
+    // names it) and its key in its own slot. Only an engine whose capabilities claim the plan-limit
+    // auto-fallback can be in 'auto' at all.
+    const mode = loadSettings()[engineProfile(engine).billingModeSetting]
+    if (mode === 'api') return getApiKey(engine)
+    if (mode !== 'auto' || !engineCapabilities(engine).apiKeyFallback) return null
+    return Date.now() / 1000 >= this.apiFallbackUntil ? null : getApiKey(engine)
   }
 
   /** Whether the API key is the effective credential for the next spawn right now (for the renderer's
@@ -641,106 +1025,297 @@ export class EngineSessionManager {
     // (non-`image/*` mediaType, csv/pdf — carrying their original `name`) are written to the
     // project's scratch folder and reach the engine as a path, same contract as the desktop
     // composer (store.send).
-    images?: (TurnImage & { name?: string })[],
+    images?: TurnAttachment[],
     // Where the turn came from. A 'remote' turn (the phone) never ran through the owner window's
     // dispatchTurn, so its user bubble has to be echoed into that window (below); a 'local' turn already
     // pushed its own optimistic bubble there, so echoing it would duplicate the message.
     origin: 'local' | 'remote' = 'local',
-  ): Promise<void> {
+    // Infrastructure recovery resumes the SAME logical human turn. It must not create a new safety/user
+    // Git boundary, reset the reply, or consume results intended for the next real human message.
+    internal: {
+      logicalContinuation?: 'broker-recovery' | 'resume-miss'
+      projectMutationScope?: ProjectMutationScope
+      attemptId?: string
+      clientTurnId?: string
+    } = {},
+  ): Promise<RemoteTurnReceipt> {
+    requireRealAccountAccess()
+    const newRemoteAttempt = origin === 'remote' && !internal.logicalContinuation
+    const attemptFingerprint =
+      newRemoteAttempt && internal.attemptId
+        ? remoteTurnFingerprint(text, images)
+        : undefined
+    if (newRemoteAttempt && internal.attemptId) {
+      const accepted = this.acceptedRemoteAttempts.get(sessionId)
+      const prior = accepted?.get(internal.attemptId)
+      if (prior) {
+        if (
+          prior.clientTurnId !== internal.clientTurnId ||
+          prior.fingerprint !== attemptFingerprint
+        )
+          throw new Error('This turn attempt was already used for a different message or attachment payload.')
+        return { status: prior.state === 'running' ? 'already-running' : 'already-complete' }
+      }
+    }
+    // Main is the final admission boundary for every head. A cold phone can open before its local stream
+    // catches up, and a reconnect drain can race launcher state; neither may inject a second top-level
+    // turn into the same engine or skip an unanswered prompt. Delegation alone is deliberately absent:
+    // once the parent ends, a human follow-up is supported while its background delegate settles.
+    // Broker recovery is the same logical turn, so it is the sole admission bypass.
+    const claimsAdmission = !internal.logicalContinuation
+    let admission: TurnAdmission | undefined
+    let workingClaimed = false
+    if (claimsAdmission) {
+      if (this.processReplacements.has(sessionId))
+        throw new Error('This session is changing settings. Let that finish before sending another message.')
+      if (this.working.has(sessionId) || this.turnAdmissions.has(sessionId))
+        throw new Error('A turn is already running. Let it finish or stop it before sending another message.')
+      if (this.gate.pendingRequests(sessionId).length > 0)
+        throw new Error('This session is waiting for your answer. Resolve it before sending another message.')
+      admission = { generation: ++this.nextTurnAdmissionGeneration, cancelled: false }
+      this.turnAdmissions.set(sessionId, admission)
+    }
+    const releaseAdmission = (): boolean => {
+      if (!admission || this.turnAdmissions.get(sessionId) !== admission) return false
+      this.turnAdmissions.delete(sessionId)
+      return true
+    }
+    const throwIfAdmissionCancelled = (): void => {
+      if (!admission?.cancelled) return
+      // Only this exact generation may release session-level liveness. A true end can retire it and a
+      // later session can reuse the id before an old await resumes; that successor remains untouched.
+      if (releaseAdmission() && workingClaimed) {
+        this.working.delete(sessionId)
+        this.pendingTurns.delete(sessionId)
+        this.maybeFinishCompletionTurn(sessionId)
+      }
+      throw new Error('This turn was stopped before it reached the engine.')
+    }
     // Invariant enforced here, at the one point every turn (local AND remote) funnels through: the live
     // engine must be running the session's INTENDED model/effort/engine before the turn goes out. The
     // engine can't switch these on a live -p process, so if what we actually spawned with has drifted from
     // the intent — a pick that landed after spawn (the desktop reattaches lazily; a phone turn arrives here
     // directly), or a first spawn that never carried the pick — respawn on the intent first. Comparison,
     // not a remembered flag: `spawnedWith` is set only where the child truly launches, so no spawn path can
-    // forget to mark a change. A turn can't start mid-turn (both surfaces block send while busy) and this
-    // runs before `working` is set, so the --resume can't drop an in-flight turn or strand an approval.
+    // forget to mark a change. The admission guard above runs before drift correction and `working`, so a
+    // stale head cannot respawn away an in-flight turn or strand an approval.
     const cwd = this.projectDirs.get(sessionId)
-    if (cwd && this.sessions.has(sessionId) && this.spawnDrifted(sessionId)) {
-      const { model, effort } = this.sessionModelEffort.get(sessionId) ?? {}
-      const engineId = this.sessionEngines.get(sessionId) ?? 'claude'
-      // Realign the actuals to the intent up front so a second turn racing in during the respawn sees no
-      // drift and can't kick off a concurrent start() for the same id (dispose/spawn interleave = two
-      // children, one broker route). start() overwrites spawnedWith with the real launch triple anyway.
-      this.spawnedWith.set(sessionId, { model, effort, engineId })
-      // Before the first turn there is no conversation to --resume, so a posture pick respawns FRESH under
-      // the same id (freshPostureStale); once a conversation exists, reattach with --resume.
-      const fresh = this.freshPostureStale.delete(sessionId)
-      await this.start({
-        ...(fresh ? { sessionId } : { resumeSessionId: sessionId }),
-        cwd,
-        model,
-        effort,
-        engineId,
-        planMode: this.gate.getSessionMode(sessionId) === 'plan',
-      })
+    let session: EngineSession
+    try {
+      this.claimProjectMutationScopeTurn(sessionId, internal)
+      if (cwd && this.sessions.has(sessionId) && this.spawnDrifted(sessionId)) {
+        const { model, effort } = this.sessionModelEffort.get(sessionId) ?? {}
+        const engineId = this.sessionEngines.get(sessionId) ?? 'claude'
+        // Keep actual spawn truth unchanged until start() launches the replacement. The admission claim
+        // above survives that method's internal dispose and keeps another head out of the await gap.
+        // Hand the live cursor back and let the driver decide: before the first turn there is nothing to
+        // reattach to, so it spawns clean under the same id instead of racing the engine's own init.
+        await this.start({
+          sessionId,
+          cwd,
+          model,
+          effort,
+          engineId,
+          planMode: this.gate.getSessionMode(sessionId) === 'plan',
+          turnAdmissionClaim: admission,
+        })
+      }
+      session = this.require(sessionId)
+      // start() awaits broker/driver setup. Even though public posture mutations are locked out during
+      // that gap, verify the replacement still matches current intent before converting the admission
+      // claim into `working`; an internal or future intent writer must never send on the wrong child.
+      if (this.spawnDrifted(sessionId))
+        throw new Error('The session settings changed while its engine was starting. Try sending again.')
+      throwIfAdmissionCancelled()
+    } catch (error) {
+      releaseAdmission()
+      throw error
     }
-    const session = this.require(sessionId)
+    this.working.add(sessionId)
+    workingClaimed = true
+    const continuedBoundary = internal.logicalContinuation
+      ? this.completionTurns.get(sessionId)
+      : undefined
+    const continuingLogicalTurn = !!continuedBoundary && continuedBoundary.cwd === cwd
+    // A background delegate can keep turn A's completion boundary open after its parent ends. A
+    // follow-up is a distinct engine/transcript turn, but the session's one completion slot must retain
+    // A's earlier tree until every writer it owns settles; replacing it with turn B's checkpoint would
+    // leave the delegate's earlier writes outside the eventual attribution window.
+    const retainedDelegationBoundary =
+      !continuingLogicalTurn && this.hasOwnedDelegation(sessionId)
+        ? this.completionTurns.get(sessionId)
+        : undefined
+    // A scheduler scope spans a whole engine turn without holding checkpointChains. Starting any OTHER
+    // turn in that tree marks the tidy's eventual completion attribution ambiguous before the new turn
+    // reaches a tool. No live-tree rollback is ever authorized from this signal.
+    if (cwd) {
+      const root = realpathOrSelf(cwd)
+      for (const scope of this.projectMutationScopes) {
+        if (scope.sessionId !== sessionId && realpathOrSelf(scope.cwd) === root) scope.ambiguous = true
+      }
+    }
+    // Concurrent turns in one working tree make path ownership ambiguous. Mark both sides now so the
+    // scheduler can see it; neither side badges the user for it. Each turn still claims what changed
+    // in its own window, so a shared file lands in both groups and Changes names the other toucher.
+    let overlappingWriters = this.completionOverlaps.delete(sessionId)
+    if (cwd) {
+      for (const otherId of this.working) {
+        if (otherId === sessionId || this.projectDirs.get(otherId) !== cwd) continue
+        const turn = this.completionTurns.get(otherId)
+        if (turn) turn.overlappingWriters = true
+        else this.completionOverlaps.add(otherId)
+        overlappingWriters = true
+      }
+    }
+    const retainedCompletionBoundary = continuedBoundary ?? retainedDelegationBoundary
+    if (retainedCompletionBoundary && overlappingWriters)
+      retainedCompletionBoundary.overlappingWriters = true
     this.lastActivityAt.set(sessionId, Date.now()) // float this session to the top of the launcher
-    this.working.add(sessionId) // live "working" glyph the instant the turn is sent, before the first delta
-    this.turnReplies.delete(sessionId) // fresh turn, fresh reply accumulator (lastAssistantReply)
+    if (!continuingLogicalTurn)
+      this.turnReplies.delete(sessionId) // fresh turn, fresh reply accumulator (lastAssistantReply)
     this.noteEngineActivity(sessionId) // feeds the dream scheduler's quiet clock (dream turns excluded)
-    // Capture the human's turn into the replay log (engine events never echo the user's own prompt, so
-    // an adopted phone transcript would otherwise be missing this half). Recorded before the response
-    // events that follow, keeping the conversation order intact. Remote-attached sessions only.
-    if (this.remoteAttached.has(sessionId)) {
+    // Split attachment provenance before recording the user turn. Exact bytes are live send material,
+    // not ordinary transcript history: successful replay keeps only media type/name. A bounded copy is
+    // promoted into replay solely when this attempt fails and the phone must be able to retry it.
+    const docs = images?.filter((i) => !i.mediaType.startsWith('image/')) ?? []
+    const inline = images?.filter((i) => i.mediaType.startsWith('image/'))
+    const hadImages = !!inline?.length
+    const hadAttachments = !!images?.length
+    const attachmentProvenance: AttachmentProvenance[] | undefined = images?.length
+      ? images.map(({ mediaType, name }) => ({ mediaType, ...(name ? { name } : {}) }))
+      : undefined
+    const logicalAlreadyRecorded =
+      !!internal.clientTurnId &&
+      this.remoteEventLog
+        .get(sessionId)
+        ?.some(
+          (entry) =>
+            entry.type === 'RemoteUserTurn' && entry.clientTurnId === internal.clientTurnId,
+        ) === true
+    const previousRemotePayload = this.remoteTurnPayloads.get(sessionId)
+    let remoteReplaySeqForAttempt: number | undefined
+    let userTurnPublished = false
+    const publishUserTurn = (): void => {
+      if (
+        userTurnPublished ||
+        internal.logicalContinuation ||
+        continuingLogicalTurn ||
+        !this.remoteAttached.has(sessionId)
+      )
+        return
+      userTurnPublished = true
+      // Engine events never echo the human prompt, so replay owns this row. Remote-origin rows wait
+      // until the driver accepts the turn: a stopped/preflight-failed retry cannot supersede the prior
+      // durable failure or leak an un-retractable user bubble to the desktop owner.
       const replayTurn = this.recordRemoteEntry({
         type: 'RemoteUserTurn',
         sessionId,
-        text: text || '(image)',
+        // Keep the exact prompt. `(image)` is a legacy display sentinel, not safe retry text.
+        text,
+        ...(internal.clientTurnId ? { clientTurnId: internal.clientTurnId } : {}),
+        hadAttachments,
+        ...(attachmentProvenance?.length ? { attachments: attachmentProvenance } : {}),
+        hadImages,
       })
-      const owner = contextForSession(sessionId)
-      if (owner) {
-        // A remote turn needs its missing user bubble appended. A local turn already has an optimistic
-        // bubble, but it still needs the replay identity stamped so a later adoption recognizes it as
-        // the same turn. The renderer distinguishes those two cases with `append`.
-        const win = owner.win
-        if (win && !win.isDestroyed())
-          win.webContents.send(IpcChannels.sessionRemoteUserTurn, {
-            sessionId,
-            text,
-            replaySeq: replayTurn.replaySeq,
-            append: origin === 'remote',
-          })
-      } else if (origin === 'remote' && cwd) {
-        // Still windowless — no renderer to name it. Title on the engine turn path (instant first-words
-        // title, then the on-device refinement), persisted into the store the phone reads from.
-        this.titleRemoteSession(sessionId, cwd, text)
+      remoteReplaySeqForAttempt = replayTurn.replaySeq
+      try {
+        const owner = contextForSession(sessionId)
+        if (owner) {
+          // A remote turn needs its missing user bubble appended. A local turn already has an optimistic
+          // bubble, but it still needs the replay identity stamped so a later adoption recognizes it as
+          // the same turn. The renderer distinguishes those two cases with `append`.
+          const win = owner.win
+          if (win && !win.isDestroyed())
+            win.webContents.send(IpcChannels.sessionRemoteUserTurn, {
+              sessionId,
+              text,
+              ...(internal.clientTurnId ? { clientTurnId: internal.clientTurnId } : {}),
+              hadAttachments,
+              ...(attachmentProvenance?.length ? { attachments: attachmentProvenance } : {}),
+              hadImages,
+              ...(inline?.length ? { images: inline } : {}),
+              replaySeq: replayTurn.replaySeq,
+              append: origin === 'remote' && !logicalAlreadyRecorded,
+            })
+        } else if (origin === 'remote' && cwd) {
+          // Still windowless — no renderer to name it. Title on the engine turn path (instant first-words
+          // title, then the selected generated-text writer), persisted into the store the phone reads from.
+          this.titleRemoteSession(sessionId, cwd, text)
+        }
+      } catch (error) {
+        // The engine already owns this turn. A renderer-close race or best-effort title write must not
+        // turn a successful driver acceptance into a rejected receipt or clear canonical liveness.
+        log.warn(
+          'remote',
+          'accepted user turn could not be published to its owner',
+          error instanceof Error ? error.message : error,
+        )
       }
     }
+    // Desktop already rendered its optimistic row. Preserve its existing early identity stamp; only a
+    // remote-origin row must wait for the Mac's synchronous engine-acceptance boundary.
+    if (origin !== 'remote') publishUserTurn()
     // Label the checkpoint with the prompt text; fall back when it's an image-only turn.
-    if (cwd) {
-      await this.runExclusive(cwd, () => this.safeCheckpoint(cwd, text || '(image)'))
-      // Pin the live-edits diff baseline to the pre-turn tree (HEAD right after the turn checkpoint).
-      // Fail-soft: no baseline ⇒ diffFile falls back to live HEAD.
-      const sha = await headSha(cwd).catch(() => null)
-      if (sha) this.diffBaselines.set(sessionId, sha)
+    if (cwd && !continuingLogicalTurn) {
+      const baseline = await this.runExclusive(cwd, () => this.safeCheckpointResult(cwd, text || '(image)'))
+      throwIfAdmissionCancelled()
+      // Another turn or a human edit can begin while either pre-turn probe is in flight, before this
+      // boundary exists. Consume that late marker at the last possible moment so the first of two
+      // concurrent writers cannot incorrectly claim the shared delta.
+      overlappingWriters ||= this.completionOverlaps.delete(sessionId)
+      let userGit: Awaited<ReturnType<typeof completionGitSnapshot>> | undefined
+      if (
+        !retainedDelegationBoundary ||
+        this.completionTurns.get(sessionId) !== retainedDelegationBoundary
+      ) {
+        userGit = await completionGitSnapshot(cwd)
+        throwIfAdmissionCancelled()
+      }
+      // Use the exact checkpoint result atomically, after every pre-boundary await. Reading safety HEAD
+      // in a second call could silently reuse an older turn after a failed checkpoint and attribute
+      // someone else's delta to this task; publishing it before Stop settles creates a phantom turn.
+      if (baseline) this.diffBaselines.set(sessionId, baseline.id)
+      else this.diffBaselines.delete(sessionId)
+      if (
+        retainedDelegationBoundary &&
+        this.completionTurns.get(sessionId) === retainedDelegationBoundary
+      ) {
+        retainedDelegationBoundary.overlappingWriters ||= overlappingWriters
+      } else {
+        this.completionTurns.set(sessionId, {
+          cwd,
+          safetyCommit: baseline?.id ?? null,
+          userGit: userGit!,
+          mutationSeen: false,
+          overlappingWriters,
+        })
+      }
     }
     // Split document attachments out of a phone turn: save each to `.koda/scratch/` and hand the
     // engine the path (attachedFilesNote — the same note the desktop composer appends), leaving only
     // real images to go inline. Best-effort like the desktop: a failed save just drops off the list.
-    const docs = images?.filter((i) => !i.mediaType.startsWith('image/')) ?? []
-    const inline = docs.length ? images?.filter((i) => i.mediaType.startsWith('image/')) : images
     let engineText = text
     if (docs.length && cwd) {
       const saved = await Promise.all(
         docs.map((d) =>
-          saveScratchImage(cwd, d.mediaType, d.dataBase64, loadScratchRetentionDays(), d.name).catch(() => null),
+          saveScratchWithRetention(cwd, d.mediaType, d.dataBase64, d.name).catch(() => null),
         ),
       )
+      throwIfAdmissionCancelled()
       const paths = saved.filter((p): p is string => p !== null)
       if (paths.length) engineText = `${engineText}\n\n${attachedFilesNote(paths)}`
     }
+    throwIfAdmissionCancelled()
     // Phone turns only: mirror what the desktop composer already did renderer-side (store.send) — write
     // each real image to `.koda/scratch/` so a phone-dropped screenshot survives the turn and shows up in
     // the Recent images strip (which only scans that folder). It still goes inline to the engine below — a
     // path note is doc-only. Guarded to 'remote' so a desktop image (saved by the renderer) isn't written
     // twice. Best-effort; once a file lands, nudge the owning window to refresh the strip (this save races
     // the sync user-turn forward above, so the notify comes after the write, not on turn receipt).
-    if (origin === 'remote' && inline?.length && cwd) {
+    if (newRemoteAttempt && inline?.length && cwd) {
       void Promise.all(
         inline.map((i) =>
-          saveScratchImage(cwd, i.mediaType, i.dataBase64, loadScratchRetentionDays(), i.name).catch(() => null),
+          saveScratchWithRetention(cwd, i.mediaType, i.dataBase64, i.name).catch(() => null),
         ),
       ).then((saved) => {
         if (!saved.some((p) => p)) return
@@ -751,11 +1326,145 @@ export class EngineSessionManager {
     // Ride any finished background-workflow results in ahead of the human's words, framed as context so
     // the agent picks up where it left off. Only what the ENGINE sees is augmented — the user's visible
     // bubble, replay entry, checkpoint label and titling above all use the untouched `text`.
-    const pending = this.drainWorkflowResults(sessionId)
-    session.sendTurn(
-      pending ? (engineText ? `${pending}\n\n${engineText}` : pending) : engineText,
-      inline?.length ? inline : undefined,
-    )
+    const pending = continuingLogicalTurn ? '' : this.drainWorkflowResults(sessionId)
+    const withResults = pending ? (engineText ? `${pending}\n\n${engineText}` : pending) : engineText
+    // A turn written to a child that is about to die on a resume miss goes nowhere, and the user would
+    // watch their message sit unanswered. Hold it until the turn actually completes, so the recovery can
+    // replay it into the clean session. Overwritten each turn, so it is never more than one message.
+    // Held WITHOUT the restore notice: the replay re-enters this method, and each send injects the
+    // currently pending notice exactly once.
+    // A continuation is infrastructure, not a new human turn. Keep the first accepted turn's untouched
+    // visible payload and original engine material authoritative across any number of broker/resume-miss
+    // respawns; otherwise a later miss could replay a broker nudge or path-expanded text as the user's row.
+    if (!internal.logicalContinuation || !this.pendingTurns.has(sessionId))
+      this.pendingTurns.set(sessionId, {
+        engineText: withResults,
+        ...(inline?.length ? { inlineImages: inline } : {}),
+        visible: {
+          text,
+          ...(images?.length ? { attachments: images } : {}),
+          origin,
+          ...(internal.attemptId ? { attemptId: internal.attemptId } : {}),
+          ...(internal.clientTurnId ? { clientTurnId: internal.clientTurnId } : {}),
+        },
+      })
+    // A restore notice rides even a logical continuation: the tree moved regardless of whose turn this
+    // is, and an agent resuming mid-turn is exactly the one holding the stalest file contents.
+    const notice = this.pendingRestoreNotices.get(sessionId) ?? ''
+    throwIfAdmissionCancelled()
+    let sent: boolean | void
+    let acceptedAdmission: boolean
+    try {
+      sent = session.sendTurn(
+        notice ? (withResults ? `${notice}\n\n${withResults}` : notice) : withResults,
+        inline?.length ? inline : undefined,
+      )
+      acceptedAdmission =
+        sent !== false && !!admission && this.turnAdmissions.get(sessionId) === admission
+    } catch (error) {
+      // A synchronous driver write failure is the throwing form of `false`: no engine turn exists to
+      // publish a terminal event, so release every lifecycle claim here and preserve the driver error.
+      this.working.delete(sessionId)
+      this.pendingTurns.delete(sessionId)
+      this.maybeFinishCompletionTurn(sessionId)
+      throw error
+    } finally {
+      // No await exists between the final cancellation check and the engine call. Once the call returns,
+      // Stop is once again a real engine interrupt rather than a prepared-turn cancellation.
+      releaseAdmission()
+    }
+    if (sent === false) {
+      // A dead/unwritable child refused the turn synchronously. Release canonical liveness and reject
+      // the caller so a remote outbox keeps the exact bubble retryable instead of treating it as acked.
+      this.working.delete(sessionId)
+      this.pendingTurns.delete(sessionId)
+      this.maybeFinishCompletionTurn(sessionId)
+      throw new Error('The engine did not accept this turn. Try again.')
+    }
+    // The engine owns a fresh human turn now. It supersedes either a seen/unseen completion or an
+    // unresolved terminal error; infrastructure continuations remain the same logical turn and retain it.
+    if (!internal.logicalContinuation) this.terminalAttention.delete(sessionId)
+    if (!internal.logicalContinuation) {
+      const clean = text.trim()
+      if (clean && clean !== '(image)' && !this.sessionFirstPrompts.has(sessionId))
+        this.sessionFirstPrompts.set(sessionId, clean)
+    }
+    if (acceptedAdmission && admission) {
+      this.acceptedTurns.set(sessionId, {
+        generation: admission.generation,
+        cancelled: false,
+        session,
+      })
+    } else if (internal.logicalContinuation) {
+      // Stop must follow the logical turn onto its replacement child. Keeping the old AcceptedTurn object
+      // would make interrupt() correctly reject the dead process but then decline to stop the live resend.
+      const accepted = this.acceptedTurns.get(sessionId)
+      this.acceptedTurns.set(sessionId, {
+        generation: accepted?.generation ?? ++this.nextTurnAdmissionGeneration,
+        cancelled: accepted?.cancelled ?? false,
+        session,
+      })
+    }
+    if (newRemoteAttempt && internal.attemptId)
+      this.rememberAcceptedRemoteAttempt(
+        sessionId,
+        internal.attemptId,
+        attemptFingerprint!,
+        internal.clientTurnId,
+      )
+    // Record accepted B before rewriting A. The replay append is fail-soft; the following strip's full
+    // rewrite can therefore heal a failed append and persist both A-without-bytes and B together.
+    if (newRemoteAttempt) publishUserTurn()
+    // Any accepted human follow-up supersedes the prior retryable failure, regardless of which head
+    // sent it. Until this boundary, Stop/preflight failure must leave the old exact bytes authoritative.
+    if (!internal.logicalContinuation && previousRemotePayload?.failed) {
+      this.stripRemoteTurnPayload(sessionId, previousRemotePayload)
+      if (this.remoteTurnPayloads.get(sessionId) === previousRemotePayload)
+        this.remoteTurnPayloads.delete(sessionId)
+    }
+    if (newRemoteAttempt) {
+      if (internal.attemptId || internal.clientTurnId) {
+        const exactAttachmentChars =
+          images?.reduce((total, image) => total + image.dataBase64.length, 0) ?? 0
+        this.setRemoteTurnPayload(sessionId, {
+          replaySeq: remoteReplaySeqForAttempt,
+          attemptId: internal.attemptId,
+          clientTurnId: internal.clientTurnId,
+          ...(images?.length && exactAttachmentChars <= MAX_DURABLE_TURN_ATTACHMENT_BASE64_CHARS
+            ? { attachments: images }
+            : {}),
+          failed: false,
+        })
+      }
+    }
+    // Acceptance is not delivery: the child can die mid-write, a Codex turn/start can still reject,
+    // and broker recovery can respawn mid-turn. The notice therefore STAYS pending — armed only
+    // records what this turn carried so forward() can discharge it at the genuine TurnComplete.
+    if (notice) this.armedRestoreNotices.set(sessionId, notice)
+    return { status: 'accepted' }
+  }
+
+  /** Only the scheduler holding the exact in-memory scope object may start its reserved turn. A
+   * visible human/phone send has no token; broker recovery is the sole same-logical-turn exception. */
+  private claimProjectMutationScopeTurn(
+    sessionId: string,
+    internal: {
+      logicalContinuation?: 'broker-recovery' | 'resume-miss'
+      projectMutationScope?: ProjectMutationScope
+    },
+  ): void {
+    const live = [...this.projectMutationScopes].find((scope) => scope.sessionId === sessionId)
+    if (!live) {
+      if (internal.projectMutationScope) throw new Error('That overnight memory tidy is no longer active.')
+      return
+    }
+    if (internal.logicalContinuation) {
+      if (!live.turnStarted) throw new Error('The overnight memory tidy has not started yet.')
+      return
+    }
+    if (internal.projectMutationScope !== live || live.turnStarted)
+      throw new Error('The overnight memory tidy is still finishing. Wait for it to finish before continuing this chat.')
+    live.turnStarted = true
   }
 
   /** A finished workflow's result, stashed until this session's next human turn delivers it inline. */
@@ -779,6 +1488,112 @@ export class EngineSessionManager {
     return this.diffBaselines.get(sessionId)
   }
 
+  /** Reconcile one finished turn without forcing another engine exchange. Safety-git answers "what
+   * changed since this turn began"; user Git answers whether only those paths remain loose. The result
+   * is passive UI state, never a claim that the aggregate worktree is clean. */
+  private finishCompletionTurn(sessionId: string): void {
+    const turn = this.completionTurns.get(sessionId)
+    if (!turn) return
+    void this.runExclusive(turn.cwd, async () => {
+      // A new turn for the same session cannot overtake this: sendTurn queues its boundary checkpoint
+      // on the same cwd chain. Still guard deletion so a future caller outside that chain is harmless.
+      const current = this.completionTurns.get(sessionId)
+      if (current !== turn) return
+
+      const result = await reconcileCompletionState(
+        sessionId,
+        turn,
+        this.completionPaths.get(sessionId),
+        undefined,
+        this.completionUncertainty.get(sessionId),
+      )
+      this.completionPaths.set(sessionId, result.owned)
+      if (result.unresolvedReason) this.completionUncertainty.set(sessionId, result.unresolvedReason)
+      else this.completionUncertainty.delete(sessionId)
+      if (this.completionTurns.get(sessionId) === turn) this.completionTurns.delete(sessionId)
+      this.pushCompletionState(result.state)
+    }).catch((err) => {
+      log.warn('completion', 'turn reconciliation failed', err instanceof Error ? err.message : err)
+      if (this.completionTurns.get(sessionId) === turn) this.completionTurns.delete(sessionId)
+      this.completionUncertainty.set(sessionId, 'git-probe-failed')
+      this.pushCompletionState({
+        sessionId,
+        state: 'needs-check',
+        paths: [...(this.completionPaths.get(sessionId)?.keys() ?? [])],
+        mixedPaths: [],
+        reason: 'git-probe-failed',
+      })
+    })
+  }
+
+  /**
+   * Reconcile a finished turn, but only once nothing is still expected to write under it. Three
+   * writers outlive the engine's TurnComplete: a scheduler-owned mutation scope, a live turn that is
+   * merely between events, and a delegate the engine backgrounded. Closing the boundary while any of
+   * them is still going loses their edits: nothing attributes a write that lands with no open
+   * boundary, so those files fall to the unowned Loose changes bucket forever.
+   */
+  private maybeFinishCompletionTurn(sessionId: string): void {
+    if (this.working.has(sessionId)) return
+    if (this.hasOwnedDelegation(sessionId)) return
+    if ([...this.projectMutationScopes].some((scope) => scope.sessionId === sessionId)) return
+    this.finishCompletionTurn(sessionId)
+  }
+
+  private pushCompletionState(candidate: TaskCompletionState): void {
+    const parsed = TaskCompletionStateSchema.safeParse(candidate)
+    if (!parsed.success) return
+    const prior = this.completionStates.get(parsed.data.sessionId)
+    if (prior && JSON.stringify(prior) === JSON.stringify(parsed.data)) return
+    this.completionStates.set(parsed.data.sessionId, parsed.data)
+    this.send(IpcChannels.completionState, parsed.data.sessionId, parsed.data)
+  }
+
+  /** Reconcile previously attributed paths against current user Git. This runs before in-app project
+   * mutations and on every Git-status refresh, so a path that became clean is retired before a later
+   * human edit can make an old session reclaim it. Must run inside the project's checkpoint chain. */
+  private async refreshCompletionStatesLocked(projectPath: string): Promise<void> {
+    const root = realpathOrSelf(projectPath)
+    for (const [sessionId, cwd] of this.projectDirs) {
+      if (realpathOrSelf(cwd) !== root) continue
+      const priorOwned = this.completionPaths.get(sessionId)
+      const priorUncertainty = this.completionUncertainty.get(sessionId)
+      if (!priorOwned?.size && !priorUncertainty) continue
+      const result = await reconcileCompletionState(
+        sessionId,
+        {
+          cwd,
+          safetyCommit: null,
+          userGit: { kind: 'unknown' },
+          mutationSeen: false,
+          overlappingWriters: false,
+        },
+        priorOwned,
+        undefined,
+        priorUncertainty,
+      )
+      this.completionPaths.set(sessionId, result.owned)
+      if (result.unresolvedReason) this.completionUncertainty.set(sessionId, result.unresolvedReason)
+      else this.completionUncertainty.delete(sessionId)
+      this.pushCompletionState(result.state)
+    }
+  }
+
+  /** Main-owned refresh door used by desktop/phone Git surfaces and after user-Git mutations. */
+  async refreshCompletionStatesForProject(projectPath: string): Promise<TaskCompletionState[]> {
+    await this.runExclusive(projectPath, () => this.refreshCompletionStatesLocked(projectPath))
+    const root = realpathOrSelf(projectPath)
+    return [...this.completionStates.entries()].flatMap(([sessionId, state]) =>
+      realpathOrSelf(this.projectDirs.get(sessionId) ?? '') === root ? [state] : [],
+    )
+  }
+
+  /** In-process catch-up for a renderer reload. Completion evidence deliberately dies with the app;
+   *  user Git remains the durable truth after restart, while a stale task attribution would not. */
+  completionStatesForProject(projectPath: string): Promise<TaskCompletionState[]> {
+    return this.refreshCompletionStatesForProject(projectPath)
+  }
+
   /** The cwd a session runs in — its safety-git root, and the correct base for resolving/diffing the
    *  files it edits. A background session (or one launched in another folder) can differ from the
    *  window's project root, so a diff MUST resolve against this, not the sender window. */
@@ -786,33 +1601,181 @@ export class EngineSessionManager {
     return this.projectDirs.get(sessionId)
   }
 
+  /** Mark every live turn sharing a project whenever one writer crosses the mutation boundary. The
+   * owner gets mutation evidence; every other writer becomes uncertain. A human/UI write has no
+   * session owner, so every active turn is marked as overlapping. */
+  private noteProjectMutation(cwd: string, owner: string | 'external'): void {
+    const root = realpathOrSelf(cwd)
+    // A long-lived scheduler scope cannot hold the checkpoint mutex while its engine runs. Record the
+    // same ownership fact here instead: any other writer makes a later rollback unsafe, even if that
+    // writer finishes before the scope scan begins.
+    for (const scope of this.projectMutationScopes) {
+      if (realpathOrSelf(scope.cwd) !== root) continue
+      if (owner === 'external' || owner !== scope.sessionId) scope.ambiguous = true
+    }
+    // Scheduler-owned writes can happen just after the engine's TurnComplete, while reconciliation is
+    // queued behind the same project chain. Attribute those writes to the still-open logical boundary
+    // even though `working` has already gone false.
+    if (owner !== 'external') {
+      const ownerTurn = this.completionTurns.get(owner)
+      if (ownerTurn && realpathOrSelf(ownerTurn.cwd) === root) ownerTurn.mutationSeen = true
+    }
+    for (const sessionId of this.working) {
+      if (realpathOrSelf(this.projectDirs.get(sessionId) ?? '') !== root) continue
+      const turn = this.completionTurns.get(sessionId)
+      if (owner !== 'external' && owner === sessionId) {
+        continue
+      }
+      if (turn) turn.overlappingWriters = true
+      else this.completionOverlaps.add(sessionId)
+    }
+  }
+
   /**
-   * Checkpoint the project tree before a USER edit (the Files editor's save), so a manual edit is
-   * recoverable exactly like an engine tool write — and so an edit that clobbers a file Claude just
-   * touched can still be undone (the dual-git safety net, ui-workspace.md §4 apply-handler). Keyed by
-   * the project dir directly (a user edit isn't tied to a session — the Files browser works with
-   * none); serialized through the same per-dir mutex as every other safety-git write.
+   * Run one USER/UI mutation inside the same project chain as turn baselines and safety checkpoints.
+   * The chain stays held THROUGH the actual write: merely announcing an external writer before the
+   * caller writes leaves a gap where a new turn can establish its boundary and later claim the human
+   * edit. Existing task ownership is reconciled before the write, then every active agent turn is
+   * marked uncertain. `checkpointLabel` is optional for additive/reversible writes; the callback sees
+   * whether the requested recovery point succeeded and decides whether a destructive write may run.
+   * Rapid coalesced writes may skip the ownership refresh after the first write in their burst, but
+   * they still cross this serialized boundary and mark every live turn.
    */
-  async checkpointProjectEdit(cwd: string, label: string): Promise<boolean> {
-    return this.runExclusive(cwd, () => this.safeCheckpoint(cwd, label))
+  async withExternalProjectMutation<T>(
+    cwd: string,
+    options: {
+      checkpointLabel?: string
+      checkpointFile?: RequiredCheckpointFile
+      refreshOwnership?: boolean
+    },
+    mutate: (checkpointed: boolean) => T | Promise<T>,
+  ): Promise<T> {
+    return this.runExclusive(cwd, async () => {
+      if (options.refreshOwnership !== false) await this.refreshCompletionStatesLocked(cwd)
+      this.noteProjectMutation(cwd, 'external')
+      const checkpointed = options.checkpointLabel
+        ? await this.safeCheckpoint(cwd, options.checkpointLabel, options.checkpointFile)
+        : true
+      return mutate(checkpointed)
+    })
+  }
+
+  /** Start a scheduler-owned project pass with one exact safety baseline. The returned scope remains
+   *  live across the engine turn, but does not hold checkpointChains (which would deadlock the gate's
+   *  per-tool checkpoints). Competing turns/writes mark it ambiguous instead. */
+  async beginProjectMutationScope(
+    sessionId: string,
+    checkpointLabel: string,
+  ): Promise<ProjectMutationScope | null> {
+    const cwd = this.projectDirs.get(sessionId)
+    if (!cwd) return null
+    return this.runExclusive(cwd, async () => {
+      const baseline = await this.safeCheckpointResult(cwd, checkpointLabel)
+      if (!baseline) return null
+      const root = realpathOrSelf(cwd)
+      const ambiguous = [...this.working].some(
+        (otherId) => otherId !== sessionId && realpathOrSelf(this.projectDirs.get(otherId) ?? '') === root,
+      )
+      const scope: LiveProjectMutationScope = {
+        cwd,
+        sessionId,
+        checkpointId: baseline.id,
+        ambiguous,
+        turnStarted: false,
+      }
+      this.projectMutationScopes.add(scope)
+      return scope
+    })
+  }
+
+  /** Finish a scheduler scope inside the project chain. Completion reconciliation stays open until
+   * the callback lands the digest, and any Koda-observed competing writer is recorded on the boundary.
+   * This overlap signal is attribution evidence only — never permission to roll back the live tree,
+   * and never a user-facing warning. */
+  async finishProjectMutationScope<T>(
+    scope: ProjectMutationScope,
+    mutate: () => T | Promise<T>,
+  ): Promise<{ overlapObserved: boolean; result: T }> {
+    const live = [...this.projectMutationScopes].find((candidate) => candidate === scope)
+    if (!live) throw new Error('project mutation scope is no longer active')
+    let finished = false
+    try {
+      const output = await this.runExclusive(live.cwd, async () => {
+        const root = realpathOrSelf(live.cwd)
+        const anotherTurnIsActive = [...this.working].some(
+          (otherId) =>
+            otherId !== live.sessionId &&
+            realpathOrSelf(this.projectDirs.get(otherId) ?? '') === root,
+        )
+        const boundary = this.completionTurns.get(live.sessionId)
+        const overlapObserved =
+          live.ambiguous || anotherTurnIsActive || boundary?.overlappingWriters === true
+        if (overlapObserved) this.markCompletionOverlap(live.sessionId)
+        this.noteProjectMutation(live.cwd, live.sessionId)
+        const result = await mutate()
+        return { overlapObserved, result }
+      })
+      finished = true
+      return output
+    } finally {
+      this.projectMutationScopes.delete(live)
+      // TurnComplete deliberately deferred reconciliation while this scope was active. Queue it only
+      // after the scheduler's final write/containment decision has landed in the boundary.
+      if (finished || this.completionTurns.has(live.sessionId))
+        this.maybeFinishCompletionTurn(live.sessionId)
+    }
+  }
+
+  /** Scheduler-owned checkpoint on the source project (REM later runs in a disposable clone). */
+  async checkpointProjectForSession(
+    sessionId: string,
+    label: string,
+  ): Promise<CheckpointResult | null> {
+    const cwd = this.projectDirs.get(sessionId)
+    if (!cwd) return null
+    return this.runExclusive(cwd, () => this.safeCheckpointResult(cwd, label))
+  }
+
+  /** Record that a competing writer was seen inside this session's still-open boundary. Evidence
+   *  only — reconciliation still attributes what changed in this turn's own window. */
+  private markCompletionOverlap(sessionId: string): void {
+    const turn = this.completionTurns.get(sessionId)
+    if (turn) turn.overlappingWriters = true
   }
 
   /** The gate's per-tool checkpoint (completes before an `allow` returns to the engine). */
   private async checkpointForSession(sessionId: string, label: string): Promise<boolean> {
     const cwd = this.projectDirs.get(sessionId)
     if (!cwd) return false
-    return this.runExclusive(cwd, () => this.safeCheckpoint(cwd, label))
+    return this.runExclusive(cwd, async () => {
+      this.noteProjectMutation(cwd, sessionId)
+      return this.safeCheckpoint(cwd, label)
+    })
   }
 
   /** Take one checkpoint, fail-soft. Returns false if it couldn't be taken (caller surfaces it). */
-  private async safeCheckpoint(cwd: string, label: string): Promise<boolean> {
+  private async safeCheckpoint(
+    cwd: string,
+    label: string,
+    requiredFile?: RequiredCheckpointFile,
+  ): Promise<boolean> {
+    return (await this.safeCheckpointResult(cwd, label, requiredFile)) !== null
+  }
+
+  /** The exact checkpoint result for callers that need a pinned baseline. Failure stays explicit;
+   *  never substitute a later HEAD, which may describe an older or concurrent tree. */
+  private async safeCheckpointResult(
+    cwd: string,
+    label: string,
+    requiredFile?: RequiredCheckpointFile,
+  ): Promise<CheckpointResult | null> {
     try {
       if (!this.ensured.has(cwd)) {
         await ensureRepo(cwd)
         this.ensured.add(cwd)
         this.scheduleMaintenance(cwd)
       }
-      const result = await checkpoint(cwd, label)
+      const result = await checkpoint(cwd, label, { requiredFile })
       // Humanize this checkpoint's timeline label in the background (non-blocking), so it's ready
       // before anyone opens the timeline. Only 'moment' points (turn/edit — labelled from the user's
       // own words) are worth it and shown; per-tool 'step' snapshots are hidden, and their thin
@@ -828,10 +1791,10 @@ export class EngineSessionManager {
         // to reach the cloud copy.
         noteMomentCheckpoint(cwd)
       }
-      return true
+      return result
     } catch (err) {
       log.error('safety-git', 'checkpoint failed (proceeding)', err instanceof Error ? err.message : err)
-      return false
+      return null
     }
   }
 
@@ -882,33 +1845,49 @@ export class EngineSessionManager {
   setSessionApprovalMode(sessionId: string, mode: ApprovalMode): void {
     const prev = this.gate.getSessionMode(sessionId)
     const crossesPlan = (mode === 'plan') !== (prev === 'plan')
-    if (crossesPlan && this.hasActiveSubagents(sessionId))
-      throw new Error('Delegated work is still running. Let it finish or stop it before switching Plan first.')
+    if (crossesPlan) this.assertPostureMutationSafe(sessionId, 'switching Plan')
     // Always pin the explicit per-session entry (a same-value push still matters: the post-restart
     // re-push pins the session against later default-mode changes) — but only a real change broadcasts.
     this.gate.setSessionMode(sessionId, mode)
     if (prev === mode) return
     this.forward({ type: 'ApprovalModeChanged', sessionId, mode })
+    // An engine that carries its mode as turn text (Codex) needs no respawn at all: hand the live
+    // driver the new posture and the NEXT turn ships the new mode block, which supersedes the old
+    // block still sitting in the thread. The conversation, the thread, and the warm process survive.
+    const liveEngine = this.sessionEngines.get(sessionId) ?? 'claude'
+    if (engineCapabilities(liveEngine).planMode === 'turnText') {
+      this.sessions.get(sessionId)?.setApprovalMode?.(mode)
+      return
+    }
     // Crossing the plan boundary needs a respawn (`--permission-mode plan` is spawn-time). A windowed
     // session's renderer does that itself when the event lands; a WINDOWLESS one (phone-started, or its
     // window closed) has no renderer — respawn here, the same eager --resume the remote model change
     // uses. The phone blocks this while a turn runs (same client-side guard as model/effort).
-    // Before the first turn there's no conversation to --resume; the eager reattach would race the fresh
-    // child's init and fatal. The gate mode is already pinned above, and sendTurn applies plan on the
-    // first turn's spawn — so skip the respawn until a conversation exists.
+    // Before the first turn there's no conversation to reattach, and a respawn would only throw away the
+    // engine's warm start. The gate mode is already pinned above and sendTurn applies plan on the first
+    // turn's spawn, so wait for the driver to report a resumable conversation.
     const conversationStarted =
-      !!this.projectDirs.get(sessionId) &&
-      (this.engineNativeIds.has(sessionId) || claudeConversationExists(this.projectDirs.get(sessionId)!, sessionId))
+      !!this.projectDirs.get(sessionId) && this.resumeCursors.get(sessionId)?.resumable === true
     if (crossesPlan && conversationStarted && !contextForSession(sessionId) && this.sessions.has(sessionId)) {
       const cwd = this.projectDirs.get(sessionId)
       if (!cwd) return
       const { model, effort } = this.sessionModelEffort.get(sessionId) ?? {}
       const engineId = this.sessionEngines.get(sessionId) ?? 'claude'
+      const replacement = this.reserveProcessReplacement(sessionId)
       void this
-        .start({ resumeSessionId: sessionId, cwd, planMode: mode === 'plan', model, effort, engineId })
+        .start({
+          sessionId,
+          cwd,
+          planMode: mode === 'plan',
+          model,
+          effort,
+          engineId,
+          processReplacementClaim: replacement,
+        })
         .catch((err) =>
           log.warn('engine', 'plan-mode respawn failed', err instanceof Error ? err.message : err),
         )
+        .finally(() => this.releaseProcessReplacement(sessionId, replacement))
     }
   }
   /** Read ONE session's current posture — so a remote head can show + set the same control the local
@@ -924,10 +1903,44 @@ export class EngineSessionManager {
    *  stray `awaitTurnEnd` waiter — a true end means no future TurnComplete will ever come for this id. */
   forgetSession(sessionId: string): void {
     this.gate.forgetSession(sessionId)
+    this.sessionGenerations.delete(sessionId)
+    const admission = this.turnAdmissions.get(sessionId)
+    if (admission) admission.cancelled = true
+    this.turnAdmissions.delete(sessionId)
+    this.acceptedTurns.delete(sessionId)
+    this.acceptedRemoteAttempts.delete(sessionId)
+    this.activeRemoteAttemptIds.delete(sessionId)
+    this.remoteTurnPayloads.delete(sessionId)
+    this.terminalAttention.delete(sessionId)
+    this.processReplacements.delete(sessionId)
     this.turnEndWaiters.delete(sessionId)
+    this.pendingTurns.delete(sessionId)
+    this.sessionFirstPrompts.delete(sessionId)
+    this.resumeCursors.delete(sessionId)
+    this.remoteAttached.delete(sessionId)
+    this.startedFromRemote.delete(sessionId)
+    // A true end owns every lingering workflow observer even when process disposal failed before
+    // handleClose could reap it. Delete first so teardown is re-entrant/idempotent; stop() may emit one
+    // final observation event synchronously, so clear replay only after every observer is stopped.
+    for (const [runId, current] of this.workflowWatchers) {
+      if (current.sessionId !== sessionId) continue
+      this.workflowWatchers.delete(runId)
+      current.watcher.stop()
+    }
     this.remoteEventLog.delete(sessionId)
     this.remoteReplaySeq.delete(sessionId)
     this.activeSubagents.delete(sessionId)
+    this.completionTurns.delete(sessionId)
+    this.completionOverlaps.delete(sessionId)
+    this.completionPaths.delete(sessionId)
+    this.completionUncertainty.delete(sessionId)
+    this.completionStates.delete(sessionId)
+    this.pendingRestoreNotices.delete(sessionId)
+    this.armedRestoreNotices.delete(sessionId)
+    for (const scope of this.projectMutationScopes)
+      if (scope.sessionId === sessionId) this.projectMutationScopes.delete(scope)
+    this.deferredDreamVisibility.delete(sessionId)
+    this.deferredDreamLabels.delete(sessionId)
   }
 
   /** Resolves the instant this session's turn genuinely ends — a real TurnComplete or a truly fatal
@@ -938,14 +1951,11 @@ export class EngineSessionManager {
     return new Promise((resolve) => this.turnEndWaiters.set(sessionId, resolve))
   }
 
-  /** Clear a session's unattended (overnight-dream) flag. Called by DreamScheduler once the dream's
-   *  own turn has ended — every LATER turn on this session is a human's, so forced asks (AskUserQuestion,
-   *  exit-plan-mode, checkpoint restore, tool install, protected-target writes) must go back to asking
-   *  instead of auto-denying. Not startDreamSession's job: `notifyDesktopOfHeadless` can adopt the tab
-   *  into an open window WHILE the dream is still running, and clearing there would reopen the hole the
-   *  flag exists to close. */
+  /** Clear a tidy session's unattended + memory-only restrictions after its engine turn AND final
+   * digest write. Every later turn is human-owned and must regain the project's normal gate posture. */
   clearUnattended(sessionId: string): void {
     this.gate.setUnattended(sessionId, false)
+    this.gate.setMemoryTidyRoot(sessionId, null)
   }
 
   /** The model/effort a session currently runs with (for the remote head's pickers). */
@@ -972,6 +1982,11 @@ export class EngineSessionManager {
   /** Sessions blocked on a human answer right now — the phone launcher's "Needs you" triage. */
   remotePendingApprovals(): Record<string, { count: number; oldestAt: number }> {
     return this.gate.pendingBySession()
+  }
+
+  /** Latest successful completion or noteworthy error for the phone launcher's per-head attention rule. */
+  remoteTerminalAttention(sessionId: string): RemoteTerminalAttention | undefined {
+    return this.terminalAttention.get(sessionId)
   }
 
   /** The full pending prompts for one session, so a phone opening a session the agent already blocked
@@ -1003,10 +2018,17 @@ export class EngineSessionManager {
    *
    * Skipped under API billing: an API key has no plan windows, and the poll would report none every
    * time, wrongly pruning the subscription windows the user will see again when they switch back.
+   *
+   * Also skipped under vitest: the poll spawns a REAL engine subprocess, and unit tests construct this
+   * manager freely (sessions.test.ts alone builds ~25) — one test run's orphaned spawns piled up to
+   * ~6.5GB of hung CLI processes and OOM'd the machine (2026-08-12). Guarded here, the single
+   * chokepoint, so the constructor timers and both turn-end triggers are all covered.
    */
   private async pollUsage(): Promise<void> {
+    if (process.env.VITEST || isE2EProfile()) return
     if (this.apiActive('claude')) return
     this.lastUsagePoll = Date.now()
+    this.usageProbe?.ran() // a turn-end poll counts as this heartbeat's run, however it was triggered
     let result: Awaited<ReturnType<typeof pollAccountUsage>>
     try {
       result = await pollAccountUsage({ resourcesPath: this.resourcesPath })
@@ -1053,8 +2075,7 @@ export class EngineSessionManager {
     const engineId = opts.engineId ?? prevEngine
     const changed =
       prev.model !== model || prev.effort !== effort || (prevEngine ?? 'claude') !== (engineId ?? 'claude')
-    if (changed && this.hasActiveSubagents(sessionId))
-      throw new Error('Delegated work is still running. Let it finish or stop it before changing the model or effort.')
+    if (changed) this.assertPostureMutationSafe(sessionId, 'changing the model or effort')
     this.sessionModelEffort.set(sessionId, { model, effort })
     if (opts.engineId) this.sessionEngines.set(sessionId, opts.engineId)
     // Crossing engines invalidates the reported model — the new engine's default is unknown until it
@@ -1084,8 +2105,8 @@ export class EngineSessionManager {
       stored.model = model
       stored.effort = effort
       if (opts.engineId) stored.engineId = opts.engineId
-      const nativeId = this.engineNativeIds.get(sessionId)
-      if (nativeId) stored.engineNativeId = nativeId
+      const cursor = this.resumeCursors.get(sessionId)
+      if (cursor) stored.resumeCursor = cursor
       saveProjectSessions(cwd, store)
     }
     this.forward({
@@ -1105,12 +2126,40 @@ export class EngineSessionManager {
   /** Codex models the account can use, for the model picker's OpenAI group (engine owns the list — no
    *  hardcoded models). Empty when not signed in / no codex binary. One-shot probe (codex-auth.ts). */
   codexModels(): Promise<CodexModel[]> {
+    if (isHermeticE2EProfile()) return Promise.resolve([])
     return listCodexModels({ resourcesPath: this.resourcesPath })
   }
 
   /** Codex sign-in state for the picker + Settings (chatgpt = active subscription). */
   codexAuthStatus(): Promise<CodexAuthStatus> {
+    if (isHermeticE2EProfile()) {
+      return Promise.resolve({ signedIn: false, authMethod: null, requiresOpenaiAuth: true, probeFailed: false })
+    }
     return getCodexAuthStatus({ resourcesPath: this.resourcesPath })
+  }
+
+  /** Provider-neutral picker payload shared by desktop and phone. Keep provider probes here, next to
+   *  the engine services, so clients never recreate auth/error semantics or provider-specific catalogs. */
+  async modelProviderCatalogs(): Promise<ProviderModelCatalogs> {
+    if (isHermeticE2EProfile()) {
+      return providerModelCatalogs({
+        codexAuthStatus: {
+          signedIn: false,
+          authMethod: null,
+          requiresOpenaiAuth: true,
+          probeFailed: false,
+        },
+      })
+    }
+    const [models, auth] = await Promise.allSettled([
+      this.codexModels(),
+      this.codexAuthStatus(),
+    ])
+    return providerModelCatalogs({
+      codexModels: models.status === 'fulfilled' ? models.value : [],
+      codexAuthStatus: auth.status === 'fulfilled' ? auth.value : null,
+      codexProbeFailed: models.status === 'rejected' || auth.status === 'rejected',
+    })
   }
 
   /** Change a session's model and/or effort from a remote head. The engine can't switch either on a
@@ -1121,11 +2170,21 @@ export class EngineSessionManager {
     const cwd = this.projectDirs.get(sessionId)
     if (!cwd) throw new Error(`unknown session: ${sessionId}`)
     const engineId = opts.engineId ?? this.sessionEngines.get(sessionId) ?? 'claude'
+    const previousIntent = this.sessionModelEffort.get(sessionId) ?? {}
+    const previousEngine = this.sessionEngines.get(sessionId) ?? 'claude'
+    const intentChanged =
+      previousIntent.model !== (opts.model || undefined) ||
+      previousIntent.effort !== (opts.effort || undefined) ||
+      previousEngine !== engineId
+    // A picker echo is a genuine no-op. In particular, never turn an unchanged selection into an eager
+    // respawn that could discard a turn or prompt merely because the client repeated its current value.
+    if (!intentChanged) return
+    this.assertPostureMutationSafe(sessionId, 'changing the model or effort')
     // Engine is locked once the conversation starts (context lives in the engine's process/store —
     // switching would silently strand it). The desktop enforces this in its picker; enforce it here
     // for remote heads too, since main is the authority. Conversation-started = a Codex thread id
     // exists, or Claude has the conversation on disk.
-    const prevEngine = this.sessionEngines.get(sessionId) ?? 'claude'
+    const prevEngine = previousEngine
     // A Codex thread id is NOT proof of a conversation: Codex creates the thread during fresh-session
     // initialization, before the first user turn. Treating that id as content locked every phone-started
     // Codex session to Codex before the user typed anything. Real content is a sent turn, a replayed phone
@@ -1136,21 +2195,32 @@ export class EngineSessionManager {
       this.working.has(sessionId) ||
       this.remoteEventLog.get(sessionId)?.some((e) => e.type === 'RemoteUserTurn') === true ||
       Boolean(stored?.items?.length) ||
-      (prevEngine === 'claude' && claudeConversationExists(cwd, storeId))
+      // An engine that keeps a readable conversation on disk proves content that way; one that doesn't
+      // returns false here and the signals above decide.
+      engineConversationHasContent(prevEngine, cwd, storeId)
     if (engineId !== prevEngine && conversationStarted)
       throw new Error('the engine is locked once a conversation has started — start a new chat to switch')
     // Record + broadcast FIRST so the desktop's pill/persisted pick follows the phone's change (else its
     // next reattach would silently revert this respawn to the old pair). This updates the intent, so the
     // live child's spawnedWith now diverges — sendTurn reconciles it on the next turn.
     this.setSessionModelEffort(sessionId, { ...opts, engineId })
-    // A brand-new session (picking a model before sending) has no conversation to reattach to — an eager
-    // `--resume` would race the fresh child's init and fatal with "No conversation found", killing the
-    // session. The intent update above makes the first turn spawn FRESH on this pair, so just record and return.
-    if (!conversationStarted) {
-      this.freshPostureStale.add(sessionId)
-      return
+    // A brand-new session (picking a model before sending) has nothing to reattach to, and respawning it
+    // would only throw away a warm engine. The intent update above makes its first turn spawn on this
+    // pair, so just record and return.
+    if (!conversationStarted) return
+    const replacement = this.reserveProcessReplacement(sessionId)
+    try {
+      await this.start({
+        sessionId,
+        cwd,
+        model: opts.model || undefined,
+        effort: opts.effort || undefined,
+        engineId,
+        processReplacementClaim: replacement,
+      })
+    } finally {
+      this.releaseProcessReplacement(sessionId, replacement)
     }
-    await this.start({ resumeSessionId: sessionId, cwd, model: opts.model || undefined, effort: opts.effort || undefined, engineId })
   }
   /** The default posture new sessions start at (the renderer seeds its per-session default from this). */
   getApprovalMode(): ApprovalMode {
@@ -1214,6 +2284,11 @@ export class EngineSessionManager {
   private readonly dreamSessions = new Set<string>()
   /** REM's disposable snapshot session is digest-only: never adopt it or list it on the phone. */
   private readonly hiddenDreamSessions = new Set<string>()
+  /** Tidy is not exposed until its turn, digest, and optional REM pass are all finished. */
+  private readonly deferredDreamVisibility = new Set<string>()
+  /** The dated title is persisted only at reveal. Persisting it earlier would let a newly opened
+   * desktop hydrate the supposedly hidden session from disk and replace its reserved engine. */
+  private readonly deferredDreamLabels = new Map<string, string>()
   setEngineActivityListener(fn: ((cwd: string) => void) | null): void {
     this.engineActivityListener = fn
   }
@@ -1239,8 +2314,8 @@ export class EngineSessionManager {
   /** Start a windowless session for the overnight dream (dream.ts) — the phone-session machinery
    *  reused: headless start on the last posture, name-locked so nothing can rename it, and gate-marked
    *  unattended so anything needing a human is DENIED instead of hanging on a prompt no window shows.
-   *  Tidy sessions are remotely attached for live adoption; REM stays hidden until it is disposed,
-   *  because its whole-project rollback must finish before any human can continue that conversation.
+   *  Tidy sessions can defer all discovery until finalization; REM stays permanently hidden because
+   *  its disposable project snapshot is implementation detail, not a conversation to resume.
    *
    *  The lock is `userNamed` (the same flag a manual rename sets) — main's own titlers and BOTH renderer
    *  retitle paths already honor it. `remoteTitled` alone wasn't enough: a window open on the project
@@ -1250,27 +2325,104 @@ export class EngineSessionManager {
   async startDreamSession(
     projectPath: string,
     label: string,
-    options: { visible?: boolean; readOnly?: boolean } = {},
+    options: {
+      visible?: boolean
+      readOnly?: boolean
+      memoryOnly?: boolean
+      deferVisibility?: boolean
+    } = {},
   ): Promise<{ sessionId: string }> {
     const last = loadLastPosture()
+    const sessionId = randomUUID()
+    // Reserve discovery state before start() can publish the live engine into `sessions`. Usually the
+    // caller's await continuation runs first anyway, but an already-queued launcher/hydration poll must
+    // not get even a one-tick view of an unattended session.
+    const reserve = (): void => {
+      this.dreamSessions.add(sessionId)
+      if (options.visible === false) this.hiddenDreamSessions.add(sessionId)
+      if (options.visible !== false && options.deferVisibility) {
+        this.deferredDreamVisibility.add(sessionId)
+        this.deferredDreamLabels.set(sessionId, label)
+      }
+      this.remoteTitled.add(sessionId)
+    }
+    const releaseReservation = (): void => {
+      this.dreamSessions.delete(sessionId)
+      this.hiddenDreamSessions.delete(sessionId)
+      this.deferredDreamVisibility.delete(sessionId)
+      this.deferredDreamLabels.delete(sessionId)
+      this.remoteTitled.delete(sessionId)
+    }
+    reserve()
     let started: { sessionId: string }
     try {
-      started = await this.start({ cwd: projectPath, model: last.model, effort: last.effort, engineId: last.engineId })
+      started = await this.start({
+        cwd: projectPath,
+        sessionId,
+        model: last.model,
+        effort: last.effort,
+        engineId: last.engineId,
+      })
     } catch (err) {
       log.warn('sessions', 'dream start with last posture failed; retrying bare', err instanceof Error ? err.message : err)
-      started = await this.start({ cwd: projectPath })
+      // A partial failed start may have run disposal hygiene. Reassert the reservation before retry.
+      reserve()
+      try {
+        started = await this.start({ cwd: projectPath, sessionId })
+      } catch (retryErr) {
+        // start() records engine/cwd intent before spawning. A double spawn failure has no live
+        // conversation, so run normal disposal hygiene as well as dropping the discovery reservation.
+        await this.dispose(sessionId).catch((disposeErr) =>
+          log.warn(
+            'sessions',
+            'failed dream start cleanup failed',
+            disposeErr instanceof Error ? disposeErr.message : disposeErr,
+          ),
+        )
+        releaseReservation()
+        this.forgetSession(sessionId)
+        throw retryErr
+      }
     }
-    const { sessionId } = started
-    this.dreamSessions.add(sessionId)
-    if (options.visible === false) this.hiddenDreamSessions.add(sessionId)
+    if (started.sessionId !== sessionId) {
+      releaseReservation()
+      throw new Error('dream session started under an unexpected identity')
+    }
+    // Attach a visible tidy to the replay buffer immediately, even while discovery stays deferred.
+    // Its scheduler-owned prompt/reply would otherwise be lost before reveal because top-level events
+    // are only buffered for remote-attached sessions. The deferred filters below remain the sole
+    // publication gate; REM is permanently hidden and never attaches.
     if (options.visible !== false) this.attachRemote(sessionId)
-    this.remoteTitled.add(sessionId) // never auto-retitle a dream session
-    this.persistRemoteTitle(projectPath, sessionId, label, true)
+    // A hidden REM session never earns a project-store row. A deferred tidy gets one only at reveal;
+    // until then both the live launcher and restart hydration must be unable to discover it.
+    if (options.visible !== false && !options.deferVisibility)
+      this.persistRemoteTitle(projectPath, sessionId, label, true)
     this.gate.setUnattended(sessionId, true)
     if (options.readOnly) this.gate.setReadOnly(sessionId, true)
-    if (options.visible !== false)
+    if (options.memoryOnly) this.gate.setMemoryTidyRoot(sessionId, projectPath)
+    if (options.visible !== false && !options.deferVisibility)
       this.notifyDesktopOfHeadless(projectPath) // a window open on this project can adopt it live
     return { sessionId }
+  }
+
+  /** Publish a deferred tidy only after all scheduler-owned work is done, so no window/phone turn can
+   * race its reserved logical turn or receive a later digest under the same session id. */
+  revealDreamSession(sessionId: string): void {
+    if (!this.deferredDreamVisibility.delete(sessionId)) return
+    const label = this.deferredDreamLabels.get(sessionId)
+    const cwd = this.projectDirs.get(sessionId)
+    if (!cwd || !this.sessions.has(sessionId)) {
+      this.deferredDreamLabels.delete(sessionId)
+      return
+    }
+    // With no renderer, main owns the session store. With a live project window, carry the locked
+    // label through adoption instead: its renderer owns the whole store blob and will persist the
+    // adopted session without racing a second writer here.
+    const win = windowForProject(realpathOrSelf(cwd))
+    if (label && (!win || win.isDestroyed()) && this.persistRemoteTitle(cwd, sessionId, label, true))
+      this.deferredDreamLabels.delete(sessionId)
+    this.attachRemote(sessionId)
+    this.notifyDesktopOfHeadless(cwd)
   }
 
   /** Live sessions a remote client can pick: id + project dir + the session's human title.
@@ -1278,6 +2430,7 @@ export class EngineSessionManager {
   remoteSessionList(): { id: string; cwd: string; label: string; engineId: EngineId; lastActivityAt: number; lastLine?: string }[] {
     return [...this.sessions.keys()]
       .filter((id) => !this.hiddenDreamSessions.has(id))
+      .filter((id) => !this.deferredDreamVisibility.has(id))
       .sort((a, b) => (this.lastActivityAt.get(b) ?? 0) - (this.lastActivityAt.get(a) ?? 0))
       .map((id) => {
         const cwd = this.projectDirs.get(id) ?? ''
@@ -1292,9 +2445,10 @@ export class EngineSessionManager {
       })
   }
 
-  /** Is a turn in flight for this session right now? Drives the remote launcher's live working glyph. */
+  /** Is parent or delegated work in flight for this session right now? Drives the remote launcher's
+   *  live working glyph and unattended schedulers from the same main-owned runtime truth. */
   isWorking(sessionId: string): boolean {
-    return this.working.has(sessionId)
+    return this.working.has(sessionId) || this.hasActiveDelegation(sessionId)
   }
 
   /** Epoch ms of this session's last engine event (0 = none yet) — engine liveness for unattended
@@ -1309,20 +2463,47 @@ export class EngineSessionManager {
     return this.turnReplies.get(sessionId)
   }
 
-  /** A live session's human title — the on-device auto-title or the user's rename, from the persisted
-   *  store (the same source `remoteHistory` trusts). Falls back to the project folder only when there's
-   *  no title yet (a session before its first turn). A remote-resumed session's live id differs from the
-   *  stored one, so fall back through `resumedFrom`. */
+  /** A live session's human title — normally the persisted store (the source `remoteHistory` trusts).
+   *  A revealed Dream keeps its scheduler-owned dated label as a fallback until a durable userNamed row
+   *  acknowledges renderer/windowless ownership; a later user rename then wins. While persistence is
+   *  catching up, use the first known user turn instead of repeating the project folder for every live
+   *  row. Remote resumes resolve through `resumedFrom`. */
   private sessionLabel(id: string, cwd: string): string {
     const storedId = this.resumedFrom.get(id) ?? id
-    const label = this.projectStore(cwd)?.sessions.find((s) => s.id === storedId)?.label?.trim()
-    return label || basename(cwd) || 'Session'
+    const stored = this.projectStore(cwd)?.sessions.find((s) => s.id === storedId)
+    const label = stored?.label?.trim()
+    // A persisted userNamed row is the renderer/windowless owner's acknowledgement. Until that
+    // exists, retain the pending dated lock across adoption/reload; afterward a real user rename wins.
+    if (stored?.userNamed && label) {
+      this.deferredDreamLabels.delete(id)
+      return label
+    }
+    const meaningfulLabel = label && !isProvisionalSessionLabel(label, cwd) ? label : undefined
+    const replayPrompt = this.remoteEventLog
+      .get(id)
+      ?.find(
+        (entry) =>
+          entry.type === 'RemoteUserTurn' &&
+          entry.text.trim() &&
+          entry.text.trim() !== '(image)',
+      )
+    const firstPrompt =
+      firstPersistedUserPrompt(stored?.items) ||
+      this.sessionFirstPrompts.get(id) ||
+      (replayPrompt?.type === 'RemoteUserTurn' ? replayPrompt.text : undefined)
+    return (
+      this.deferredDreamLabels.get(id)?.trim() ||
+      meaningfulLabel ||
+      (firstPrompt ? titleFromPrompt(firstPrompt) : undefined) ||
+      basename(cwd) ||
+      'Session'
+    )
   }
 
   /** First-turn auto-titling for a headless (phone-started) session. Titling normally lives in the
    *  renderer's dispatch path, but a phone session runs windowless — no renderer ever names it, so its
    *  label would stay the project-folder fallback. Mirror the desktop's two stages here on the engine
-   *  turn path: the instant first-words title, then the on-device-model refinement ~300ms later. Both
+   *  turn path: the instant first-words title, then the selected generated-text writer. Both
    *  persist to the per-project store, which the phone's session list + history read from. Runs once per
    *  session (a resumed or already-named session is left alone); the caller only invokes it while the
    *  session is windowless, so the store writes can't race the renderer's whole-blob persistence. */
@@ -1332,24 +2513,174 @@ export class EngineSessionManager {
     if (!clean) return // image-only turn — let the next text turn name it
     const storedId = this.resumedFrom.get(sessionId) ?? sessionId
     const stored = this.projectStore(cwd)?.sessions.find((s) => s.id === storedId)
-    // Already named (a resumed past session, or a restart-resume) — never re-title.
-    if (stored?.label?.trim() || stored?.userNamed) {
+    const storedLabel = stored?.label?.trim()
+    // Already meaningfully named (a resumed past session, or a restart-resume) — never re-title.
+    // Folder names and creation placeholders are not titles; a pre-turn posture pick can persist one.
+    if (stored?.userNamed || (storedLabel && !isProvisionalSessionLabel(storedLabel, cwd))) {
       this.remoteTitled.add(sessionId)
       return
     }
     this.remoteTitled.add(sessionId)
     this.remoteFirstPrompt.set(sessionId, { prompt: clean, cwd }) // feeds the substance retitle at first TurnComplete
     this.persistRemoteTitle(cwd, storedId, titleFromPrompt(clean))
-    // Fire-and-forget on-device upgrade; never blocks the turn, never throws. Skip once a window has
+    // Fire-and-forget generated-text naming; never blocks the turn, never throws. Skip once a window has
     // adopted the session (its renderer owns the label then) so the write can't race the renderer.
     const gen = (this.remoteTitleGen.get(sessionId) ?? 0) + 1
     this.remoteTitleGen.set(sessionId, gen)
-    void assistTitle(clean, this.takenRemoteTitles(cwd, storedId))
-      .then((title) => {
+    void this.nameSession({
+      kind: 'initial',
+      evidence: clean,
+      avoid: this.takenRemoteTitles(cwd, storedId),
+    })
+      .then(({ title, overview }) => {
         if (this.remoteTitleGen.get(sessionId) !== gen) return // superseded by the substance retitle
-        if (title.trim() && !contextForSession(sessionId)) this.persistRemoteTitle(cwd, storedId, title.trim())
+        if (title.trim() && !contextForSession(sessionId))
+          this.persistRemoteTitle(cwd, storedId, title.trim(), false, overview)
       })
       .catch(() => {})
+  }
+
+  /**
+   * Name a session through the app-global writer chosen in Settings. Apple runs locally, plain uses the
+   * deterministic floor, and a cloud model runs through the inert structured-generation seam. The picker is
+   * the user's explicit billing choice, so it may differ from the conversation engine without Koda
+   * silently choosing an account on their behalf.
+   */
+  async nameSession(req: {
+    kind: NamingKind
+    evidence: string
+    currentTitle?: string
+    avoid?: string[]
+  }): Promise<GeneratedName> {
+    const selected = loadTextGenerationModel()
+    const floor = (text: string, avoid: string[]): Promise<string> =>
+      selected.provider === 'plain'
+        ? Promise.resolve(disambiguate(deterministic('title', text), avoid))
+        : assistTitle(text, avoid)
+    if (isHermeticE2EProfile()) {
+      // Same split as a real miss (naming.ts rule 2): only an `initial` may take the floor, or E2E
+      // would exercise a regenerate path that renames from the framed digest — which is the bug.
+      return req.kind === 'initial'
+        ? { title: await floor(req.evidence, req.avoid ?? []), overview: '' }
+        : { title: '', overview: '' }
+    }
+    if (selected.provider === 'apple' || selected.provider === 'plain') {
+      return req.kind === 'initial'
+        ? { title: await floor(req.evidence, req.avoid ?? []), overview: '' }
+        : { title: '', overview: '' }
+    }
+    const apiKey = this.effectiveApiKey(selected.provider)
+    return generateSessionName(
+      {
+        ...req,
+        engineId: selected.provider,
+        model: selected.model,
+        effort: selected.effort,
+        resourcesPath: this.resourcesPath,
+        env: apiKey ? { apiMode: true, apiKey } : undefined,
+      },
+      floor,
+    )
+  }
+
+  /**
+   * Describe a save before it happens with the app-global generated-text writer. Apple runs locally;
+   * a cloud choice is an explicit account choice and re-adds that provider's API credential only when
+   * API billing is active. `version-message.ts` owns the evidence prompt and deterministic floor.
+   *
+   * Never throws and never blocks a save: the deterministic floor answers whenever the toggle is off,
+   * plain text is selected, or the chosen writer misses.
+   */
+  async proposeVersionMessage(req: {
+    cwd: string
+    /** The changed files, which is all the deterministic floor needs. */
+    status: StatusResult
+    /** The expensive half (diff + recent subjects), read only once a turn is actually going to run. */
+    readEvidence: () => Promise<ChangeEvidence>
+  }): Promise<VersionMessage> {
+    const floor: VersionMessage = {
+      message: fallbackVersionMessage(req.status.files, req.status.truncated),
+      source: 'fallback',
+    }
+    // E2E must never spend a real turn describing a fixture repo; the floor is what it asserts on.
+    if (isHermeticE2EProfile() || !loadSuggestVersionMessage()) return floor
+    const selected = loadTextGenerationModel()
+    // Plain is a complete answer, not a failed generation, and needs no expensive diff read.
+    if (selected.provider === 'plain') return floor
+    const evidence = await req.readEvidence()
+    // Without a diff, the file-list floor is the complete honest answer.
+    if (!evidence.diff.trim()) return floor
+    if (selected.provider === 'apple') {
+      const written = await assistVersionMessage(buildVersionMessagePrompt(evidence))
+      return written ? { message: written, source: 'on-device' } : floor
+    }
+    const apiKey = this.effectiveApiKey(selected.provider)
+    return generateVersionMessage({
+      ...evidence,
+      engineId: selected.provider,
+      model: selected.model,
+      effort: selected.effort,
+      resourcesPath: this.resourcesPath,
+      env: apiKey ? { apiMode: true, apiKey } : undefined,
+    })
+  }
+
+  /**
+   * The engine a session actually runs on: the live choice for a session that has started this run,
+   * else the one persisted with the chat. A renderer that knows which chat it is asking from names the
+   * SESSION, never an engine — main reads the engine off the session itself, so no surface can pick a
+   * billing path on the user's behalf. Undefined when the id names nothing Koda can see.
+   */
+  sessionEngine(cwd: string, sessionId: string): EngineId | undefined {
+    const live = this.sessionEngines.get(sessionId)
+    if (live) return live
+    const storedId = this.resumedFrom.get(sessionId) ?? sessionId
+    const persisted = readPersistedSession(cwd, storedId)
+    return persisted ? (persisted.engineId ?? 'claude') : undefined
+  }
+
+  /** Whether a renderer hot-store snapshot still includes every finalized session turn. A turn or
+   *  delegated writer that main still owns is incomplete by definition; a transcript event after the
+   *  acknowledged save proves the file is stale even if the renderer's next write has not fired yet. */
+  hotSessionSnapshotComplete(projectPath: string, savedAt: number | undefined): boolean {
+    if (savedAt === undefined) return false
+    const root = realpathOrSelf(projectPath)
+    for (const [sessionId, cwd] of this.projectDirs) {
+      if (realpathOrSelf(cwd) !== root) continue
+      if (this.working.has(sessionId) || this.hasOwnedDelegation(sessionId)) return false
+      // `savedAt` is the renderer's snapshot START, so same-millisecond events are conservatively
+      // considered newer too; wall-clock resolution must never certify an omitted turn as complete.
+      if ((this.engineEventAt.get(sessionId) ?? 0) >= savedAt) return false
+    }
+    return true
+  }
+
+  /**
+   * The engine runner the Library's "Ask Koda" answers through (`library-ask.ts` owns the prompt, the
+   * evidence and the citation mapping). Here for one reason only, the same one `nameSession` is here
+   * for: billing parity is decided in exactly ONE place. An ask re-adds the API credential only when
+   * that engine is actually in API billing mode, exactly like the session's own turns, so a question
+   * asked from the document surface bills the path the user chose and lands in the usage they already
+   * see. `effectiveApiKey` stays private; callers get a configured runner, never a key.
+   *
+   * WHICH engine is decided here too, and it is not a default. An ask is launched from a chat, so it
+   * runs on THAT chat's engine (`sessionEngine`, resolved by the IPC caller from the asking window):
+   * app-wide resolution refused an ask launched from a Claude chat because some other session had been
+   * switched to Codex, and ran Claude for an ask launched from a Codex chat — in both directions the
+   * refusal copy names an engine the user is not looking at. Only an ask with no chat behind it at all
+   * falls back to the engine they last explicitly ran on, which is main's own copy of that choice and
+   * the same source a phone-side new session opens on. Hard-coding Claude here spawned Claude for a
+   * Codex user: an ask billed to an Anthropic account they never chose for it, with nothing on screen
+   * saying so, and for a Codex-only user a permanent "could not be answered" with no way to learn why.
+   */
+  libraryAskRunner(engineId?: EngineId): AskRunner {
+    const engine = engineId ?? loadLastPosture().engineId ?? 'claude'
+    const apiKey = this.effectiveApiKey(engine)
+    return engineAskRunner({
+      engineId: engine,
+      resourcesPath: this.resourcesPath,
+      env: apiKey ? { apiMode: true, apiKey } : undefined,
+    })
   }
 
   /** Sibling-session names in this project the auto-titler must avoid — same list the renderer builds
@@ -1358,7 +2689,7 @@ export class EngineSessionManager {
     return (this.projectStore(cwd)?.sessions ?? [])
       .filter((s) => s.id !== excludeId)
       .map((s) => s.label?.trim())
-      .filter((l): l is string => !!l && l !== 'New session')
+      .filter((l): l is string => !isProvisionalSessionTitle(l))
       .slice(-12)
   }
 
@@ -1366,17 +2697,35 @@ export class EngineSessionManager {
    *  and history read labels from. Upserts a minimal entry when the renderer hasn't persisted this
    *  (windowless) session, updates the label in place otherwise. Never clobbers a user rename.
    *  `lock` marks the label userNamed — for a name Koda itself chose deliberately (the dream's dated
-   *  title) that no auto-titler on either side of the IPC boundary may overwrite. */
-  private persistRemoteTitle(cwd: string, storedId: string, label: string, lock = false): void {
+   *  title) that no auto-titler on either side of the IPC boundary may overwrite. Returns whether a
+   *  durable userNamed row already existed or the requested write landed. */
+  private persistRemoteTitle(
+    cwd: string,
+    storedId: string,
+    label: string,
+    lock = false,
+    /** The generated one-line overview, when there is one — the sessions map's second line. */
+    overview?: string,
+  ): boolean {
     const store = this.projectStore(cwd)
-    if (!store) return // unreadable store — a title isn't worth rewriting it from an empty one
+    if (!store) return false // unreadable store — a title isn't worth rewriting it from an empty one
     const existing = store.sessions.find((s) => s.id === storedId)
-    if (existing?.userNamed) return
+    if (existing?.userNamed) return true
     if (existing) {
       existing.label = label
+      if (overview?.trim()) existing.overview = overview.trim()
       if (lock) existing.userNamed = true
-    } else store.sessions.push({ id: storedId, label, cwd, userNamed: lock, items: [] })
+    } else
+      store.sessions.push({
+        id: storedId,
+        label,
+        cwd,
+        userNamed: lock,
+        items: [],
+        ...(overview?.trim() ? { overview: overview.trim() } : {}),
+      })
     saveProjectSessions(cwd, store)
+    return true
   }
 
   // ── Remote launcher: start-new / resume-old from the phone (no desktop window) ────────────────────
@@ -1405,10 +2754,10 @@ export class EngineSessionManager {
       if (!stored) continue
       for (const s of stored.sessions) {
         if (this.sessions.has(s.id)) continue // already running → shown under "running", not "resume"
-        if ((s.engineId ?? 'claude') === 'claude' && !claudeConversationExists(s.cwd || p, s.id)) continue
-        // Real last-activity: the conversation file's mtime (0 for Codex, which keeps stored order).
-        // Kept in the payload — the phone day-groups its Sessions list by it.
-        out.push({ id: s.id, label: s.label, projectPath: p, projectName: basename(p) || p, updatedAt: claudeConversationMtime(s.cwd || p, s.id) })
+        if (!engineConversationExists(s.engineId, s.cwd || p, s.id)) continue
+        // Real last-activity: the conversation file's mtime (0 for an engine that keeps none, which
+        // holds stored order). Kept in the payload — the phone day-groups its Sessions list by it.
+        out.push({ id: s.id, label: s.label, projectPath: p, projectName: basename(p) || p, updatedAt: engineConversationMtime(s.engineId, s.cwd || p, s.id) })
       }
     }
     return out.sort((a, b) => b.updatedAt - a.updatedAt)
@@ -1418,7 +2767,7 @@ export class EngineSessionManager {
    *  that isn't a known recent project (the phone can't spawn an agent in an arbitrary directory).
    *
    *  IDEMPOTENT on the phone's chosen `sessionId`. A start is a WRITE whose reply can be lost in transit
-   *  (a recycled relay socket, a cold WG tunnel) — the phone then reports "could not start" for a session
+   *  (a recycled relay socket, a cold Connect route) — the phone then reports "could not start" for a session
    *  that IS running, and a blind retry would spawn a second engine. So the phone names the id up front
    *  and re-sends the same one: an id that's already live under the remote head in this same project is
    *  simply handed back. A live id we DON'T own (a desktop session the phone named) is never touched —
@@ -1431,7 +2780,7 @@ export class EngineSessionManager {
       const inflight = this.remoteStarts.get(chosen)
       if (inflight) return inflight
       if (this.sessions.has(chosen))
-        return this.remoteAttached.has(chosen) && this.projectDirs.get(chosen) === projectPath
+        return this.startedFromRemote.has(chosen) && this.projectDirs.get(chosen) === projectPath
           ? { sessionId: chosen } // the re-send of a start that already landed
           : this.startNewRemote(projectPath) // live but not ours — mint a fresh id instead
       const p = this.spawnNewRemote(projectPath, chosen).finally(() => this.remoteStarts.delete(chosen))
@@ -1462,6 +2811,7 @@ export class EngineSessionManager {
       started = await this.start({ cwd: projectPath, sessionId: chosen })
     }
     const id = started.sessionId
+    this.startedFromRemote.add(id)
     this.attachRemote(id)
     this.notifyDesktopOfHeadless(projectPath) // if this project is open on the Mac, let it adopt this live
     return { sessionId: id }
@@ -1477,30 +2827,28 @@ export class EngineSessionManager {
     // respawn silently falls back to the account default model and clobbers the intent map.
     const stored = this.projectStore(projectPath)?.sessions.find((s) => s.id === sessionId)
     const { sessionId: id } = await this.start({
-      resumeSessionId: sessionId,
+      sessionId,
       cwd: projectPath,
       model: stored?.model,
       effort: stored?.effort,
       engineId: stored?.engineId,
-      engineNativeId: stored?.engineNativeId,
+      // The blob the desktop persisted for this session — the engine's own reattach state.
+      resumeCursor: stored?.resumeCursor,
       // A phone attachment is sticky, while a true session end clears the in-memory counter. Seed
       // the respawn before SessionStarted is buffered so restored rows cannot restart at 1 and be
       // mistaken for already-rendered history.
       replaySeq: stored?.replaySeq,
     })
     if (id !== sessionId) this.resumedFrom.set(id, sessionId) // so the phone can load the prior transcript
+    this.startedFromRemote.add(id)
     this.attachRemote(id)
     // Seed the replay buffer with the prior history when the store holds no transcript (a headless
     // session's items are never persisted). Without this, the first turn after a resume makes the
     // buffer non-empty, so remoteTranscript's file fallback stops firing and a reopen would show ONLY
     // the new turn. Seeding happens before the resumed engine emits anything, so nothing can double.
-    if (
-      !stored?.items?.length &&
-      !this.remoteEventLog.get(id)?.length &&
-      (stored?.engineId ?? 'claude') === 'claude'
-    ) {
+    if (!stored?.items?.length && !this.remoteEventLog.get(id)?.length) {
       const seed = normalizeReplaySequence(
-        readClaudeConversationReplay(stored?.cwd || projectPath, sessionId, id),
+        readEngineConversationReplay(stored?.engineId, stored?.cwd || projectPath, sessionId, id),
       )
       if (seed.length) {
         this.remoteEventLog.set(id, seed)
@@ -1622,6 +2970,7 @@ export class EngineSessionManager {
       existing.userNamed = true
     } else store.sessions.push({ id: storedId, label, cwd, userNamed: true, items: [] })
     saveProjectSessions(cwd, store)
+    this.deferredDreamLabels.delete(sessionId)
   }
 
   // ── Desktop adoption of headless (phone-started) sessions ─────────────────────────────────────────
@@ -1633,11 +2982,17 @@ export class EngineSessionManager {
   /** Append full replay for remote-attached sessions and delegated-task replay for local sessions.
    *  Streaming deltas are ephemeral; finalized blocks re-carry any text worth restoring. */
   private bufferRemoteEvent(event: EngineEvent): EngineEvent {
-    if (event.type === 'AssistantDelta' || event.type === 'ThinkingDelta') return event
+    // Routing/runtime state, not transcript: cursor and capability updates would bloat the durable replay
+    // sidecar and burn replay identities for rows that should be freshly observed on every engine start.
+    if (
+      event.type === 'AssistantDelta' ||
+      event.type === 'ThinkingDelta' ||
+      event.type === 'ResumeCursorUpdated' ||
+      event.type === 'SessionCapabilitiesUpdated'
+    )
+      return event
     const delegated =
-      event.type === 'SubagentStarted' ||
-      event.type === 'SubagentProgress' ||
-      event.type === 'SubagentCompleted' ||
+      isDelegationLifecycleEvent(event) ||
       ((event.type === 'AssistantBlock' || event.type === 'ToolRequested' || event.type === 'ToolResult') &&
         !!event.parentToolUseId)
     if (!this.remoteAttached.has(event.sessionId) && !delegated) return event
@@ -1661,6 +3016,156 @@ export class EngineSessionManager {
     return recorded
   }
 
+  private rememberAcceptedRemoteAttempt(
+    sessionId: string,
+    attemptId: string,
+    fingerprint: string,
+    clientTurnId?: string,
+  ): void {
+    let attempts = this.acceptedRemoteAttempts.get(sessionId)
+    if (!attempts) {
+      attempts = new Map()
+      this.acceptedRemoteAttempts.set(sessionId, attempts)
+    }
+    // Map insertion order is our bounded LRU. Refreshing the same accepted id must not grow it.
+    attempts.delete(attemptId)
+    attempts.set(attemptId, { clientTurnId, fingerprint, state: 'running' })
+    this.activeRemoteAttemptIds.set(sessionId, attemptId)
+    while (attempts.size > REMOTE_ATTEMPT_HISTORY_PER_SESSION) {
+      const oldest = attempts.keys().next().value
+      if (oldest === undefined) break
+      attempts.delete(oldest)
+    }
+  }
+
+  private markAcceptedRemoteAttemptComplete(sessionId: string): void {
+    const attemptId = this.activeRemoteAttemptIds.get(sessionId)
+    if (!attemptId) return
+    const accepted = this.acceptedRemoteAttempts.get(sessionId)?.get(attemptId)
+    if (accepted) accepted.state = 'complete'
+    this.activeRemoteAttemptIds.delete(sessionId)
+  }
+
+  /** Keep the exact unresolved payload set globally bounded. Eviction preserves provenance and removes
+   * only retry bytes, turning that oldest failure into the explicit reattach path. */
+  private setRemoteTurnPayload(sessionId: string, payload: RemoteTurnPayload): void {
+    this.remoteTurnPayloads.delete(sessionId)
+    this.remoteTurnPayloads.set(sessionId, payload)
+    while (this.remoteTurnPayloads.size > REMOTE_ATTACHMENT_PAYLOAD_SESSIONS) {
+      const oldestSessionId = this.remoteTurnPayloads.keys().next().value
+      if (oldestSessionId === undefined) break
+      const oldest = this.remoteTurnPayloads.get(oldestSessionId)
+      this.remoteTurnPayloads.delete(oldestSessionId)
+      if (oldest?.failed) this.stripRemoteTurnPayload(oldestSessionId, oldest)
+    }
+  }
+
+  private rewriteRemoteReplay(sessionId: string): void {
+    const entries = this.remoteEventLog.get(sessionId)
+    const cwd = this.projectDirs.get(sessionId)
+    if (!entries || !cwd) return
+    const storedId = this.resumedFrom.get(sessionId) ?? sessionId
+    replaceRemoteReplay(
+      cwd,
+      storedId,
+      entries.map((entry) => ({ ...entry, sessionId: storedId })),
+    )
+  }
+
+  private remotePayloadMatches(entry: ReplayEntry, payload: RemoteTurnPayload): boolean {
+    if (entry.type !== 'RemoteUserTurn') return false
+    if (payload.clientTurnId) return entry.clientTurnId === payload.clientTurnId
+    return payload.replaySeq !== undefined && entry.replaySeq === payload.replaySeq
+  }
+
+  /** Remove exact bytes from every replay boundary for one logical turn. Engine retries intentionally
+   * share clientTurnId, so a later success cleans the prior failure attempt as well. */
+  private stripRemoteTurnPayload(sessionId: string, payload: RemoteTurnPayload): void {
+    const entries = this.remoteEventLog.get(sessionId)
+    if (!entries) return
+    let changed = false
+    const next = entries.map((entry) => {
+      if (!this.remotePayloadMatches(entry, payload) || entry.type !== 'RemoteUserTurn' || !entry.images)
+        return entry
+      changed = true
+      const { images: _images, ...provenanceOnly } = entry
+      return provenanceOnly as ReplayEntry
+    })
+    if (!changed) return
+    this.remoteEventLog.set(sessionId, next)
+    this.rewriteRemoteReplay(sessionId)
+  }
+
+  /** A window that already owns a phone session saw the provenance-only user row live. When that
+   * attempt fails, update that exact row with the bounded retry payload before the EngineError is
+   * delivered, so its durable failure envelope cannot offer a text-only retry for a missing document. */
+  private publishPromotedRemoteTurn(
+    sessionId: string,
+    entry: Extract<ReplayEntry, { type: 'RemoteUserTurn' }>,
+  ): void {
+    const win = contextForSession(sessionId)?.win
+    if (!win || win.isDestroyed()) return
+    try {
+      win.webContents.send(IpcChannels.sessionRemoteUserTurn, {
+        sessionId,
+        text: entry.text,
+        ...(entry.clientTurnId ? { clientTurnId: entry.clientTurnId } : {}),
+        hadAttachments: entry.hadAttachments,
+        ...(entry.attachments?.length ? { attachments: entry.attachments } : {}),
+        hadImages: entry.hadImages,
+        images: entry.images,
+        replaySeq: entry.replaySeq,
+        append: false,
+      })
+    } catch (error) {
+      // The replay sidecar remains authoritative. A closing renderer can adopt that exact payload on
+      // its next open; publication failure must not interfere with settling the engine attempt.
+      log.warn(
+        'remote',
+        'failed turn payload could not be published to its owner',
+        error instanceof Error ? error.message : error,
+      )
+    }
+  }
+
+  /** A failed engine attempt may need an exact manual retry after the phone reloads. Promote only the
+   * pre-capped whole payload; a missing/oversize payload keeps provenance and requires reattachment. */
+  private promoteRemoteTurnPayload(sessionId: string): void {
+    const payload = this.remoteTurnPayloads.get(sessionId)
+    if (!payload) return
+    payload.failed = true
+    if (!payload.attachments?.length || payload.replaySeq === undefined) return
+    const entries = this.remoteEventLog.get(sessionId)
+    if (!entries) return
+    let changed = false
+    let promoted: Extract<ReplayEntry, { type: 'RemoteUserTurn' }> | undefined
+    const next = entries.map((entry) => {
+      if (
+        entry.type !== 'RemoteUserTurn' ||
+        entry.replaySeq !== payload.replaySeq ||
+        entry.images
+      )
+        return entry
+      changed = true
+      promoted = { ...entry, images: payload.attachments }
+      return promoted
+    })
+    if (!changed) return
+    this.remoteEventLog.set(sessionId, next)
+    this.rewriteRemoteReplay(sessionId)
+    if (promoted) this.publishPromotedRemoteTurn(sessionId, promoted)
+  }
+
+  private finishRemoteTurnPayload(sessionId: string, failed: boolean): void {
+    const payload = this.remoteTurnPayloads.get(sessionId)
+    if (!payload) return
+    if (failed) this.promoteRemoteTurnPayload(sessionId)
+    else this.stripRemoteTurnPayload(sessionId, payload)
+    // Failed entries remain in this bounded map until retry/supersession/eviction so their durable bytes
+    // count against the global cap. Success has no exact material left to retain.
+    if (!failed) this.remoteTurnPayloads.delete(sessionId)
+  }
+
   /** Track delegated leaves independently from the parent turn. Replacing the engine process while
    *  this map is non-empty would silently orphan work, so all posture/model respawn paths consult it. */
   private trackSubagentLifecycle(event: EngineEvent): void {
@@ -1680,28 +3185,32 @@ export class EngineSessionManager {
       return
     }
     if (event.type === 'SubagentProgress') {
-      const active =
-        this.activeSubagents.get(event.sessionId) ??
-        new Map<string, Extract<EngineEvent, { type: 'SubagentStarted' }>>()
-      const current = active.get(event.toolUseId)
+      const active = this.activeSubagents.get(event.sessionId)
+      const current = active?.get(event.toolUseId)
+      // Progress refines an already-live child; it never opens one. Claude can deliver a final
+      // task_notification after the evidence-bearing tool result already closed the card, and
+      // synthesizing a new entry here resurrects finished work forever.
+      if (!active || !current) return
       active.set(event.toolUseId, {
-        ...(current ?? {
-          type: 'SubagentStarted' as const,
-          sessionId: event.sessionId,
-          toolUseId: event.toolUseId,
-          subagentType: 'subagent',
-          description: '',
-        }),
+        ...current,
         taskId: event.taskId ?? current?.taskId,
       })
-      this.activeSubagents.set(event.sessionId, active)
       return
     }
     if (event.type === 'SubagentCompleted') {
+      // Every stop sweep waiting on this child (interrupt) is released here — the child's own terminal
+      // event is the only honest proof it stopped, and it proves it for all of them at once.
+      const waiting = this.childEndWaiters.get(`${event.sessionId}:${event.toolUseId}`)
+      if (waiting) for (const release of [...waiting]) release()
       const active = this.activeSubagents.get(event.sessionId)
       if (!active) return
       active.delete(event.toolUseId)
-      if (!active.size) this.activeSubagents.delete(event.sessionId)
+      if (!active.size) {
+        this.activeSubagents.delete(event.sessionId)
+        // The last delegate is in. If its parent turn already ended, this is where that turn's real
+        // file changes finally settle — TurnComplete deliberately left the boundary open for them.
+        this.maybeFinishCompletionTurn(event.sessionId)
+      }
     }
   }
 
@@ -1717,8 +3226,60 @@ export class EngineSessionManager {
     }
   }
 
-  private hasActiveSubagents(sessionId: string): boolean {
-    return (this.activeSubagents.get(sessionId)?.size ?? 0) > 0
+  private activeWorkflowSnapshots(sessionId: string): { runId: string; runningAgentIds: string[] }[] {
+    const snapshots: { runId: string; runningAgentIds: string[] }[] = []
+    for (const [runId, current] of this.workflowWatchers) {
+      if (current.sessionId === sessionId && current.watcher.isLive())
+        snapshots.push({ runId, runningAgentIds: current.watcher.activeAgentIds() })
+    }
+    return snapshots
+  }
+
+  private hasActiveDelegation(sessionId: string): boolean {
+    return (
+      (this.activeSubagents.get(sessionId)?.size ?? 0) > 0 ||
+      [...this.workflowWatchers.values()].some(
+        (current) => current.sessionId === sessionId && current.watcher.isLive(),
+      )
+    )
+  }
+
+  /** Stronger than visible liveness: a workflow watcher lingers after quiet completion because a late
+   *  wave can still write. Engine teardown and completion attribution must retain that process owner
+   *  until observation really ends, even though the launcher correctly reads the session as settled. */
+  private hasOwnedDelegation(sessionId: string): boolean {
+    return (
+      (this.activeSubagents.get(sessionId)?.size ?? 0) > 0 ||
+      [...this.workflowWatchers.values()].some((current) => current.sessionId === sessionId)
+    )
+  }
+
+  private reserveProcessReplacement(sessionId: string): ProcessReplacementClaim {
+    if (this.processReplacements.has(sessionId))
+      throw new Error('This session is already changing settings. Let that finish first.')
+    const claim = { generation: ++this.nextProcessReplacementGeneration }
+    this.processReplacements.set(sessionId, claim)
+    return claim
+  }
+
+  private releaseProcessReplacement(sessionId: string, claim: ProcessReplacementClaim): void {
+    if (this.processReplacements.get(sessionId) === claim) this.processReplacements.delete(sessionId)
+  }
+
+  /** Model/effort and Plan-boundary changes can replace the engine process. Main owns the final guard:
+   *  a cold or lagging client must never cancel a live turn, strand a pending answer, or cut off a
+   *  delegated writer by mutating posture before its local controls have caught up. */
+  private assertPostureMutationSafe(sessionId: string, action: string): void {
+    if (this.hasOwnedDelegation(sessionId))
+      throw new Error(`Delegated work is still running. Let it finish or stop it before ${action}.`)
+    if (this.processReplacements.has(sessionId))
+      throw new Error(`This session is already changing settings. Let that finish before ${action}.`)
+    if (this.turnAdmissions.has(sessionId))
+      throw new Error(`A turn is already starting. Let it finish before ${action}.`)
+    if (this.working.has(sessionId))
+      throw new Error(`A turn is still running. Let it finish or stop it before ${action}.`)
+    if (this.gate.pendingRequests(sessionId).length > 0)
+      throw new Error(`This session is waiting for your answer. Resolve it before ${action}.`)
   }
 
   /** The owning process vanished, so success vs failure is unknowable. Emit the same terminal event
@@ -1733,6 +3294,17 @@ export class EngineSessionManager {
         ...(task.taskId ? { taskId: task.taskId } : {}),
         outcome: 'unknown',
       })
+    }
+  }
+
+  /** Infrastructure teardown is the one authorized path that may abandon delegated work. Publish an
+   *  honest terminal state for both protocols before dropping their runtime owners. */
+  private markActiveDelegationUnknown(sessionId: string): void {
+    this.markActiveSubagentsUnknown(sessionId)
+    for (const [runId, current] of this.workflowWatchers) {
+      if (current.sessionId !== sessionId) continue
+      current.watcher.stop()
+      this.workflowWatchers.delete(runId)
     }
   }
 
@@ -1752,6 +3324,7 @@ export class EngineSessionManager {
     const root = realpathOrSelf(projectPath)
     const out: AdoptedHeadlessSession[] = []
     for (const id of this.sessions.keys()) {
+      if (this.deferredDreamVisibility.has(id)) continue
       const owner = contextForSession(id)
       const ownedByRequester = owner?.win.id === windowId
       if (owner && !ownedByRequester) continue
@@ -1763,6 +3336,9 @@ export class EngineSessionManager {
       // rename) so the renderer adopts it verbatim instead of regenerating a name the user has seen.
       const storedId = this.resumedFrom.get(id) ?? id
       const stored = this.projectStore(cwd)?.sessions.find((x) => x.id === storedId)
+      const storedLabel = stored?.label?.trim()
+      const durableLockedLabel = stored?.userNamed && storedLabel ? storedLabel : undefined
+      const pendingLabel = durableLockedLabel ? undefined : this.deferredDreamLabels.get(id)?.trim()
       // The gate's REAL posture, not the window's default — a phone (or the dream scheduler) may have
       // set this session's mode before any window existed to display it. Pin it as an explicit entry
       // too (setSessionApprovalMode's same-value push — no broadcast, no loop reset when unchanged):
@@ -1777,13 +3353,17 @@ export class EngineSessionManager {
         engineId: this.sessionEngines.get(id) ?? 'claude',
         model: this.sessionModelEffort.get(id)?.model,
         effort: this.sessionModelEffort.get(id)?.effort,
-        label: stored?.label?.trim() || undefined,
-        userNamed: stored?.userNamed || undefined,
+        label: durableLockedLabel || pendingLabel || storedLabel || undefined,
+        userNamed: durableLockedLabel || pendingLabel ? true : stored?.userNamed || undefined,
+        fromRemote: this.startedFromRemote.has(id),
         approvalMode,
         working: this.working.has(id),
         activeSubagentToolUseIds: [...(this.activeSubagents.get(id)?.keys() ?? [])],
+        activeWorkflows: this.activeWorkflowSnapshots(id),
+        capabilities: this.sessionCapabilities.get(id),
         events: [...(this.remoteEventLog.get(id) ?? [])],
       })
+      if (durableLockedLabel) this.deferredDreamLabels.delete(id)
     }
     return out
   }
@@ -1833,13 +3413,19 @@ export class EngineSessionManager {
     items = settleRestoredTranscriptItems(
       items,
       new Set(this.activeSubagents.get(sessionId)?.keys() ?? []),
+      new Map(
+        this.activeWorkflowSnapshots(sessionId).map((workflow) => [
+          workflow.runId,
+          new Set(workflow.runningAgentIds),
+        ]),
+      ),
     )
     // The replay buffer is in-memory, so a Mac relaunch wipes it — a phone-driven session then opened
     // to a blank "Ready" screen with its whole history sitting in the engine's own conversation file.
-    // Last resort: rebuild the events from that file (claude only; Codex keeps its own store).
-    if (!items.length && !events?.length && engine === 'claude') {
+    // Last resort: rebuild the events from that file (nothing to read for an engine that keeps none).
+    if (!items.length && !events?.length) {
       if (fileCwd) {
-        events = normalizeReplaySequence(readClaudeConversationReplay(fileCwd, storeId, sessionId))
+        events = normalizeReplaySequence(readEngineConversationReplay(engine, fileCwd, storeId, sessionId))
         if (events.length)
           replaceRemoteReplay(fileCwd, storeId, events.map((entry) => ({ ...entry, sessionId: storeId })))
       }
@@ -1885,6 +3471,7 @@ export class EngineSessionManager {
     // page). Lets the phone hide the Preview chip when there's nothing to show — same beat as the changes.
     const hasPreview = getSessionPreview(sessionId) != null
     const cwd = this.remoteCwd(sessionId)
+    await this.refreshCompletionStatesForProject(cwd)
     const info = await detectRepo(cwd)
     if (!info.isRepo) return { repo: false, files: [], truncated: false, hasPreview }
     const { files, truncated } = await getStatus(cwd)
@@ -1903,8 +3490,10 @@ export class EngineSessionManager {
     message: string,
     paths: string[],
   ): Promise<{ ok: true; sha: string } | { ok: false; code: string; message: string }> {
+    const cwd = this.remoteCwd(sessionId)
     try {
-      const { sha } = await commitPaths(this.remoteCwd(sessionId), paths, message)
+      const { sha } = await commitPaths(cwd, paths, message)
+      await this.refreshCompletionStatesForProject(cwd)
       return { ok: true, sha }
     } catch (err) {
       if (err instanceof UserGitError) return { ok: false, code: err.code, message: err.message }
@@ -1943,8 +3532,10 @@ export class EngineSessionManager {
   ): Promise<{ ok: true; sha: string } | { ok: false; code: string; message: string }> {
     if (typeof sha !== 'string' || !/^[0-9a-fA-F]{4,40}$/.test(sha))
       return { ok: false, code: 'git_failed', message: 'invalid version id' }
+    const cwd = this.remoteCwd(sessionId)
     try {
-      const r = await restoreVersion(this.remoteCwd(sessionId), sha)
+      const r = await this.withExternalProjectMutation(cwd, {}, () => restoreVersion(cwd, sha))
+      await this.refreshCompletionStatesForProject(cwd)
       return { ok: true, sha: r.sha }
     } catch (err) {
       if (err instanceof UserGitError) return { ok: false, code: err.code, message: err.message }
@@ -2026,8 +3617,14 @@ export class EngineSessionManager {
     const now = Date.now()
     const startsNewBurst = now - (this.lastRemoteWriteAt.get(cwd) ?? 0) > REMOTE_WRITE_BURST_MS
     this.lastRemoteWriteAt.set(cwd, now)
-    if (startsNewBurst) await this.checkpointProjectEdit(cwd, `edit to ${basename(path)}`)
-    return { path: relative(cwd, await writeProjectFile(cwd, path, content)) }
+    return this.withExternalProjectMutation(
+      cwd,
+      {
+        ...(startsNewBurst ? { checkpointLabel: `edit to ${basename(path)}` } : {}),
+        refreshOwnership: startsNewBurst,
+      },
+      async () => ({ path: relative(cwd, await writeProjectFile(cwd, path, content)) }),
+    )
   }
 
   /** One of a doc's local images, base64 + media type, so the phone's live doc viewer can inline it
@@ -2171,7 +3768,7 @@ export class EngineSessionManager {
    *  ABSENT store is not a failure — it starts empty, which is how the first headless session lands. */
   private projectStore(projectPath: string): PersistedSessions | null {
     try {
-      return loadProjectSessions(projectPath) ?? { version: 2 as const, activeId: null, sessions: [] }
+      return loadProjectSessions(projectPath) ?? { version: 3 as const, activeId: null, sessions: [] }
     } catch (err) {
       log.warn('sessions', 'project store unreadable — skipping this read/write', err instanceof Error ? err.message : err)
       return null
@@ -2211,18 +3808,30 @@ export class EngineSessionManager {
         )
       }
     const rateLimits = this.remoteRateLimits()
-    if (persisted) return { ...persisted, rateLimits }
+    if (persisted)
+      return {
+        ...persisted,
+        // Old stores can predate persistence compaction, and durable replay can append a fresh verbose
+        // result after the last renderer save. Bound every transcript at the final main -> renderer
+        // handoff so one giant tool response cannot prevent the boot payload from arriving and healing.
+        sessions: persisted.sessions.map((session) => ({
+          ...session,
+          items: compactTranscriptToolOutput(session.items),
+        })),
+        rateLimits,
+      }
     // Account usage is global, not project-owned. A project with no chat file still needs main's
     // disk-restored snapshot so its footer is honest before the delayed live poll (or while offline).
     return Object.keys(rateLimits).length
-      ? { version: 2, activeId: null, sessions: [], rateLimits }
+      ? { version: 3, activeId: null, sessions: [], rateLimits }
       : null
   }
 
   /** Persist a project's open sessions + transcripts (keyed by the window's root, supplied by main). */
-  persistProjectSessions(projectPath: string, data: PersistedSessions): void {
-    saveProjectSessions(projectPath, data)
+  persistProjectSessions(projectPath: string, data: PersistedSessions): boolean {
+    const saved = saveProjectSessions(projectPath, data)
     for (const s of data.sessions) if (!this.projectDirs.has(s.id)) this.projectDirs.set(s.id, s.cwd)
+    return saved
   }
 
   /** The recovery timeline for a session's project, newest first. */
@@ -2243,7 +3852,35 @@ export class EngineSessionManager {
    */
   async restoreCheckpoint(sessionId: string, checkpointId: string): Promise<Checkpoint> {
     const dir = this.requireDir(sessionId)
-    return this.runExclusive(dir, () => restore(dir, checkpointId))
+    return this.runExclusive(dir, () => {
+      this.noteProjectMutation(dir, sessionId)
+      // The caller learns of its own restore from the tool result (REREAD_AFTER_RESTORE), in the turn
+      // it asked — so it is excluded here rather than told the same thing twice on its next turn.
+      return this.restoreLocked(dir, checkpointId, sessionId)
+    })
+  }
+
+  /**
+   * The one restore body both doors share: rewind the tree, then leave every OTHER session running in
+   * this project a notice for its next turn. Without it a restore is invisible to a live conversation,
+   * which keeps editing files as it last read them (dual-git.md §2). Must run inside runExclusive.
+   */
+  private async restoreLocked(
+    projectDir: string,
+    checkpointId: string,
+    initiatorSessionId?: string,
+  ): Promise<Checkpoint> {
+    // Read the target's subject BEFORE the restore records its own "recovered to …" tip, so the notice
+    // names the point the user actually picked rather than the marker the recovery just wrote.
+    const target = await readCheckpoint(projectDir, checkpointId)
+    const restored = await restore(projectDir, checkpointId)
+    const notice = restoreNotice(target ? applyHumanizedLabels([target])[0] : null)
+    const root = realpathOrSelf(projectDir)
+    for (const [sessionId, cwd] of this.projectDirs) {
+      if (sessionId === initiatorSessionId || realpathOrSelf(cwd) !== root) continue
+      this.pendingRestoreNotices.set(sessionId, notice)
+    }
+    return restored
   }
 
   // ── Project-scoped recovery (the Settings → Recovery surface) ─────────────────
@@ -2256,11 +3893,95 @@ export class EngineSessionManager {
 
   /** Forward-only restore of a project's working tree, serialized against its safety checkpoints. */
   async restoreProjectCheckpoint(projectDir: string, checkpointId: string): Promise<Checkpoint> {
-    return this.runExclusive(projectDir, () => restore(projectDir, checkpointId))
+    return this.runExclusive(projectDir, async () => {
+      await this.refreshCompletionStatesLocked(projectDir)
+      this.noteProjectMutation(projectDir, 'external')
+      const restored = await this.restoreLocked(projectDir, checkpointId)
+      await this.refreshCompletionStatesLocked(projectDir)
+      return restored
+    })
   }
 
-  interrupt(sessionId: string): void {
-    this.sessions.get(sessionId)?.interrupt()
+  /**
+   * The user's stop button. Delegated children are stopped FIRST, then the parent turn — an engine
+   * child outlives the parent's interrupt on both engines (Claude's task keeps running after the
+   * control_request; a Codex child is its own thread), so interrupting the parent first leaves work
+   * running that the user believes they stopped, spending quota and touching files.
+   *
+   * Bounded in both directions (the T3 discipline): a child that never confirms cannot hold the stop
+   * button hostage, so each gets `CHILD_STOP_TIMEOUT_MS` and the whole sweep `CHILD_STOP_TOTAL_MS`,
+   * after which the parent is interrupted regardless. Returns a promise for tests and callers that
+   * want the sweep; the void callers (IPC, remote ops) are unaffected.
+   */
+  async interrupt(sessionId: string): Promise<void> {
+    // Cancel the exact prepared turn synchronously, before the child-stop await. The send owns cleanup
+    // when its current preflight await resumes. Capturing the engine handle here also prevents a slow
+    // child sweep from interrupting a later replacement process that reused the same session id.
+    const admission = this.turnAdmissions.get(sessionId)
+    if (admission) admission.cancelled = true
+    const session = this.sessions.get(sessionId)
+    const accepted = this.acceptedTurns.get(sessionId)
+    if (accepted) accepted.cancelled = true
+    await this.stopDelegatedChildren(sessionId, session)
+    // A live admission has not crossed session.sendTurn yet. Its token is the stop; interrupting the
+    // idle process after an awaited child sweep could instead hit a newer turn on that same process.
+    if (!admission) {
+      const current = this.acceptedTurns.get(sessionId)
+      if (accepted) {
+        // Infrastructure recovery may replace the process while the child sweep is waiting. Follow the
+        // same logical generation onto that replacement, but never let an old Stop reach a successor.
+        const live = this.sessions.get(sessionId)
+        if (current?.generation === accepted.generation && live && current.session === live)
+          live.interrupt()
+      } else if (current === undefined && this.sessions.get(sessionId) === session) {
+        session?.interrupt()
+      }
+    }
+  }
+
+  /** Stop every tracked child of `sessionId` and wait for each to actually end, within the bounds.
+   *  Children whose stop the driver refuses (an untracked task, a driver with no task protocol) are
+   *  not waited on — there is nothing coming for them. */
+  private async stopDelegatedChildren(
+    sessionId: string,
+    session = this.sessions.get(sessionId),
+  ): Promise<void> {
+    if (!session?.stopTask) return
+    const children = [...(this.activeSubagents.get(sessionId)?.values() ?? [])]
+    const waits: Promise<void>[] = []
+    for (const child of children) {
+      if (!child.taskId) continue
+      let accepted = false
+      try {
+        accepted = session.stopTask(child.taskId)
+      } catch (err) {
+        log.warn('engine', 'stop-child failed during interrupt', err instanceof Error ? err.message : err)
+      }
+      if (accepted) waits.push(this.awaitChildEnd(sessionId, child.toolUseId))
+    }
+    if (!waits.length) return
+    await Promise.race([
+      Promise.all(waits),
+      new Promise<void>((resolve) => setTimeout(resolve, CHILD_STOP_TOTAL_MS)),
+    ])
+  }
+
+  /** Resolve when this child's terminal event lands, or when this sweep's own bound expires. */
+  private awaitChildEnd(sessionId: string, toolUseId: string): Promise<void> {
+    const key = `${sessionId}:${toolUseId}`
+    return new Promise<void>((resolve) => {
+      const waiters = this.childEndWaiters.get(key) ?? new Set<() => void>()
+      this.childEndWaiters.set(key, waiters)
+      // One resolver per sweep, removed by whichever arrives first (terminal event or bound).
+      const release = (): void => {
+        clearTimeout(timer)
+        waiters.delete(release)
+        if (!waiters.size) this.childEndWaiters.delete(key)
+        resolve()
+      }
+      const timer = setTimeout(release, CHILD_STOP_TIMEOUT_MS)
+      waiters.add(release)
+    })
   }
 
   /** Stop one delegated child without aborting the parent turn/session or its siblings. */
@@ -2280,6 +4001,10 @@ export class EngineSessionManager {
    * Needs the session's cwd to resume; if it's gone (disposed), reports an error event.
    */
   askSideQuestion(sessionId: string, asideId: string, question: string): void {
+    if (isHermeticE2EProfile()) {
+      this.sendAside(sessionId, asideId, 'error', 'Side questions are disabled in hermetic Koda E2E.')
+      return
+    }
     const key = `${sessionId}:${asideId}`
     const cwd = this.projectDirs.get(sessionId)
     if (!cwd) {
@@ -2304,15 +4029,18 @@ export class EngineSessionManager {
         this.sendAside(sessionId, asideId, 'error', message)
       },
     }
-    const nativeId = this.engineNativeIds.get(sessionId)
+    // DRIVER SELECTION (see start): each driver forks its own live conversation its own way.
     if (engineId === 'codex') {
-      if (!nativeId) {
+      // Forking the live Codex thread needs its id, and the cursor is where that lives — read through
+      // the driver that owns the blob rather than reaching into it from here.
+      const threadId = codexThreadId(this.resumeCursors.get(sessionId))
+      if (!threadId) {
         this.sendAside(sessionId, asideId, 'error', 'that conversation is not ready for a side question yet')
         return
       }
       const handle = askCodexSideQuestion(
         {
-          parentThreadId: nativeId,
+          parentThreadId: threadId,
           cwd,
           question,
           model: modelEffort?.model,
@@ -2358,22 +4086,45 @@ export class EngineSessionManager {
     }
     const session = this.sessions.get(sessionId)
     if (session) {
+      const processGeneration = this.sessionGenerations.get(sessionId)
       this.sessions.delete(sessionId)
-      await session.dispose() // → 'close' → handleClose() cancels approvals + unregisters the broker
+      try {
+        await session.dispose() // → 'close' → handleClose() cancels approvals + unregisters the broker
+      } finally {
+        // Driver disposal is deliberately bounded. If its child never emitted close before that bound,
+        // perform the exact generation's cleanup here; a later callback is then stale and harmless.
+        if (
+          processGeneration &&
+          this.sessionGenerations.get(sessionId) === processGeneration
+        ) {
+          this.sessionGenerations.delete(sessionId)
+          this.gate.cancelSession(sessionId)
+          await this.broker.unregister(sessionId)
+        }
+      }
     }
     // Drop the project mapping only after teardown (a crash keeps it so recovery still works;
     // handleClose, which needs the dir to cancel approvals, has already run by here).
     this.projectDirs.delete(sessionId)
-    this.dreamSessions.delete(sessionId)
-    this.hiddenDreamSessions.delete(sessionId)
+    // A broker recovery replaces only the engine transport under the same logical session. Preserve
+    // Dream discovery state across that respawn: exposing a deferred tidy or a hidden REM snapshot
+    // during the reconnect would reopen the exact human-handoff race those sets close.
+    if (!this.recoveringBroker.has(sessionId)) {
+      this.dreamSessions.delete(sessionId)
+      this.hiddenDreamSessions.delete(sessionId)
+      this.deferredDreamVisibility.delete(sessionId)
+      this.deferredDreamLabels.delete(sessionId)
+    }
     this.diffBaselines.delete(sessionId)
     this.sessionModelEffort.delete(sessionId)
     this.spawnedWith.delete(sessionId)
     this.resolvedModels.delete(sessionId)
-    this.freshPostureStale.delete(sessionId)
     this.sessionEngines.delete(sessionId)
-    this.engineNativeIds.delete(sessionId)
+    // The replacement child republishes its cursor at SessionStarted; a resume-miss restart deliberately
+    // clears it first so the fresh spawn can't be handed the dead blob back.
+    this.resumeCursors.delete(sessionId)
     this.advertisedTools.delete(sessionId)
+    this.sessionCapabilities.delete(sessionId)
     this.brokerRecovery.delete(sessionId)
     this.resumeAfterReconnect.delete(sessionId)
     this.remoteTitled.delete(sessionId)
@@ -2381,11 +4132,26 @@ export class EngineSessionManager {
     this.remoteLastReply.delete(sessionId)
     this.remoteTitleGen.delete(sessionId)
     this.lastActivityAt.delete(sessionId)
-    this.working.delete(sessionId)
+    // Infrastructure recovery replaces only the transport process; its logical human turn stays active
+    // until the replacement child's TurnComplete. Keeping `working` also preserves overlap detection and
+    // prevents the completion boundary from closing in the respawn gap.
+    if (!this.recoveringBroker.has(sessionId) && !this.resumeMissRecovery.has(sessionId)) {
+      this.working.delete(sessionId)
+      this.acceptedTurns.delete(sessionId)
+    }
     this.lastLines.delete(sessionId)
     this.engineEventAt.delete(sessionId)
-    this.turnReplies.delete(sessionId)
+    // The reply accumulator belongs to the logical human turn, not the engine process. Broker
+    // recovery tears that process down mid-turn and resumes it under the same completion boundary,
+    // so keep every delta already received (including any that drain while dispose awaits exit).
+    // A failed respawn with no replacement session is cleaned in recoverBroker's finally block.
+    if (!this.recoveringBroker.has(sessionId) && !this.resumeMissRecovery.has(sessionId))
+      this.turnReplies.delete(sessionId)
     this.activeSubagents.delete(sessionId)
+    // Those delegates died with the process, so nothing is left to wait on. Close any boundary their
+    // liveness was holding open, or a turn whose process vanished would never reconcile at all.
+    // Broker recovery keeps `working`, so a respawn's teardown correctly falls through here.
+    this.maybeFinishCompletionTurn(sessionId)
     // NB: pendingWorkflowResults is NOT cleared here — like recoveringBroker, it must SURVIVE a respawn
     // (dispose() is also the broker-recovery / model-effort teardown, and a workflow result stashed
     // before the respawn still needs to ride the next human turn). It's drained on delivery; a truly
@@ -2413,7 +4179,10 @@ export class EngineSessionManager {
       log.info('remote', 'window closed; keeping session alive headless (remote-attached)', { sessionId })
       return
     }
-    this.interrupt(sessionId) // best-effort: stop any in-flight turn before teardown
+    // Best-effort: stop the in-flight turn before teardown. The parent only — the dispose below kills
+    // the engine process, which takes its children with it, so waiting out a child sweep here would
+    // only delay a teardown whose window is already gone.
+    this.sessions.get(sessionId)?.interrupt()
     try {
       await this.dispose(sessionId)
     } finally {
@@ -2426,6 +4195,8 @@ export class EngineSessionManager {
       clearInterval(this.usageTimer)
       this.usageTimer = null
     }
+    this.usageProbe?.release()
+    this.usageProbe = null
     await Promise.all(
       [...this.projectDirs.keys()].map(async (id) => {
         try {
@@ -2444,21 +4215,138 @@ export class EngineSessionManager {
    * and the renderer clears its prompts) and close the MCP transport. projectDirs is intact here,
    * so the gate can still resolve the dir while cancelling.
    */
-  private handleClose(sessionId: string): void {
+  private handleClose(sessionId: string, processGeneration?: symbol): void {
+    // A bounded dispose may have returned and installed a successor under this same public id before
+    // the old child finally closes. Its callback owns nothing now — especially not the new broker route.
+    if (
+      processGeneration &&
+      this.sessionGenerations.get(sessionId) !== processGeneration
+    )
+      return
+    if (processGeneration) this.sessionGenerations.delete(sessionId)
+    // dispose() removes the installed handle before asking the child to exit, while broker recovery
+    // and resume-miss recovery mark their logical turns explicitly. A still-installed current child
+    // disappearing with an accepted remote attempt is therefore a real crash: settle that attempt and
+    // publish one durable retryable terminal before ordinary close cleanup erases liveness.
+    const unexpectedAcceptedRemoteClose =
+      this.sessions.has(sessionId) &&
+      !this.recoveringBroker.has(sessionId) &&
+      !this.resumeMissRecovery.has(sessionId) &&
+      this.activeRemoteAttemptIds.has(sessionId)
     // The process is gone and any non-terminal child may have made side effects. Surface + persist the
     // honest state before clearing its handle; a later restart must never resurrect it as Running.
-    this.markActiveSubagentsUnknown(sessionId)
+    this.markActiveDelegationUnknown(sessionId)
+    if (unexpectedAcceptedRemoteClose)
+      this.forward({
+        type: 'EngineError',
+        sessionId,
+        message: 'The engine process stopped before this turn finished.',
+        fatal: true,
+      })
     this.sessions.delete(sessionId)
-    this.working.delete(sessionId) // the child is gone → no turn is running (a broker-recovery respawn re-sets it)
+    this.sessionCapabilities.delete(sessionId)
+    // Broker recovery replaces the transport process inside the same logical turn. Keep that writer
+    // present through the respawn gap so another same-project turn cannot have its changes claimed by
+    // the recovered boundary. A failed recovery's fatal EngineError clears it through forward().
+    if (!this.recoveringBroker.has(sessionId) && !this.resumeMissRecovery.has(sessionId)) {
+      this.working.delete(sessionId)
+      this.acceptedTurns.delete(sessionId)
+    }
     this.gate.cancelSession(sessionId)
     void this.broker.unregister(sessionId)
-    // The workflow process dies with its launching engine, so stop watching its journal too.
-    for (const [runId, w] of this.workflowWatchers) {
-      if (w.sessionId === sessionId) {
-        w.watcher.stop()
-        this.workflowWatchers.delete(runId)
+    // A crash (unlike dispose()) has no later teardown frame to close a boundary the dead process held.
+    // Broker recovery deliberately keeps `working`, so this remains a no-op until its replacement ends.
+    this.maybeFinishCompletionTurn(sessionId)
+  }
+
+  /**
+   * The engine no longer holds a conversation the driver asked it to reattach. Everything the user can
+   * see — the transcript, the project, the posture, the phone attachment — belongs to Koda, not to the
+   * engine's memory of it, so the session continues under the same id with a clean engine conversation
+   * and one plain line saying what happened. The turn the dead child swallowed is sent again, so a
+   * resume miss costs the user the agent's memory of earlier turns and nothing else.
+   *
+   * Single-flight per session. Ordering note: this is called from inside the dying child's close
+   * handling, and `start()` awaits the broker before it registers — so that child's own teardown
+   * (broker unregister, gate cancel) always completes before the replacement registers.
+   */
+  private async recoverResumeMiss(sessionId: string): Promise<void> {
+    if (this.resumeMissRecovery.has(sessionId)) return
+    const cwd = this.projectDirs.get(sessionId)
+    if (!cwd) return
+    this.resumeMissRecovery.add(sessionId)
+    // The blob is dead. Drop it so the replacement can't be handed it back.
+    this.resumeCursors.delete(sessionId)
+    log.warn('engine', 'resume miss — restarting this session on a clean conversation', { sessionId })
+    const { model, effort } = this.sessionModelEffort.get(sessionId) ?? {}
+    const engineId = this.sessionEngines.get(sessionId) ?? 'claude'
+    const planMode = this.gate.getSessionMode(sessionId) === 'plan'
+    const replay = this.pendingTurns.get(sessionId)
+    const accepted = this.acceptedTurns.get(sessionId)
+    try {
+      await this.start({ sessionId, cwd, model, effort, engineId, planMode, abandonActiveDelegation: true })
+      // Stop is attached to the logical admission generation, which survives the no-process gap. If it
+      // landed while start() was replacing the child, do not claim that Koda resent anything and do not
+      // let the fresh process touch files for a turn the user already stopped.
+      const currentAccepted = this.acceptedTurns.get(sessionId)
+      if (
+        accepted?.cancelled ||
+        (accepted && currentAccepted?.generation !== accepted.generation)
+      ) {
+        if (currentAccepted?.generation === accepted.generation) {
+          this.settleStoppedContinuation(sessionId)
+        }
+        return
       }
+      this.forward({
+        type: 'EngineError',
+        sessionId,
+        fatal: false,
+        message: replay
+          ? "The engine had no memory of this chat left, so Koda continued it on a fresh conversation and sent your last message again. Earlier messages are still here to read, but the agent can't see them."
+          : "The engine had no memory of this chat left, so Koda continued it on a fresh conversation. Earlier messages are still here to read, but the agent can't see them.",
+      })
+      if (replay) {
+        // The held copy stays authoritative while the continuation re-enters sendTurn; only the genuine
+        // TurnComplete discharges it. Deleting first would lose the user's message if the clean replacement
+        // dies before accepting the resend.
+        await this.sendTurn(
+          sessionId,
+          replay.engineText,
+          replay.inlineImages,
+          replay.visible.origin,
+          {
+            logicalContinuation: 'resume-miss',
+            ...(replay.visible.attemptId ? { attemptId: replay.visible.attemptId } : {}),
+            ...(replay.visible.clientTurnId ? { clientTurnId: replay.visible.clientTurnId } : {}),
+          },
+        )
+      } else this.working.delete(sessionId)
+    } catch (err) {
+      this.working.delete(sessionId)
+      this.forward({
+        type: 'EngineError',
+        sessionId,
+        fatal: true,
+        message: `Koda couldn't restart this chat: ${err instanceof Error ? err.message : String(err)}. Start a new chat to keep going.`,
+      })
+      // The fatal terminal above performs normal turn cleanup. Restore the original held payload afterward
+      // so a failed replacement remains diagnosable/retryable instead of silently erasing its send material.
+      if (replay) this.pendingTurns.set(sessionId, replay)
+    } finally {
+      this.resumeMissRecovery.delete(sessionId)
     }
+  }
+
+  /** Settle a logical turn stopped while its replacement process had not accepted the continuation.
+   *  The synthetic terminal closes liveness/receipts, but it must not claim the replacement read a
+   *  restore notice. Disarm that delivery first so the next genuine human turn receives it again. */
+  private settleStoppedContinuation(sessionId: string): void {
+    this.armedRestoreNotices.delete(sessionId)
+    // A broker transport TurnComplete is normally suppressed while recovery is in flight. This one is
+    // the logical terminal created after the replacement exists, so retire that suppression first.
+    this.recoveringBroker.delete(sessionId)
+    this.forward({ type: 'TurnComplete', sessionId, stopReason: 'interrupted' })
   }
 
   /**
@@ -2467,8 +4355,9 @@ export class EngineSessionManager {
    * so recovery = respawn the same session with --resume: dispose the child, mint a fresh broker route,
    * spawn again (the conversation is preserved by --resume). Single-flight per session (a burst of
    * failing tools triggers one respawn) and rate-limited (a broker that won't stay up can't spin us in a
-   * loop). The interrupted turn is dropped — it was already failing every tool — so the user continues
-   * with their next message. Reuses the model/effort/engine the session last ran with.
+   * loop). The interrupted turn resumes under the SAME logical completion boundary, so edits made
+   * before the drop remain visible/attributed even if the resumed child performs no further write.
+   * Reuses the model/effort/engine the session last ran with.
    */
   private async recoverBroker(sessionId: string): Promise<void> {
     if (this.recoveringBroker.has(sessionId)) return // a respawn is already in flight
@@ -2499,6 +4388,9 @@ export class EngineSessionManager {
     this.recoveringBroker.add(sessionId)
     this.brokerRecovery.set(sessionId, { count: streak + 1, at: now })
     this.forward({ type: 'EngineError', sessionId, fatal: false, message: "Reconnecting Koda's safety net — one moment…" })
+    const interruptedBoundary = this.completionTurns.get(sessionId)
+    const interruptedDiffBaseline = this.diffBaselines.get(sessionId)
+    const interruptedAccepted = this.acceptedTurns.get(sessionId)
     try {
       const { model, effort } = this.sessionModelEffort.get(sessionId) ?? {}
       // The gate's posture now survives this respawn (ApprovalGate.cancelSession no longer wipes it),
@@ -2509,19 +4401,46 @@ export class EngineSessionManager {
       // start() disposes the still-live child first (it sees the id in this.sessions), which unregisters
       // the stale broker route, then re-registers a fresh one before spawning with --resume.
       await this.start({
-        resumeSessionId: sessionId,
+        sessionId,
         cwd,
         model,
         effort,
         planMode,
-        abandonActiveSubagents: true,
+        abandonActiveDelegation: true,
       })
+      // start()'s process teardown clears the live-diff baseline as normal disposal hygiene. A broker
+      // respawn is not a new task, though: restore the interrupted task's exact pinned baseline unless
+      // a genuinely newer turn raced in and installed its own.
+      if (
+        interruptedDiffBaseline &&
+        this.completionTurns.get(sessionId) === interruptedBoundary &&
+        !this.diffBaselines.has(sessionId)
+      )
+        this.diffBaselines.set(sessionId, interruptedDiffBaseline)
+      // Stop belongs to the logical admission generation, including the gap where start() has removed
+      // the old process but not yet published the replacement's SessionStarted. Never auto-resume a
+      // cancelled turn, and never let this recovery nudge a successor generation that reused the id.
+      const currentAccepted = this.acceptedTurns.get(sessionId)
+      if (
+        interruptedAccepted?.cancelled ||
+        (interruptedAccepted && currentAccepted?.generation !== interruptedAccepted.generation)
+      ) {
+        if (currentAccepted?.generation === interruptedAccepted.generation)
+          this.settleStoppedContinuation(sessionId)
+        return
+      }
       // Auto-resume: pick the interrupted turn back up on its own once the fresh session is initialized.
       // Added AFTER start() (its internal dispose of the old child already ran) and before the new
       // child's SessionStarted can fire (a later event-loop tick), so the flag is set in time.
-      this.resumeAfterReconnect.add(sessionId)
+      this.resumeAfterReconnect.set(sessionId, interruptedAccepted?.generation)
       this.forward({ type: 'EngineError', sessionId, fatal: false, message: 'Reconnected — resuming where you left off…' })
     } catch (err) {
+      if (
+        interruptedDiffBaseline &&
+        this.completionTurns.get(sessionId) === interruptedBoundary &&
+        !this.diffBaselines.has(sessionId)
+      )
+        this.diffBaselines.set(sessionId, interruptedDiffBaseline)
       this.resumeAfterReconnect.delete(sessionId)
       this.forward({
         type: 'EngineError',
@@ -2534,7 +4453,10 @@ export class EngineSessionManager {
       // Stamp completion time so the cooldown measures from when this recovery finished. Drop the entry
       // if the session is gone (a failed recovery already disposed it) so no stale streak lingers.
       if (this.sessions.has(sessionId)) this.brokerRecovery.set(sessionId, { count: streak + 1, at: Date.now() })
-      else this.brokerRecovery.delete(sessionId)
+      else {
+        this.brokerRecovery.delete(sessionId)
+        this.turnReplies.delete(sessionId)
+      }
     }
   }
 
@@ -2551,6 +4473,21 @@ export class EngineSessionManager {
     return dir
   }
 
+  /** Only the exact process incarnation installed for this public session id may publish events. A
+   *  bounded dispose can leave the old child alive briefly after its successor starts; its late
+   *  TurnComplete/Error must not settle or clear the successor's turn state. */
+  private forwardProcessEvent(
+    event: EngineEvent,
+    processGeneration?: symbol,
+  ): EngineEvent | undefined {
+    if (
+      !processGeneration ||
+      this.sessionGenerations.get(event.sessionId) !== processGeneration
+    )
+      return undefined
+    return this.forward(event)
+  }
+
   /**
    * One window per project for now, so every event goes to the sole window;
    * the renderer routes by the event's `sessionId`. Validate before crossing
@@ -2558,19 +4495,13 @@ export class EngineSessionManager {
    * stdout-drain callback chain that calls this.
    */
   private forward(event: EngineEvent): EngineEvent | undefined {
-    // A --resume whose conversation the engine no longer holds exits "No conversation found with
-    // session ID: …" (a ghost store entry, a cleared/partial transcript, or an auto-recovery respawn of
-    // a session that never completed its first turn). The filesystem can't reliably predict this — the
-    // engine is the authority — so we can't gate every --resume ahead of time. Rewrite the raw engine
-    // line into a plain reason before it reaches the log, the desktop, or the phone (where it read as a
-    // wall of cryptic errors). Every --resume site funnels through forward(), so this one guard covers
-    // resumeRemote, the model/effort respawn, and broker recovery alike.
-    if (event.type === 'EngineError' && event.fatal && /No conversation found with session ID/i.test(event.message)) {
-      log.warn('engine', 'resume-miss (engine has no conversation for this session)', { sessionId: event.sessionId })
-      event = {
-        ...event,
-        message: "This chat's earlier history is no longer available, so it can't be reopened. Start a new chat to keep going.",
-      }
+    // The driver asked its engine to reattach a conversation the engine no longer holds (a ghost store
+    // entry, a cleared transcript, a thread deleted on the other side). Nothing on disk predicts this —
+    // the engine is the only authority — so it is handled where it lands: restart the session clean and
+    // say so once. The signal itself never reaches a surface; recoverResumeMiss posts the notice.
+    if (event.type === 'EngineError' && event.category === 'resumeMiss') {
+      void this.recoverResumeMiss(event.sessionId)
+      return undefined
     }
     // Telemetry (opt-in): the classifier TONE only — the message can carry file paths, so it never
     // leaves. forward() is the one funnel both drivers' errors pass through.
@@ -2579,22 +4510,51 @@ export class EngineSessionManager {
 
     this.logEvent(event)
     this.trackSubagentLifecycle(event)
+    // A broker-drop ToolResult starts recovery synchronously before the adapter can drain the next
+    // stdout line. If that old child then emits TurnComplete, it ended only the failed transport
+    // attempt—not the logical human turn that the replacement child is about to continue.
+    const brokerTransportTurnComplete =
+      event.type === 'TurnComplete' && this.recoveringBroker.has(event.sessionId)
 
     // Per-session turn-activity → the launcher's live working/idle glyph (remote heads poll the launcher;
     // they have no event stream at browse level). Driven off the SAME live events the client's `busy`
     // reducer uses, so ANY active session shows working regardless of how its turn started — a desktop IPC
     // turn, a phone turn, a resume, a broker-recovery nudge — not only turns routed through sendTurn (which
-    // sets it too, for the instant before the first delta lands). Ends on TurnComplete / fatal error.
+    // sets it too, for the instant before the first delta lands). Ends on TurnComplete, fatal process
+    // loss, or an explicit turn rejection that happened before any work could start.
     if (isTopLevelTurnActivity(event)) {
       this.working.add(event.sessionId)
       this.engineEventAt.set(event.sessionId, Date.now())
     }
-    // ToolResult refreshes the liveness clock WITHOUT joining working.add: a finished tool proves the
-    // engine is alive (a long-legitimate tool would otherwise read as a stall — review catch), but
-    // working-state transitions stay owned by the branch above.
-    else if (event.type === 'ToolResult') this.engineEventAt.set(event.sessionId, Date.now())
-    else if (event.type === 'TurnComplete' || (event.type === 'EngineError' && event.fatal)) {
+    // ToolResult and delegation lifecycle events refresh the evidence clock WITHOUT joining
+    // working.add. Besides proving activity, delegated events mutate the saved transcript after the
+    // parent turn can already be idle, so corpus certification must see their exact arrival time.
+    else if (
+      event.type === 'ToolResult' ||
+      isDelegationLifecycleEvent(event)
+    )
+      this.engineEventAt.set(event.sessionId, Date.now())
+    else if (
+      !brokerTransportTurnComplete &&
+      (event.type === 'TurnComplete' ||
+        (event.type === 'EngineError' && (event.fatal || event.category === 'turnRejected')))
+    ) {
+      // A genuine TurnComplete proves the agent read the notice its turn carried — the one moment
+      // the pending notice is discharged. The text must still match: a restore DURING the turn
+      // queued a newer notice describing the current disk, which the finished turn never saw.
+      if (event.type === 'TurnComplete') {
+        const armed = this.armedRestoreNotices.get(event.sessionId)
+        if (armed && this.pendingRestoreNotices.get(event.sessionId) === armed)
+          this.pendingRestoreNotices.delete(event.sessionId)
+      }
+      this.armedRestoreNotices.delete(event.sessionId)
       this.working.delete(event.sessionId)
+      this.acceptedTurns.delete(event.sessionId)
+      // The turn reached its end, so there is nothing left for a resume-miss recovery to replay.
+      this.pendingTurns.delete(event.sessionId)
+      // A scheduler-owned scope and a backgrounded delegate both still have writes to land after the
+      // engine stops. Keep the logical completion boundary open until the last of them is done.
+      this.maybeFinishCompletionTurn(event.sessionId)
       // The genuine end-of-turn signal `awaitTurnEnd` waits for (W3) — resolved here, not off
       // `working`, so a benign respawn's transient false (fatal: false) never fires it.
       const waiter = this.turnEndWaiters.get(event.sessionId)
@@ -2604,7 +4564,39 @@ export class EngineSessionManager {
       }
     }
 
-    event = this.bufferRemoteEvent(event)
+    // Keep the transport attempt's real usage/account activity, but do not expose a false logical
+    // completion to the renderer/phone, consume first-turn titling, reconcile task ownership, or wake
+    // an unattended supervisor. The resumed child's TurnComplete owns all of those effects.
+    if (event.type === 'TurnComplete' && brokerTransportTurnComplete) {
+      recordTurnUsage(event.models, event.costEstimate, this.sessionEngines.get(event.sessionId) ?? 'claude')
+      this.noteEngineActivity(event.sessionId)
+      if (Date.now() - this.lastUsagePoll >= USAGE_POLL_MIN_GAP_MS) void this.pollUsage()
+      return undefined
+    }
+
+    // A retryable engine failure is the only point exact phone attachment bytes may enter durable
+    // replay. A genuine terminal event also settles the accepted-attempt receipt used by app-kill
+    // recovery; broker transport completions returned above are explicitly not logical terminals.
+    if (
+      event.type === 'EngineError' &&
+      (event.fatal || event.category === 'apiError' || event.category === 'turnRejected')
+    ) {
+      this.promoteRemoteTurnPayload(event.sessionId)
+      if (event.fatal || event.category === 'turnRejected') {
+        this.finishRemoteTurnPayload(event.sessionId, true)
+        this.markAcceptedRemoteAttemptComplete(event.sessionId)
+      }
+    } else if (event.type === 'TurnComplete') {
+      const payload = this.remoteTurnPayloads.get(event.sessionId)
+      this.finishRemoteTurnPayload(event.sessionId, payload?.failed === true)
+      this.markAcceptedRemoteAttemptComplete(event.sessionId)
+    }
+
+    // The native envelope has done its job by here: the drivers stamped it and every main-side reader
+    // above has seen it. Everything below this line serializes — the durable replay log, the relay
+    // frame, the renderer send — so drop a payload no surface reads before it doubles disk and wire.
+    event = this.bufferRemoteEvent(stripRawEnvelope(event))
+    this.noteTerminalAttention(event)
 
     // The launcher's "what is it doing" line — the first non-empty line of the latest finalized reply.
     if (event.type === 'AssistantBlock') {
@@ -2627,7 +4619,11 @@ export class EngineSessionManager {
     // TurnComplete retitle: once the FIRST turn finishes cleanly, rename from prompt + final reply so
     // repeat sessions on the same topic come apart. The maps only ever hold a session between its
     // first prompt and first TurnComplete, so this can't re-fire. persistRemoteTitle guards userNamed.
-    if (event.type === 'TurnComplete' && this.remoteFirstPrompt.has(event.sessionId)) {
+    if (
+      event.type === 'TurnComplete' &&
+      event.stopReason !== TURN_REJECTED_STOP_REASON &&
+      this.remoteFirstPrompt.has(event.sessionId)
+    ) {
       const sid = event.sessionId
       const { prompt, cwd } = this.remoteFirstPrompt.get(sid)!
       const reply = this.remoteLastReply.get(sid)
@@ -2637,10 +4633,16 @@ export class EngineSessionManager {
         const storedId = this.resumedFrom.get(sid) ?? sid
         const gen = (this.remoteTitleGen.get(sid) ?? 0) + 1
         this.remoteTitleGen.set(sid, gen) // invalidates a still-in-flight birth-title call
-        void assistTitle(`${prompt.slice(0, 1500)}\n\nWhat was done:\n${reply}`, this.takenRemoteTitles(cwd, storedId))
-          .then((title) => {
+        void this.nameSession({
+          kind: 'regenerate',
+          evidence: `${prompt.slice(0, 1500)}\n\nWhat the agent did:\n${reply}`,
+          currentTitle: this.projectStore(cwd)?.sessions.find((s) => s.id === storedId)?.label,
+          avoid: this.takenRemoteTitles(cwd, storedId),
+        })
+          .then(({ title, overview }) => {
             if (this.remoteTitleGen.get(sid) !== gen) return
-            if (title.trim() && !contextForSession(sid)) this.persistRemoteTitle(cwd, storedId, title.trim())
+            if (title.trim() && !contextForSession(sid))
+              this.persistRemoteTitle(cwd, storedId, title.trim(), false, overview)
           })
           .catch(() => {})
       }
@@ -2660,19 +4662,38 @@ export class EngineSessionManager {
       void this.recoverBroker(event.sessionId)
     }
 
+    // The driver's own reattach state, stored verbatim. Read nothing but the envelope.
+    if (event.type === 'ResumeCursorUpdated') this.resumeCursors.set(event.sessionId, event.cursor)
+
     if (event.type === 'SessionStarted') {
-      if (event.engineNativeId) this.engineNativeIds.set(event.sessionId, event.engineNativeId)
-      else this.engineNativeIds.delete(event.sessionId)
       if (event.tools.length) this.advertisedTools.set(event.sessionId, event.tools)
       // The model the engine actually resolved to — what a "Default" pick means, shown on the phone.
       if (event.model) this.resolvedModels.set(event.sessionId, event.model)
       // A fresh session from a broker reconnect: auto-send the continuation nudge now that the engine is
       // initialized, so the turn the drop interrupted resumes without the user resending anything.
-      if (this.resumeAfterReconnect.delete(event.sessionId)) {
-        this.sendTurn(event.sessionId, BROKER_RESUME_NUDGE).catch((err) =>
-          log.warn('broker', 'auto-resume turn failed', err instanceof Error ? err.message : err),
-        )
+      if (this.resumeAfterReconnect.has(event.sessionId)) {
+        const recoveryGeneration = this.resumeAfterReconnect.get(event.sessionId)
+        this.resumeAfterReconnect.delete(event.sessionId)
+        const accepted = this.acceptedTurns.get(event.sessionId)
+        if (
+          recoveryGeneration !== undefined &&
+          accepted?.generation !== recoveryGeneration
+        ) {
+          // A newer logical turn owns this public id. The delayed recovery signal owns nothing now.
+        } else if (accepted?.cancelled) {
+          this.settleStoppedContinuation(event.sessionId)
+        } else {
+          this.sendTurn(event.sessionId, BROKER_RESUME_NUDGE, undefined, 'local', {
+            logicalContinuation: 'broker-recovery',
+          }).catch((err) =>
+            log.warn('broker', 'auto-resume turn failed', err instanceof Error ? err.message : err),
+          )
+        }
       }
+    }
+    if (event.type === 'SessionCapabilitiesUpdated') {
+      this.advertisedTools.set(event.sessionId, event.snapshot.tools)
+      this.sessionCapabilities.set(event.sessionId, event.snapshot)
     }
 
     // Fold each completed turn into the daily usage rollup (main-side, file-first). Asides ("btw")
@@ -2684,6 +4705,10 @@ export class EngineSessionManager {
     // Turn-end is engine activity too — the dream scheduler's quiet clock re-arms from the LAST
     // event of the day, not the last send (a long final turn shouldn't shorten the quiet window).
     if (event.type === 'TurnComplete') this.noteEngineActivity(event.sessionId)
+
+    // The steered turn is over, so the live posture is the truth again. A posture the user changed
+    // mid-turn takes effect from here — the same boundary the next turn's mode block announces.
+    if (event.type === 'TurnComplete') this.gate.pinTurnMode(event.sessionId, null)
 
     // A turn just moved the needle — refresh the plan gauge instead of leaving it up to a minute stale.
     // Debounced, so a run of short turns doesn't spawn a poll each time.
@@ -2728,7 +4753,12 @@ export class EngineSessionManager {
         event.runId,
         event.dir,
         (e) => this.forward(e), // the watcher's own WorkflowAgent/Completed events route back through here
-        (runId) => this.workflowWatchers.delete(runId),
+        (runId) => {
+          this.workflowWatchers.delete(runId)
+          // TurnComplete may already have arrived. The workflow watcher was the final possible writer,
+          // so its observation boundary is the moment change attribution may honestly reconcile.
+          this.maybeFinishCompletionTurn(event.sessionId)
+        },
         // Stash the finished workflow's result for delivery on this session's next human turn.
         (resultText) => this.stashWorkflowResult(event.sessionId, resultText),
       )
@@ -2785,6 +4815,19 @@ export class EngineSessionManager {
     }
   }
 
+  /** Fold engine terminal edges into the small launcher fact. This deliberately mirrors the desktop's
+   *  error-banner threshold. Once an error wins a logical turn, its compatibility TurnComplete cannot
+   *  relabel that failed turn as done; only acceptance of a later human turn clears it. */
+  private noteTerminalAttention(event: EngineEvent): void {
+    const kind = terminalAttentionKind(event)
+    if (!kind) return
+    if (kind === 'done' && this.terminalAttention.get(event.sessionId)?.kind === 'error') return
+    this.terminalAttention.set(event.sessionId, {
+      kind,
+      revision: terminalAttentionRevision(event) ?? randomUUID(),
+    })
+  }
+
   /**
    * Diagnostic trail, not a transcript: log failures fully, plus thin lifecycle
    * breadcrumbs (event type + a locating id — no payloads) so an error has context
@@ -2831,14 +4874,25 @@ export class EngineSessionManager {
 
 function noop(): void {}
 
-/** The instant provisional session title from the first words of a prompt — the on-device model
- *  (`assistTitle`) refines it moments later. Mirrors the renderer's `titleFromPrompt` so a phone-started
- *  session named here matches one named on the desktop. */
-function titleFromPrompt(text: string): string {
-  const clean = text.trim().replace(/\s+/g, ' ')
-  return clean.length <= 40 ? clean : `${clean.slice(0, 40).trimEnd()}…`
+/** Main stores renderer transcript rows opaquely, but this tiny structural read is enough to give a
+ *  launcher row its human subject after a restart when the saved label is still only a placeholder. */
+function firstPersistedUserPrompt(items: readonly unknown[] | undefined): string | undefined {
+  for (const raw of items ?? []) {
+    const item = raw as { kind?: unknown; text?: unknown }
+    if (item?.kind !== 'user' || typeof item.text !== 'string') continue
+    const text = item.text.trim()
+    if (text && text !== '(image)') return text
+  }
+  return undefined
 }
 
+/** Labels created before the conversation has a subject. A manual rename always bypasses this check. */
+function isProvisionalSessionLabel(label: string, cwd: string): boolean {
+  if (isProvisionalSessionTitle(label)) return true
+  const normalized = label.trim().toLocaleLowerCase()
+  const projectName = basename(cwd).trim().toLocaleLowerCase()
+  return normalized === 'session' || (!!projectName && normalized === projectName)
+}
 /** Realpath a dir for stable comparison (symlinks, /tmp vs /private/tmp), falling back to the input
  *  when it can't be resolved (a gone dir) — so a match still works on the raw string. */
 function realpathOrSelf(p: string): string {

@@ -1,8 +1,9 @@
-import { test, expect, _electron as electron, type ElectronApplication } from '@playwright/test'
+import { test, expect, type ElectronApplication } from '@playwright/test'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { launchKoda } from './support/koda'
 
 /**
  * Runtime proof for the half unit tests can't reach: main refusing to report an unreadable store as
@@ -15,12 +16,7 @@ import { join } from 'node:path'
  */
 
 async function launchSeeded(projectPath: string, userDataDir: string): Promise<ElectronApplication> {
-  writeFileSync(
-    join(userDataDir, 'koda-app-state.json'),
-    JSON.stringify({ version: 1, openProjects: [projectPath], recentProjects: [projectPath] }),
-  )
-  writeFileSync(join(userDataDir, 'koda-settings.json'), JSON.stringify({ hasOnboarded: true }))
-  return electron.launch({ args: ['out/main/index.js', `--user-data-dir=${userDataDir}`] })
+  return launchKoda({ projectPath, userDataDir })
 }
 
 /** The same filenames main derives (sha256 of the project root, first 16 hex) — session-store.ts. */
@@ -52,7 +48,7 @@ test('an unreadable session store survives a full boot + quit instead of being r
   try {
     const win = await app.firstWindow()
     // The workspace renders (nothing restored — that part is expected and fine).
-    await expect(win.getByText('Nothing on stage yet')).toBeVisible({ timeout: 20_000 })
+    await expect(win.getByRole('button', { name: 'New chat' })).toBeVisible({ timeout: 20_000 })
     // Well past the 500ms save debounce, and past the store churn a boot produces on its own.
     await win.waitForTimeout(4000)
   } finally {
@@ -80,7 +76,7 @@ test('an unreadable archive index survives a boot instead of being rewritten emp
   const app = await launchSeeded(project, userDataDir)
   try {
     const win = await app.firstWindow()
-    await expect(win.getByText('Nothing on stage yet')).toBeVisible({ timeout: 20_000 })
+    await expect(win.getByRole('button', { name: 'New chat' })).toBeVisible({ timeout: 20_000 })
     await win.waitForTimeout(4000)
   } finally {
     await app.close()
@@ -98,7 +94,7 @@ function seedHealthyStore(userDataDir: string, project: string, label: string): 
   writeFileSync(
     storeFile,
     JSON.stringify({
-      version: 2,
+      version: 3,
       projectPath: project,
       activeId: 's1',
       // A non-empty `items` matters: main's boot-time pruneGhostSessions drops any session with no
@@ -141,6 +137,148 @@ test('a healthy session store hydrates on boot, and a change is written back to 
   expect(saved.sessions[0].userNamed).toBe(true)
 })
 
+test('an archived chat cannot return from a stale hot store, and repeated archive rows collapse', async () => {
+  const { project, userDataDir } = scratch()
+  const storeFile = join(userDataDir, storeName(project))
+  const indexFile = join(userDataDir, archiveName(project))
+  const now = Date.now()
+
+  // This is the exact split-brain state from the regression: the small archive write landed, but the
+  // much larger hot-store save never crossed Electron IPC, so the same id remains live on disk. Each
+  // retry then prepended another cold row for that id.
+  writeFileSync(
+    storeFile,
+    JSON.stringify({
+      version: 3,
+      projectPath: project,
+      activeId: 'still-live',
+      sessions: [
+        {
+          id: 'keeps-returning',
+          label: 'Keeps coming back',
+          cwd: project,
+          items: [{ id: 1, kind: 'user', text: 'archive this' }],
+        },
+        {
+          id: 'still-live',
+          label: 'Actually live',
+          cwd: project,
+          items: [{ id: 2, kind: 'user', text: 'keep this one' }],
+        },
+      ],
+    }),
+  )
+  writeFileSync(
+    indexFile,
+    JSON.stringify({
+      version: 2,
+      archived: [
+        { id: 'keeps-returning', label: 'Latest archive click', cwd: project, archivedAt: now },
+        { id: 'keeps-returning', label: 'Earlier archive click', cwd: project, archivedAt: now - 1000 },
+      ],
+    }),
+  )
+  const bodiesDir = `${indexFile.replace(/\.json$/, '')}.bodies`
+  mkdirSync(bodiesDir)
+  writeFileSync(
+    join(bodiesDir, bodyName('keeps-returning')),
+    JSON.stringify({ items: [{ id: 1, kind: 'user', text: 'archive this' }] }),
+  )
+
+  const app = await launchSeeded(project, userDataDir)
+  try {
+    const win = await app.firstWindow()
+    await expect(win.locator('aside').getByText('Actually live', { exact: true })).toBeVisible({
+      timeout: 20_000,
+    })
+    await expect(win.locator('aside').getByText('Keeps coming back', { exact: true })).toHaveCount(0)
+
+    // One id means one archive, however many times the user retried the click. The first row is the
+    // newest one, so its metadata wins when the index repairs itself.
+    const archived = win.getByRole('button', { name: 'Archived chats (1)' })
+    await expect(archived).toBeVisible()
+    await archived.hover()
+    await expect(win.getByText('Latest archive click', { exact: true })).toBeVisible()
+    await expect(win.getByText('Earlier archive click', { exact: true })).toHaveCount(0)
+    await win.waitForTimeout(1500) // let the ordinary renderer debounce run after main's repair
+  } finally {
+    await app.close()
+  }
+
+  const hot = JSON.parse(readFileSync(storeFile, 'utf8'))
+  expect(hot.sessions.map((session: { id: string }) => session.id)).toEqual(['still-live'])
+  const cold = JSON.parse(readFileSync(indexFile, 'utf8'))
+  expect(cold.archived).toEqual([
+    expect.objectContaining({ id: 'keeps-returning', label: 'Latest archive click' }),
+  ])
+})
+
+test('archive metadata without a readable body keeps the live fallback and tells the user', async () => {
+  const { project, userDataDir } = scratch()
+  const storeFile = join(userDataDir, storeName(project))
+  writeFileSync(
+    storeFile,
+    JSON.stringify({
+      version: 3,
+      projectPath: project,
+      activeId: 's1',
+      sessions: [
+        {
+          id: 's1',
+          label: 'Only readable copy',
+          cwd: project,
+          items: [{ id: 1, kind: 'user', text: 'hello' }],
+        },
+        {
+          id: 's2',
+          label: 'Archive something else',
+          cwd: project,
+          items: [{ id: 2, kind: 'user', text: 'unrelated' }],
+        },
+      ],
+    }),
+  )
+  const indexFile = join(userDataDir, archiveName(project))
+  writeFileSync(
+    indexFile,
+    JSON.stringify({
+      version: 2,
+      archived: [
+        { id: 's1', label: 'Broken archive copy', cwd: project, archivedAt: Date.now() },
+      ],
+    }),
+  )
+
+  const app = await launchSeeded(project, userDataDir)
+  try {
+    const win = await app.firstWindow()
+    await expect(win.locator('aside').getByText('Only readable copy', { exact: true })).toBeVisible({
+      timeout: 20_000,
+    })
+    await expect(win.getByText('Koda couldn’t read the archived copy of 1 chat.', { exact: true })).toBeVisible()
+    await expect(win.getByText('Its live copy is still here and nothing was deleted.', { exact: false })).toBeVisible()
+    // The broken row remains on disk for recovery, but it cannot appear as a restorable archive in
+    // this run because its transcript body is precisely what could not be read.
+    await expect(win.getByRole('button', { name: /Archived chats/ })).toHaveCount(0)
+
+    // Any later archive write is a complete index replacement. Archiving an unrelated live chat must
+    // carry the hidden recovery row forward instead of silently orphaning the broken body metadata.
+    const unrelated = win.locator('aside').getByText('Archive something else', { exact: true })
+    await expect(unrelated).toBeVisible()
+    await unrelated.click({ button: 'right' })
+    await win.getByText('Archive session').click()
+    await expect(unrelated).toHaveCount(0)
+    await expect(win.getByRole('button', { name: 'Archived chats (1)' })).toBeVisible()
+  } finally {
+    await app.close()
+  }
+
+  const hot = JSON.parse(readFileSync(storeFile, 'utf8'))
+  expect(hot.sessions.map((session: { id: string }) => session.id)).toEqual(['s1'])
+  const cold = JSON.parse(readFileSync(indexFile, 'utf8'))
+  expect(cold.archived.map((meta: { id: string }) => meta.id).sort()).toEqual(['s1', 's2'])
+})
+
 test('an unreadable session store shows an un-missable warning instead of looking like an empty project', async () => {
   const { project, userDataDir } = scratch()
   const storeFile = join(userDataDir, storeName(project))
@@ -175,7 +313,7 @@ test('a chat that drifted out of schema is reported to the user instead of vanis
   writeFileSync(
     storeFile,
     JSON.stringify({
-      version: 2,
+      version: 3,
       projectPath: project,
       activeId: 's1',
       sessions: [
@@ -336,7 +474,7 @@ test('a project list that cannot be read says so, and the project opened after i
   writeFileSync(stateFile, original)
   writeFileSync(join(userDataDir, 'koda-settings.json'), JSON.stringify({ hasOnboarded: true }))
 
-  const first = await electron.launch({ args: ['out/main/index.js', `--user-data-dir=${userDataDir}`] })
+  const first = await launchKoda({ userDataDir })
   try {
     const win = await first.firstWindow()
     // Empty openProjects ⇒ main opens ProjectHome. This is the screen that used to lie by omission.
@@ -363,7 +501,7 @@ test('a project list that cannot be read says so, and the project opened after i
     // swaps the renderer itself off the openProject result; the reload is how a test that skipped the
     // button asks main who this window is now.
     await win.reload()
-    await expect(win.getByText('Nothing on stage yet')).toBeVisible({ timeout: 20_000 })
+    await expect(win.getByRole('button', { name: 'New chat' })).toBeVisible({ timeout: 20_000 })
     await win.waitForTimeout(2000)
   } finally {
     await first.close()
@@ -385,10 +523,10 @@ test('a project list that cannot be read says so, and the project opened after i
   expect(saved.knownProjects).toEqual([project]) // the phone's Home list restarts with it
 
   // …and it sticks. A relaunch reopens the project instead of dead-ending on ProjectHome again.
-  const second = await electron.launch({ args: ['out/main/index.js', `--user-data-dir=${userDataDir}`] })
+  const second = await launchKoda({ userDataDir })
   try {
     const win = await second.firstWindow()
-    await expect(win.getByText('Nothing on stage yet')).toBeVisible({ timeout: 20_000 })
+    await expect(win.getByRole('button', { name: 'New chat' })).toBeVisible({ timeout: 20_000 })
     // The notice was about a file that reads fine now, so it must be gone.
     await expect(win.getByText('Koda couldn’t read your list of projects.', { exact: false })).toHaveCount(0)
   } finally {

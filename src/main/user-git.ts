@@ -20,7 +20,13 @@ import { promisify } from 'node:util'
 import { readFile, realpath } from 'node:fs/promises'
 import { relative, resolve, sep } from 'node:path'
 import { excludeKodaFromUserGit } from './safety-git/repo'
-import { buildGraph, type RawCommit, type GraphLayout } from './git-graph'
+import {
+  buildGraph,
+  computeMergeInflows,
+  type MergeInflow,
+  type RawCommit,
+  type GraphLayout,
+} from './git-graph'
 import { gitEnv } from './engine/user-path'
 import { log } from './logger'
 
@@ -86,6 +92,121 @@ export interface StatusResult {
   files: StatusFile[]
   /** True when the real changed count exceeded MAX_STATUS_FILES (list is clipped). */
   truncated: boolean
+}
+
+/** Uncapped main-process evidence for one turn's task-owned paths. This never reaches the aggregate
+ *  Changes payload: it exists so completion can distinguish prior dirt from this turn's delta without
+ *  turning a clipped/fail-soft UI status into an ownership claim. */
+export type CompletionGitSnapshot =
+  | { kind: 'repo'; dirty: string[] }
+  | { kind: 'not-repo' }
+  | { kind: 'unknown' }
+
+function gitProbeKind(err: unknown): 'not-repo' | 'unknown' {
+  const e = err as { stderr?: string; message?: string }
+  return /not a git repository/i.test(`${e.stderr ?? ''}\n${e.message ?? ''}`) ? 'not-repo' : 'unknown'
+}
+
+/** Parse porcelain-v1 -z, retaining BOTH sides of a rename. The normal status surface intentionally
+ *  shows only the destination; completion needs both paths because safety-git expresses a rename as
+ *  delete+add and either side may be the task path it is reconciling. */
+function porcelainPaths(stdout: string): string[] {
+  const tokens = stdout.split('\0')
+  const paths: string[] = []
+  for (let i = 0; i < tokens.length; i++) {
+    const entry = tokens[i]
+    if (entry.length < 4) continue
+    paths.push(entry.slice(3))
+    if (entry[0] === 'R' || entry[1] === 'R') {
+      const prior = tokens[++i]
+      if (prior) paths.push(prior)
+    }
+  }
+  return [...new Set(paths)]
+}
+
+/** Porcelain-v1 always reports paths from the USER repo root, even when git runs inside a nested
+ *  Koda project. Safety-git reports paths from the project root, so completion must translate the
+ *  former into the latter and drop any rename side that lives outside the opened project. */
+function projectRelativePorcelainPaths(stdout: string, repoPrefix: string): string[] {
+  if (!repoPrefix) return porcelainPaths(stdout)
+  const prefix = repoPrefix.endsWith('/') ? repoPrefix : `${repoPrefix}/`
+  return porcelainPaths(stdout)
+    .filter((path) => path.startsWith(prefix))
+    .map((path) => path.slice(prefix.length))
+    .filter(Boolean)
+}
+
+/** With `normal` untracked handling Git may collapse a wholly-untracked nested project (or one of
+ *  its untracked ancestors) to a directory entry outside our project prefix. That entry would
+ *  otherwise normalize to no evidence at all. */
+function hasCollapsedProjectRoot(stdout: string, repoPrefix: string): boolean {
+  if (!repoPrefix) return false
+  return porcelainPaths(stdout).some((path) => path.endsWith('/') && repoPrefix.startsWith(path))
+}
+
+/** Repo-root-relative prefix of projectDir, with Git's `/` separators and trailing slash. */
+async function projectRepoPrefix(projectDir: string): Promise<string> {
+  const { stdout } = await runUserGit(projectDir, ['rev-parse', '--show-prefix'])
+  // Remove only Git's record terminator: leading/trailing spaces are valid path characters.
+  return stdout.replace(/\r?\n$/, '')
+}
+
+/** Raw user-Git state at a turn boundary. Untracked directories normally stay collapsed so a missing
+ *  .gitignore cannot explode this in-memory snapshot. A wholly-untracked nested project is the one
+ *  exception: it expands within that project rather than falsely reading as clean. Unlike getStatus,
+ *  the list is uncapped and probe failure remains explicit. */
+export async function completionGitSnapshot(projectDir: string): Promise<CompletionGitSnapshot> {
+  try {
+    const repoPrefix = await projectRepoPrefix(projectDir)
+    const args = [
+      'status',
+      '--porcelain=v1',
+      '-z',
+      '--untracked-files=normal',
+      '--',
+      '.',
+    ]
+    let { stdout } = await runUserGit(projectDir, args)
+    // Preserve the cheap collapsed probe for normal projects. Only enumerate when Git collapsed the
+    // opened project itself, because treating a wholly-untracked project as clean is worse than the
+    // bounded-to-this-project expansion.
+    if (hasCollapsedProjectRoot(stdout, repoPrefix)) {
+      ;({ stdout } = await runUserGit(
+        projectDir,
+        args.map((arg) => (arg === '--untracked-files=normal' ? '--untracked-files=all' : arg)),
+      ))
+    }
+    return { kind: 'repo', dirty: projectRelativePorcelainPaths(stdout, repoPrefix) }
+  } catch (err) {
+    return { kind: gitProbeKind(err) }
+  }
+}
+
+/** Reconcile only paths safety-git attributed to this task. Pathspec-after-`--` prevents filenames
+ *  from becoming flags; `all` expands an owned untracked directory so every remaining file is named. */
+export async function completionStatusForPaths(
+  projectDir: string,
+  paths: string[],
+): Promise<CompletionGitSnapshot> {
+  const unique = [...new Set(paths)].filter(Boolean)
+  if (unique.length === 0) return { kind: 'repo', dirty: [] }
+  try {
+    const repoPrefix = await projectRepoPrefix(projectDir)
+    const { stdout } = await runUserGit(projectDir, [
+      '--literal-pathspecs',
+      'status',
+      '--porcelain=v1',
+      '-z',
+      '--untracked-files=all',
+      '--',
+      ...unique,
+    ])
+    const reported = new Set(projectRelativePorcelainPaths(stdout, repoPrefix))
+    return { kind: 'repo', dirty: unique.filter((path) => reported.has(path)) }
+  } catch (err) {
+    return { kind: gitProbeKind(err) }
+  }
 }
 
 /**
@@ -196,11 +317,87 @@ export async function getStatus(projectDir: string): Promise<StatusResult> {
   return { files, truncated: total > files.length }
 }
 
+/** Everything a saved version's description is written from: the changed files, the diff since the
+ *  last version, and the project's own recent descriptions (the house style to match). */
+export interface ChangeEvidence {
+  files: StatusFile[]
+  truncated: boolean
+  diff: string
+  recentSubjects: string[]
+}
+
+/** How much diff text leaves this function. The description turn caps it again for its prompt; this
+ *  cap is about not carrying a megabyte of the user's source around for a one-line summary. */
+const MAX_EVIDENCE_DIFF_CHARS = 24_000
+const RECENT_SUBJECTS = 10
+
+/**
+ * Read-only evidence for describing the current changes. `--patch-with-stat` puts the stat block
+ * FIRST so it survives the truncation below on a large change, and `--no-ext-diff --no-textconv`
+ * keep a user-configured external differ out of a background read. Untracked files never appear in
+ * `git diff`, so they reach the description through the file list only, by name.
+ *
+ * `status` is passed IN rather than read here: the deterministic floor needs only the status, and it
+ * is decided before anything commits to the expensive half. That ordering is the point — a save that
+ * takes the floor (Codex, setting off, no owning session) must not have read a whole diff first.
+ *
+ * Fail-soft everywhere, like detect/status: a repo with no commits yet (unborn HEAD) has no diff and
+ * no history, and answers with an empty string rather than an error.
+ */
+export async function getChangeEvidence(
+  projectDir: string,
+  status: StatusResult,
+): Promise<ChangeEvidence> {
+  const [diff, recentSubjects] = await Promise.all([
+    readWorkingDiff(projectDir),
+    readRecentSubjects(projectDir),
+  ])
+  return { files: status.files, truncated: status.truncated, diff, recentSubjects }
+}
+
+async function readWorkingDiff(projectDir: string): Promise<string> {
+  try {
+    const { stdout } = await runUserGit(projectDir, [
+      'diff',
+      '--patch-with-stat',
+      '--no-color',
+      '--no-ext-diff',
+      '--no-textconv',
+      '--unified=1',
+      'HEAD',
+    ])
+    return stdout.length > MAX_EVIDENCE_DIFF_CHARS
+      ? `${stdout.slice(0, MAX_EVIDENCE_DIFF_CHARS)}\n… (diff truncated)`
+      : stdout
+  } catch {
+    return ''
+  }
+}
+
+async function readRecentSubjects(projectDir: string): Promise<string[]> {
+  try {
+    const { stdout } = await runUserGit(projectDir, [
+      'log',
+      `--max-count=${RECENT_SUBJECTS}`,
+      '--no-merges',
+      '--pretty=format:%s',
+    ])
+    return stdout
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
 export interface CommitGraphResult {
   /** Per-row draw instructions + lane palette (see git-graph.ts). */
   layout: GraphLayout
   /** Local branches with work not in the current branch — powers the "stranded work" banner. */
   unmergedBranches: { name: string; ahead: number }[]
+  /** Merge SHA → the commits that merge brought in (see computeMergeInflows). */
+  mergeInflows: Record<string, MergeInflow>
   /** Current branch name (null on detached HEAD / unborn). */
   headBranch: string | null
   /** True when more commits exist than the cap. */
@@ -210,6 +407,7 @@ export interface CommitGraphResult {
 const EMPTY_GRAPH: CommitGraphResult = {
   layout: { rows: [], laneCount: 0, laneKinds: {} },
   unmergedBranches: [],
+  mergeInflows: {},
   headBranch: null,
   truncated: false,
 }
@@ -253,14 +451,17 @@ export async function getCommitGraph(projectDir: string, limit = 50): Promise<Co
       '--branches',
       '--date-order',
       `--max-count=${limit + 1}`,
-      '--pretty=format:%h%x1f%p%x1f%s%x1f%cr%x1f%an%x1f%D',
+      // %ct alongside %cr: the relative string ("23 hours ago") can't say which calendar day a commit
+      // fell on, and the rail groups by day.
+      '--pretty=format:%h%x1f%p%x1f%s%x1f%cr%x1f%an%x1f%ct%x1f%D',
     ])
     const lines = stdout.split('\n').filter((l) => l.length > 0)
     const truncated = lines.length > limit
     let headBranch: string | null = null
 
     const raw: RawCommit[] = lines.slice(0, limit).map((line) => {
-      const [sha, parents, subject, relativeDate, authorName, decoration] = line.split('\x1f')
+      const [sha, parents, subject, relativeDate, authorName, committedAt, decoration] =
+        line.split('\x1f')
       const refsRaw = (decoration ?? '')
         .split(',')
         .map((s) => s.trim())
@@ -279,6 +480,7 @@ export async function getCommitGraph(projectDir: string, limit = 50): Promise<Co
         parents: parents ? parents.split(' ').filter(Boolean) : [],
         subject,
         relativeDate,
+        committedAt: Number(committedAt) * 1000,
         authorName,
         refs,
         isHead,
@@ -291,7 +493,13 @@ export async function getCommitGraph(projectDir: string, limit = 50): Promise<Co
       unmergedBranchNames: new Set(unmerged.map((branch) => branch.name)),
       headBranch,
     })
-    return { layout, unmergedBranches: unmerged, headBranch, truncated }
+    return {
+      layout,
+      unmergedBranches: unmerged,
+      mergeInflows: computeMergeInflows(raw),
+      headBranch,
+      truncated,
+    }
   } catch {
     // No commits yet / not a repo — fail soft like detect/status.
     return EMPTY_GRAPH

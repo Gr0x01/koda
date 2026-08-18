@@ -87,8 +87,8 @@ let chain: Promise<void> = Promise.resolve()
 
 /**
  * Fold one completed turn into today's rollup. Fire-and-forget — callers never await. `costEstimate`
- * is the turn's authoritative total (`total_cost_usd`); `models` carries the per-model token split.
- * A turn with neither (an error result that produced no usage) is skipped.
+ * is the provider's authoritative total when it reports one; `models` carries normalized per-model
+ * token facts and may carry zero cost on tokens-only engines. A turn with neither is skipped.
  */
 export function recordTurnUsage(
   models: ModelTurnUsage[] | undefined,

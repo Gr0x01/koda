@@ -19,17 +19,32 @@
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import readline from 'node:readline'
-import type { EngineEvent, ToolDecision } from '@shared/ipc'
+import { z } from 'zod'
+import { TURN_REJECTED_STOP_REASON } from '@shared/ipc'
+import type {
+  ApprovalMode,
+  EngineEvent,
+  RawEngineEvent,
+  ResumeCursor,
+  SessionCapabilitySnapshot,
+  ToolDecision,
+} from '@shared/ipc'
 import { rateLimitBand } from '@shared/rate-limits'
+import {
+  buildSessionCapabilitySnapshot,
+  codexMcpServers,
+  codexSkillNames,
+} from '@shared/session-capabilities'
 import type { EngineSession, EventSink, TurnImage } from './adapter'
+import { buildCodexTurnSteering } from './codex-steering'
 import { resolveEnginePath } from './binary'
 import { buildEngineEnv, type EngineEnvOptions } from './env'
-import { isKodaCleanFinishHook, type CodexHookSummary } from './codex-clean-finish'
 import { looksLikeProviderDown } from './status-watch'
 import type { ApproveRequest, DecideFn } from '../broker/types'
 import { BROKER_TOKEN_ENV, SERVER_NAME as BROKER_SERVER_NAME } from '../broker/server'
 import type { McpStdioServer } from '../playwright/manager'
 import { log } from '../logger'
+import { logUnmappedEvent } from './unmapped-log'
 
 export interface CodexSessionOpts {
   sessionId: string
@@ -37,19 +52,31 @@ export interface CodexSessionOpts {
   /** The gate — Codex calls it directly from its approval callbacks (no broker on the Codex path). */
   decide: DecideFn
   /** Guardrail text → Codex's `developerInstructions` (ADDITIVE; never `baseInstructions`, which would
-   *  REPLACE Codex's own agent prompt). Undefined only when no Koda rules/memory/docs are available. */
+   *  REPLACE Codex's own agent prompt). Undefined only when no Koda rules/memory/docs are available.
+   *  DURABLE text only: the always-on pack, project card, and skills. Anything that can change inside a
+   *  conversation belongs in the per-turn block (codex-steering.ts), not here. */
   developerInstructions?: string
+  /** The session's approval posture at spawn. Kept live by `setApprovalMode` and re-rendered into the
+   *  steering block on every turn, so switching posture mid-thread never needs a respawn. */
+  approvalMode?: ApprovalMode
+  /** Per-project native skill overrides. Paths identify the installed bundled skill or a project
+   *  `.claude/skills` fork; passed as `skills.config` at process start so Settings toggles are real
+   *  delivery controls rather than prompt-level stand-down prose. */
+  skillConfig?: Array<{ path: string; enabled: boolean }>
+  /** Whether this project's switches intentionally leave any Koda playbook enabled. Runtime
+   * `skills/list` still decides ready vs degraded. */
+  playbooksExpected?: boolean
   /** Preferred model id; ignored if the account's `model/list` doesn't include it (we fall back to the
    *  account default — a ChatGPT subscription rejects the `-codex` thread/start default). */
   model?: string
   /** Reasoning effort, passed through to the first turn (engine's own terms). */
   effort?: string
-  /** Resume an existing Codex thread by id (loaded from disk — proven cross-process in
-   *  spike/codex/verify-resume.mjs) instead of starting fresh. This is the engine's own thread id
-   *  (≠ Koda's sessionId), captured from `SessionStarted.engineNativeId` and persisted. Used on a
-   *  restart-reattach AND a mid-conversation model/effort change (resume takes a model override, so
-   *  the context is preserved across the respawn). Absent ⇒ a fresh `thread/start`. */
-  resumeThreadId?: string
+  /** This session's last resume cursor, handed back verbatim by the shared layer. THIS driver owns the
+   *  shape (see `codexResumeCursor`): a valid cursor resumes that Codex thread by id (`thread/resume`,
+   *  proven cross-process in spike/codex/verify-resume.mjs), anything else starts a fresh thread. Used
+   *  on a restart-reattach AND a mid-conversation model/effort change (resume takes a model override, so
+   *  the context survives the respawn). */
+  resumeCursor?: ResumeCursor
   /** process.resourcesPath in the packaged app; omit in dev (resolves the Homebrew/dev codex). */
   resourcesPath?: string
   /** Explicit binary to spawn, bypassing resolveEnginePath — used by the engine-contract smoke test to
@@ -69,6 +96,41 @@ export interface CodexSessionOpts {
   playwrightServer?: McpStdioServer
   /** Fired once when the child exits (any cause) so the manager can drop its handle + tear down. */
   onClose?: (sessionId: string) => void
+  /** The posture this turn's steering block actually declared, reported as the turn goes out. The owner
+   *  pins the gate's fence to it so a posture change made WHILE the turn runs cannot relax or tighten
+   *  the rules the model was steered under — the new mode reaches it on the next turn, which is exactly
+   *  what the block's supersession text promises. */
+  onTurnSteered?: (mode: ApprovalMode) => void
+}
+
+/**
+ * Codex's resume cursor — the shape THIS driver owns inside the opaque `ResumeCursor.data`. Codex
+ * reattaches by its OWN thread id, which is not Koda's session id. `turns` rides along for the
+ * envelope's `resumable` answer only: Codex mints the thread during `thread/start`, before the user has
+ * said anything, so a thread id alone was never proof that a conversation exists.
+ */
+const CodexResumeDataSchema = z.object({
+  threadId: z.string().min(1),
+  turns: z.number().int().nonnegative(),
+})
+type CodexResumeData = z.infer<typeof CodexResumeDataSchema>
+
+/** Build this driver's cursor. Exported so the session manager can hand one back without reading it. */
+export function codexResumeCursor(threadId: string, turns: number): ResumeCursor {
+  return { engine: 'codex', resumable: turns > 0, data: { threadId, turns } }
+}
+
+/** Validate a cursor as OURS. A Claude blob or a hand-edited file starts a fresh thread instead. */
+export function parseCodexResumeCursor(cursor: ResumeCursor | undefined): CodexResumeData | null {
+  if (!cursor || cursor.engine !== 'codex') return null
+  const parsed = CodexResumeDataSchema.safeParse(cursor.data)
+  return parsed.success ? parsed.data : null
+}
+
+/** The Codex thread a live session is on, for the features that fork it (a side question). Reading the
+ *  blob stays in the driver that owns it; callers pass the cursor and get an id or nothing. */
+export function codexThreadId(cursor: ResumeCursor | undefined): string | undefined {
+  return parseCodexResumeCursor(cursor)?.threadId
 }
 
 /** Launch a long-lived Codex session. Spawns immediately; the init handshake runs async and the first
@@ -106,6 +168,37 @@ interface PendingCall {
   reject: (err: Error) => void
 }
 
+const CAPABILITY_PROBE_TIMEOUT_MS = 2_000
+const CAPABILITY_SETTLE_DELAY_MS = 1_500
+const CODEX_TOOL_OUTPUT_TOKEN_LIMIT = 4_000
+
+/** A startup inventory is additive: never let a protocol regression or slow MCP server block the
+ * conversation. Each native read has one deadline and consumes no model turn; a late RPC response is
+ * still drained by the ordinary pending-call map. The caller may perform one bounded settling read
+ * when expected evidence is initially absent, because MCP and plugin startup can finish just after
+ * thread creation. */
+function boundedCapabilityProbe(promise: Promise<unknown>): Promise<{ value?: unknown; failed: boolean }> {
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (result: { value?: unknown; failed: boolean }): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(result)
+    }
+    const timer = setTimeout(() => finish({ failed: true }), CAPABILITY_PROBE_TIMEOUT_MS)
+    timer.unref?.()
+    promise.then(
+      (value) => finish({ value, failed: false }),
+      () => finish({ failed: true }),
+    )
+  })
+}
+
+/** The engine ANSWERED our call with a JSON-RPC error — as opposed to the transport dying under us.
+ *  Only the former tells us anything about the request we made (e.g. that a thread is gone). */
+export class CodexRpcError extends Error {}
+
 interface McpToolElicitation {
   toolName: string
   input: unknown
@@ -141,6 +234,45 @@ export function mcpElicitationResponse(accepted: boolean): McpElicitationRespons
   return { action: accepted ? 'accept' : 'decline', content: null, _meta: null }
 }
 
+/**
+ * JSON-RPC messages this driver ignores ON PURPOSE, so the unmapped log stays signal. Anything not
+ * here and not translated below is logged — that is the "never silently swallowed" contract.
+ *  - reasoning items: already carried live by the reasoning deltas.
+ *  - userMessage items: Koda's own turn echoed back.
+ *  - `item/started/agentMessage`: the finalized `completed` item is the block Koda renders.
+ *  - the acked server requests (time, attestation, token refresh): answers, not events.
+ */
+const DELIBERATELY_IGNORED = new Set([
+  'item/started/reasoning',
+  'item/completed/reasoning',
+  'item/started/userMessage',
+  'item/completed/userMessage',
+  'item/started/agentMessage',
+  'item/started/contextCompaction',
+  'item/started/collabAgentToolCall',
+  'item/started/subAgentActivity',
+  'request/currentTime/read',
+  'request/attestation/generate',
+  'request/chatgptAuthTokens/refresh',
+])
+
+/** Codex's own ids for a notification, flattened so a consumer can join a child thread to its launch
+ *  without re-reading the payload. Only keys the message actually carries appear. */
+export function codexIds(params: unknown): Record<string, string> | undefined {
+  const p = (params ?? {}) as Record<string, unknown>
+  const item = (p.item ?? {}) as Record<string, unknown>
+  const turn = (p.turn ?? {}) as Record<string, unknown>
+  const ids: Record<string, string> = {}
+  const put = (key: string, value: unknown) => {
+    if (typeof value === 'string' && value) ids[key] = value
+  }
+  put('threadId', p.threadId)
+  put('turnId', turn.id ?? p.turnId)
+  put('itemId', item.id ?? p.itemId)
+  put('agentThreadId', item.agentThreadId)
+  return Object.keys(ids).length ? ids : undefined
+}
+
 const EARLY_CHILD_NOTIFICATION_METHODS = new Set([
   'item/started',
   'item/completed',
@@ -157,14 +289,19 @@ class CodexSession implements EngineSession {
   private readonly child: ChildProcessWithoutNullStreams
   private readonly onEvent: EventSink
   private readonly opts: CodexSessionOpts
-  private readonly codexHomePath: string
 
   private nextId = 1
   private readonly pending = new Map<number, PendingCall>()
   private threadId: string | null = null
+  /** Completed turns on THIS thread, carried forward from the cursor we resumed with. Codex hands out a
+   *  thread id before the user has said anything, so this is what makes the cursor's `resumable` honest. */
+  private turns = 0
   private currentTurnId: string | null = null
   private ready = false
   private disposed = false
+  /** Transport truth is separate from an intentional dispose. Startup probes are fail-soft, but a
+   *  dead child is not a degraded capability state and must never be promoted to SessionStarted. */
+  private closed = false
   /** Resolves dispose()'s await once the child's 'close' actually fires (so a respawn-with-same-id
    *  doesn't create the replacement before this one's teardown ran — mirrors the Claude adapter). */
   private closeResolve?: () => void
@@ -193,18 +330,30 @@ class CodexSession implements EngineSession {
   /** A stop can race the child's first turn/started notification. Remember it and interrupt as soon
    *  as Codex gives us the turn id instead of telling the user the task could not be stopped. */
   private readonly pendingChildStops = new Set<string>()
+  /** The native notification being translated right now — stamped onto every event it produces. */
+  private nativeRaw: RawEngineEvent | undefined
+  /** The session's posture RIGHT NOW. Every turn re-renders the steering block from it, so a switch
+   *  mid-thread lands on the next turn with no respawn (engine-capabilities: planMode 'turnText'). */
+  private approvalMode: ApprovalMode
+  /** The posture actually RENDERED into the running turn's block, or null between turns. Every
+   *  per-turn safety decision reads this, never `approvalMode`: the user can flip posture while a turn
+   *  runs, and a turn must be held to the rules its own block gave the model. Same lifecycle as the
+   *  gate's pin — set as the turn goes out, cleared when it ends. */
+  private steeredTurnMode: ApprovalMode | null = null
+  /** The model Codex actually resolved for this thread — the runtime-identity footer's honest answer. */
+  private activeModel = ''
 
   constructor(onEvent: EventSink, opts: CodexSessionOpts) {
     this.onEvent = onEvent
     this.opts = opts
     this.id = opts.sessionId
     this.cwd = opts.cwd
+    this.approvalMode = opts.approvalMode ?? 'auto'
 
     const loc = opts.binaryPath
       ? { path: opts.binaryPath, source: 'dev-fallback' as const }
       : resolveEnginePath({ resourcesPath: opts.resourcesPath, binaryName: 'codex' })
     const env = buildEngineEnv(process.env, { ...opts.env, engineId: 'codex' })
-    this.codexHomePath = env.CODEX_HOME ?? ''
     // `-c check_for_update_on_startup=false`: suppress the startup version-check network call. Codex
     // never self-replaces (manual `codex update`), so the binary stays pinned without an env toggle.
     const args = [
@@ -213,8 +362,14 @@ class CodexSession implements EngineSession {
       '-c',
       'check_for_update_on_startup=false',
       '-c',
-      'features.hooks=true',
+      `tool_output_token_limit=${CODEX_TOOL_OUTPUT_TOKEN_LIMIT}`,
     ]
+    if (opts.skillConfig?.length) {
+      const entries = opts.skillConfig
+        .map(({ path, enabled }) => `{path=${JSON.stringify(path)},enabled=${enabled ? 'true' : 'false'}}`)
+        .join(',')
+      args.push('-c', `skills.config=[${entries}]`)
+    }
     // Attach Koda's capability tools as a streamable-HTTP MCP server (the same broker Claude consults).
     // The bearer token is read from the env var the broker token was injected as (KODA_BROKER_TOKEN),
     // so it never lands in argv/process listings. The `-c` value is parsed as TOML — hence the quotes.
@@ -246,6 +401,7 @@ class CodexSession implements EngineSession {
       this.emit({ type: 'EngineError', sessionId: this.id, message: `Codex failed to start: ${err.message}`, fatal: true })
     })
     this.child.on('close', () => {
+      this.closed = true
       if (!this.disposed) log.info('codex', 'process closed', { sessionId: this.id })
       for (const p of this.pending.values()) p.reject(new Error('codex process closed'))
       this.pending.clear()
@@ -263,7 +419,6 @@ class CodexSession implements EngineSession {
         clientInfo: { name: 'koda', title: 'Koda', version: '0.0.0' },
         capabilities: { experimentalApi: true, requestAttestation: false },
       })
-      await this.trustKodaStopHook()
       const model = await this.pickModel()
       // sandbox:'read-only' + approvalPolicy:'on-request' is load-bearing: it forces EVERY file change
       // and command to surface as a server-initiated approval → our gate sees them all → checkpoint-
@@ -278,24 +433,49 @@ class CodexSession implements EngineSession {
         ...(this.opts.effort ? { config: { model_reasoning_effort: this.opts.effort } } : {}),
       }
       // Resume by thread id (loaded from disk, proven cross-process in spike/codex/verify-resume) when
-      // reattaching an existing conversation — preserves context across a restart or a model/effort
-      // change (resume takes the model override above). Fresh `thread/start` otherwise.
-      const method = this.opts.resumeThreadId ? 'thread/resume' : 'thread/start'
-      if (this.opts.resumeThreadId) params.threadId = this.opts.resumeThreadId
-      const res = (await this.rpc(method, params)) as { thread?: { id?: string }; model?: string }
-      this.threadId = res?.thread?.id ?? this.opts.resumeThreadId ?? null
+      // the cursor names a thread that has actually held a turn — preserves context across a restart or
+      // a model/effort change (resume takes the model override above). Fresh `thread/start` otherwise.
+      const parsed = parseCodexResumeCursor(this.opts.resumeCursor)
+      const resume = parsed && parsed.turns > 0 ? parsed : null
+      const method = resume ? 'thread/resume' : 'thread/start'
+      if (resume) params.threadId = resume.threadId
+      let res: { thread?: { id?: string }; model?: string }
+      try {
+        res = (await this.rpc(method, params)) as { thread?: { id?: string }; model?: string }
+      } catch (err) {
+        // The engine refused to reattach the thread we named (deleted, stale, or from another account).
+        // That is recoverable, not fatal: report a resume miss and let the owner restart this session
+        // clean. A transport failure (the process died) is NOT a miss — it falls through to the fatal.
+        if (resume && err instanceof CodexRpcError) {
+          this.emit({
+            type: 'EngineError',
+            sessionId: this.id,
+            message: 'the engine no longer holds this conversation',
+            fatal: false,
+            category: 'resumeMiss',
+          })
+          return
+        }
+        throw err
+      }
+      this.threadId = res?.thread?.id ?? resume?.threadId ?? null
       if (!this.threadId) throw new Error(`${method} returned no thread id`)
+      this.turns = resume?.turns ?? 0
+      const capabilitySnapshot = await this.attestCapabilities()
+      this.assertTransportOpen()
       this.ready = true
-      // engineNativeId = Codex's own thread id (≠ Koda sessionId); persisted so a later reattach can
-      // resume THIS thread by id.
+      this.activeModel = res?.model ?? model ?? ''
       this.emit({
         type: 'SessionStarted',
         sessionId: this.id,
-        model: res?.model ?? model ?? '',
-        tools: [],
+        model: this.activeModel,
+        tools: capabilitySnapshot.tools,
         cwd: this.cwd,
-        engineNativeId: this.threadId,
       })
+      this.emit({ type: 'SessionCapabilitiesUpdated', sessionId: this.id, snapshot: capabilitySnapshot })
+      // The thread id is the whole of Codex's resume state; publish it before the first turn so a crash
+      // or a posture respawn can hand it straight back.
+      this.emitResumeCursor()
       // Pull a fresh window snapshot right away so the gauge shows the real number from the first paint,
       // not the stale boot-seeded value (the `updated` push is sparse — see refreshRateLimits).
       this.refreshRateLimits()
@@ -326,69 +506,103 @@ class CodexSession implements EngineSession {
     return (models.find((m) => !m.id.endsWith('-codex')) ?? models[0]).id
   }
 
-  /**
-   * Codex deliberately requires review before an unmanaged hook can run. Koda's plugin is generated
-   * inside Koda's isolated CODEX_HOME, so approve only that exact plugin's Stop hook using the hash
-   * Codex itself reports. Project/user hooks remain untouched and keep Codex's normal trust boundary.
-   * Fail soft for older candidate engines: the prompt rule still applies even if hooks/list is absent.
-   */
-  private async trustKodaStopHook(): Promise<void> {
-    try {
-      const list = async (): Promise<CodexHookSummary[]> => {
-        const res = (await this.rpc('hooks/list', { cwds: [this.cwd] })) as {
-          data?: Array<{ cwd?: string; hooks?: CodexHookSummary[] }>
-        }
-        return res.data?.find((entry) => entry.cwd === this.cwd)?.hooks ?? res.data?.[0]?.hooks ?? []
-      }
-      const ours = (await list()).filter((hook) => isKodaCleanFinishHook(hook, this.codexHomePath))
-      const pending = ours.filter(
-        (hook): hook is CodexHookSummary & { key: string; currentHash: string } =>
-          hook.trustStatus !== 'trusted' && !!hook.key && !!hook.currentHash,
-      )
-      if (pending.length === 0) return
-
-      await this.rpc('config/batchWrite', {
-        edits: [
-          {
-            keyPath: 'hooks.state',
-            value: Object.fromEntries(
-              pending.map((hook) => [
-                hook.key,
-                { enabled: true, trusted_hash: hook.currentHash },
-              ]),
-            ),
-            mergeStrategy: 'upsert',
-          },
-        ],
-        reloadUserConfig: true,
-      })
-
-      const trusted = new Map((await list()).map((hook) => [hook.key, hook.trustStatus]))
-      const missed = pending.filter((hook) => trusted.get(hook.key) !== 'trusted')
-      if (missed.length > 0) {
-        log.warn('codex', 'Koda clean-finish hook did not become trusted', {
-          keys: missed.map((hook) => hook.key),
-        })
-      }
-    } catch (err) {
-      log.warn('codex', 'Koda clean-finish hook unavailable', err instanceof Error ? err.message : err)
-    }
+  private assertTransportOpen(): void {
+    if (this.closed) throw new Error('codex process closed during startup')
   }
 
-  sendTurn(text: string, images?: TurnImage[]): void {
-    if (this.disposed) return
+  /** Ask Codex's app-server for its own workspace-scoped skill and MCP inventories. These are native,
+   * zero-model-token reads after thread creation, so they attest the effective cwd/config without
+   * launching a hidden agent turn or loading user MCPs in a separate probe process. MCP/plugin
+   * startup is asynchronous in app-server, so missing expected evidence gets one delayed reread. */
+  private async attestCapabilities(): Promise<SessionCapabilitySnapshot> {
+    const first = await this.readCapabilitySnapshot()
+    this.assertTransportOpen()
+    if (!first.capabilities.some((capability) => capability.status === 'degraded')) return first
+
+    await new Promise<void>((resolve) => setTimeout(resolve, CAPABILITY_SETTLE_DELAY_MS))
+    if (this.disposed) throw new Error('codex session disposed during startup')
+    this.assertTransportOpen()
+    const settled = await this.readCapabilitySnapshot()
+    this.assertTransportOpen()
+    return settled
+  }
+
+  private async readCapabilitySnapshot(): Promise<SessionCapabilitySnapshot> {
+    const [skillsProbe, mcpProbe] = await Promise.all([
+      boundedCapabilityProbe(this.rpc('skills/list', { cwds: [this.cwd] })),
+      // We consume only tool names + auth/connectivity. `full` also waits for every server's
+      // resources/templates; one slow unrelated MCP could then exhaust our whole startup deadline and
+      // make healthy Koda tools look absent. Codex exposes this narrow mode for exactly that case.
+      boundedCapabilityProbe(
+        this.rpc('mcpServerStatus/list', { detail: 'toolsAndAuthOnly', threadId: this.threadId }),
+      ),
+    ])
+    const skills = skillsProbe.failed ? null : codexSkillNames(skillsProbe.value, this.cwd)
+    const mcpServers = mcpProbe.failed ? null : codexMcpServers(mcpProbe.value)
+    return buildSessionCapabilitySnapshot({
+      engine: 'codex',
+      cwd: this.cwd,
+      source: 'native-probe',
+      skills: skills ?? [],
+      mcpServers: mcpServers ?? [],
+      expected: {
+        kodaTools: !!this.opts.brokerUrl,
+        playbooks: this.opts.playbooksExpected ?? true,
+        browserTesting: !!this.opts.playwrightServer,
+      },
+      probeFailed: {
+        skills: skillsProbe.failed || skills === null,
+        mcp: mcpProbe.failed || mcpServers === null,
+      },
+    })
+  }
+
+  sendTurn(text: string, images?: TurnImage[]): boolean {
+    if (this.disposed) return false
     if (!this.ready) {
       this.turnQueue.push({ text, images })
-      return
+      return true
     }
-    this.doTurn(text, images)
+    return this.doTurn(text, images)
   }
 
-  private doTurn(text: string, images?: TurnImage[]): void {
-    if (!this.threadId) return
+  /**
+   * The session's posture changed. Nothing is sent now — the next turn re-renders the steering block
+   * from this value, which is the whole point of turn-scoped delivery: no respawn, no lost context,
+   * and the previous mode's text stays in the thread where the new block explicitly supersedes it.
+   * A queued turn (sent during the handshake) also picks this up, since the block is built at delivery.
+   */
+  setApprovalMode(mode: ApprovalMode): void {
+    this.approvalMode = mode
+  }
+
+  private doTurn(text: string, images?: TurnImage[]): boolean {
+    if (!this.threadId) return false
     this.reasoningChars = 0
     this.compactionNotifiedThisTurn = false
-    const input: unknown[] = [{ type: 'text', text, text_elements: [] }]
+    // The steering block leads the turn as its own text element — the only turn-scoped instruction
+    // channel `turn/start` has (see codex-steering.ts for the protocol check). Built HERE, at
+    // delivery, so it always states the posture the gate will actually enforce for this turn. Read the
+    // live posture ONCE and hold it: everything downstream — the block, the driver's own refusals, the
+    // gate's pin — must agree about what this turn was told, even if the user flips posture mid-turn.
+    const steered = this.approvalMode
+    this.steeredTurnMode = steered
+    const input: unknown[] = [
+      {
+        type: 'text',
+        text: buildCodexTurnSteering({
+          mode: steered,
+          model: this.activeModel || this.opts.model,
+          effort: this.opts.effort,
+        }),
+        text_elements: [],
+      },
+      { type: 'text', text, text_elements: [] },
+    ]
+    // Report the mode this turn was steered with, BEFORE the turn goes out: the fence that judges
+    // this turn's tool calls must be the one the model was just told about, even if the user flips
+    // posture a second later while it runs.
+    this.opts.onTurnSteered?.(steered)
     for (const img of images ?? []) {
       input.push({ type: 'image', url: `data:${img.mediaType};base64,${img.dataBase64}` })
     }
@@ -398,6 +612,8 @@ class CodexSession implements EngineSession {
         if (turnId) this.currentTurnId = turnId
       },
       (err) => {
+        // No turn is running, so nothing is owed the block's rules until the next one goes out.
+        this.steeredTurnMode = null
         if (this.disposed) return
         const message = `turn failed: ${err.message}`
         this.emit({
@@ -405,10 +621,22 @@ class CodexSession implements EngineSession {
           sessionId: this.id,
           message,
           fatal: false,
+          category: 'turnRejected',
           ...(looksLikeProviderDown(message) ? { providerStatus: 'down' as const } : {}),
+        })
+        // `turnRejected` was added after the first phone client shipped. That client only releases its
+        // busy gate for TurnComplete or a fatal EngineError, and marking this reusable process fatal
+        // would be false. Pair the classified error with an explicitly unsuccessful legacy terminal.
+        // The handshake carries no app/capability version, so we cannot withhold this from newer clients
+        // or stop old clients that haptic on every TurnComplete; the new client suppresses that haptic.
+        this.emit({
+          type: 'TurnComplete',
+          sessionId: this.id,
+          stopReason: TURN_REJECTED_STOP_REASON,
         })
       },
     )
+    return true
   }
 
   interrupt(): void {
@@ -433,6 +661,7 @@ class CodexSession implements EngineSession {
   async dispose(): Promise<void> {
     if (this.disposed) return
     this.disposed = true
+    if (this.closed) return
     // Await the child's 'close' so the owner's respawn-with-same-id (start() does `await dispose(id)`
     // before re-registering) can't have the OLD child's late close tear down the NEW session's state.
     // A bounded race guards against 'close' never arriving (already-dead child, stuck pipe).
@@ -474,7 +703,7 @@ class CodexSession implements EngineSession {
       const slot = this.pending.get(msg.id as number)
       if (!slot) return
       this.pending.delete(msg.id as number)
-      if (msg.error) slot.reject(new Error(JSON.stringify(msg.error)))
+      if (msg.error) slot.reject(new CodexRpcError(JSON.stringify(msg.error)))
       else slot.resolve(msg.result)
       return
     }
@@ -490,6 +719,18 @@ class CodexSession implements EngineSession {
 
   // ── Notification → EngineEvent ────────────────────────────────────────────────
   private handleNotification(method: string, params: unknown): void {
+    const previousRaw = this.nativeRaw
+    this.nativeRaw = { source: 'codex', method, ids: codexIds(params), payload: params }
+    try {
+      this.translateNotification(method, params)
+    } finally {
+      // Restored rather than cleared: a buffered child notification replays INSIDE another
+      // notification's translation, and the outer one still owns the events it emits afterwards.
+      this.nativeRaw = previousRaw
+    }
+  }
+
+  private translateNotification(method: string, params: unknown): void {
     const p = (params ?? {}) as Record<string, unknown>
     const eventThreadId = typeof p.threadId === 'string' ? p.threadId : ''
     const childLaunchId = eventThreadId ? this.childLaunchIds.get(eventThreadId) : undefined
@@ -600,6 +841,9 @@ class CodexSession implements EngineSession {
           break
         }
         if (eventThreadId && eventThreadId !== this.threadId) break
+        // A completed turn is what makes this thread worth reattaching to, so the cursor moves with it.
+        this.turns += 1
+        this.emitResumeCursor()
         this.emit({
           type: 'TurnComplete',
           sessionId: this.id,
@@ -607,6 +851,8 @@ class CodexSession implements EngineSession {
           stopReason: normalizeTurnStatus(status),
         })
         this.currentTurnId = null
+        // Turn boundary: the live posture is the truth again, and the next turn's block will say so.
+        this.steeredTurnMode = null
         // Refresh the account windows now that the turn spent tokens — the sparse `updated` push often
         // doesn't fire per turn, so an active read is what actually keeps the 5-hour gauge climbing.
         this.refreshRateLimits()
@@ -627,9 +873,11 @@ class CodexSession implements EngineSession {
       case 'account/rateLimits/updated':
         this.emitRateLimits(p.rateLimits as CodexRateLimitSnapshot)
         break
-      // Many other notifications (plan, diff, mcp progress, …) are not surfaced in v1.
+      // Everything else (diff, mcp progress, an engine bump's new notification) is not surfaced — but
+      // it is written to the session's unmapped log, so "does Codex emit anything for X" is answerable
+      // from a real run instead of another wire spike.
       default:
-        break
+        this.unmapped(method, params, codexIds(params))
     }
   }
 
@@ -737,9 +985,10 @@ class CodexSession implements EngineSession {
         this.startChildLifecycle(childThreadId, id, description)
         break
       }
-      // reasoning/userMessage/etc. are covered by deltas or are the user's own input — not surfaced.
+      // reasoning/userMessage/etc. are covered by deltas or are the user's own input — not surfaced
+      // (DELIBERATELY_IGNORED). Any other item type is a shape Koda has no card for: log it.
       default:
-        break
+        this.unmapped(`item/${phase}/${type || 'unknown'}`, item, codexIds({ item }))
     }
   }
 
@@ -813,8 +1062,9 @@ class CodexSession implements EngineSession {
         }
         case 'item/fileChange/requestApproval': {
           const itemId = String(p.itemId ?? id)
-          const file_path = this.itemPaths.get(itemId)?.[0]
-          const decision = await this.gateDecision('Write', { file_path }, itemId)
+          const file_paths = this.itemPaths.get(itemId) ?? []
+          const file_path = file_paths[0]
+          const decision = await this.gateDecision('Write', { file_path, file_paths }, itemId)
           this.reply(id, { decision })
           break
         }
@@ -822,6 +1072,16 @@ class CodexSession implements EngineSession {
           // A command wants to escalate beyond the sandbox (network / broader write). Route through the
           // gate as a Bash-class decision; on accept grant exactly what was requested (turn scope), on
           // decline grant nothing. v1-conservative — the common path is the two approvals above.
+          //
+          // Plan mode is the exception, and it belongs HERE rather than in the gate: Codex reports an
+          // escalation as an opaque permissions blob with no command in it, so the gate cannot tell it
+          // apart from an ordinary command. Read-only commands are what makes exploration possible in
+          // Plan mode; widening this session's own sandbox is what the turn's steering block promises
+          // Koda will refuse. Grant nothing and never raise a card the mode says can't be answered.
+          if ((this.steeredTurnMode ?? this.approvalMode) === 'plan') {
+            this.reply(id, { permissions: {}, scope: 'turn' })
+            break
+          }
           const decision = await this.gateDecision('Bash', p, String(p.itemId ?? id))
           if (decision === 'accept') this.reply(id, { permissions: p.permissions ?? {}, scope: 'turn' })
           else this.reply(id, { permissions: {}, scope: 'turn' })
@@ -848,6 +1108,9 @@ class CodexSession implements EngineSession {
         default:
           if (method.endsWith('requestApproval')) this.reply(id, { decision: 'decline' })
           else this.reply(id, {})
+          // A denied-by-default approval is exactly the case worth having on record: it is the
+          // engine asking for something Koda's gate can't yet describe to the user.
+          this.unmapped(`request/${method}`, params, codexIds(params))
           break
       }
     } catch (err) {
@@ -992,7 +1255,25 @@ class CodexSession implements EngineSession {
   }
 
   private emit(event: EngineEvent): void {
-    if (!this.disposed) this.onEvent(event)
+    if (this.disposed) return
+    // The native notification being translated rides along (the lossless envelope). Events Koda mints
+    // itself — the resume cursor, a spawn failure — carry none, which is how a reader tells them apart.
+    this.onEvent(this.nativeRaw ? { ...event, raw: this.nativeRaw } : event)
+  }
+
+  /** A JSON-RPC message this driver has no mapping for. Logged, never dropped. */
+  private unmapped(method: string, payload: unknown, ids?: Record<string, string>): void {
+    if (DELIBERATELY_IGNORED.has(method)) return
+    logUnmappedEvent(this.id, { source: 'codex', method, ids, payload })
+  }
+
+  private emitResumeCursor(): void {
+    if (!this.threadId) return
+    this.emit({
+      type: 'ResumeCursorUpdated',
+      sessionId: this.id,
+      cursor: codexResumeCursor(this.threadId, this.turns),
+    })
   }
 
   private emitCompaction(): void {

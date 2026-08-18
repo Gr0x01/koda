@@ -1,47 +1,47 @@
 {
-  "note": "Presentation-only. Groups the rules in rules.json into a few human-scale principles for the Settings → Guardrails surface. Does NOT affect the prompt — the engine assembles its system prompt from rules.json alone (engine/pack.ts assemblePackRules). `members` are rule ids from rules.json; a principle's on/off toggle simply disables/enables all of its members through the existing per-id mechanism. A principle is treated as protected (confirm before switching off) when any member is a `safety` rule.",
+  "note": "Presentation-only. Every principle keeps its existing id so saved project overrides and toggles remain addressable while detailed procedure moves into native playbooks.",
   "principles": [
     {
       "id": "work-like-this",
       "title": "Work like this",
       "section": "core",
-      "summary": "Gets on with it — does the work instead of describing it, takes the simplest path that solves the task, and explains things in plain terms.",
-      "members": ["do-the-work", "smallest-thing", "try-it", "check-for-a-skill", "critique-before-done", "talk-like-a-person"]
+      "summary": "Acts on clear asks, takes the smallest useful path, keeps its answers short and plain, and gets fresh judgment before substantial work is delivered.",
+      "members": ["do-the-work", "smallest-thing", "check-for-a-skill", "critique-before-done", "talk-like-a-person"]
     },
     {
       "id": "thinks-it-through",
       "title": "Thinks it through with you",
       "section": "core",
-      "summary": "When you ask for something new, it helps you shape it first — asks the few questions that matter, suggests what you haven't thought of, keeps the big idea alive while building in steps, and never waves you off because something sounds like too much work.",
-      "members": ["shape-the-ask", "slice-not-shrink", "your-labor-is-cheap", "say-whats-missing", "bring-the-judgment"]
+      "summary": "Shapes genuinely new work first and raises consequential gaps in terms of what you will experience.",
+      "members": ["bring-the-judgment"]
     },
     {
       "id": "keep-it-clean",
       "title": "Keep it clean",
       "section": "core",
-      "summary": "Tidies as it goes — edits what's there before adding more, clears out clutter and dead files, and keeps your documents and notes where they belong.",
-      "members": ["improve-before-add", "notice-sprawl", "leave-it-clean", "documents-home", "project-memory"]
+      "summary": "Extends the right existing artifact before adding another and surfaces accumulated sprawl as its own choice.",
+      "members": ["improve-before-add"]
     },
     {
       "id": "careful-where-it-counts",
       "title": "Careful where it counts",
       "section": "core",
-      "summary": "Moves freely on anything that can be undone, but stops to ask before the few things that can't — tells you plainly what changed (including anything you didn't ask for), and when something breaks, looks at going back before patching over it.",
-      "members": ["confirm-at-the-edge", "recap-what-changed", "recover-before-patch", "never-destructive-git"]
+      "summary": "Moves freely on reversible work, asks at hard edges, recovers before patching, and reports only what the evidence supports.",
+      "members": ["confirm-at-the-edge", "never-destructive-git", "recover-before-patch", "recap-what-changed"]
     },
     {
       "id": "code",
-      "title": "When it writes code",
-      "section": "capability",
-      "summary": "How it works with code — checks that the current branch fits the work before editing, verifies the result, matches your project's style, and keeps each change small and on-target.",
-      "members": ["verify-before-done", "delegate-independent-work", "delegate-independent-work-codex", "outside-eyes-before-done", "touch-only-needed", "no-over-engineering", "match-surrounding-code", "local-first-data", "keep-files-focused", "comment-why-not-what", "skip-ceremony", "new-tool-is-users-call", "commit-skillfully", "durable-backup-is-user-git", "finish-the-merge"]
+      "title": "Finishes material work",
+      "section": "core",
+      "summary": "Routes changed or inspectable work through proportional verification and, when enabled, fresh review.",
+      "members": ["verify-before-done"]
     },
     {
       "id": "working-in-koda",
       "title": "Works through Koda",
-      "section": "capability",
-      "summary": "Uses Koda's own tools the way they're meant to be used — researches live while you wait, shows running output in the preview instead of a server you can't see, asks Koda to install any runtime or tool it needs, and builds app ideas as mini apps Koda can run and put on your phone.",
-      "members": ["research-live", "preview-through-koda", "terminal-in-stage", "ask-koda-for-tools", "connectors-check-dont-invent", "app-ask-uses-recipe", "faced-app-summon"]
+      "section": "core",
+      "summary": "Uses only real capabilities, asks Koda for its live options when useful, and routes personal apps through Koda's make-and-run recipe.",
+      "members": ["connectors-check-dont-invent", "discover-koda-capabilities", "app-ask-uses-recipe"]
     }
   ]
 }

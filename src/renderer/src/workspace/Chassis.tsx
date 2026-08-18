@@ -7,9 +7,12 @@ import { AppFace } from './AppFace'
 import { Sidebar } from './Sidebar'
 import { SourceControl } from './SourceControl'
 import { SearchOverlay } from './SearchOverlay'
+import { LibraryHost } from './library/LibraryHost'
 import { TitleBar } from './TitleBar'
 import { StatusBar, BillingFallbackBanner, AccountSignInBanner, DataIntegrityBanner } from './StatusBar'
-import { useWorkspace, activeEditor, PREVIEW_SURFACE_ID } from './store'
+import { stageVisible, useWorkspace } from './store'
+import { windowHasOpenModal } from '../window-modal'
+import { handleFileMenuCommand } from './file-menu-command'
 
 // Settings / Versions swap in over the workspace: a soft fade + short rise, quicker fade-out. No scale
 // (a full-cover panel zooming reads as a jump); the small y-lift gives it a "settles into place" feel.
@@ -30,28 +33,35 @@ export function Chassis() {
   const versionsOpen = useWorkspace((s) => s.versionsOpen)
   const setVersionsOpen = useWorkspace((s) => s.setVersionsOpen)
   const searchOpen = useWorkspace((s) => s.searchOpen)
-  const previewExpanded = useWorkspace(
-    (s) => s.previewExpanded && s.dockOpen && activeEditor(s).activeSurfaceId === PREVIEW_SURFACE_ID,
-  )
+  // Stage expanded: the sidebar steps aside too, so the staged surface really is the whole window.
+  const stageExpanded = useWorkspace((s) => s.stageExpanded && stageVisible(s))
   const projectPath = useWorkspace((s) => s.projectPath)
   const faceDir = useWorkspace((s) => s.faceDir)
   const faceOn = useWorkspace((s) => !!s.faceDir && s.faceView === 'app')
 
-  // Native File menu actions reuse the same store paths as the sidebar buttons. Main owns the
-  // native import dialog; its completion event only needs to refresh the Files tree here. New items
-  // land in the user's Documents/ home (a bare folder at the project root wouldn't show in the
-  // default doc-first sidebar — it reads as "nothing happened"); the folder opens in rename mode.
+  // The sidebar's Files tree is gone, so the native File menu remains the app-wide route to these.
+  // New document is also visible inside the Library, where document creation belongs; either route
+  // lands in the user's Documents/ home and opens on the Stage. A new folder still lands at the
+  // project root. `filesRev` keeps the Library, document shelf, and @-mention picker live.
+  //
+  // A folder created this way keeps the name main gave it: rename-on-create needed the tree's inline
+  // editor, and nothing else in the renderer can rename a folder. Flagged for RB rather than patched
+  // over with invented UI.
   useEffect(() =>
     window.koda.onFileMenuCommand((command) => {
       const s = useWorkspace.getState()
-      if (command === 'newDocument') return void s.newDocument()
-      if (command === 'newFolder')
-        return void s.newFolder(undefined, true).then((path) => {
-          if (path) window.dispatchEvent(new CustomEvent('koda:rename-doc-folder', { detail: path }))
-        })
-      // The visible doc editor answers (it owns the rendered DOM); no doc on the Stage = no-op.
-      if (command === 'exportPdf') return window.dispatchEvent(new CustomEvent('koda:export-pdf'))
-      useWorkspace.setState((state) => ({ filesRev: state.filesRev + 1 }))
+      handleFileMenuCommand(command, {
+        newDocument: () => void s.newDocument(),
+        newFolder: () => void s.newFolder(),
+        importFiles: () =>
+          void window.koda
+            .importFilesFromMenu()
+            .then((result) => result && useWorkspace.setState((state) => ({ filesRev: state.filesRev + 1 })))
+            .catch(console.error),
+        filesImported: () => useWorkspace.setState((state) => ({ filesRev: state.filesRev + 1 })),
+        // The visible doc editor answers (it owns the rendered DOM); no doc on the Stage = no-op.
+        exportPdf: () => window.dispatchEvent(new CustomEvent('koda:export-pdf')),
+      })
     }), [])
 
   // Mini apps (the face): learn this project's registered apps, then front one — either the app the
@@ -124,6 +134,7 @@ export function Chassis() {
   // actually has an app fronted or frontable.
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
+      if (windowHasOpenModal()) return
       if (!(e.metaKey && e.key === '\\')) return
       const s = useWorkspace.getState()
       if (!s.faceDir) return
@@ -152,7 +163,7 @@ export function Chassis() {
             no status bar. BOTH sides stay mounted and flip via CSS — unmounting the workshop would
             dispose the Dock terminal's xterm (losing scrollback while the pty keeps printing), and
             unmounting the face would reload the app's iframe state on every ⌘\ round-trip. */}
-        {!previewExpanded && (
+        {!stageExpanded && (
           <div className={faceOn ? 'hidden' : 'contents'}>
             <Sidebar />
           </div>
@@ -203,6 +214,10 @@ export function Chassis() {
       {/* Find overlay — summoned over everything (⌘P / ⌘⇧F); mounted only while open so each open is
           a fresh autofocus + clean state. AnimatePresence defers the unmount so it animates out. */}
       <AnimatePresence>{searchOpen && <SearchOverlay />}</AnimatePresence>
+
+      {/* The Library (⌘K) — the document surface, beside the code-shaped Find overlay rather than
+          inside it. It owns its own open flag and AnimatePresence. */}
+      <LibraryHost />
 
       {/* The one image preview — opened by any thumbnail anywhere (composer, transcript, Recent images). */}
       <ImageLightbox />

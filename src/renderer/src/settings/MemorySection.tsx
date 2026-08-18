@@ -5,10 +5,10 @@ import { SettingsSection, SettingsRow, Toggle } from './controls'
 import { IconWarning } from './icons'
 
 /**
- * Settings → Memory: what the project's memory is, how heavy the always-loaded part has grown, and
+ * Settings → Memory: what the project's memory is, how heavy its navigation layer has grown, and
  * the one action that matters — asking the agent to tidy it. The status-bar pill deep-links here when
- * the injected pair (MEMORY.md index + active-context.md) crosses the heaviness line, because a bloated
- * always-loaded context measurably dulls the agent. The tidy itself is a normal conversational turn
+ * the index + active-context pair crosses the heaviness line, because a bloated map becomes difficult
+ * to retrieve from reliably. The tidy itself is a normal conversational turn
  * (the agent does the pruning, safety-git makes it undoable) — Koda never rewrites memory behind
  * the user's back.
  */
@@ -54,16 +54,13 @@ export function MemorySection() {
 
   return (
     <>
-      <p className="text-[12.5px] leading-relaxed text-text-muted">
-        The agent keeps what it learns about this project in a set of notes: how things are built,
-        decisions and the reasons behind them, context worth carrying forward. Two of those notes,
-        the index and the current context, load into every conversation so each session starts
-        already oriented.
-      </p>
-      <SettingsSection title="Project memory">
+      <SettingsSection
+        title="Project memory"
+        note="The agent keeps what it learns about this project in a set of notes: how things are built, decisions and the reasons behind them, context worth carrying forward. A tiny project card travels with every conversation, and the index, current context, and topic notes open only when the work needs them. A tidy runs as a normal conversation you can watch, every change it makes is recoverable, and anything needing your judgment is flagged rather than decided."
+      >
         <SettingsRow
-          label="Always-loaded size"
-          description="The part of memory that rides along in every conversation. Past a point, that weight dulls the agent instead of sharpening it."
+          label="Navigation size"
+          description="How big the index and current-context notes have grown, which is the map the agent reads to find everything else."
           control={
             weight === null ? (
               <span className="text-[12.5px] text-text-muted">…</span>
@@ -83,7 +80,7 @@ export function MemorySection() {
         />
         <SettingsRow
           label="Tidy memory"
-          description="Asks the agent to distill the always-loaded notes back down, moving detail into topic notes and archiving the old tail. Nothing is lost: replaced notes are marked, not deleted, and every change can be undone."
+          description="Ask the agent to distill those notes back down, moving detail into topic notes and archiving the old tail."
           control={
             <Button
               variant={weight?.heavy ? 'primary' : 'ghost'}
@@ -94,11 +91,12 @@ export function MemorySection() {
               Tidy memory
             </Button>
           }
-        />
-        {hint && <div className="px-4 py-2.5 text-[12px] text-amber-500">{hint}</div>}
+        >
+          {hint && <p className="text-[12px] text-amber-500">{hint}</p>}
+        </SettingsRow>
         <SettingsRow
           label="Tidy overnight"
-          description="A couple of quiet hours after you stop working, Koda tidies the memory of the projects you worked in that day and leaves the session for you to read in the morning. Anything needing your judgment is flagged, never decided. Uses your plan while you're away."
+          description="Run that tidy on its own a couple of quiet hours after you stop working, using your plan while you are away."
           control={<Toggle checked={dream ?? false} onChange={toggleDream} label="Tidy overnight" />}
         />
       </SettingsSection>

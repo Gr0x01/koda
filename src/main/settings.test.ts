@@ -3,7 +3,14 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { loadRemEnabled, loadSettings, settingsHealth, updateSettings } from './settings'
+import {
+  loadCritiquePass,
+  loadRemEnabled,
+  loadSessionAgentRole,
+  loadSettings,
+  settingsHealth,
+  updateSettings,
+} from './settings'
 import { log } from './logger'
 
 // The electron stub points getPath('userData') at tmpdir() (see test/electron-stub.ts).
@@ -14,6 +21,7 @@ function cleanSettings(): void {
   rmSync(settingsFile, { force: true })
   rmSync(backupFile, { force: true })
   delete process.env.KODA_REM
+  delete process.env.KODA_SESSION_AGENT_ROLE
 }
 
 afterEach(() => {
@@ -35,6 +43,44 @@ describe('REM dogfood gate', () => {
   })
 })
 
+describe('session agent role', () => {
+  it('preserves the shipped adaptive behavior when the option is absent or invalid', () => {
+    expect(loadSessionAgentRole()).toBe('adaptive')
+    writeFileSync(settingsFile, JSON.stringify({ sessionAgentRole: 'always-spawn' }))
+    expect(loadSessionAgentRole()).toBe('adaptive')
+  })
+
+  it('enables the orchestrator role from this install settings file', () => {
+    writeFileSync(settingsFile, JSON.stringify({ sessionAgentRole: 'orchestrator' }))
+    expect(loadSessionAgentRole()).toBe('orchestrator')
+  })
+
+  it('lets an explicit launch override the persisted role', () => {
+    writeFileSync(settingsFile, JSON.stringify({ sessionAgentRole: 'orchestrator' }))
+    process.env.KODA_SESSION_AGENT_ROLE = 'adaptive'
+    expect(loadSessionAgentRole()).toBe('adaptive')
+
+    process.env.KODA_SESSION_AGENT_ROLE = 'orchestrator'
+    expect(loadSessionAgentRole()).toBe('orchestrator')
+  })
+
+  it('survives unrelated user-facing settings writes', () => {
+    writeFileSync(settingsFile, JSON.stringify({ sessionAgentRole: 'orchestrator' }))
+    updateSettings({ notificationsEnabled: false })
+    expect(loadSessionAgentRole()).toBe('orchestrator')
+  })
+})
+
+describe('finishing review preference', () => {
+  it('defaults off and preserves an explicit choice', () => {
+    expect(loadCritiquePass()).toBe(false)
+    expect(loadSettings().critiquePass).toBe(false)
+    writeFileSync(settingsFile, JSON.stringify({ critiquePass: true }))
+    expect(loadCritiquePass()).toBe(true)
+    expect(loadSettings().critiquePass).toBe(true)
+  })
+})
+
 // Item 16: readSettings() used to return {} on ANY throw with no log, conflating first-run (benign)
 // with real corruption/EACCES, and every writer spread from that {} and wrote it straight back.
 describe('a missing settings file is first-run, not corruption', () => {
@@ -53,6 +99,61 @@ describe('a missing settings file is first-run, not corruption', () => {
     loadSettings()
     expect(warn).not.toHaveBeenCalled()
     expect(existsSync(backupFile)).toBe(false)
+  })
+})
+
+describe('text generation model', () => {
+  it('defaults to Apple Intelligence on-device', () => {
+    cleanSettings()
+    expect(loadSettings().textGenerationModel).toEqual({ provider: 'apple' })
+  })
+
+  it('preserves an old combined-assist opt-out as plain text', () => {
+    writeFileSync(settingsFile, JSON.stringify({ assistEnabled: false }))
+    expect(loadSettings().textGenerationModel).toEqual({ provider: 'plain' })
+  })
+
+  it('migrates a pre-effort Claude choice to the original thinking-off behavior', () => {
+    writeFileSync(
+      settingsFile,
+      JSON.stringify({ textGenerationModel: { provider: 'claude', model: 'sonnet' } }),
+    )
+    expect(loadSettings().textGenerationModel).toEqual({
+      provider: 'claude',
+      model: 'sonnet',
+      effort: 'off',
+    })
+  })
+
+  it('persists an explicit safe Claude alias and effort', () => {
+    updateSettings({
+      textGenerationModel: { provider: 'claude', model: 'sonnet', effort: 'high' },
+    })
+    expect(loadSettings().textGenerationModel).toEqual({
+      provider: 'claude',
+      model: 'sonnet',
+      effort: 'high',
+    })
+  })
+
+  it('persists a Codex catalog model and reasoning effort', () => {
+    updateSettings({
+      textGenerationModel: { provider: 'codex', model: 'gpt-current', effort: 'high' },
+    })
+    expect(loadSettings().textGenerationModel).toEqual({
+      provider: 'codex',
+      model: 'gpt-current',
+      effort: 'high',
+    })
+  })
+
+  it('does not let the now-label-only assist toggle change the generated-text choice', () => {
+    writeFileSync(settingsFile, JSON.stringify({ assistEnabled: true }))
+    updateSettings({ assistEnabled: false })
+    expect(loadSettings()).toMatchObject({
+      assistEnabled: false,
+      textGenerationModel: { provider: 'apple' },
+    })
   })
 })
 

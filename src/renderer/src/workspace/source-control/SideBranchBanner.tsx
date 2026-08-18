@@ -24,30 +24,30 @@ export function SideBranchBanner({
   }
 
   return (
-    <div className="border-b border-border px-3 py-3">
-      <div className="rounded-lg border border-accent/25 bg-accent/[0.07] px-2.5 py-2">
-        <p className="text-[11.5px] leading-snug text-text-muted">
-          <b className="font-semibold text-text">You're on a side branch.</b> New versions save to{' '}
-          <span className="font-mono text-text">{branch}</span>, not{' '}
-          <span className="font-mono">{trunk}</span>.
-        </p>
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => void askClaude()}
-          disabled={!canAsk}
-          title={
-            !hasSession
-              ? 'Open a session first'
-              : anyBusy
-                ? 'Wait for the agent to finish first'
-                : `Claude reviews the branch, merges it into ${trunk}, and switches you back`
-          }
-          className="mt-1.5 text-accent hover:opacity-80 disabled:opacity-50"
-        >
-          Ask Claude to finish it into {trunk} →
-        </Button>
-      </div>
+    // One hairline at the one real edge — where this notice stops and the timeline starts. It used to
+    // be a bordered box inside a bordered section, which is two walls around one sentence.
+    <div className="border-b border-border px-3 pb-3 pt-2.5">
+      <p className="text-[11.5px] leading-snug text-text-muted">
+        <b className="font-semibold text-text">You're on a side branch.</b> New versions save to{' '}
+        <span className="font-mono text-text">{branch}</span>, not{' '}
+        <span className="font-mono">{trunk}</span>.
+      </p>
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={() => void askClaude()}
+        disabled={!canAsk}
+        title={
+          !hasSession
+            ? 'Open a session first'
+            : anyBusy
+              ? 'Wait for the agent to finish first'
+              : `Claude reviews the branch, merges it into ${trunk}, and switches you back`
+        }
+        className="-ml-2 mt-0.5 text-accent hover:opacity-80 disabled:opacity-50"
+      >
+        Ask Claude to finish it into {trunk} →
+      </Button>
     </div>
   )
 }

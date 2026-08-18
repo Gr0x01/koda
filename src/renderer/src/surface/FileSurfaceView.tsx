@@ -81,7 +81,8 @@ export function FileSurfaceView({
         ) : (
           <Suspense fallback={<p className="px-4 py-3 text-xs text-text-muted">Loading editor…</p>}>
             <MonacoFileEditor
-              path={path}
+              path={file.path}
+              surfacePath={path}
               initialContent={file.content}
               readOnly={file.truncated}
               gotoLine={gotoLine}

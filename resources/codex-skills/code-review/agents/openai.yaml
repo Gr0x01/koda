@@ -1,4 +1,6 @@
 interface:
   display_name: "Code Review"
   short_description: "Review a change for real bugs and security holes"
-  default_prompt: "Review the latest change for real bugs, security holes, and obvious cleanups."
+  default_prompt: "Use $code-review to review this bounded change for real bugs and security holes."
+policy:
+  allow_implicit_invocation: false

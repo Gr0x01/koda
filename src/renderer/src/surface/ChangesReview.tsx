@@ -1,16 +1,15 @@
 import { useEffect, useRef, useState } from 'react'
 import { type SessionChangeGroup } from '../workspace/store'
 import { FileButton } from '../workspace/source-control/shared'
-import { Button } from '../ui'
+import {
+  selectOnFocus,
+  useProposedVersionMessage,
+} from '../workspace/source-control/use-proposed-version-message'
+import { Button, PixelGlyph } from '../ui'
 import { gitErrorCopy } from '../git-error-copy'
 
 /** A version we just saved — kept so the calm "Saved as …" strip can offer a rename while it's fresh. */
 export type SavedInfo = { sha: string; name: string }
-
-/** A session's auto-generated version name (its title); falls back when a title isn't set yet. */
-function nameForGroup(group: SessionChangeGroup): string {
-  return group.label.trim() || 'Saved changes'
-}
 
 // One session's group of changes: a header (colored dot + label + count) and its files (with an "also
 // edited by" hint when a sibling session touched the same file). Attribution only — saving is one
@@ -88,35 +87,63 @@ export function ChangeGroup({
   )
 }
 
-// The desk's anchored footer: a quiet count label (what Save will save) on the left, one real Save
+// The Changes surface's anchored footer: a quiet count label (what Save will save) on the left, one real Save
 // button on the right. Collapse lives on the header now, so the footer no longer competes with a second
-// caret. Saving commits the whole working tree as a single version, auto-named from the lone session.
+// caret. Saving commits the whole working tree as a single version.
+//
+// "Save version" opens the name it will be saved under rather than committing on the spot, because the
+// name it used to pick was the lone session's TITLE — the thread's subject, which stops describing a
+// save the moment the thread touches anything else. The box arrives already filled: the deterministic
+// floor immediately, then the selected generated-text writer's description of the actual diff
+// (useProposedVersionMessage). ⌘Enter saves, so the one-click save is still one click and a chord.
+//
+// The box is a TEXTAREA, not an input: a description can carry a short body under its subject, and an
+// input renders those two lines run together while committing the newlines the user never saw. Same
+// control, same keys as the Versions working tip.
 export function Footer({
   groups,
   fileCount,
+  truncated,
   onSaved,
 }: {
   groups: SessionChangeGroup[]
   fileCount: number
+  /** The changed count exceeded the status cap. Carried so the seed says "200+ files" exactly when
+   *  main's floor does — otherwise a missed generation would replace the box with a different number. */
+  truncated: boolean
   onSaved: (info: SavedInfo) => void | Promise<void>
 }) {
+  const [composing, setComposing] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  const sessionGroups = groups.filter((g) => g.sessionId !== null)
-  const name =
-    sessionGroups.length === 1
-      ? nameForGroup(sessionGroups[0])
-      : `Saved ${fileCount} ${fileCount === 1 ? 'change' : 'changes'}`
+  const files = groups.flatMap((g) => g.files)
+  const { message, setMessage, proposing, begin, reset } = useProposedVersionMessage()
+
+  function openComposer(): void {
+    setComposing(true)
+    setError(null)
+    begin(files, truncated)
+  }
+
+  function cancelComposer(): void {
+    setComposing(false)
+    setError(null)
+    reset()
+  }
 
   async function save(): Promise<void> {
-    if (busy) return
+    const name = message.trim()
+    if (busy || !name) return
     setBusy(true)
     setError(null)
     try {
       const res = await window.koda.gitCommit({ message: name })
-      if (res.ok) await onSaved({ sha: res.sha, name })
-      else setError(gitErrorCopy(res.code, 'save'))
+      if (res.ok) {
+        reset()
+        setComposing(false)
+        await onSaved({ sha: res.sha, name })
+      } else setError(gitErrorCopy(res.code, 'save'))
     } catch (err) {
       setError('Could not save.')
       console.error('save version failed', err)
@@ -127,22 +154,56 @@ export function Footer({
 
   return (
     <div className="shrink-0">
-      <div className="flex items-center gap-2 px-3 py-2.5">
-        <span className="flex items-center gap-2 text-xs text-text-muted">
-          <span className="h-1.5 w-1.5 rounded-full bg-accent" aria-hidden />
-          <span className="font-medium text-text">
-            {fileCount} {fileCount === 1 ? 'change' : 'changes'}
+      {!composing ? (
+        <div className="flex items-center gap-2 px-3 py-2.5">
+          <span className="flex items-center gap-2 text-xs text-text-muted">
+            <span className="h-1.5 w-1.5 rounded-full bg-accent" aria-hidden />
+            <span className="font-medium text-text">
+              {fileCount} {fileCount === 1 ? 'change' : 'changes'}
+            </span>
           </span>
-        </span>
-        <Button
-          onClick={save}
-          disabled={busy}
-          title="Save a version of everything that changed"
-          className="ml-auto"
-        >
-          {busy ? 'Saving…' : 'Save version'}
-        </Button>
-      </div>
+          <Button
+            onClick={openComposer}
+            disabled={busy}
+            title="Save a version of everything that changed"
+            className="ml-auto"
+          >
+            Save version
+          </Button>
+        </div>
+      ) : (
+        <div className="px-3 py-2.5">
+          <textarea
+            autoFocus
+            ref={selectOnFocus}
+            value={message}
+            onChange={(e) => setMessage(e.target.value)}
+            onKeyDown={(e) => {
+              if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                e.preventDefault()
+                void save()
+              } else if (e.key === 'Escape' && !busy) cancelComposer()
+            }}
+            rows={2}
+            aria-label="What this version is"
+            className="w-full resize-none rounded-md border border-accent bg-surface px-2.5 py-1 text-[13px] text-text focus:outline-none"
+          />
+          <div className="mt-2 flex items-center gap-2">
+            <Button onClick={save} disabled={busy || !message.trim()}>
+              {busy ? 'Saving…' : 'Save version'}
+            </Button>
+            <Button variant="ghost" size="sm" onClick={cancelComposer} disabled={busy}>
+              Cancel
+            </Button>
+            {proposing && (
+              <span className="ml-auto flex items-center gap-1.5 text-[11px] text-text-muted/80">
+                <PixelGlyph loader variant="diamond" size={11} className="text-accent" />
+                Writing a description
+              </span>
+            )}
+          </div>
+        </div>
+      )}
       {error && <p className="px-3 pb-2 text-[11px] text-red-400">{error}</p>}
     </div>
   )

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Work"
+  short_description: "Get fresh judgment on substantial finished work."
+  default_prompt: "Use $review-work to get fresh judgment on this finished work."

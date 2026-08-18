@@ -1,28 +1,37 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import type { CodexAuthStatus, CodexModel, EngineId } from '@shared/ipc'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import type { EngineId, ProviderCatalogAvailability, ProviderModelCatalogs } from '@shared/ipc'
+import { engineCapabilities } from '@shared/engine-capabilities'
+import { providerModelCatalogs as initialProviderModelCatalogs } from '@shared/model-catalog'
 import { Menu } from '../motion'
 import { Caret } from '../Caret'
 import { BusyText } from '../ui'
 import { useWorkspace } from './store'
-import { QUICK_ALIASES, isModelAlias, prettyModel } from './models'
+import { ProviderMark } from './EngineMark'
+import {
+  MODEL_PROVIDERS,
+  engineDisplay,
+  modelChoicesFor,
+  prettyModel,
+  providerAvailability,
+} from './models'
 
-// Codex model list + auth are fetched async; the menu opens UPWARD (`bottom-full`), so if they resolve
-// after open the menu grows taller and the Claude rows shift up under the cursor. Cache the last-known
-// values module-wide so repeat opens render at full height immediately — the open still refreshes them,
-// but from a stable starting point instead of an empty one.
-let cachedCodexModels: CodexModel[] = []
-let cachedCodexSignedIn: boolean | null = null
-let cachedCodexCheckFailed = false
+// Provider catalogs are fetched async; the menu opens UPWARD (`bottom-full`), so keep the last-known
+// result module-wide and render its fixed-height frame immediately on repeat opens.
+let cachedProviderCatalogs: ProviderModelCatalogs = initialProviderModelCatalogs()
+let providerCatalogsWarmed = false
+
+type PickerView = EngineId | 'providers'
 
 /**
- * Per-session model + engine picker — a compact pill (active model + chevron) beside the approval-mode
- * pill. The dropdown groups models by ENGINE (Claude / OpenAI); picking a model under an engine sets
- * the session's engine to it (`[[codex-engine-selection-ux]]`). Rules:
- *   • Before the first turn: either engine is selectable (switching engine respawns a fresh session).
- *   • After the first turn: the OTHER engine grays out — you can change model WITHIN the same engine,
- *     but not cross engines (the conversation lives in the engine process, so it can't be handed over).
- * Selecting reattaches the session with `--model` (or a fresh spawn for an engine switch) on its next
- * turn — blocked mid-turn, same as crossing plan mode.
+ * Per-session model + engine picker. The compact trigger opens the CURRENT provider's curated model
+ * list; provider switching is a deliberate drill-down rather than a permanent rail or one long mixed
+ * catalog. That keeps the everyday choice small while MODEL_PROVIDERS remains the single extensible
+ * presentation seam for future registered engines.
+ *
+ * Before the first turn either provider is selectable. Once real conversation content exists, the
+ * other provider remains discoverable but its choices lock: context lives in the engine process and
+ * cannot be handed across engines. Model changes within the current provider remain available while
+ * idle and reattach the session on its next turn.
  */
 export function ModelControl({
   sessionId,
@@ -37,94 +46,125 @@ export function ModelControl({
 }) {
   const setSessionModel = useWorkspace((s) => s.setSessionModel)
   const setSessionEngine = useWorkspace((s) => s.setSessionEngine)
+  const openSettingsTo = useWorkspace((s) => s.openSettingsTo)
   const session = useWorkspace((s) => s.sessions[sessionId])
   const hasPending = useWorkspace((s) => s.pending.some((r) => r.sessionId === sessionId))
   const engineId: EngineId = session?.engineId ?? 'claude'
-  // The conversation binds to its engine once a real user turn exists — past then the other engine locks.
-  // A fresh session already carries the engine's auto "session started" notice, so item count alone would
-  // lock prematurely; gate on an actual user/canvas turn (same signal as send()'s `firstTurn`).
-  const conversationStarted = session?.items.some((it) => it.kind === 'user' || it.kind === 'canvas') ?? false
+  const conversationStarted =
+    session?.items.some((item) => item.kind === 'user' || item.kind === 'canvas') ?? false
   const locked = !!busy || hasPending
   const [open, setOpen] = useState(false)
+  const [view, setView] = useState<PickerView>(engineId)
   const [recent, setRecent] = useState<string[]>([])
-  const [codexModels, setCodexModels] = useState<CodexModel[]>(cachedCodexModels)
-  const [codexSignedIn, setCodexSignedIn] = useState<boolean | null>(cachedCodexSignedIn)
-  const [codexCheckFailed, setCodexCheckFailed] = useState(cachedCodexCheckFailed)
+  const [providerCatalogs, setProviderCatalogs] = useState(cachedProviderCatalogs)
   const [showCustom, setShowCustom] = useState(false)
   const [custom, setCustom] = useState('')
   const ref = useRef<HTMLDivElement>(null)
-  const codexAuthRequest = useRef(0)
-  const applyCodexAuth = useCallback((status: CodexAuthStatus | null): void => {
-    cachedCodexCheckFailed = status?.probeFailed ?? true
-    cachedCodexSignedIn = cachedCodexCheckFailed ? null : status!.signedIn
-    setCodexCheckFailed(cachedCodexCheckFailed)
-    setCodexSignedIn(cachedCodexSignedIn)
-  }, [])
-  const refreshCodexAuth = useCallback((): void => {
-    const request = ++codexAuthRequest.current
-    window.koda
-      .getCodexAuthStatus()
-      .then((status) => request === codexAuthRequest.current && applyCodexAuth(status))
-      .catch(() => request === codexAuthRequest.current && applyCodexAuth(null))
-  }, [applyCodexAuth])
+  const catalogRequest = useRef(0)
 
-  // Warm the Codex cache once so the first open already renders at full height (no upward shift).
+  const refreshProviderCatalogs = useCallback((): void => {
+    const request = ++catalogRequest.current
+    window.koda
+      .getProviderModelCatalogs()
+      .then((catalogs) => {
+        if (request !== catalogRequest.current) return
+        cachedProviderCatalogs = catalogs
+        setProviderCatalogs(catalogs)
+      })
+      .catch(() => {
+        if (request !== catalogRequest.current) return
+        const failed = initialProviderModelCatalogs({ codexProbeFailed: true })
+        cachedProviderCatalogs = failed
+        setProviderCatalogs(failed)
+      })
+  }, [])
+
+  // Warm once so the first open already has a stable-height model list.
   useEffect(() => {
-    if (cachedCodexSignedIn !== null) return
-    window.koda.getCodexModels().then((m) => { cachedCodexModels = m; setCodexModels(m) }).catch(() => {})
-    refreshCodexAuth()
-  }, [refreshCodexAuth])
+    if (providerCatalogsWarmed) return
+    providerCatalogsWarmed = true
+    refreshProviderCatalogs()
+  }, [refreshProviderCatalogs])
 
   useEffect(() => {
     if (!open) return
     window.koda.getRecentModels().then(setRecent).catch(() => {})
-    window.koda.getCodexModels().then((m) => { cachedCodexModels = m; setCodexModels(m) }).catch(() => {})
-    refreshCodexAuth()
-    const onDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+    refreshProviderCatalogs()
+    const onDown = (event: MouseEvent) => {
+      if (ref.current && !ref.current.contains(event.target as Node)) {
+        setOpen(false)
+        setShowCustom(false)
+        setCustom('')
+      }
     }
     document.addEventListener('mousedown', onDown)
     return () => document.removeEventListener('mousedown', onDown)
-  }, [open, refreshCodexAuth])
+  }, [open, refreshProviderCatalogs])
 
-  // Preference-first display (matches the dropdown checkmark): show the user's chosen model immediately
-  // (it's what the next turn reattaches with), else the model the engine actually reported defaulting to.
+  // Preference-first display: the explicit pick wins, then the model the engine reported resolving.
   const value = model ? prettyModel(model) : activeModel ? prettyModel(activeModel) : ''
-  const label = value ? `Model: ${value}` : 'Model'
+  const label = value || 'Model'
 
-  // A Claude group row was picked (next = a model id, or undefined for "Default" = engine picks).
-  function chooseClaude(next: string | undefined): void {
-    if (engineId === 'codex') setSessionEngine(sessionId, 'claude', next)
-    else setSessionModel(sessionId, next)
-    close()
-  }
-  // A Codex (OpenAI) group row was picked.
-  function chooseCodex(next: string | undefined): void {
-    if (engineId === 'claude') setSessionEngine(sessionId, 'codex', next)
-    else setSessionModel(sessionId, next)
-    close()
-  }
   function close(): void {
     setOpen(false)
     setShowCustom(false)
     setCustom('')
   }
 
-  // Recently-typed full ids, freshest first, minus the current pick (it shows in the alias/default rows).
-  const recents = recent.filter((id) => id !== model)
-  // An engine other than the session's locks once the conversation has started.
-  const claudeLocked = conversationStarted && engineId !== 'claude'
-  const codexLocked = conversationStarted && engineId !== 'codex'
+  function toggle(): void {
+    if (locked) return
+    setOpen((wasOpen) => {
+      if (!wasOpen) {
+        setView(engineId)
+        setShowCustom(false)
+      }
+      return !wasOpen
+    })
+  }
+
+  function showProvider(next: EngineId): void {
+    setShowCustom(false)
+    setCustom('')
+    setView(next)
+  }
+
+  function choose(nextEngine: EngineId, nextModel: string | undefined): void {
+    if (nextEngine === engineId) setSessionModel(sessionId, nextModel)
+    else setSessionEngine(sessionId, nextEngine, nextModel)
+    close()
+  }
+
+  const choicesFor = (provider: EngineId) =>
+    modelChoicesFor(provider, {
+      engineId,
+      model,
+      activeModel,
+      recentModels: recent,
+      providerCatalogs,
+    })
+
+  function providerSummary(provider: EngineId): string {
+    const owner = engineDisplay(provider).owner
+    if (provider !== engineId) return `${owner} · Choose a model`
+    if (model) return `${owner} · ${prettyModel(model)}`
+    if (activeModel) return `${owner} · ${prettyModel(activeModel)} · auto`
+    return `${owner} · Engine default`
+  }
 
   return (
     <div ref={ref} className="relative min-w-0 shrink">
       <button
-        onClick={() => !locked && setOpen((v) => !v)}
+        onClick={toggle}
         disabled={locked}
         title={locked ? 'Finish or stop what’s running to switch models' : `Model: ${value || 'Default'}`}
-        className="flex min-w-0 items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-medium text-text-muted transition-colors hover:text-text disabled:opacity-40"
+        aria-label={`Model: ${value || 'Default'}`}
+        aria-expanded={open}
+        className={`flex min-w-0 items-center gap-1.5 rounded-lg py-1 pl-1 pr-2 text-[11px] font-medium transition-colors hover:text-text disabled:opacity-40 ${
+          open ? 'bg-bg text-text' : 'text-text-muted'
+        }`}
       >
-        <span className="truncate">{label}</span>
+        <ProviderMark engineId={engineId} />
+        <span className="max-w-36 truncate">{label}</span>
         <Caret className="text-text-muted" />
       </button>
 
@@ -132,105 +172,233 @@ export function ModelControl({
         open={open}
         onClose={close}
         origin="origin-bottom-left"
-        className="absolute bottom-full left-0 z-10 mb-1.5 max-h-[60vh] w-64 overflow-y-auto rounded-lg border border-border bg-surface shadow-pop"
+        className="absolute bottom-full left-0 z-10 mb-1.5 flex h-[328px] w-80 max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-xl border border-border bg-surface shadow-pop"
       >
-        {/* ── Claude ── */}
-        <Divider label="Claude" />
-        <Row label="Default" hint={engineId === 'claude' && !model && activeModel ? `engine picks · now ${prettyModel(activeModel)}` : 'engine picks'} active={engineId === 'claude' && !model} disabled={claudeLocked} onClick={() => chooseClaude(undefined)} />
-        {QUICK_ALIASES.map((a) => (
-          <Row key={a.id} label={a.label} active={engineId === 'claude' && model === a.id} disabled={claudeLocked} onClick={() => chooseClaude(a.id)} />
-        ))}
-        {recents.length > 0 && (
+        {view === 'providers' ? (
           <>
-            {recents.map((id) => (
-              <Row key={id} label={prettyModel(id)} hint={isModelAlias(id) ? undefined : id} active={false} disabled={claudeLocked} onClick={() => chooseClaude(id)} />
-            ))}
+            <div className="flex min-h-[59px] items-center border-b border-border px-3.5 py-2.5">
+              <div>
+                <h2 className="font-display text-[14px] font-semibold tracking-[-0.02em] text-text">
+                  AI providers
+                </h2>
+                <p className="mt-0.5 text-[9px] text-text-muted">Choose where this chat runs</p>
+              </div>
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto p-2">
+              {MODEL_PROVIDERS.map((provider) => {
+                const display = engineDisplay(provider)
+                const crossEngineLocked = conversationStarted && provider !== engineId
+                return (
+                  <button
+                    key={provider}
+                    onClick={() => showProvider(provider)}
+                    className="grid min-h-[58px] w-full grid-cols-[30px_minmax(0,1fr)_auto] items-center gap-2.5 rounded-[10px] px-2.5 py-2 text-left text-text transition-colors hover:bg-bg"
+                  >
+                    <ProviderMark engineId={provider} size="regular" />
+                    <span className="min-w-0">
+                      <span className="block truncate text-[11.5px] font-semibold">{display.short}</span>
+                      <span className="mt-0.5 block truncate text-[9px] text-text-muted">
+                        {crossEngineLocked
+                          ? `${display.owner} · New chat required to switch`
+                          : providerSummary(provider)}
+                      </span>
+                    </span>
+                    <ArrowRight />
+                  </button>
+                )
+              })}
+            </div>
           </>
-        )}
-        {showCustom ? (
-          <form
-            onSubmit={(e) => {
-              e.preventDefault()
-              if (custom.trim()) chooseClaude(custom.trim())
-            }}
-            className="flex items-center gap-1.5 px-2.5 py-2"
-          >
-            <input
-              autoFocus
-              value={custom}
-              onChange={(e) => setCustom(e.target.value)}
-              placeholder="e.g. claude-opus-4-6"
-              className="min-w-0 flex-1 rounded border border-border bg-bg px-1.5 py-1 text-[11px] outline-none placeholder:text-text-muted focus:border-accent/50"
-            />
-            <button type="submit" disabled={!custom.trim()} className="shrink-0 rounded bg-accent px-2 py-1 text-[11px] font-medium text-white disabled:opacity-40">
-              Use
-            </button>
-          </form>
         ) : (
-          !claudeLocked && (
-            <button onClick={() => setShowCustom(true)} className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-[11px] text-text-muted transition-colors hover:bg-bg hover:text-text">
-              <span className="w-3 shrink-0" />
-              Custom…
+          <>
+            <button
+              onClick={() => setView('providers')}
+              className="grid min-h-[59px] w-full grid-cols-[30px_minmax(0,1fr)_auto] items-center gap-2.5 border-b border-border px-3 py-2.5 text-left text-text transition-colors hover:bg-bg"
+            >
+              <ProviderMark engineId={view} size="regular" />
+              <span className="min-w-0">
+                <span className="block truncate text-[11.5px] font-semibold">
+                  {engineDisplay(view).short}
+                </span>
+                <span className="mt-0.5 block truncate text-[9px] text-text-muted">
+                  {engineDisplay(view).owner} · switch provider
+                </span>
+              </span>
+              <ArrowRight />
             </button>
-          )
+            <div className="min-h-0 flex-1 overflow-y-auto p-2">
+              {unavailableFor(view, providerAvailability(view, providerCatalogs)) ? (
+                <div className="px-2.5 py-3 text-[11px] leading-relaxed text-text-muted">
+                  {unavailableFor(view, providerAvailability(view, providerCatalogs))}
+                </div>
+              ) : (
+                choicesFor(view).map((choice) => (
+                  <ModelRow
+                    key={choice.id ?? 'engine-default'}
+                    {...choice}
+                    active={view === engineId && model === choice.id}
+                    disabled={conversationStarted && view !== engineId}
+                    onClick={() => choose(view, choice.id)}
+                  />
+                ))
+              )}
+
+              {engineCapabilities(view).customModelIds &&
+                !(conversationStarted && view !== engineId) &&
+                (showCustom ? (
+                  <form
+                    onSubmit={(event) => {
+                      event.preventDefault()
+                      if (custom.trim()) choose(view, custom.trim())
+                    }}
+                    className="flex items-center gap-1.5 px-2 py-2"
+                  >
+                    <input
+                      autoFocus
+                      value={custom}
+                      onChange={(event) => setCustom(event.target.value)}
+                      placeholder="Full model ID"
+                      className="min-w-0 flex-1 rounded-md border border-border bg-bg px-2 py-1.5 text-[10px] outline-none placeholder:text-text-muted/70 focus:border-accent/50"
+                    />
+                    <button
+                      type="submit"
+                      disabled={!custom.trim()}
+                      className="shrink-0 rounded-md bg-accent px-2 py-1.5 text-[10px] font-medium text-white disabled:opacity-40"
+                    >
+                      Use
+                    </button>
+                  </form>
+                ) : (
+                  <button
+                    onClick={() => setShowCustom(true)}
+                    className="w-full rounded-[10px] px-2.5 py-2 text-left text-[10px] text-text-muted transition-colors hover:bg-bg hover:text-text"
+                  >
+                    Custom model ID…
+                  </button>
+                ))}
+
+              {conversationStarted && view !== engineId && (
+                <p className="px-2.5 py-2 text-[10px] leading-relaxed text-text-muted">
+                  This conversation is already running on {engineDisplay(engineId).short}. Start a new
+                  chat to switch providers.
+                </p>
+              )}
+            </div>
+          </>
         )}
 
-        {/* ── OpenAI (Codex) ── */}
-        <Divider label="OpenAI" />
-        {codexCheckFailed ? (
-          <div className="px-2.5 py-1.5 text-[11px] text-text-muted">Couldn’t check sign-in.</div>
-        ) : codexSignedIn === false ? (
-          <div className="px-2.5 py-1.5 text-[11px] text-text-muted">Sign in to OpenAI in Settings → AI providers.</div>
-        ) : codexModels.length === 0 ? (
-          <div className="px-2.5 py-1.5 text-[11px] text-text-muted">
-            {codexSignedIn === null ? <BusyText size={11}>Checking…</BusyText> : 'No models available.'}
-          </div>
-        ) : (
-          <>
-            <Row label="Default" hint={engineId === 'codex' && !model && activeModel ? `engine picks · now ${prettyModel(activeModel)}` : 'engine picks'} active={engineId === 'codex' && !model} disabled={codexLocked} onClick={() => chooseCodex(undefined)} />
-            {codexModels.map((m) => (
-              <Row key={m.id} label={m.label} active={engineId === 'codex' && model === m.id} disabled={codexLocked} onClick={() => chooseCodex(m.id)} />
-            ))}
-          </>
-        )}
+        <button
+          onClick={() => {
+            close()
+            openSettingsTo('providers')
+          }}
+          className="flex shrink-0 items-center gap-1.5 border-t border-border px-3.5 py-2.5 text-left text-[9.5px] text-text-muted transition-colors hover:text-text"
+        >
+          <SettingsIcon />
+          AI providers in Settings
+        </button>
       </Menu>
     </div>
   )
 }
 
-function Row({
+function unavailableFor(
+  provider: EngineId,
+  availability: ProviderCatalogAvailability,
+): ReactNode | undefined {
+  switch (availability) {
+    case 'ready':
+      return undefined
+    case 'checking':
+      return <BusyText size={11}>Checking…</BusyText>
+    case 'signed-out':
+      return `Sign in to ${engineDisplay(provider).owner} in Settings → AI providers.`
+    case 'probe-failed':
+      return `Couldn’t check ${engineDisplay(provider).owner} sign-in.`
+    case 'empty':
+      return 'No models available.'
+  }
+}
+
+function ModelRow({
   label,
-  hint,
+  description,
+  badge,
   active,
   disabled,
   onClick,
 }: {
   label: string
-  hint?: string
+  description?: string
+  badge?: string
   active: boolean
   disabled?: boolean
   onClick: () => void
-}) {
+}): React.JSX.Element {
   return (
     <button
-      onClick={disabled ? undefined : onClick}
+      onClick={onClick}
       disabled={disabled}
-      title={disabled ? 'This conversation is already running on the other engine' : hint}
-      className={`flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-[11px] transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-        active ? 'bg-accent/10 text-accent' : 'text-text hover:bg-bg'
+      title={disabled ? 'This conversation is already running on the other provider' : description}
+      className={`grid min-h-11 w-full grid-cols-[minmax(0,1fr)_18px] items-center gap-2.5 rounded-[10px] px-2.5 py-1.5 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+        active ? 'bg-accent/[0.06]' : 'hover:bg-bg'
       }`}
     >
-      <span className="w-3 shrink-0 text-accent">{active ? '✓' : ''}</span>
-      <span className="truncate font-medium">{label}</span>
-      {hint && <span className="ml-auto truncate text-[10px] text-text-muted">{hint}</span>}
+      <span className="min-w-0">
+        <span
+          className={`flex min-w-0 items-center gap-1.5 truncate text-[11.5px] font-medium ${
+            active ? 'text-accent' : 'text-text'
+          }`}
+        >
+          <span className="truncate">{label}</span>
+          {badge && (
+            <span className="shrink-0 rounded-full bg-bg px-1.5 py-0.5 text-[8px] font-medium text-text-muted">
+              {badge}
+            </span>
+          )}
+        </span>
+        {description && (
+          <span className="mt-0.5 block truncate text-[9.5px] text-text-muted">{description}</span>
+        )}
+      </span>
+      <span className={`text-center text-[11px] ${active ? 'text-accent' : 'text-transparent'}`}>
+        ✓
+      </span>
     </button>
   )
 }
 
-function Divider({ label }: { label: string }): React.JSX.Element {
+function ArrowRight(): React.JSX.Element {
   return (
-    <div className="border-t border-border px-2.5 pb-0.5 pt-1.5 text-[9px] font-medium uppercase tracking-wide text-text-muted first:border-t-0">
-      {label}
-    </div>
+    <svg
+      className="size-3.5 text-text-muted"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="m9 18 6-6-6-6" />
+    </svg>
+  )
+}
+
+function SettingsIcon(): React.JSX.Element {
+  return (
+    <svg
+      className="size-3.5"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.7"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z" />
+    </svg>
   )
 }

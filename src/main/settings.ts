@@ -25,6 +25,7 @@ import {
   clampLayout,
   EngineIdSchema,
   ImageDetailSchema,
+  TextGenerationModelSchema,
   type ApprovalMode,
   type BillingMode,
   type CodexBillingMode,
@@ -32,6 +33,7 @@ import {
   type ImageDetail,
   type KodaSettings,
   type RuntimeId,
+  type TextGenerationModel,
   type WorkspaceLayoutSizes,
 } from '@shared/ipc'
 import { log } from './logger'
@@ -132,6 +134,23 @@ export function loadApprovalMode(): ApprovalMode {
   return parsed.success && parsed.data !== 'plan' ? parsed.data : 'auto'
 }
 
+/** How a fresh session approaches delegation. `adaptive` preserves the shipped behavior: playbooks
+ *  and explicit asks may delegate, but the parent does not begin by looking for work to fan out.
+ *  `orchestrator` adds one compact route at session spawn that makes the parent proactively identify
+ *  two or more independent lanes while retaining decomposition, integration, and verification.
+ *
+ * This is intentionally a hidden per-install dogfood option for now. A persisted value survives
+ * ordinary Settings writes because every writer spreads the raw object; the env override makes an
+ * isolated dev launch possible without changing the user's file. Invalid values fail to the shipped
+ * behavior rather than silently increasing usage on every new session. */
+export type SessionAgentRole = 'adaptive' | 'orchestrator'
+
+export function loadSessionAgentRole(): SessionAgentRole {
+  const env = process.env.KODA_SESSION_AGENT_ROLE
+  if (env === 'adaptive' || env === 'orchestrator') return env
+  return readSettings().sessionAgentRole === 'orchestrator' ? 'orchestrator' : 'adaptive'
+}
+
 /** Most-recent-first model ids the user has explicitly chosen (engine aliases excluded by the caller).
  *  Powers the picker's "Recently used" quick-picks so an older fallback model is one click next time.
  *  Koda can't enumerate available models, so this list — built from real usage — is the substitute. */
@@ -143,10 +162,9 @@ export function loadRecentModels(): string[] {
   return v.filter((m): m is string => typeof m === 'string' && m.trim().length > 0).slice(0, RECENT_MODELS_CAP)
 }
 
-/** The model/effort/engine the user last explicitly ran a session on — so a NEW session opens on their
- *  last-used settings instead of the engine default (the desktop keeps its own renderer-local copy; this
- *  is main's copy, which the phone's headless new-session path reads since it has no renderer). Written
- *  at the one model/effort chokepoint (setSessionModelEffort), so desktop and phone picks both feed it. */
+/** The model/effort/engine the user last explicitly ran a session on — the single durable source for
+ *  every NEW session, whether desktop or phone. Written at the one model/effort chokepoint
+ *  (setSessionModelEffort), so picks from either control head feed the same next-chat posture. */
 export type LastPosture = { model?: string; effort?: string; engineId?: EngineId }
 
 export function loadLastPosture(): LastPosture {
@@ -194,6 +212,16 @@ export function loadAssistEnabled(): boolean {
   return typeof v === 'boolean' ? v : true
 }
 
+/** Small generated-text writer. Existing installs used one `assistEnabled` switch for both titles and
+ *  recovery labels, so preserve an explicit old opt-out as `plain` until the person chooses from the
+ *  new picker. Every other missing/invalid value takes the intended Apple-on-device default. */
+export function loadTextGenerationModel(): TextGenerationModel {
+  const settings = readSettings()
+  const parsed = TextGenerationModelSchema.safeParse(settings.textGenerationModel)
+  if (parsed.success) return parsed.data
+  return settings.assistEnabled === false ? { provider: 'plain' } : { provider: 'apple' }
+}
+
 /** Native-notification toggle — default-on. Read by the renderer at boot to gate the background-session
  *  notification (the in-app ring + dock badge are unaffected). */
 function loadNotificationsEnabled(): boolean {
@@ -229,12 +257,19 @@ export function loadAppDaySessions(): boolean {
   return typeof v === 'boolean' ? v : true
 }
 
-/** Fresh-critic pass on finished work the user will look at — default-on, and general (not just mini
- *  apps). Read at spawn: it gates the `critique-stood-down` rule, so flipping it applies to the next
- *  session rather than mid-turn. Off only when the user would rather spend the usage window building
- *  than checking. */
+/** Proportional fresh-review pass during finishing. It is opt-in: verification remains automatic, while
+ *  a second agent is reserved for work whose risk or visible quality bar warrants the extra usage. Read
+ *  at spawn, so flipping it applies to the next session rather than mid-turn. */
 export function loadCritiquePass(): boolean {
   const v = readSettings().critiquePass
+  return typeof v === 'boolean' ? v : false
+}
+
+/** Engine-written version descriptions — default-on. Read live when a save composer opens, so
+ *  flipping it applies to the very next save. Off keeps saving entirely deterministic (no turn is
+ *  spawned and no usage is spent), which is the only reason to want it off. */
+export function loadSuggestVersionMessage(): boolean {
+  const v = readSettings().suggestVersionMessage
   return typeof v === 'boolean' ? v : true
 }
 
@@ -245,8 +280,8 @@ export function loadImageDetail(): ImageDetail {
   return parsed.success ? parsed.data : 'balanced'
 }
 
-/** Scratch-image retention in days — saved pasted/dropped images older than this are pruned. `0` keeps
- *  them forever. Default 7. Read by the scratch:save handler so a change applies on the next save. */
+/** Scratch-attachment retention in days — saved pasted/dropped files older than this are pruned. `0`
+ *  keeps them forever. Default 7. Read on save/list; settings:set applies it to every open project. */
 export function loadScratchRetentionDays(): number {
   const v = readSettings().scratchRetentionDays
   return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 7
@@ -343,6 +378,15 @@ export function loadReplicaEnabled(): boolean {
   return process.env.KODA_REPLICA === '1' || readSettings().replicaEnabled === true
 }
 
+/** The Connect tailnet node (Build A of connect-embedded-tailscale.md) — the embedded Tailscale helper
+ *  that lets a phone reach this Mac's web surfaces from anywhere. Same dogfood posture as the flags
+ *  above: `"connectNode": true` in koda-settings.json or `KODA_CONNECT=1` in dev, default OFF. Gates
+ *  the helper spawn, the tailnet route for Preview and app faces, and the Settings row. It rides on top
+ *  of cloudRelay (control still goes over the relay), so it does nothing without a signed-in account. */
+export function loadConnectNodeEnabled(): boolean {
+  return process.env.KODA_CONNECT === '1' || readSettings().connectNode === true
+}
+
 /** Mini-apps make-and-run (the in-progress apps platform; mini-apps-plan.md). ONE gate for the whole
  *  half-built project so normal releases stay shippable while it lands over a couple weeks: it's read
  *  at every *activation seam* — the create-mini-app skill (a staging --plugin-dir wired only when on),
@@ -432,6 +476,7 @@ export function loadSettings(): KodaSettings {
   return {
     defaultApprovalMode: loadApprovalMode(),
     assistEnabled: loadAssistEnabled(),
+    textGenerationModel: loadTextGenerationModel(),
     notificationsEnabled: loadNotificationsEnabled(),
     usageResetNotify: loadUsageResetNotify(),
     providerStatusNotify: loadProviderStatusNotify(),
@@ -448,6 +493,7 @@ export function loadSettings(): KodaSettings {
     telemetryEnabled: loadTelemetryEnabled(),
     appDaySessions: loadAppDaySessions(),
     critiquePass: loadCritiquePass(),
+    suggestVersionMessage: loadSuggestVersionMessage(),
     layout: loadLayout(),
   }
 }
@@ -471,13 +517,22 @@ export function updateSettings(patch: Partial<KodaSettings>): KodaSettings {
   const next = readSettings()
   if (patch.defaultApprovalMode !== undefined)
     next.approvalMode = patch.defaultApprovalMode === 'plan' ? 'auto' : patch.defaultApprovalMode
-  if (patch.assistEnabled !== undefined) next.assistEnabled = patch.assistEnabled
+  if (patch.assistEnabled !== undefined) {
+    // The former toggle also owned session titles. Freeze that legacy choice into the new field
+    // BEFORE changing the now-label-only toggle, or turning recovery labels off would silently move
+    // an Apple text-generation choice to plain on the next read.
+    if (next.textGenerationModel === undefined) next.textGenerationModel = loadTextGenerationModel()
+    next.assistEnabled = patch.assistEnabled
+  }
+  if (patch.textGenerationModel !== undefined) next.textGenerationModel = patch.textGenerationModel
   if (patch.notificationsEnabled !== undefined) next.notificationsEnabled = patch.notificationsEnabled
   if (patch.usageResetNotify !== undefined) next.usageResetNotify = patch.usageResetNotify
   if (patch.providerStatusNotify !== undefined) next.providerStatusNotify = patch.providerStatusNotify
   if (patch.previewAutoStart !== undefined) next.previewAutoStart = patch.previewAutoStart
   if (patch.appDaySessions !== undefined) next.appDaySessions = patch.appDaySessions
   if (patch.critiquePass !== undefined) next.critiquePass = patch.critiquePass
+  if (patch.suggestVersionMessage !== undefined)
+    next.suggestVersionMessage = patch.suggestVersionMessage
   if (patch.imageDetail !== undefined) next.imageDetail = patch.imageDetail
   if (patch.scratchRetentionDays !== undefined)
     next.scratchRetentionDays = Math.max(0, Math.floor(patch.scratchRetentionDays))

@@ -1,4 +1,4 @@
 interface:
   display_name: "Project Memory"
   short_description: "Keep and use this project's memory in .koda/memory"
-  default_prompt: "Read the project memory index and get oriented before working."
+  default_prompt: "Use $memory to retrieve the project context relevant to this task."

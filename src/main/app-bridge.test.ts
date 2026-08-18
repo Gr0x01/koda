@@ -13,6 +13,7 @@ import {
   bridgeAppState,
   _setCompleteForTest,
 } from './app-bridge'
+import { publishedRate } from '@shared/model-pricing'
 
 // The key store is Keychain-backed and unavailable in plain Node — mock it so the test drives both
 // the no-key (402) and key-present (200) paths.
@@ -41,13 +42,20 @@ describe('infer request contract', () => {
 })
 
 describe('spend estimate', () => {
-  it('prices by the tier table', () => {
+  it('prices by the shared published-rate table', () => {
     // 1M input + 1M output at the fast tier = exactly the per-MTok prices summed.
-    const t = BRIDGE_TIERS.fast
+    const rate = publishedRate(BRIDGE_TIERS.fast.model)!
     expect(estimateUsd('fast', 1_000_000, 1_000_000)).toBeCloseTo(
-      t.inputUsdPerMTok + t.outputUsdPerMTok,
+      rate.inputPerMTok + rate.outputPerMTok,
     )
     expect(estimateUsd('smart', 0, 0)).toBe(0)
+  })
+
+  // Tripwire: bumping a tier's model past the pricing table would silently bill every app call at $0.
+  it('keeps every tier model priced', () => {
+    for (const tier of Object.values(BRIDGE_TIERS)) {
+      expect(publishedRate(tier.model), `${tier.model} has no published rate`).not.toBeNull()
+    }
   })
 })
 

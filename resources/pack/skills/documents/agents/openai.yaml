@@ -1,4 +1,4 @@
 interface:
   display_name: "Koda Documents"
-  short_description: "Rich formatting for documents in Koda"
-  default_prompt: "Format this document so it reads as a polished page in Koda."
+  short_description: "Placing, keeping, and formatting documents in Koda"
+  default_prompt: "Use $documents to place and format this document as a polished Koda page, or to keep this conversation as one."

@@ -26,6 +26,8 @@ export interface RawCommit {
   parents: string[]
   subject: string
   relativeDate: string
+  /** Commit time in epoch ms — what the rail groups days by; `relativeDate` can't name a day. */
+  committedAt: number
   authorName: string
   /** Branch/tag ref names decorating this commit (HEAD already stripped into `isHead`). */
   refs: string[]
@@ -49,6 +51,8 @@ export interface GraphRow {
   sha: string
   subject: string
   relativeDate: string
+  /** Commit time in epoch ms — see RawCommit. */
+  committedAt: number
   authorName: string
   parents: string[]
   /** Lane the node sits on. */
@@ -68,6 +72,67 @@ export interface GraphLayout {
   laneCount: number
   /** color key → palette family, so the renderer colors a whole branch lane consistently. */
   laneKinds: Record<number, LaneKind>
+}
+
+/**
+ * What each merge on the current line actually brought in, newest-first.
+ *
+ * The rail draws HEAD's first-parent chain, so the commits a merge carried in through its SECOND
+ * parent are fetched, laid out, and then never rendered — which is why a merge used to be an arc
+ * curving around nothing. This attributes them: walk back from the second parent and stop at the
+ * trunk (any commit already on the first-parent chain), because the merge base is on that chain and
+ * the walk terminates there naturally.
+ *
+ * Merges are processed newest-first and commits are claimed once, so a branch that was merged in
+ * stages belongs to the merge that actually landed it rather than to every later merge above it.
+ *
+ * `partial` is the honest edge: the fetch window is finite, so a walk can run out of commits before
+ * it reaches the trunk. Then the list is what we hold, not what exists.
+ */
+export interface MergeInflow {
+  /** Short SHAs this merge brought in, newest-first. */
+  shas: string[]
+  /** The walk hit the end of the fetched window instead of the trunk. */
+  partial: boolean
+}
+
+export function computeMergeInflows(commits: RawCommit[]): Record<string, MergeInflow> {
+  const bySha = new Map(commits.map((c) => [c.sha, c]))
+
+  // HEAD's first-parent chain — the line the rail draws, and the wall every walk stops at.
+  const trunk = new Set<string>()
+  let cursor = commits.find((c) => c.isHead)?.sha
+  while (cursor) {
+    trunk.add(cursor)
+    cursor = bySha.get(cursor)?.parents[0]
+  }
+
+  const claimed = new Set<string>()
+  const inflows: Record<string, MergeInflow> = {}
+
+  for (const merge of commits) {
+    if (!trunk.has(merge.sha) || merge.parents.length < 2) continue
+    let partial = false
+    const queue = merge.parents.slice(1)
+    const found = new Set<string>()
+    while (queue.length > 0) {
+      const sha = queue.shift() as string
+      if (trunk.has(sha) || claimed.has(sha) || found.has(sha)) continue
+      const commit = bySha.get(sha)
+      if (!commit) {
+        // Outside the fetched window: we know something is there, not what.
+        partial = true
+        continue
+      }
+      found.add(sha)
+      queue.push(...commit.parents)
+    }
+    for (const sha of found) claimed.add(sha)
+    // Ordered by the fetch's own date order, so the list reads newest-first like the rail does.
+    const shas = commits.filter((c) => found.has(c.sha)).map((c) => c.sha)
+    if (shas.length > 0 || partial) inflows[merge.sha] = { shas, partial }
+  }
+  return inflows
 }
 
 export interface BuildGraphOptions {
@@ -204,6 +269,7 @@ export function buildGraph(commits: RawCommit[], opts: BuildGraphOptions): Graph
       sha: c.sha,
       subject: c.subject,
       relativeDate: c.relativeDate,
+      committedAt: c.committedAt,
       authorName: c.authorName,
       parents: c.parents,
       lane,

@@ -1,7 +1,9 @@
-import { existsSync, readFileSync, readdirSync, type Dirent } from 'node:fs'
-import { extname, join } from 'node:path'
+import { existsSync, readFileSync } from 'node:fs'
+import { basename, join } from 'node:path'
 import type { EngineId } from '@shared/ipc'
-import { principleKey, readDisabledSet, readOverrides, ruleKey } from '../guardrails-config'
+import { principleKey, readDisabledSet, readOverrides, ruleKey, skillKey } from '../guardrails-config'
+import { projectSkillCollisionNames } from '../project-skills'
+import { engineCapabilities } from '@shared/engine-capabilities'
 
 /**
  * The Koda behavior-layer pack — a Claude Code plugin (skills + specialist subagents) plus a
@@ -25,29 +27,73 @@ export interface PackLocation {
  * Every skill shipped to Codex also carries `agents/openai.yaml` interface metadata (display name,
  * short description, default prompt) — OpenAI's own curated skills do 20/20; match that convention
  * when adding a skill here. Claude ignores the `agents/` folder. */
-export const CODEX_PACK_SKILLS = ['memory', 'documents', 'verify', 'frontend-design', 'review-architecture'] as const
+export const CODEX_PACK_SKILLS = [
+  'memory',
+  'documents',
+  'shape-new-work',
+  'code-work',
+  'git-work',
+  'finish-work',
+  'review-work',
+  'research',
+  'fan-out-work',
+  'verify',
+  'frontend-design',
+  'review-architecture',
+] as const
 
 /**
  * Built-but-not-shipped skills — they live in the separate `pack-staging` plugin (resolveStagingPack),
  * NOT the main pack, and reach an engine only when the mini-apps dogfood flag is on (loadMiniAppsEnabled):
- * Claude via a second `--plugin-dir` at the staging pack, Codex by copying these from staging into its
- * plugin. Keeping them physically out of the main pack is what makes normal releases ship clean without
- * per-file flag checks. When the mini-apps project ships, graduate the skill back into the main pack +
- * CODEX_PACK_SKILLS and drop it here. See mini-apps-plan.md.
+ * Claude via a second `--plugin-dir` at the staging pack; Codex keeps an immutable private catalog and
+ * disables these paths natively for every flag-off app-server spawn. Keeping them physically out of the
+ * main pack keeps Claude's normal release path clean, while per-process Codex enablement avoids rewriting
+ * one shared plugin cache under concurrent sessions. When mini-apps ships, graduate the skill back into
+ * the main pack + CODEX_PACK_SKILLS and drop it here. See mini-apps-plan.md.
  */
 export const GATED_PACK_SKILLS = ['create-mini-app', 'app-data'] as const
 
-/** Bump when same-app-version dogfood must rematerialize the Codex plugin after pack wiring changes. */
-export const CODEX_PACK_REVISION = 28
+/** The shared playbook that is usable only when Koda wires Playwright for the session. */
+export const BROWSER_VERIFY_SKILL = 'browser-verify'
 
-export function codexPackMarker(appVersion: string, playwrightWired: boolean, miniAppsWired: boolean): string {
-  return `${appVersion}:pack${CODEX_PACK_REVISION}:pw${playwrightWired ? 1 : 0}:ma${miniAppsWired ? 1 : 0}`
+/** Whether this project's guardrail switches leave at least one Koda playbook intentionally enabled.
+ * Runtime attestation answers whether it loaded; this answers only expected vs deliberately disabled. */
+export function kodaPlaybooksExpected(
+  cwd: string,
+  opts: { includeBrowser?: boolean; includeGated?: boolean } = {},
+): boolean {
+  const disabled = readDisabledSet(cwd)
+  const names: readonly string[] = [
+    ...CODEX_PACK_SKILLS,
+    ...(opts.includeBrowser ? [BROWSER_VERIFY_SKILL] : []),
+    ...(opts.includeGated ? GATED_PACK_SKILLS : []),
+  ]
+  return names.some((name) => !disabled.has(skillKey(name)))
+}
+
+/** Standalone first-party plugin loaded beside the behavior pack on both engines. Keeping its own
+ * namespace proves the plugin seam without folding an expensive, explicit workflow into Koda's core
+ * review route. */
+export const DEEP_REVIEW_PLUGIN_NAME = 'deep-review'
+
+/** Bump when same-app-version dogfood must rematerialize the Codex plugin after pack wiring changes. */
+export const CODEX_PACK_REVISION = 37
+
+export function codexPackMarker(appVersion: string, deepReviewVersion: string | null): string {
+  const deepReviewRevision = deepReviewVersion ? encodeURIComponent(deepReviewVersion) : 'none'
+  return `${appVersion}:pack${CODEX_PACK_REVISION}:dr${deepReviewRevision}`
 }
 
 export interface PackRule {
   id: string
   kind: 'preference' | 'safety'
   text: string
+  /** Runtime-only dogfood rule. It still participates in prompt assembly and capability gates, but
+   * does not appear as an orphaned toggle in the public Settings → Guardrails presentation. */
+  internal?: boolean
+  /** Native playbook this compact route names. Disabling that playbook removes the route too, so the
+   * prompt never asks an engine to load guidance the user deliberately switched off. */
+  targetSkill?: string
   /**
    * Gate: the rule only assembles into the prompt when that capability is wired. `'broker'` = the
    * in-process MCP broker is present, so the tools the rule names (`mcp__koda_broker__*`) actually
@@ -59,9 +105,11 @@ export interface PackRule {
    * `'mini-apps-wired'` = the mini-apps dogfood flag is on, so the staging create-mini-app skill is
    * loaded — gates the routing rule that hands app-shaped asks to that skill (naming an absent skill
    * would dangle). Distinct from `'mini-app'`: wired = the feature exists, mini-app = THIS project has one.
-   * `'critique-off'` = the user turned the critique pass off (Settings → General → Finishing work),
-   * so the rule standing it down assembles. The always-on `critique-before-done` rule carries the
-   * behavior itself, which is why default-ON assembles NO rule here — silence is the on state.
+   * `'critique-on'` = the review preference is enabled (Settings → General → Finishing work), so the
+   * compact route to `review-work` assembles. Turning the preference off removes the instruction;
+   * there is no contradictory stand-down prose.
+   * `'orchestrator-session'` = this install's session role is orchestrator, so the compact route to
+   * `fan-out-work` assembles. The playbook owns engine-specific mechanics and keeps atomic work local.
    *
    * Gates FAIL CLOSED: a `requires` value this code doesn't know drops the rule (see assemblePackRules).
    * `'claude-delegation'` = Claude's named, capability-bounded leaf profiles are loaded.
@@ -72,7 +120,8 @@ export interface PackRule {
     | 'broker'
     | 'mini-app'
     | 'mini-apps-wired'
-    | 'critique-off'
+    | 'critique-on'
+    | 'orchestrator-session'
     | 'claude-delegation'
     | 'codex-delegation'
 }
@@ -142,6 +191,33 @@ export function resolveStagingPack(opts: { resourcesPath?: string } = {}): PackL
   return null
 }
 
+/** Resolve the standalone Deep Review plugin. It stays outside `pack`: Claude therefore exposes its
+ * own `deep-review:*` namespace, while Codex installs the same source as a second native plugin. */
+export function resolveDeepReviewPlugin(opts: { resourcesPath?: string } = {}): PackLocation | null {
+  const candidates: string[] = []
+  if (opts.resourcesPath) candidates.push(join(opts.resourcesPath, 'plugins', DEEP_REVIEW_PLUGIN_NAME))
+  candidates.push(join(process.cwd(), 'resources', 'plugins', DEEP_REVIEW_PLUGIN_NAME))
+  for (const dir of candidates) {
+    if (existsSync(join(dir, '.claude-plugin', 'plugin.json'))) return { dir }
+  }
+  return null
+}
+
+/** The standalone plugin owns its Codex cache revision in its native manifest. Returning null for a
+ * missing or malformed manifest keeps Claude's independently valid half loadable while Codex fails
+ * closed instead of installing content it cannot version. Bump this version when the plugin changes. */
+export function deepReviewPluginVersion(plugin: PackLocation | null): string | null {
+  if (!plugin) return null
+  try {
+    const raw = JSON.parse(readFileSync(join(plugin.dir, '.codex-plugin', 'plugin.json'), 'utf8')) as {
+      version?: unknown
+    }
+    return typeof raw.version === 'string' && raw.version.trim() ? raw.version.trim() : null
+  } catch {
+    return null
+  }
+}
+
 /**
  * Parse the structured rules source; missing/unreadable/malformed ⇒ null (the plugin half still
  * loads). Validated through to the rule level so a bad hand-edit of rules.json fails SOFT (no rules)
@@ -156,7 +232,12 @@ export function loadPackRules(dir: string): PackRules | null {
     for (const g of raw.groups) {
       if (!g || typeof g.heading !== 'string' || !Array.isArray(g.rules)) return null
       for (const r of g.rules) {
-        if (!r || typeof r.id !== 'string' || typeof r.text !== 'string') return null
+        if (
+          !r ||
+          typeof r.id !== 'string' ||
+          typeof r.text !== 'string' ||
+          (r.targetSkill !== undefined && typeof r.targetSkill !== 'string')
+        ) return null
       }
     }
     return raw as PackRules
@@ -193,8 +274,8 @@ export function loadPresentation(dir: string): PackPrinciple[] | null {
 
 /**
  * Assemble the always-on rules text for `--append-system-prompt`, omitting any rule whose key is in
- * `disabled` or whose `requires` capability isn't wired (e.g. `requires:'broker'` drops when
- * `opts.brokerWired` is false). A group left with no surviving rules drops its heading too. The
+ * `disabled`, whose target playbook is disabled, or whose `requires` capability isn't wired (e.g.
+ * `requires:'broker'` drops when `opts.brokerWired` is false). A group left with no surviving rules drops its heading too. The
  * framing preamble always rides along (it's the agent's footing, not a toggleable rule). Returns ''
  * only if there's no source.
  *
@@ -211,7 +292,8 @@ export function assemblePackRules(
     brokerWired?: boolean
     miniAppProject?: boolean
     miniAppsWired?: boolean
-    critiqueOff?: boolean
+    critiqueOn?: boolean
+    orchestratorSession?: boolean
     engine?: EngineId
   } = {},
 ): string {
@@ -219,14 +301,20 @@ export function assemblePackRules(
     broker: !!opts.brokerWired,
     'mini-app': !!opts.miniAppProject,
     'mini-apps-wired': !!opts.miniAppsWired,
-    'critique-off': !!opts.critiqueOff,
-    'claude-delegation': opts.engine === 'claude',
-    'codex-delegation': opts.engine === 'codex',
+    'critique-on': opts.critiqueOn === true,
+    'orchestrator-session': !!opts.orchestratorSession,
+    // Delegation guidance follows how this engine actually launches children, not its name: Claude's
+    // Agent tool vs Codex's spawned collaboration threads.
+    'claude-delegation': engineCapabilities(opts.engine).delegation === 'subagents',
+    'codex-delegation': engineCapabilities(opts.engine).delegation === 'collab',
   }
   const parts: string[] = [`# ${rules.title}`, '', rules.preamble]
   for (const group of rules.groups) {
     const live = group.rules.filter(
-      (r) => !disabled.has(ruleKey(r.id)) && (r.requires === undefined || wired[r.requires] === true),
+      (r) =>
+        !disabled.has(ruleKey(r.id)) &&
+        (!r.targetSkill || !disabled.has(skillKey(r.targetSkill))) &&
+        (r.requires === undefined || wired[r.requires] === true),
     )
     if (live.length === 0) continue
     parts.push('', `## ${group.heading}`, '', ...live.map((r) => `- ${r.text}`))
@@ -234,16 +322,8 @@ export function assemblePackRules(
   return parts.join('\n').trim()
 }
 
-/**
- * Fold the project's memory index + live context straight into the system prompt so the agent SEES
- * them on turn one instead of having to choose to read them. The "read memory on start" rule was pure
- * prompt guidance — a looser instruction-follower skipped it until nudged. Injecting the files here
- * makes memory-loading model- and engine-independent; it does not rely on an engine choosing to read.
- * We inject only the small, always-relevant pair — the one-line-per-note index and active-context —
- * not every note;
- * the agent still opens individual notes on demand, preserving the "read only what you need" design.
- * Missing dir/files ⇒ '' (fails soft; a project without `.koda/memory/` just gets no block).
- */
+/** Read the memory navigation pair for library-health measurement only. Neither file is assembled into
+ * the session prompt; the project card points at them and the memory playbook retrieves them on demand. */
 function readMemoryPair(cwd: string): { index: string; active: string } {
   const dir = join(cwd, '.koda', 'memory')
   const read = (name: string): string => {
@@ -256,18 +336,12 @@ function readMemoryPair(cwd: string): { index: string; active: string } {
   return { index: read('MEMORY.md'), active: read('active-context.md') }
 }
 
-/**
- * Heaviness threshold for the always-injected pair (index + active-context), in characters —
- * ~7.5k tokens at ~4 chars/token, under 4% of the context window. Past it the injected memory starts
- * weighing down every turn of every session, which is the documented failure mode for always-loaded
- * context (bloat degrades compliance). Sized so a freshly-tidied heavy project (~13k measured on the
- * Koda repo) has weeks of normal growth before the pill fires — at 20k it re-fired within a day, a
- * nag instead of a signal. The status bar warns at this line and offers a tidy; it does NOT stop
- * injection — memory still loads in full, heavy or not.
- */
+/** Heaviness threshold for the navigation pair (index + active-context), in characters. Above this,
+ * finding the right topic becomes unreliable even though the files are retrieved only when relevant.
+ * The existing threshold keeps the tidy signal occasional rather than turning normal growth into a nag. */
 export const MEMORY_HEAVY_CHARS = 30_000
 
-/** How much always-injected memory this project carries, for the status-bar pill + Settings → Memory. */
+/** How large the project's memory navigation pair has grown, for the status-bar pill + Settings. */
 export function projectMemoryWeight(cwd: string): { present: boolean; chars: number; heavy: boolean } {
   const { index, active } = readMemoryPair(cwd)
   const present = index.length > 0
@@ -275,104 +349,85 @@ export function projectMemoryWeight(cwd: string): { present: boolean; chars: num
   return { present, chars, heavy: present && chars >= MEMORY_HEAVY_CHARS }
 }
 
-const DOC_EXTS = new Set(['.md', '.markdown', '.mdx', '.txt', '.rst', '.org'])
+/** The source card is intentionally tiny and parseable. The fixed cap prevents a hand-edited card
+ *  from turning back into the project narrative this layer replaces. Detailed context stays behind
+ *  the fixed memory pointers and is retrieved through the memory playbook. */
+export const PROJECT_CARD_MAX_CHARS = 700
+const PROJECT_CARD_POINTER =
+  'Before changing files, read an existing `CLAUDE.md` or `AGENTS.md`. Deeper context: `.koda/memory/MEMORY.md`; current state: `.koda/memory/active-context.md`; open only relevant notes.'
 
-/** How much of the user's `Documents/` shape we describe. Depth 3 reaches a topic folder's own
- *  sub-grouping without turning the map into a file listing. Two budgets, not one: `maxNested` stops a
- *  deep subtree from eating the room the TOP-LEVEL folders need (they're the actual filing choice — a
- *  cap that hides them under a header claiming to be the shape is worse than no map at all), and
- *  `maxLines` is the overall ceiling so this can't crowd out the rules above it. */
-const DOC_MAP = { maxDepth: 3, maxNested: 60, maxLines: 120 }
+function cardField(source: string, label: 'What' | 'Now' | 'Critical'): string {
+  const line = source.split(/\r?\n/).find((candidate) => candidate.trimStart().startsWith(`${label}:`))
+  if (!line) return ''
+  return line
+    .slice(line.indexOf(':') + 1)
+    .replace(/[\p{Cc}\s]+/gu, ' ')
+    .trim()
+}
 
-/**
- * A compact map of the user's `Documents/` folders (names + how many documents each holds) for the
- * system prompt.
- *
- * The placement rule ("file each new document in the folder it belongs to") was guidance with nothing
- * behind it: an agent about to write a doc had never seen the folders that already exist, so obeying
- * it meant choosing to go list them first — and skipping that step looks exactly like following the
- * rule, right up until you have three sibling folders holding one topic. Showing the shape makes the
- * right placement the cheap one. Counts, never filenames: this is for choosing a folder, and the doc
- * list itself would grow without bound.
- *
- * Missing/empty `Documents/` ⇒ '' (a new project has no shape to honor yet).
- */
-function readDocumentsMap(cwd: string): string {
-  const lines: string[] = []
-  let looseDocs = 0
-  let truncated = false
-  const walk = (dir: string, name: string, depth: number): void => {
-    if (depth > 1 && lines.length >= DOC_MAP.maxNested) return void (truncated = true)
-    if (lines.length >= DOC_MAP.maxLines) return void (truncated = true)
-    let entries: Dirent[]
-    try {
-      entries = readdirSync(dir, { withFileTypes: true })
-    } catch {
-      return // unreadable dir (missing, EACCES) — fail soft, same as the memory pair
-    }
-    const docs = entries.filter((e) => e.isFile() && DOC_EXTS.has(extname(e.name).toLowerCase()))
-    const count = `${docs.length} doc${docs.length === 1 ? '' : 's'}`
-    if (depth > 0) lines.push(`${'  '.repeat(depth - 1)}- ${label(name)}/ — ${count}`)
-    else looseDocs = docs.length
-    if (depth >= DOC_MAP.maxDepth) return
-    // Sorted so the block is stable and scannable rather than in filesystem order — once a cap bites,
-    // readdir order would also change WHICH folders survive. `isDirectory()` is false for a symlinked
-    // dir, which is what keeps this walk from following a link back to an ancestor: don't swap in
-    // statSync to "fix" symlinked folders showing up without adding a visited-set first.
-    const dirs = entries
-      .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
-      .sort((a, b) => a.name.localeCompare(b.name))
-    for (const e of dirs) walk(join(dir, e.name), e.name, depth + 1)
+/** Keep bounded fields readable. Prefer the last complete word that uses most of the available room;
+ * a single very long token still gets a hard cut rather than breaking the card's total budget. */
+function truncateCardField(value: string, max: number): string {
+  if (value.length <= max) return value
+  if (max <= 1) return ''
+  const prefix = value.slice(0, max - 1).trimEnd()
+  const wordBreak = prefix.lastIndexOf(' ')
+  const cut = wordBreak >= Math.floor(max * 0.6) ? prefix.slice(0, wordBreak) : prefix
+  return cut ? `${cut}…` : ''
+}
+
+/** A bounded always-loaded identity + routing card. Missing or malformed files fail soft to the
+ *  sanitized project folder name; read-only conversation never creates the card as a side effect. */
+export function readProjectCard(cwd: string): string {
+  let source = ''
+  try {
+    // The card's source contract is itself 700 characters. Bound parsing too, so one malformed file
+    // cannot turn this tiny ambient route into arbitrary startup work.
+    source = readFileSync(join(cwd, '.koda', 'memory', 'project-card.md'), 'utf8').slice(0, PROJECT_CARD_MAX_CHARS)
+  } catch {
+    // A project does not need a memory system to get a truthful, bounded identity card.
   }
-  walk(join(cwd, 'Documents'), '', 0)
-  if (!lines.length && !looseDocs) return ''
-  return [
-    '# The shape of this project’s `Documents/` (already listed — no need to go look)',
-    '',
-    'These folders already exist. Put a new document in the one it belongs to; only make a new folder when a genuinely new topic has nothing here that fits, and prefer extending an existing document over adding a parallel one.',
-    '',
-    ...(looseDocs ? [`- (loose at the \`Documents/\` root) — ${looseDocs} doc${looseDocs === 1 ? '' : 's'}`] : []),
-    ...lines,
-    // Never let a cut list read as the whole shape — that's what makes an agent confidently duplicate
-    // a folder it simply wasn't shown.
-    ...(truncated ? ['- …more folders exist below this — list `Documents/` yourself before filing.'] : []),
-  ].join('\n')
-}
+  const projectName = basename(cwd).replace(/[\p{Cc}\s]+/gu, ' ').trim().slice(0, 80) || 'this project'
+  let what = cardField(source, 'What') || `Project folder \`${projectName}\`.`
+  let now = cardField(source, 'Now')
+  let critical = cardField(source, 'Critical')
+  const render = (): string =>
+    [
+      '# Project card',
+      '',
+      `What: ${what}`,
+      ...(now ? [`Now: ${now}`] : []),
+      ...(critical ? [`Critical: ${critical}`] : []),
+      '',
+      PROJECT_CARD_POINTER,
+    ].join('\n')
 
-/** A folder name safe to drop into a markdown list line: a newline in a name would otherwise forge a
- *  second list entry (a folder literally named "x\n- invented" reads as two folders). */
-function label(name: string): string {
-  // Control characters (a newline is the dangerous one) collapse to spaces; hyphens survive.
-  return name.replace(/[\p{Cc}\s]+/gu, ' ').trim().slice(0, 80)
-}
-
-function readProjectMemory(cwd: string): string {
-  const { index, active } = readMemoryPair(cwd)
-  if (!index) return '' // no index ⇒ no memory system to inject
-  const parts = [
-    '# Project memory (already loaded — do not re-read these files)',
-    '',
-    'You have been shown this project’s memory index and current context below. Open the individual notes named in the index only as the task needs them; do NOT spend a turn re-reading MEMORY.md or active-context.md — their content is here.',
-    '',
-    'This pair is also the ONLY memory the next session is guaranteed to see. So when you record something the next session must act on — a handoff, an open problem, a just-reverted approach — put it in active-context.md, or make its MEMORY.md index line point straight at it. A fact left only in a topic note, with no index line leading to it, will not be seen next session.',
-    '',
-    '## .koda/memory/MEMORY.md',
-    '',
-    index,
-  ]
-  if (active) parts.push('', '## .koda/memory/active-context.md', '', active)
-  return parts.join('\n')
+  // The public contract is one assembled budget, not three arbitrary field caps. Preserve Critical
+  // intact whenever possible because it carries the high-consequence route; reclaim space from Now,
+  // then What, before shortening it. All shortening happens at a word boundary.
+  let overflow = render().length - PROJECT_CARD_MAX_CHARS
+  if (overflow > 0 && now) {
+    const target = now.length - overflow
+    now = target >= 16 ? truncateCardField(now, target) : ''
+  }
+  overflow = render().length - PROJECT_CARD_MAX_CHARS
+  if (overflow > 0) what = truncateCardField(what, Math.max(16, what.length - overflow))
+  overflow = render().length - PROJECT_CARD_MAX_CHARS
+  if (overflow > 0 && critical) critical = truncateCardField(critical, Math.max(0, critical.length - overflow))
+  overflow = render().length - PROJECT_CARD_MAX_CHARS
+  if (overflow > 0) what = truncateCardField(what, Math.max(1, what.length - overflow))
+  return render()
 }
 
 /**
  * The full guardrail system-prompt text for a session: the assembled always-on pack rules (this
  * project's disabled defaults dropped, plus the broker-gated rules dropped when `brokerWired` is false),
- * any edited-principle overrides, the project's memory index + live context folded in (so the agent
- * always sees it rather than relying on a "read memory on start" instruction it might skip), and the
- * shape of the user's `Documents/` so a new doc gets filed instead of dropped anywhere. The ONE
+ * any edited-principle overrides, and the project's bounded identity/routing card. Detailed memory
+ * and the live `Documents/` shape are retrieved by their native playbooks only when work calls for
+ * them. The ONE
  * assembly both engine drivers share — Claude appends it via `--append-system-prompt`, Codex passes it
- * as additive `developerInstructions`. Returns '' only when every part is empty — no pack, no memory,
- * and no `Documents/` shape to describe.
+ * as additive `developerInstructions`. A bounded fallback card means a valid cwd always has something
+ * truthful to describe even when the optional pack is absent.
  */
 export function assembleGuardrailText(opts: {
   cwd: string
@@ -382,20 +437,26 @@ export function assembleGuardrailText(opts: {
   miniAppProject?: boolean
   /** The mini-apps dogfood flag is on (staging create-mini-app skill loaded) — assembles the app-ask routing rule. */
   miniAppsWired?: boolean
-  /** The user turned the critique pass off — assembles the stand-down rule (on assembles nothing). */
-  critiqueOff?: boolean
+  /** The user explicitly enabled the optional fresh-review route. */
+  critiqueOn?: boolean
+  /** This install starts sessions as parent orchestrators — adds the compact fan-out route. */
+  orchestratorSession?: boolean
   /** The engine this text is for. Reserved for engine-specific assembly differences. */
   engine?: EngineId
 }): string {
   const pack = resolvePack({ resourcesPath: opts.resourcesPath })
-  const disabled = readDisabledSet(opts.cwd)
+  const disabled = new Set(readDisabledSet(opts.cwd))
+  // One ambiguous project identity disables every consumer, including compact routes that name a
+  // bundled skill of the same name. The engines and Settings read this same collision source.
+  for (const name of projectSkillCollisionNames(opts.cwd)) disabled.add(skillKey(name))
   const packRules = pack ? loadPackRules(pack.dir) : null
   const rulesText = packRules
     ? assemblePackRules(packRules, disabled, {
         brokerWired: opts.brokerWired,
         miniAppProject: opts.miniAppProject,
         miniAppsWired: opts.miniAppsWired,
-        critiqueOff: opts.critiqueOff,
+        critiqueOn: opts.critiqueOn,
+        orchestratorSession: opts.orchestratorSession,
         engine: opts.engine,
       })
     : ''
@@ -404,8 +465,7 @@ export function assembleGuardrailText(opts: {
     .filter(([id]) => !disabled.has(principleKey(id)))
     .map(([, text]) => text)
     .join('\n\n')
-  const memoryText = readProjectMemory(opts.cwd)
-  const docsMapText = readDocumentsMap(opts.cwd)
-  const text = [rulesText, overrideText, memoryText, docsMapText].filter(Boolean).join('\n\n')
+  const projectCardText = readProjectCard(opts.cwd)
+  const text = [rulesText, overrideText, projectCardText].filter(Boolean).join('\n\n')
   return text
 }

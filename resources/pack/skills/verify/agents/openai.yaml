@@ -1,4 +1,4 @@
 interface:
   display_name: "Verify It Works"
   short_description: "Prove a change works by running it, not just reading it"
-  default_prompt: "Verify the latest change actually works by running it."
+  default_prompt: "Use $verify to prove the latest change actually works by running it."

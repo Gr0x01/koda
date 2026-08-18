@@ -34,6 +34,7 @@ export function Overlay({
   align = 'center',
   className = '',
   scrimClassName = 'bg-black/30',
+  scrimRef,
 }: {
   onDismiss: () => void
   children: ReactNode
@@ -42,9 +43,13 @@ export function Overlay({
   className?: string
   /** Override the scrim tint if a surface needs a darker/lighter backdrop. */
   scrimClassName?: string
+  /** The scrim's own node. A modal overlay needs it to tell itself apart from the background it is
+   *  claiming to have made unreachable, since these render inline rather than through a portal. */
+  scrimRef?: React.Ref<HTMLDivElement>
 }) {
   return (
     <motion.div
+      ref={scrimRef}
       variants={backdropVariants}
       initial="hidden"
       animate="visible"
@@ -161,6 +166,12 @@ export function Menu({
     <AnimatePresence>
       {open && (
         <motion.div
+          // The one marker that says "a menu owns the pointer right now". `HoverCard` consults it
+          // before opening so a menu summoned from ANY trigger suppresses every card in the window,
+          // not just the one it was opened from. A data attribute rather than `role="menu"` because
+          // that role obliges `role="menuitem"` children, and claiming it without them would be a
+          // worse lie than saying nothing.
+          data-open-menu=""
           variants={menuVariants}
           initial="hidden"
           animate="visible"

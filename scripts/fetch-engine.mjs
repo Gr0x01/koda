@@ -5,7 +5,7 @@
  * The binaries are NOT committed (gitignored, ~200 MB claude + ~95 MB codex). This runs before packaging
  * (`npm run dist`) and on demand for dev. Idempotent: an already-present binary whose SHA-256 matches the
  * pin is left alone. Both engines ship bundled + pinned so a Koda release carries known-good versions of
- * each (see architecture/engine-updates.md); the weekly engine-contract workflow proposes bumps.
+ * each (see architecture/engine-updates.md); the daily engine-contract workflow gates stable bumps.
  *
  * Claude — the scheme the official install.sh uses (Anthropic publishes a per-platform checksum manifest):
  *   <CLAUDE_BASE>/<version>/manifest.json      → { platforms: { "<platform>": { checksum, size } } }
@@ -31,22 +31,23 @@ const execFileP = promisify(execFile)
 // bleeding-edge. 2.1.221 is a deliberate exception: it's `latest` (stable was 2.1.220 at pin time)
 // because the fixes that motivate this bump land only in 221 — the `-p` stream-json MCP first-turn
 // connect fix (Koda's exact launch path) and the zsh `[[ ]]` Bash permission-bypass fix — while 220
-// was bug-fixes-only. Re-converge on `stable` at the next bump. Bump deliberately (the engine-contract
-// workflow opens the PR). NOTE: check-engine-floor.mjs + the workflow read `PINNED_VERSION` by regex — keep the name.
+// was bug-fixes-only. Re-converge on `stable` at the next bump. The engine-contract workflow verifies,
+// writes, and merges only a strictly newer compatible stable pin. NOTE: check-engine-floor.mjs + the
+// workflow read `PINNED_VERSION` by regex — keep the name.
 const PINNED_VERSION = '2.1.221'
 const CLAUDE_BASE = 'https://downloads.claude.ai/claude-code-releases'
 
 // ── Codex ──────────────────────────────────────────────────────────────────────────────────────────
-// Latest GitHub-releases `stable` (non-prerelease) at pin time. Bump deliberately (the codex-contract
-// workflow opens the PR, updating BOTH the version and the per-platform tarball SHA below).
-const PINNED_CODEX_VERSION = '0.144.1'
+// Latest GitHub-releases `stable` (non-prerelease) at pin time. The codex-contract job updates BOTH the
+// version and the per-platform tarball SHA only after its real app-server contract and repository gate.
+const PINNED_CODEX_VERSION = '0.147.0'
 const CODEX_BASE = 'https://github.com/openai/codex/releases/download'
 // koda platform → codex release triple.
 const CODEX_TRIPLE = { 'darwin-arm64': 'aarch64-apple-darwin' }
 // SHA-256 of the plain `codex-<triple>.tar.gz` asset, per koda platform. Self-pinned (OpenAI publishes no
 // checksum for the plain binary). Recompute when bumping PINNED_CODEX_VERSION.
 const CODEX_TARBALL_SHA256 = {
-  'darwin-arm64': '88e72ac8bd30815f7d18e62dac333dc20ce3ad1cba94be1649a1977dd9bfdbb8',
+  'darwin-arm64': '75984b81f92a71b0c0f4b3b5cad80e5c57177e4d8c8b4b1e13db703b20dc4358',
 }
 
 const PLATFORMS = ['darwin-arm64']

@@ -32,6 +32,10 @@ export const RELAY_UNREACHABLE = 'koda:relay-unreachable'
  *  so the banner shows the fix instead of a Try again button. */
 export const RELAY_IMAGES_LOST = 'koda:relay-images-lost'
 
+/** Generic successor to RELAY_IMAGES_LOST. Covers photos as well as document attachments whose exact
+ * bytes were deliberately not retained across a reload. Keep the old sentinel readable for history. */
+export const RELAY_ATTACHMENTS_LOST = 'koda:relay-attachments-lost'
+
 /** Provider-side failure shapes. The single definition: the status pill (status-watch, via the drivers'
  *  EngineError) and the banner copy below both classify from THIS, so a user can never be told the
  *  provider is down by one surface and something else by the other. */
@@ -56,6 +60,14 @@ export function friendlyEngineError(message: string, fatal: boolean): FriendlyEn
     return {
       tone: 'network',
       title: "Your photos didn't reach your Mac",
+      detail: "They didn't survive the app restart. Attach them again.",
+      retryable: false,
+    }
+
+  if (message === RELAY_ATTACHMENTS_LOST)
+    return {
+      tone: 'network',
+      title: "Your attachments didn't reach your Mac",
       detail: "They didn't survive the app restart. Attach them again.",
       retryable: false,
     }

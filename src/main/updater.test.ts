@@ -8,6 +8,9 @@ import type { UpdateStatus } from '@shared/ipc'
 const fakeUpdater = Object.assign(new EventEmitter(), {
   autoDownload: false,
   autoInstallOnAppQuit: true,
+  allowPrerelease: false,
+  allowDowngrade: true,
+  channel: null as string | null,
   logger: null as unknown,
   checkForUpdates: vi.fn(async () => null),
   quitAndInstall: vi.fn(() => {}),
@@ -20,11 +23,13 @@ const sent: UpdateStatus[] = []
 
 // Layered on test/electron-stub.ts (the vitest alias for `electron`): updater.ts is packaged-only and
 // broadcasts to every window. Typed loosely because tsconfig.node.json doesn't include test/.
+const runtime = vi.hoisted(() => ({ version: '0.1.9' }))
+
 vi.mock('electron', async (importOriginal) => {
   const actual = (await importOriginal()) as Record<string, unknown>
   return {
     ...actual,
-    app: { ...(actual.app as object), isPackaged: true, getVersion: () => '0.1.9' },
+    app: { ...(actual.app as object), isPackaged: true, getVersion: () => runtime.version },
     BrowserWindow: {
       getAllWindows: () => [{ webContents: { send: (_ch: string, s: UpdateStatus) => sent.push(s) } }],
     },
@@ -46,6 +51,29 @@ async function bootUpdater(): Promise<typeof import('./updater')> {
 
 beforeEach(() => {
   vi.useFakeTimers() // initUpdater sets a 6h re-check interval; don't leave a live timer behind
+  runtime.version = '0.1.9'
+  fakeUpdater.allowPrerelease = false
+  fakeUpdater.allowDowngrade = true
+  fakeUpdater.channel = null
+})
+
+describe('release channels', () => {
+  it('keeps a stable install on the latest feed with prereleases refused', async () => {
+    await bootUpdater()
+
+    expect(fakeUpdater.channel).toBe('latest')
+    expect(fakeUpdater.allowPrerelease).toBe(false)
+    expect(fakeUpdater.allowDowngrade).toBe(false)
+  })
+
+  it('keeps an installed nightly on the nightly feed without permitting downgrades', async () => {
+    runtime.version = '0.1.10-nightly.202608170300.d90d343'
+    await bootUpdater()
+
+    expect(fakeUpdater.channel).toBe('nightly')
+    expect(fakeUpdater.allowPrerelease).toBe(true)
+    expect(fakeUpdater.allowDowngrade).toBe(false)
+  })
 })
 
 afterEach(() => {

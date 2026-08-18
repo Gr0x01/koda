@@ -43,6 +43,21 @@ export function unwatchProjectDocs(wc: WebContents): void {
   perWc.delete(wc)
 }
 
+/**
+ * A Koda-owned filesystem mutation has already landed. Invalidate before its IPC reply reaches the
+ * renderer, then tell every window on the project to re-read — including documents outside the
+ * `Documents/` folder the narrow watcher covers. The later OS watcher event may coalesce into one
+ * extra cached read, but it can no longer be the owner of correctness or race an immediate refresh.
+ */
+export function notifyProjectDocsMutation(root: string): void {
+  invalidateDocsCache(root)
+  for (const [wc, entry] of perWc) {
+    if (entry.root !== root || wc.isDestroyed()) continue
+    wc.send(IpcChannels.fsDocsChanged)
+  }
+  void uploadReplicaNow(root)
+}
+
 function arm(wc: WebContents, entry: Entry): void {
   const home = join(entry.root, DOCS_HOME)
   try {

@@ -16,6 +16,13 @@
 import net from 'node:net'
 import { log } from './logger'
 
+/** The forwarder needs one capability, not the private remote stack that minted it. Keeping this
+ * structural also lets the curated public build retain same-WiFi preview plumbing after that stack is
+ * pruned, without a type-only import into a directory that deliberately does not ship. */
+interface LanForwardActivationPermit {
+  valid(): boolean
+}
+
 interface Forward {
   server: net.Server
   devPort: number
@@ -27,15 +34,27 @@ interface Forward {
 
 /** One forwarder per session (v1: a single phone watching a single session, but keyed for correctness). */
 const forwards = new Map<string, Forward>()
+const forwardGenerations = new Map<string, number>()
+let lifecycleEpoch = 0
 
 /**
  * Ensure a LAN forwarder to `devPort` for this session, returning the public port the phone loads. Reuses
  * an existing forwarder unless the dev port changed (a restarted dev server on a new port re-points it).
  */
-export function ensureLanForward(sessionId: string, devPort: number): Promise<number> {
+export function ensureLanForward(
+  sessionId: string,
+  devPort: number,
+  // Required, deliberately: this binds 0.0.0.0. A default permit would let the next caller open that
+  // listener without passing the activation gate, and no grep would ever find the omission.
+  permit: LanForwardActivationPermit,
+): Promise<number> {
+  if (!permit.valid()) return Promise.reject(new Error('lan-forward: remote access activation is blocked'))
   const existing = forwards.get(sessionId)
   if (existing && existing.devPort === devPort) return Promise.resolve(existing.port)
   if (existing) stopLanForward(sessionId)
+  const generation = (forwardGenerations.get(sessionId) ?? 0) + 1
+  forwardGenerations.set(sessionId, generation)
+  const epoch = lifecycleEpoch
 
   const conns = new Set<net.Socket>()
   return new Promise((resolve, reject) => {
@@ -67,6 +86,11 @@ export function ensureLanForward(sessionId: string, devPort: number): Promise<nu
         server.close()
         return reject(new Error('lan-forward: no bound address'))
       }
+      if (!permit.valid() || lifecycleEpoch !== epoch || forwardGenerations.get(sessionId) !== generation) {
+        server.close()
+        for (const socket of conns) socket.destroy()
+        return reject(new Error('lan-forward: activation was cancelled'))
+      }
       forwards.set(sessionId, { server, devPort, port: addr.port, conns })
       log.info('lan-forward', 'started', { sessionId, devPort, port: addr.port })
       resolve(addr.port)
@@ -76,6 +100,7 @@ export function ensureLanForward(sessionId: string, devPort: number): Promise<nu
 
 /** Tear down a session's forwarder (preview closed / session ended). Idempotent. */
 export function stopLanForward(sessionId: string): void {
+  forwardGenerations.set(sessionId, (forwardGenerations.get(sessionId) ?? 0) + 1)
   const f = forwards.get(sessionId)
   if (!f) return
   forwards.delete(sessionId)
@@ -86,5 +111,6 @@ export function stopLanForward(sessionId: string): void {
 
 /** Tear down every forwarder (remote tier off / app quit). */
 export function stopAllLanForwards(): void {
+  lifecycleEpoch += 1
   for (const id of [...forwards.keys()]) stopLanForward(id)
 }

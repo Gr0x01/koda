@@ -53,7 +53,7 @@ export const KODA_LIGHT = 'koda-light'
 export const KODA_DARK = 'koda-dark'
 
 // ── The catalog ───────────────────────────────────────────────────────────────────────
-export const THEMES: ThemeDef[] = [
+const THEMES: ThemeDef[] = [
   { id: KODA_LIGHT, label: 'Koda Light', mode: 'light' },
   {
     id: 'github-light',

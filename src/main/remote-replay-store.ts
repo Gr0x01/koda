@@ -122,3 +122,47 @@ export function loadRemoteReplay(
     return []
   }
 }
+
+/** Search-only bounded replay read. Restore still uses the complete reader above; retrieval must be
+ * able to skip one huge sidecar before allocating/parsing it and say the corpus was partial. */
+export function loadRemoteReplayBounded(
+  projectPath: string,
+  storedSessionId: string,
+  maxBytes: number,
+  liveSessionId = storedSessionId,
+): { entries: ReplayEntry[]; bytes: number; truncated: boolean } {
+  try {
+    const path = replayPath(projectPath, storedSessionId)
+    if (!existsSync(path)) return { entries: [], bytes: 0, truncated: false }
+    const bytes = fstatPathSize(path)
+    if (bytes > maxBytes) return { entries: [], bytes, truncated: true }
+    const entries: ReplayEntry[] = []
+    let truncated = false
+    for (const line of readFileSync(path, 'utf8').split('\n')) {
+      if (!line.trim()) continue
+      let raw: unknown
+      try {
+        raw = JSON.parse(line)
+      } catch {
+        truncated = true
+        continue
+      }
+      const parsed = ReplayEntrySchema.safeParse(raw)
+      if (parsed.success) entries.push(remap(parsed.data, liveSessionId))
+      else truncated = true
+    }
+    return { entries, bytes, truncated }
+  } catch {
+    return { entries: [], bytes: 0, truncated: true }
+  }
+}
+
+function fstatPathSize(path: string): number {
+  let fd: number | undefined
+  try {
+    fd = openSync(path, 'r')
+    return fstatSync(fd).size
+  } finally {
+    if (fd !== undefined) closeSync(fd)
+  }
+}

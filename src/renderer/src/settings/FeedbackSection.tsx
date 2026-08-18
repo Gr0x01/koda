@@ -90,7 +90,7 @@ export function FeedbackSection() {
   if (state === 'sent') {
     return (
       <SettingsSection title="Send feedback">
-        <div className="flex flex-col items-start gap-3 p-4 text-[13px] text-text">
+        <div className="flex flex-col items-start gap-3 py-3 text-[13px] text-text">
           <p>Thanks, that's in. It helps more than you'd think.</p>
           <Button variant="secondary" onClick={() => setState('idle')}>
             Send more
@@ -101,13 +101,11 @@ export function FeedbackSection() {
   }
 
   return (
-    <SettingsSection title="Send feedback">
-      <div className="flex flex-col gap-3.5 p-4">
-        <p className="text-[12.5px] leading-snug text-text-muted">
-          Hit a bug or want something? This comes straight to us, privately. A screenshot or your
-          recent logs makes a bug much easier to fix.
-        </p>
-
+    <SettingsSection
+      title="Send feedback"
+      note="Hit a bug or want something? This comes straight to us, privately. A screenshot or your recent logs makes a bug much easier to fix."
+    >
+      <div className="flex flex-col gap-3.5 py-3">
         <SegmentedControl value={kind} options={KIND_OPTIONS} onChange={setKind} ariaLabel="Feedback type" />
 
         <textarea
@@ -144,7 +142,7 @@ export function FeedbackSection() {
 
         <label className="flex cursor-pointer items-center justify-between gap-6">
           <span className="text-[12.5px] leading-snug text-text-muted">
-            Include recent logs. Helps with bugs, stays private.
+            Include your recent logs, which stay just as private and make a bug much easier to place.
           </span>
           <Toggle checked={includeLogs} onChange={setIncludeLogs} label="Include recent logs" />
         </label>

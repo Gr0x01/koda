@@ -11,8 +11,18 @@
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import type { EngineEvent } from '@shared/ipc'
+import { z } from 'zod'
+import type {
+  ApprovalMode,
+  EngineEvent,
+  RawEngineEvent,
+  ResumeCursor,
+  SessionCapabilitySnapshot,
+  SessionMcpServer,
+} from '@shared/ipc'
 import { rateLimitBand } from '@shared/rate-limits'
+import { buildSessionCapabilitySnapshot, capabilitySnapshotFingerprint } from '@shared/session-capabilities'
+import { logUnmappedEvent } from './unmapped-log'
 import { resolveEnginePath } from './binary'
 import { buildEngineEnv, type EngineEnvOptions } from './env'
 import { looksLikeProviderDown } from './status-watch'
@@ -39,12 +49,19 @@ export interface SessionOpts {
    * When absent, falls back to `bypassPermissions` (standalone/dev — no gate).
    */
   mcpConfigJson?: string
+  /** Whether this spawn was configured with Koda's optional Playwright MCP server. Runtime evidence
+   * still decides ready vs degraded; this flag only distinguishes expected from intentionally off. */
+  browserWired?: boolean
+  /** At least one Koda playbook is intentionally enabled for this project. Defaults true for direct
+   * driver callers; the session manager derives it from the project's guardrail switches. */
+  playbooksExpected?: boolean
   /**
-   * Reattach the prior conversation for `sessionId` (spawns `claude --resume <id>` instead of
-   * `--session-id <id>`). The engine restores full context and keeps the same id — verified in
-   * spike/resume. Must launch from the same cwd the session was created in (resume is cwd-scoped).
+   * This session's last resume cursor, handed back verbatim by the shared layer. THIS driver owns the
+   * shape (see `claudeResumeCursor`): a valid cursor with turns > 0 spawns `claude --resume <id>`,
+   * anything else spawns fresh (`--session-id <id>`). Must launch from the same cwd the session was
+   * created in (resume is cwd-scoped).
    */
-  resume?: boolean
+  resumeCursor?: ResumeCursor
   /**
    * Launch in plan mode (`--permission-mode plan`): the engine stays read-only and the agent must
    * call ExitPlanMode (always-confirmed by the gate) to get the go-ahead, after which the SAME
@@ -84,12 +101,12 @@ export interface SessionOpts {
    * names a skill that isn't loaded.
    */
   miniAppsWired?: boolean
-  /**
-   * The user turned the critique pass off (Settings → General → Finishing work) — assembles the rule
-   * standing it down. Default-on assembles nothing: the always-on `critique-before-done` rule already
-   * carries the behavior, so "on" is the absence of a contradiction rather than an extra instruction.
-   */
-  critiqueOff?: boolean
+  /** The user explicitly enabled the fresh-review pass (Settings → General → Finishing work).
+   * Reviewer capabilities remain available for an explicit user request when this is false. */
+  critiqueOn?: boolean
+  /** This install starts sessions as parent orchestrators, so prompt assembly adds the compact route
+   * to the existing fan-out playbook. Snapshotted at spawn; a setting change affects the next session. */
+  orchestratorSession?: boolean
   /**
    * Extra plugin dirs to load alongside the bundled pack (each `--plugin-dir`, repeatable). The
    * Electron layer resolves these — today the Koda-managed global skills plugin (the user's
@@ -115,6 +132,79 @@ const STDERR_CAP = 8192
 const DISALLOWED_DEEP_RESEARCH = 'Skill(deep-research)'
 
 /**
+ * Engine messages this driver ignores ON PURPOSE, so the unmapped log stays signal. Everything not in
+ * this list and not translated below gets logged — that is the "never silently swallowed" contract.
+ *  - `control_response` / `control_cancel_request`: acks to control requests Koda itself sent.
+ *  - `stream_event` framing (message_start, content_block_*, message_delta, message_stop): envelope
+ *    only; the content arrives as deltas and again as the finalized message.
+ *  - a subagent's copy of a delta Koda maps at top level: children render as finalized blocks under
+ *    their card, so their live deltas are a deliberate skip.
+ *  - the engine echoing back the turn Koda just sent (`user` text/image blocks).
+ *  - `assistant/block/thinking` (+ redacted): reasoning text is redacted on subscription `-p`
+ *    (engine-adapter-and-output-view.md §8) — presence is all there is, and ThinkingDelta carries it.
+ *  - `system/task_updated`: carries only a task_id + patch, with no tool_use_id to join a card on.
+ */
+const DELIBERATELY_IGNORED = new Set([
+  'control_response',
+  'control_cancel_request',
+  'stream_event/message_start',
+  'stream_event/content_block_start',
+  'stream_event/content_block_delta',
+  'stream_event/content_block_stop',
+  'stream_event/message_delta',
+  'stream_event/message_stop',
+  'stream_event/text_delta',
+  'stream_event/thinking_delta',
+  'user/block/text',
+  'user/block/image',
+  'assistant/block/thinking',
+  'assistant/block/redacted_thinking',
+  'system/task_updated',
+])
+
+/**
+ * Claude's resume cursor — the shape THIS driver owns inside the opaque `ResumeCursor.data`. The engine
+ * reattaches by its own session id, which for Claude is Koda's session id (`--resume <id>` keeps it;
+ * spike/resume). `turns` is how many turns this conversation has actually completed: a conversation the
+ * engine has never written has nothing to reattach to, so 0 means "spawn fresh", which is what keeps a
+ * pre-first-turn posture respawn from racing the engine's own init.
+ */
+const ClaudeResumeDataSchema = z.object({
+  sessionId: z.string().min(1),
+  turns: z.number().int().nonnegative(),
+  /** Reserved for A5's coupled rewind (resume the conversation at a specific message). Nothing sets it
+   *  yet; it is validated and carried across respawns so the seam exists where the driver owns it. */
+  resumeAt: z.string().min(1).optional(),
+})
+type ClaudeResumeData = z.infer<typeof ClaudeResumeDataSchema>
+
+/** The engine's own words when `--resume` names a conversation it no longer holds (it exits code 1).
+ *  There is no way to ask ahead of time — `claudeConversationExists` only proves a file exists, not that
+ *  it holds a resumable conversation — so the engine's answer IS the check. */
+const RESUME_MISS = /No conversation found with session ID/i
+
+/** Build this driver's cursor. Exported so the session manager can hand one back without knowing the shape. */
+export function claudeResumeCursor(sessionId: string, turns: number, resumeAt?: string): ResumeCursor {
+  return {
+    engine: 'claude',
+    resumable: turns > 0,
+    data: { sessionId, turns, ...(resumeAt ? { resumeAt } : {}) },
+  }
+}
+
+/** Validate a cursor as OURS, for THIS session. A Codex blob, a hand-edited file, or a cursor minted for
+ *  another conversation is not resumable here — the caller starts clean rather than guessing. */
+export function parseClaudeResumeCursor(
+  cursor: ResumeCursor | undefined,
+  sessionId: string,
+): ClaudeResumeData | null {
+  if (!cursor || cursor.engine !== 'claude') return null
+  const parsed = ClaudeResumeDataSchema.safeParse(cursor.data)
+  if (!parsed.success || parsed.data.sessionId !== sessionId) return null
+  return parsed.data
+}
+
+/**
  * Engine-neutral session handle. The design sketches `events` as an
  * AsyncIterable; we take the equivalent push-callback (`onEvent`) instead — it
  * maps directly onto Electron's `webContents.send` with no buffering layer.
@@ -127,10 +217,16 @@ export interface TurnImage {
 
 export interface EngineSession {
   readonly id: string
-  sendTurn(text: string, images?: TurnImage[]): void
+  /** Returns whether the turn was accepted for delivery; callers holding must-arrive
+   *  content (e.g. a restore notice) re-queue it on false. */
+  sendTurn(text: string, images?: TurnImage[]): boolean
   interrupt(): void
   /** A targeted stop for an engine-owned delegated child; absent without a task protocol. */
   stopTask?(taskId: string): boolean
+  /** Tell a live session its posture changed. Present only on drivers whose capabilities declare
+   *  `planMode: 'turnText'` — they carry the mode in each turn's text, so no respawn is needed. A
+   *  driver with a native mode (Claude) has no such setter and the caller respawns instead. */
+  setApprovalMode?(mode: ApprovalMode): void
   dispose(): Promise<void>
 }
 
@@ -154,8 +250,29 @@ class ClaudeSession implements EngineSession {
   private buf = ''
   private stderr = ''
   private started = false
+  /** Repeated system/init messages carry MCP connection changes. Keep one content fingerprint so the
+   * normalized stream updates only when the engine's evidence really changed. */
+  private capabilityFingerprint = ''
+  /** Claude may first report an expected MCP server as pending, then re-emit init once connected. Give
+   * that native transition one bounded grace period instead of flashing a false degradation. */
+  private capabilityGraceTimer?: ReturnType<typeof setTimeout>
+  private pendingCapabilitySnapshot?: SessionCapabilitySnapshot
+  private readonly expectedKodaTools: boolean
+  private readonly expectedPlaybooks: boolean
+  private readonly expectedBrowserTesting: boolean
+  /** Skill names Koda denied for this spawn. Claude's init inventory reports loaded skills but does
+   * not label their effective deny state, so filter that native list through the policy we applied. */
+  private readonly disabledSkillNames: Set<string>
   private disposed = false
   private closed = false
+  /** Completed turns in THIS conversation, carried forward from the cursor we resumed with. Drives the
+   *  cursor's `resumable` answer, so nothing above the driver has to guess whether a conversation exists. */
+  private turns = 0
+  /** The A5 rewind anchor, carried through untouched (see ClaudeResumeDataSchema). */
+  private readonly resumeAt?: string
+  /** This spawn asked the engine to reattach — so a "no conversation" exit is a resume miss to recover
+   *  from, not an unexplained fatal. */
+  private readonly resuming: boolean
   /** Session model id from system/init — used to pick the right context window out of
    *  `result.modelUsage` (which also lists aux models like the haiku titler). */
   private model = ''
@@ -172,6 +289,9 @@ class ClaudeSession implements EngineSession {
   /** Background Agent launch ids. Their immediate tool result is only a receipt; their actual
    *  result arrives later in task_notification. Foreground agents still finish via tool_result. */
   private readonly backgroundSubagentIds = new Set<string>()
+  /** Top-level SendMessage calls. A call can wake a finished agent back up in the background; its
+   *  ordinary tool card still closes on the receipt while the resumed work gets its own live card. */
+  private readonly sendMessageInputs = new Map<string, Record<string, any>>()
   /** Launch ids of NESTED subagents (an Agent launched by another subagent). The engine doesn't
    *  stream their inner transcript (spike/capture), so we render them as a tool-child under their
    *  parent and SUPPRESS their top-level task_* lifecycle (which would else show a stuck card). */
@@ -179,12 +299,20 @@ class ClaudeSession implements EngineSession {
   /** Workflow tool_use ids — the launch returns a run id + on-disk run dir in its tool_result;
    *  we suppress the generic tool card and open a WorkflowCard from the parsed result instead. */
   private readonly workflowLaunchIds = new Set<string>()
+  /** The native message being translated right now. Every event emitted during that translation carries
+   *  it (the lossless envelope); events Koda mints on its own leave it undefined. */
+  private nativeRaw: RawEngineEvent | undefined
 
   constructor(onEvent: EventSink, opts: SessionOpts) {
     this.onEvent = onEvent
     this.onClose = opts.onClose
     this.id = opts.sessionId ?? randomUUID()
     this.cwd = opts.cwd ?? process.cwd()
+    // The driver reads its own cursor and decides reattach-vs-fresh here, once.
+    const cursor = parseClaudeResumeCursor(opts.resumeCursor, this.id)
+    this.turns = cursor?.turns ?? 0
+    this.resumeAt = cursor?.resumeAt
+    this.resuming = this.turns > 0
 
     const enginePath = opts.binaryPath ?? resolveEnginePath({ resourcesPath: opts.resourcesPath }).path
     const env = buildEngineEnv(process.env, opts.env)
@@ -192,6 +320,9 @@ class ClaudeSession implements EngineSession {
     // judgment rules ride the system prompt here (spike/plugin-load — plugin CLAUDE.md isn't
     // auto-injected). Null when no pack is present (additive — sessions still start without it).
     const pack = resolvePack({ resourcesPath: opts.resourcesPath })
+    this.expectedKodaTools = !!opts.mcpConfigJson
+    this.expectedPlaybooks = opts.playbooksExpected ?? true
+    this.expectedBrowserTesting = opts.browserWired === true
     // Which bundled defaults this project switched off (Settings → Guardrails). Disabled rules drop
     // from the assembled prompt; disabled skills/subagents become --disallowedTools denials below.
     const disabled = readDisabledSet(this.cwd)
@@ -205,7 +336,8 @@ class ClaudeSession implements EngineSession {
       brokerWired: !!opts.mcpConfigJson,
       miniAppProject: opts.miniAppProject,
       miniAppsWired: opts.miniAppsWired,
-      critiqueOff: opts.critiqueOff,
+      critiqueOn: opts.critiqueOn,
+      orchestratorSession: opts.orchestratorSession,
       engine: 'claude',
     })
 
@@ -216,6 +348,12 @@ class ClaudeSession implements EngineSession {
       ...disabledToolTokens(disabled),
       ...(opts.extraDisallowedTools ?? []),
     ]
+    this.disabledSkillNames = new Set(
+      disallowedTools.flatMap((token) => {
+        const name = /^Skill\((.+)\)$/.exec(token)?.[1]
+        return name ? [name] : []
+      }),
+    )
 
     this.child = spawn(
       enginePath,
@@ -256,7 +394,7 @@ class ClaudeSession implements EngineSession {
           : ['--permission-mode', 'bypassPermissions']),
         // Resume reattaches a prior conversation by id (keeps the same id); a fresh session mints it
         // deterministically so renderer routing works from the first event. Never pass both (spike/resume).
-        ...(opts.resume ? ['--resume', this.id] : ['--session-id', this.id]),
+        ...(this.resuming ? ['--resume', this.id] : ['--session-id', this.id]),
       ],
       { cwd: this.cwd, env, stdio: ['pipe', 'pipe', 'pipe'] },
     ) as ChildProcessWithoutNullStreams
@@ -276,10 +414,10 @@ class ClaudeSession implements EngineSession {
     this.child.stdin.on('error', (err) => this.emitError(`engine stdin: ${err.message}`, false))
   }
 
-  sendTurn(text: string, images?: TurnImage[]): void {
+  sendTurn(text: string, images?: TurnImage[]): boolean {
     if (this.disposed || this.closed || !this.child.stdin.writable) {
       this.emitError('cannot send turn: engine session is not running', false)
-      return
+      return false
     }
     // Image blocks first, then text — the order Anthropic recommends for image+question turns.
     const content: Array<Record<string, unknown>> = []
@@ -289,6 +427,7 @@ class ClaudeSession implements EngineSession {
     if (text) content.push({ type: 'text', text })
     const msg = { type: 'user', message: { role: 'user', content } }
     this.child.stdin.write(JSON.stringify(msg) + '\n')
+    return true
   }
 
   /**
@@ -320,6 +459,7 @@ class ClaudeSession implements EngineSession {
 
   async dispose(): Promise<void> {
     this.disposed = true
+    if (this.capabilityGraceTimer) clearTimeout(this.capabilityGraceTimer)
     if (this.closed) return // already exited — no signals, no 3s timer
     if (this.child.stdin.writable) this.child.stdin.end()
     this.child.kill('SIGTERM')
@@ -348,8 +488,116 @@ class ClaudeSession implements EngineSession {
       } catch {
         continue // partial/garbage line — skip (spike-proven pattern)
       }
-      this.translate(raw as Record<string, unknown>)
+      const ev = raw as Record<string, any>
+      // Stamp the native message onto everything this line produces, then clear it so a later
+      // Koda-minted event can't inherit someone else's envelope.
+      this.nativeRaw = { source: 'claude', method: claudeMethod(ev), ids: claudeIds(ev), payload: ev }
+      try {
+        this.translate(ev)
+      } finally {
+        this.nativeRaw = undefined
+      }
     }
+  }
+
+  /** Attach the native envelope (when this event came off the wire) and hand the event up. */
+  private emit(event: EngineEvent): void {
+    this.onEvent(this.nativeRaw ? { ...event, raw: this.nativeRaw } : event)
+  }
+
+  /** An engine message this driver has no mapping for. Logged, never dropped. */
+  private unmapped(method: string, payload: unknown, ids?: Record<string, string>): void {
+    if (DELIBERATELY_IGNORED.has(method)) return
+    logUnmappedEvent(this.id, { source: 'claude', method, ids, payload })
+  }
+
+  /** Turn Claude's repeated native init inventory into one effective session snapshot. The first init
+   * can arrive while MCP servers are still pending; a later init normally resolves it. A bounded grace
+   * timer is a deadline only — it performs no probe and consumes no model turn. */
+  private observeCapabilities(ev: Record<string, any>): void {
+    const strings = (value: unknown): string[] =>
+      Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+    const mcpServers: SessionMcpServer[] = Array.isArray(ev.mcp_servers)
+      ? ev.mcp_servers.flatMap((entry: unknown) => {
+          if (!entry || typeof entry !== 'object') return []
+          const server = entry as Record<string, unknown>
+          if (typeof server.name !== 'string') return []
+          const rawTools = server.tools
+          const tools = Array.isArray(rawTools)
+            ? rawTools.filter((tool): tool is string => typeof tool === 'string')
+            : rawTools && typeof rawTools === 'object'
+              ? Object.keys(rawTools)
+              : []
+          return [{
+            name: server.name,
+            status: typeof server.status === 'string' ? server.status : tools.length > 0 ? 'connected' : 'unknown',
+            tools,
+          }]
+        })
+      : []
+    const plugins = Array.isArray(ev.plugins)
+      ? ev.plugins.flatMap((entry: unknown) => {
+          if (typeof entry === 'string') return [entry]
+          if (!entry || typeof entry !== 'object') return []
+          const name = (entry as { name?: unknown }).name
+          return typeof name === 'string' ? [name] : []
+        })
+      : []
+    const snapshot = buildSessionCapabilitySnapshot({
+      engine: 'claude',
+      cwd: typeof ev.cwd === 'string' ? ev.cwd : this.cwd,
+      source: 'engine-init',
+      tools: strings(ev.tools),
+      skills: strings(ev.skills).filter((name) => {
+        const localName = name.slice(name.lastIndexOf(':') + 1)
+        return !this.disabledSkillNames.has(name) && !this.disabledSkillNames.has(localName)
+      }),
+      agents: strings(ev.agents),
+      plugins,
+      mcpServers,
+      expected: {
+        kodaTools: this.expectedKodaTools,
+        playbooks: this.expectedPlaybooks,
+        browserTesting: this.expectedBrowserTesting,
+      },
+    })
+    const degraded = snapshot.capabilities.some((entry) => entry.status === 'degraded')
+    const degradedIds = new Set(
+      snapshot.capabilities.filter((entry) => entry.status === 'degraded').map((entry) => entry.id),
+    )
+    // A failed inherited/user MCP is not evidence that Koda's own pending broker or Playwright will
+    // fail. Only cancel the grace period when the explicitly failed server owns a degraded group.
+    const explicitFailure = mcpServers.some((server) => {
+      if (!/failed|error|disconnected|unreachable/i.test(server.status)) return false
+      return (
+        (server.name === 'koda_broker' && degradedIds.has('koda-tools')) ||
+        (server.name === 'playwright' && degradedIds.has('browser-testing'))
+      )
+    })
+    if (degraded && !explicitFailure && !this.capabilityFingerprint) {
+      this.pendingCapabilitySnapshot = snapshot
+      if (!this.capabilityGraceTimer) {
+        this.capabilityGraceTimer = setTimeout(() => {
+          this.capabilityGraceTimer = undefined
+          const pending = this.pendingCapabilitySnapshot
+          this.pendingCapabilitySnapshot = undefined
+          if (pending && !this.disposed) this.publishCapabilities(pending)
+        }, 2_500)
+        this.capabilityGraceTimer.unref?.()
+      }
+      return
+    }
+    if (this.capabilityGraceTimer) clearTimeout(this.capabilityGraceTimer)
+    this.capabilityGraceTimer = undefined
+    this.pendingCapabilitySnapshot = undefined
+    this.publishCapabilities(snapshot)
+  }
+
+  private publishCapabilities(snapshot: SessionCapabilitySnapshot): void {
+    const fingerprint = capabilitySnapshotFingerprint(snapshot)
+    if (fingerprint === this.capabilityFingerprint) return
+    this.capabilityFingerprint = fingerprint
+    this.emit({ type: 'SessionCapabilitiesUpdated', sessionId: this.id, snapshot })
   }
 
   /** Claude stream-json → normalized EngineEvents. The translation table. */
@@ -360,18 +608,24 @@ class ClaudeSession implements EngineSession {
 
     switch (ev?.type) {
       case 'system':
-        if (ev.subtype === 'init' && !this.started) {
-          this.started = true
-          this.model = typeof ev.model === 'string' ? ev.model : ''
-          this.onEvent({
-            type: 'SessionStarted',
-            sessionId: this.id,
-            model: this.model,
-            tools: Array.isArray(ev.tools) ? ev.tools : [],
-            cwd: typeof ev.cwd === 'string' ? ev.cwd : this.cwd,
-          })
+        if (ev.subtype === 'init') {
+          if (!this.started) {
+            this.started = true
+            this.model = typeof ev.model === 'string' ? ev.model : ''
+            this.emit({
+              type: 'SessionStarted',
+              sessionId: this.id,
+              model: this.model,
+              tools: Array.isArray(ev.tools) ? ev.tools : [],
+              cwd: typeof ev.cwd === 'string' ? ev.cwd : this.cwd,
+            })
+            // Publish the cursor as soon as the engine is up: a session that dies before its first turn
+            // still leaves the owner holding an honest "nothing to reattach to yet" answer.
+            this.emitResumeCursor()
+          }
+          this.observeCapabilities(ev)
         } else {
-          this.translateTask(ev) // system/task_* — subagent lifecycle (spike/subagent)
+          this.translateTask(ev) // system/task_* — agents and ordinary background jobs share this wire
         }
         break
 
@@ -380,15 +634,21 @@ class ClaudeSession implements EngineSession {
         // Only top-level deltas drive live UI; subagent internals show as finalized
         // blocks under its card (no live subagent streaming in v0).
         if (delta?.type === 'text_delta' && typeof delta.text === 'string' && !parentToolUseId) {
-          this.onEvent({ type: 'AssistantDelta', sessionId: this.id, text: delta.text })
+          this.emit({ type: 'AssistantDelta', sessionId: this.id, text: delta.text })
         } else if (delta?.type === 'thinking_delta' && !parentToolUseId) {
           // Reasoning text is redacted on subscription (delta.thinking is ''); the only
           // usable signal is the cumulative token estimate — surfaces a "Thinking…" state.
-          this.onEvent({
+          this.emit({
             type: 'ThinkingDelta',
             sessionId: this.id,
             estimatedTokens: typeof delta.estimated_tokens === 'number' ? delta.estimated_tokens : undefined,
           })
+        } else if (delta) {
+          // Anything new arrives here first (the §8 seam: every delta that isn't text or thinking used
+          // to fall out of the stream unnoticed).
+          this.unmapped(`stream_event/${String(delta.type ?? 'unknown')}`, ev, claudeIds(ev))
+        } else {
+          this.unmapped(`stream_event/${String(ev?.event?.type ?? 'unknown')}`, ev, claudeIds(ev))
         }
         break
       }
@@ -406,7 +666,7 @@ class ClaudeSession implements EngineSession {
             if (!parentToolUseId && (isApiErrorText(block.text) || isAuthRequiredText(block.text))) {
               this.emitApiError(block.text)
             } else {
-              this.onEvent({ type: 'AssistantBlock', sessionId: this.id, markdown: block.text, parentToolUseId })
+              this.emit({ type: 'AssistantBlock', sessionId: this.id, markdown: block.text, parentToolUseId })
             }
           } else if (block?.type === 'tool_use') {
             const blockId = String(block.id ?? '')
@@ -425,7 +685,9 @@ class ClaudeSession implements EngineSession {
               // and remember its id so its top-level task_* lifecycle is suppressed — otherwise it
               // double-renders as a stuck-"running" sibling card that never completes.
               if (isSubagentTool(block.name)) this.nestedSubagentIds.add(blockId)
-              this.onEvent({
+              if (!parentToolUseId && isSendMessageTool(block.name))
+                this.sendMessageInputs.set(blockId, (block.input ?? {}) as Record<string, any>)
+              this.emit({
                 type: 'ToolRequested',
                 sessionId: this.id,
                 id: blockId,
@@ -434,30 +696,71 @@ class ClaudeSession implements EngineSession {
                 parentToolUseId,
               })
             }
+          } else {
+            // A content block Koda has no card for (a new block type, or a finalized thinking block).
+            this.unmapped(`assistant/block/${String(block?.type ?? 'unknown')}`, block, claudeIds(ev))
           }
         }
         break
 
       case 'user':
         for (const block of asArray(ev?.message?.content)) {
-          if (block?.type === 'tool_result') {
+          if (block?.type !== 'tool_result') {
+            this.unmapped(`user/block/${String(block?.type ?? 'unknown')}`, block, claudeIds(ev))
+          } else {
             const id = String(block.tool_use_id ?? '')
+            const resultText = toolResultText(block.content)
+            const sendMessageInput = !parentToolUseId ? this.sendMessageInputs.get(id) : undefined
+            if (sendMessageInput) {
+              this.sendMessageInputs.delete(id)
+              // SendMessage is still an ordinary visible tool action; close that card on its receipt.
+              this.emit({
+                type: 'ToolResult',
+                sessionId: this.id,
+                id,
+                output: resultText,
+                isError: block.is_error === true,
+              })
+              // A message to an idle agent can resume it in the background. The JSON receipt is not
+              // the agent's answer; keep the delegated card live until task_notification arrives.
+              if (isBackgroundSubagentLaunchResult(resultText)) {
+                const taskId = resumedAgentId(resultText)
+                this.backgroundSubagentIds.add(id)
+                this.emitSubagentStarted(id, {
+                  task_id: taskId,
+                  subagent_type: 'subagent',
+                  description:
+                    typeof sendMessageInput.summary === 'string'
+                      ? sendMessageInput.summary
+                      : 'Agent follow-up',
+                  prompt:
+                    typeof sendMessageInput.message === 'string'
+                      ? sendMessageInput.message
+                      : undefined,
+                })
+                this.emit({
+                  type: 'SubagentProgress',
+                  sessionId: this.id,
+                  toolUseId: id,
+                  taskId,
+                  description: 'Working in background',
+                })
+              }
             // Foreground Agent results close the card; background Agents return a launch receipt here.
-            if (!parentToolUseId && this.subagentLaunchIds.has(id)) {
-              const resultText = toolResultText(block.content)
+            } else if (!parentToolUseId && this.subagentLaunchIds.has(id)) {
               // A background Agent returns an immediate launch receipt through the SAME tool_result
               // slot a foreground Agent uses for its final answer. The receipt is not evidence and
               // must not close the card; task_notification carries the real result later.
               if (isBackgroundSubagentLaunchResult(resultText)) {
                 this.backgroundSubagentIds.add(id)
-                this.onEvent({
+                this.emit({
                   type: 'SubagentProgress',
                   sessionId: this.id,
                   toolUseId: id,
                   description: 'Working in background',
                 })
               } else {
-                this.onEvent({
+                this.emit({
                   type: 'SubagentCompleted',
                   sessionId: this.id,
                   toolUseId: id,
@@ -471,7 +774,7 @@ class ClaudeSession implements EngineSession {
               this.workflowLaunchIds.delete(id)
               this.emitWorkflowStarted(toolResultText(block.content))
             } else {
-              this.onEvent({
+              this.emit({
                 type: 'ToolResult',
                 sessionId: this.id,
                 id,
@@ -485,7 +788,10 @@ class ClaudeSession implements EngineSession {
         break
 
       case 'result':
-        this.onEvent({
+        // A completed turn is what makes this conversation reattachable, so the cursor moves with it.
+        this.turns += 1
+        this.emitResumeCursor()
+        this.emit({
           type: 'TurnComplete',
           sessionId: this.id,
           // Window fill = the LAST assistant step's prompt size (lastAssistantUsage), NOT the
@@ -507,7 +813,7 @@ class ClaudeSession implements EngineSession {
         const info = ev.rate_limit_info
         if (info && typeof info.rateLimitType === 'string' && typeof info.resetsAt === 'number') {
           const status = typeof info.status === 'string' ? info.status : 'allowed'
-          this.onEvent({
+          this.emit({
             type: 'RateLimitUpdate',
             sessionId: this.id,
             engine: 'claude',
@@ -529,9 +835,17 @@ class ClaudeSession implements EngineSession {
               source: 'stream',
             },
           })
+        } else {
+          this.unmapped('rate_limit_event/unrecognized', ev)
         }
         break
       }
+
+      // A message type this driver has never seen — an engine bump's new event, or an old one that
+      // changed shape. It lands in the session's unmapped log so the next mapping question has
+      // evidence instead of needing a fresh wire spike.
+      default:
+        this.unmapped(claudeMethod(ev), ev, claudeIds(ev))
     }
   }
 
@@ -542,11 +856,11 @@ class ClaudeSession implements EngineSession {
     const taskId = typeof input.task_id === 'string' ? input.task_id : undefined
     if (this.subagentLaunchIds.has(id)) {
       if (taskId)
-        this.onEvent({ type: 'SubagentProgress', sessionId: this.id, toolUseId: id, taskId })
+        this.emit({ type: 'SubagentProgress', sessionId: this.id, toolUseId: id, taskId })
       return
     }
     this.subagentLaunchIds.add(id)
-    this.onEvent({
+    this.emit({
       type: 'SubagentStarted',
       sessionId: this.id,
       toolUseId: id,
@@ -569,59 +883,71 @@ class ClaudeSession implements EngineSession {
       this.emitError('a workflow launched but Koda could not track it (unrecognized launch output)', false)
       return
     }
-    this.onEvent({ type: 'WorkflowStarted', sessionId: this.id, runId, name: name || 'Workflow', dir })
+    this.emit({ type: 'WorkflowStarted', sessionId: this.id, runId, name: name || 'Workflow', dir })
   }
 
-  /** The engine's purpose-built subagent lifecycle stream (system/task_*), keyed by
-   *  `tool_use_id` = the Agent launch id. Drives the card's live status + usage. */
+  /** The engine's shared task lifecycle stream. Delegated agents identify themselves with
+   *  `task_type: "local_agent"`; commands running inside those agents use this same wire and already
+   *  render from their parent-tagged ToolRequested/ToolResult events, so they must not open siblings. */
   private translateTask(ev: Record<string, any>): void {
     const toolUseId = typeof ev.tool_use_id === 'string' ? ev.tool_use_id : undefined
     const taskId = typeof ev.task_id === 'string' ? ev.task_id : undefined
-    // Nested subagents render as a tool-child under their parent (their inner transcript isn't
-    // streamed) — drop their top-level lifecycle so they don't double-render as a stuck card.
-    if (toolUseId && this.nestedSubagentIds.has(toolUseId)) return
+    const parentToolUseId = typeof ev.parent_tool_use_id === 'string' ? ev.parent_tool_use_id : undefined
+    // A nested tool already belongs under its parent's card. Nested Agent launches additionally stay
+    // in nestedSubagentIds for engine versions that omit the parent marker on their lifecycle rows.
+    if (parentToolUseId || (toolUseId && this.nestedSubagentIds.has(toolUseId))) return
+    // Claude also emits task_* for ordinary shell jobs. Only a declared local agent (or a launch the
+    // preceding Agent tool_use already registered) owns Koda's delegated-task lifecycle.
+    if (!toolUseId || (ev.task_type !== 'local_agent' && !this.subagentLaunchIds.has(toolUseId))) return
     switch (ev.subtype) {
       case 'task_started':
-        if (toolUseId) this.emitSubagentStarted(toolUseId, ev)
+        this.emitSubagentStarted(toolUseId, ev)
         break
       case 'task_progress':
-        if (toolUseId)
-          this.onEvent({
+        this.emit({
+          type: 'SubagentProgress',
+          sessionId: this.id,
+          toolUseId,
+          taskId,
+          description: typeof ev.description === 'string' ? ev.description : undefined,
+          lastToolName: typeof ev.last_tool_name === 'string' ? ev.last_tool_name : undefined,
+          usage: normalizeUsage(ev.usage),
+        })
+        break
+      case 'task_notification':
+        this.emitSubagentStarted(toolUseId, ev)
+        if (this.backgroundSubagentIds.has(toolUseId)) {
+          this.emit(taskNotificationToCompletion(this.id, toolUseId, ev))
+        } else {
+          // Foreground agents also announce their task status here, but their full answer follows
+          // in the Agent tool_result. Keep the card live until that evidence-bearing result lands.
+          this.emit({
             type: 'SubagentProgress',
             sessionId: this.id,
             toolUseId,
             taskId,
-            description: typeof ev.description === 'string' ? ev.description : undefined,
-            lastToolName: typeof ev.last_tool_name === 'string' ? ev.last_tool_name : undefined,
+            description: typeof ev.status === 'string' ? ev.status : undefined,
             usage: normalizeUsage(ev.usage),
           })
-        break
-      case 'task_notification':
-        if (toolUseId) {
-          this.emitSubagentStarted(toolUseId, ev)
-          if (this.backgroundSubagentIds.has(toolUseId)) {
-            this.onEvent(taskNotificationToCompletion(this.id, toolUseId, ev))
-          } else {
-            // Foreground agents also announce their task status here, but their full answer follows
-            // in the Agent tool_result. Keep the card live until that evidence-bearing result lands.
-            this.onEvent({
-              type: 'SubagentProgress',
-              sessionId: this.id,
-              toolUseId,
-              taskId,
-              description: typeof ev.status === 'string' ? ev.status : undefined,
-              usage: normalizeUsage(ev.usage),
-            })
-          }
         }
         break
       // task_updated carries only task_id + patch (no tool_use_id to join on). The joinable foreground
       // tool_result / background task_notification paths above carry the lifecycle Koda can render.
+      default:
+        this.unmapped(claudeMethod(ev), ev, claudeIds(ev))
     }
   }
 
+  private emitResumeCursor(): void {
+    this.emit({
+      type: 'ResumeCursorUpdated',
+      sessionId: this.id,
+      cursor: claudeResumeCursor(this.id, this.turns, this.resumeAt),
+    })
+  }
+
   private emitError(message: string, fatal: boolean): void {
-    this.onEvent({
+    this.emit({
       type: 'EngineError',
       sessionId: this.id,
       message,
@@ -633,7 +959,7 @@ class ClaudeSession implements EngineSession {
   /** A turn-level API failure the CLI printed as assistant text. Non-fatal (the process stays alive for
    *  the next turn); `category: 'apiError'` flags it for the composer error banner. */
   private emitApiError(message: string): void {
-    this.onEvent({
+    this.emit({
       type: 'EngineError',
       sessionId: this.id,
       message,
@@ -646,6 +972,21 @@ class ClaudeSession implements EngineSession {
   private handleClose(code: number | null): void {
     if (this.closed) return
     this.closed = true
+    if (this.capabilityGraceTimer) clearTimeout(this.capabilityGraceTimer)
+    // We asked to reattach and the engine says it has no such conversation. That is recoverable, not
+    // fatal: report it as a resume miss and let the owner restart this session clean.
+    if (!this.disposed && this.resuming && RESUME_MISS.test(this.stderr)) {
+      this.emit({
+        type: 'EngineError',
+        sessionId: this.id,
+        message: 'the engine no longer holds this conversation',
+        fatal: false,
+        category: 'resumeMiss',
+      })
+      this.disposed = true
+      this.onClose?.(this.id)
+      return
+    }
     // A non-zero exit we didn't initiate (and didn't interrupt) is fatal; an
     // interrupt or our own dispose is an expected, non-fatal end.
     if (!this.disposed && code !== 0 && code !== null) {
@@ -658,6 +999,33 @@ class ClaudeSession implements EngineSession {
 
 function asArray(v: unknown): any[] {
   return Array.isArray(v) ? v : []
+}
+
+/** The engine's own name for a message: its `type`, qualified by `subtype` where one exists
+ *  (`system/init`, `system/task_progress`). This is the key the unmapped log groups by, and the
+ *  `method` on the raw envelope. */
+export function claudeMethod(ev: Record<string, any>): string {
+  const type = typeof ev?.type === 'string' ? ev.type : 'unknown'
+  // `result.subtype` is the stop reason ('success'), not a message kind — qualifying it would mint a
+  // new method name per outcome.
+  const subtype = typeof ev?.subtype === 'string' && type !== 'result' ? ev.subtype : ''
+  return subtype ? `${type}/${subtype}` : type
+}
+
+/** The engine's own ids for a message, flattened so a consumer can join a child to its parent without
+ *  re-reading the payload. Only keys the message actually carries appear. */
+export function claudeIds(ev: Record<string, any>): Record<string, string> | undefined {
+  const ids: Record<string, string> = {}
+  const put = (key: string, value: unknown) => {
+    if (typeof value === 'string' && value) ids[key] = value
+  }
+  put('uuid', ev?.uuid)
+  put('sessionId', ev?.session_id)
+  put('parentToolUseId', ev?.parent_tool_use_id)
+  put('toolUseId', ev?.tool_use_id)
+  put('taskId', ev?.task_id)
+  put('messageId', ev?.message?.id)
+  return Object.keys(ids).length ? ids : undefined
 }
 
 /** The CLI prints an unrecoverable API failure as an assistant text block prefixed "API Error:" (its
@@ -680,10 +1048,32 @@ function isSubagentTool(name: unknown): boolean {
   return name === 'Agent' || name === 'Task'
 }
 
+function isSendMessageTool(name: unknown): boolean {
+  return name === 'SendMessage'
+}
+
 /** The exact metadata receipt Claude 2.1.x returns immediately for an async Agent launch. It is not
  *  the child's answer; treating it as one is the empty/premature-card bug the background spike found. */
 export function isBackgroundSubagentLaunchResult(text: string): boolean {
-  return /^Async agent launched successfully\./.test(text) && text.includes('working in the background')
+  if (/^Async agent launched successfully\./.test(text) && text.includes('working in the background'))
+    return true
+  const taskId = resumedAgentId(text)
+  if (!taskId) return false
+  try {
+    const receipt = JSON.parse(text) as Record<string, unknown>
+    return typeof receipt.message === 'string' && receipt.message.includes('in the background')
+  } catch {
+    return false
+  }
+}
+
+function resumedAgentId(text: string): string | undefined {
+  try {
+    const receipt = JSON.parse(text) as Record<string, unknown>
+    return typeof receipt.resumedAgentId === 'string' ? receipt.resumedAgentId : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /** The background multi-agent orchestration tool (spike/capture). */
@@ -763,8 +1153,12 @@ function extractContextUsage(usage: unknown, modelUsage: unknown, model: string)
  * Each entry carries its own cost + token split — flattened to an array the store folds into the
  * session's running by-model totals. Zero-usage entries (a model listed but never actually used this
  * turn) are dropped so they don't clutter the breakdown. Model ids pass through opaquely.
+ *
+ * Exported because the one-shot turns Koda spawns outside a session (the Library's ask) read the same
+ * `--output-format json` envelope on their way into the same daily rollup. One reader, so a second
+ * copy cannot drift from the shape the driver actually receives.
  */
-function extractModelUsage(modelUsage: unknown): import('@shared/ipc').ModelTurnUsage[] | undefined {
+export function extractModelUsage(modelUsage: unknown): import('@shared/ipc').ModelTurnUsage[] | undefined {
   if (!modelUsage || typeof modelUsage !== 'object') return undefined
   const n = (v: unknown) => (typeof v === 'number' ? v : 0)
   const out: import('@shared/ipc').ModelTurnUsage[] = []

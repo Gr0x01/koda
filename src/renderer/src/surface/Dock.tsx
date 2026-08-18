@@ -1,13 +1,16 @@
 import { useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { AnimatePresence, Menu, motion, useReducedMotion, duration, ease, spring } from '../motion'
 import { FileSurfaceView } from './FileSurfaceView'
 import { DocSurfaceView } from './DocSurfaceView'
 import { DiffSurfaceView } from './DiffSurfaceView'
 import { PreviewSurfaceView, type PreviewViewport } from './PreviewSurfaceView'
-import { StageDesk } from './ChangesSurface'
+import { ChangesSurface } from './ChangesSurface'
+import { AgentsSurface } from './AgentsSurface'
+import { BranchGlyph } from './ChangesReview'
 import { TerminalSurfaceView } from './TerminalSurfaceView'
-import { Caret } from '../Caret'
 import { useWorkspace, activeEditor, type FileSurface } from '../workspace/store'
+import { isFleetEntry } from '../transcript/fleet'
 
 const isMarkdown = (path: string): boolean => /\.(md|markdown)$/i.test(path)
 // A displayable image has only one meaningful view (the picture) — no File/Diff/Doc toggle.
@@ -18,145 +21,131 @@ const PREVIEW_PRESET_DOCK_WIDTH: Record<PreviewViewport, number> = {
   phone: 430,
 }
 
-// ── The dock: the stage bar, the stage, the terminal shelf, the desk ───────────────────────────────
+// ── The dock: the stage bar and the stage ──────────────────────────────────────────────────────────
+// Everything that can take the stage — the running app, a file, the changes, the shell — is a TAB on
+// the one stage. No shelf under it, no desk below it: one method, so learning any surface teaches all
+// of them.
 export function Dock() {
   return (
     <div className="flex h-full flex-col">
       <StageBar />
       <Stage />
-      <TerminalShelf />
-      <StageDesk />
     </div>
   )
 }
 
-/**
- * The stage bar — what's showing, and the stage's few controls. Left: the switcher (the staged
- * surface's name + a menu of everything else on this session's workbench — the old Editor tab row,
- * demoted to a dropdown). Right: the view toggle for a staged file, the pin, the terminal.
- */
+/** The stage bar — co-open tabs and the stage's few controls. */
 function StageBar() {
   const editor = useWorkspace(activeEditor)
   const setStagePinned = useWorkspace((s) => s.setStagePinned)
-  const termOpen = useWorkspace((s) => s.termOpen)
-  const setTermOpen = useWorkspace((s) => s.setTermOpen)
-  const staged =
-    editor.surfaces.find((s) => s.path === editor.activeSurfaceId) ??
-    editor.surfaces[editor.surfaces.length - 1] ??
-    null
+  const stageExpanded = useWorkspace((s) => s.stageExpanded)
+  const setStageExpanded = useWorkspace((s) => s.setStageExpanded)
+  const staged = stagedSurface(editor)
+  const barBtn = 'grid h-[26px] w-[26px] place-items-center rounded-md transition-colors'
+  const heldHint = staged ? `${staged.title} holds the view while the agent works. Click another tab to leave it.` : ''
   return (
-    <div className="flex h-9 shrink-0 items-center gap-1 border-b border-border px-1.5">
-      <StageSwitcher surfaces={editor.surfaces} staged={staged} />
-      <div className="ml-auto flex shrink-0 items-center gap-1">
-        {staged && staged.kind !== 'preview' && <ViewToggle surface={staged} />}
+    <div className="flex h-9 shrink-0 items-center gap-1 border-b border-border pl-1 pr-1.5">
+      <StageTabs surfaces={editor.surfaces} staged={staged} />
+      <div className="ml-auto flex shrink-0 items-center gap-1 pl-1">
+        {staged && !staged.kind && <ViewToggle surface={staged} />}
         {staged &&
-          // The preview soft-pins itself (see stageHeld in the store): while it's on stage the agent's
-          // edits stop stealing focus, so there's nothing to toggle — show a quiet held indicator instead
-          // of a pin button that would look "off" while it's actually holding.
-          (staged.kind === 'preview' ? (
+          // The live surfaces hold the view by themselves (see stageHeld in the store): while one is
+          // selected the agent's edits stop stealing the selection, so there's nothing to toggle — show
+          // a quiet held indicator instead of a Hold view button that would look "off" while it holds.
+          (staged.kind === 'preview' || staged.kind === 'terminal' ? (
             <div
-              title="Preview stays on stage while the agent works — pick a file to leave it"
-              className="grid h-[26px] w-[26px] place-items-center rounded-md text-accent"
+              // Named as an image: a bare div is generic to assistive tech, so the one held state the
+              // user can't toggle would otherwise announce as nothing at all.
+              role="img"
+              aria-label={heldHint}
+              title={heldHint}
+              className={`${barBtn} text-accent`}
             >
               <IconPin filled />
             </div>
           ) : (
             <button
               onClick={() => setStagePinned(!editor.pinned)}
-              title={editor.pinned ? 'Unpin — let the agent’s work take the stage' : 'Pin — keep this on stage while the agent works'}
+              title={
+                editor.pinned
+                  ? 'Release the view. Let the agent’s work take the stage again.'
+                  : 'Hold view. Keep this tab on stage while the agent works.'
+              }
+              aria-label="Hold view on this tab"
               aria-pressed={editor.pinned}
-              className={`grid h-[26px] w-[26px] place-items-center rounded-md transition-colors ${
-                editor.pinned ? 'bg-text/5 text-accent' : 'text-text-muted hover:text-text'
-              }`}
+              className={`${barBtn} ${editor.pinned ? 'bg-text/5 text-accent' : 'text-text-muted hover:text-text'}`}
             >
               <IconPin filled={editor.pinned} />
             </button>
           ))}
         <button
-          onClick={() => setTermOpen(!termOpen)}
-          title={termOpen ? 'Hide terminal' : 'Terminal'}
-          aria-pressed={termOpen}
-          className={`grid h-[26px] w-[26px] place-items-center rounded-md transition-colors ${
-            termOpen ? 'bg-text/5 text-text' : 'text-text-muted hover:text-text'
-          }`}
+          onClick={() => setStageExpanded(!stageExpanded)}
+          title={stageExpanded ? 'Shrink back and show the session' : 'Expand to the full window'}
+          aria-label={stageExpanded ? 'Shrink the stage' : 'Expand the stage'}
+          aria-pressed={stageExpanded}
+          className={`${barBtn} ${stageExpanded ? 'bg-text/5 text-text' : 'text-text-muted hover:text-text'}`}
         >
-          <IconTerminal />
+          {stageExpanded ? <IconCollapse /> : <IconExpand />}
         </button>
       </div>
     </div>
   )
 }
 
-/** The stage switcher — the staged surface's identity as a quiet pill; click for the workbench menu
- *  (preview + open files), where each row stages on click and closes on ✕. */
-function StageSwitcher({ surfaces, staged }: { surfaces: FileSurface[]; staged: FileSurface | null }) {
+/** Which surface is showing: the selected tab, or the newest one if the selection went stale. */
+function stagedSurface(editor: { surfaces: FileSurface[]; activeSurfaceId: string | null }): FileSurface | null {
+  return (
+    editor.surfaces.find((s) => s.path === editor.activeSurfaceId) ??
+    editor.surfaces[editor.surfaces.length - 1] ??
+    null
+  )
+}
+
+/**
+ * The tab strip: everything co-open on this session's stage, in open order, plus the add control. A
+ * tab selects on click and closes on ✕; the selected one is a raised white chip that slides between
+ * tabs. The agent's auto-follow adds and selects tabs here, so the strip is the running record of what
+ * it has touched this session.
+ */
+function StageTabs({ surfaces, staged }: { surfaces: FileSurface[]; staged: FileSurface | null }) {
   const selectSurface = useWorkspace((s) => s.selectSurface)
   const closeSurface = useWorkspace((s) => s.closeSurface)
-  const [open, setOpen] = useState(false)
-  const ref = useRef<HTMLDivElement>(null)
+  const stripRef = useRef<HTMLDivElement>(null)
+  // Keep the selected tab in view when the agent adds or selects one off-screen.
   useEffect(() => {
-    if (!open) return
-    const onDown = (e: PointerEvent): void => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
-    }
-    const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') setOpen(false)
-    }
-    document.addEventListener('pointerdown', onDown)
-    document.addEventListener('keydown', onKey)
-    return () => {
-      document.removeEventListener('pointerdown', onDown)
-      document.removeEventListener('keydown', onKey)
-    }
-  }, [open])
-  // Preview first (it's "the app"), then files in open order — same order the menu shows.
-  const ordered = [...surfaces].sort((a, b) => (a.kind === 'preview' ? -1 : 0) - (b.kind === 'preview' ? -1 : 0))
-  if (!staged) {
-    return <span className="px-2 text-xs text-text-muted/70">Nothing on stage</span>
-  }
+    stripRef.current?.querySelector('[data-staged="true"]')?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+  }, [staged?.path, surfaces.length])
   return (
-    <div ref={ref} className="relative min-w-0">
-      <button
-        onClick={() => setOpen((v) => !v)}
-        title="Switch what's on stage"
-        className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium text-text transition-colors hover:bg-text/5"
-      >
-        {staged.kind === 'preview' ? (
-          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500 shadow-[0_0_5px] shadow-emerald-500/60" aria-hidden />
-        ) : (
-          <span className="shrink-0 text-text-muted">
-            <SurfaceGlyph surface={staged} />
-          </span>
-        )}
-        <span className={`truncate ${staged.kind === 'preview' ? '' : 'font-mono text-[11.5px] font-normal'}`}>
-          {staged.title}
-        </span>
-        {ordered.length > 1 && <Caret size={12} className="text-text-muted" />}
-      </button>
-      <div className="absolute left-0 top-full z-10 mt-1">
-        <Menu
-          open={open && ordered.length > 1}
-          origin="origin-top-left"
-          className="w-max min-w-[200px] max-w-[300px] rounded-xl border border-border bg-surface p-1 shadow-pop"
-        >
-          {ordered.map((s) => (
+    // The add control sits OUTSIDE the scrolling row: `overflow-x-auto` clips the other axis too, so a
+    // menu anchored inside the row would be cut off at the bar's height.
+    <div className="flex min-w-0 flex-1 items-center gap-0.5">
+      <div ref={stripRef} className="flex min-w-0 items-center gap-0.5 overflow-x-auto">
+        {surfaces.map((s) => {
+          const active = s.path === staged?.path
+          return (
             <div
               key={s.path}
-              onClick={() => {
-                selectSurface(s.path)
-                setOpen(false)
-              }}
-              title={s.kind === 'preview' ? 'The running preview' : s.path}
-              className={`group flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-xs transition-colors ${
-                s.path === staged.path ? 'bg-bg text-text' : 'text-text-muted hover:bg-bg hover:text-text'
+              data-staged={active}
+              onClick={() => selectSurface(s.path)}
+              title={singletonKind(s) ? SINGLETON_HINT[singletonKind(s)!] : s.path}
+              className={`group relative flex h-[26px] max-w-[180px] shrink-0 cursor-pointer items-center gap-1.5 rounded-md pl-2 pr-1 text-xs transition-colors ${
+                active ? 'text-text' : 'text-text-muted hover:text-text'
               }`}
             >
-              {s.kind === 'preview' ? (
-                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" aria-hidden />
-              ) : (
-                <SurfaceGlyph surface={s} />
+              {/* Shared layoutId → the selected chip SLIDES between tabs instead of flashing. */}
+              {active && (
+                <motion.span
+                  layoutId="stage-tab-active"
+                  className="absolute inset-0 rounded-md bg-surface shadow-soft"
+                  transition={spring.snappy}
+                />
               )}
-              <span className={`min-w-0 flex-1 truncate ${s.kind === 'preview' ? '' : 'font-mono text-[11.5px]'}`}>
+              <span className="relative z-10 shrink-0">
+                <SurfaceGlyph surface={s} />
+              </span>
+              <span
+                className={`relative z-10 min-w-0 flex-1 truncate ${singletonKind(s) ? '' : 'font-mono text-[11.5px]'}`}
+              >
                 {s.title}
               </span>
               <button
@@ -164,61 +153,162 @@ function StageSwitcher({ surfaces, staged }: { surfaces: FileSurface[]; staged: 
                   e.stopPropagation()
                   closeSurface(s.path)
                 }}
-                title="Remove from the workbench"
-                className="shrink-0 opacity-0 transition-opacity hover:text-text group-hover:opacity-100"
+                title="Close this tab"
+                aria-label={`Close ${s.title}`}
+                className="relative z-10 grid h-4 w-4 shrink-0 place-items-center rounded text-[10px] text-text-muted opacity-0 transition-opacity hover:bg-text/5 hover:text-text focus-visible:opacity-100 group-hover:opacity-100"
               >
                 ✕
               </button>
             </div>
-          ))}
-        </Menu>
+          )
+        })}
       </div>
+      <AddSurfaceButton />
     </div>
   )
 }
 
-/** A tiny kind-glyph for switcher rows: rendered doc, diff, or code file. */
+const PICKER_WIDTH = 300
+
+/** The add control at the end of the strip — the same surface picker the empty stage shows. The menu
+ *  is PORTALED with fixed coords: the dock clips its overflow and the tab row scrolls, so an anchored
+ *  menu would be cut off at the dock's edge (RemoteMenu solves the same problem the same way). */
+function AddSurfaceButton() {
+  const [open, setOpen] = useState(false)
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!open) return
+    const place = (): void => {
+      const r = triggerRef.current?.getBoundingClientRect()
+      if (!r) return
+      // Left-aligned to the button, then pulled back in when that would run past the window edge.
+      setPos({ top: r.bottom + 6, left: Math.min(r.left, window.innerWidth - PICKER_WIDTH - 12) })
+    }
+    place()
+    window.addEventListener('resize', place)
+    const onDown = (e: PointerEvent): void => {
+      const t = e.target as Node
+      if (!triggerRef.current?.contains(t) && !menuRef.current?.contains(t)) setOpen(false)
+    }
+    document.addEventListener('pointerdown', onDown)
+    return () => {
+      window.removeEventListener('resize', place)
+      document.removeEventListener('pointerdown', onDown)
+    }
+  }, [open])
+  return (
+    <>
+      <button
+        ref={triggerRef}
+        onClick={() => setOpen((v) => !v)}
+        title="Put something else on stage"
+        aria-label="Put something else on stage"
+        aria-expanded={open}
+        className="grid h-[26px] w-[26px] shrink-0 place-items-center rounded-md text-text-muted transition-colors hover:bg-text/5 hover:text-text"
+      >
+        <IconPlus />
+      </button>
+      {pos &&
+        createPortal(
+          <Menu
+            open={open}
+            origin="origin-top-left"
+            onClose={() => setOpen(false)}
+            className="fixed z-50 rounded-xl border border-border bg-surface p-1.5 shadow-pop"
+            style={{ top: pos.top, left: pos.left, width: PICKER_WIDTH }}
+          >
+            <div ref={menuRef}>
+              <SurfacePicker onPicked={() => setOpen(false)} />
+            </div>
+          </Menu>,
+          document.body,
+        )}
+    </>
+  )
+}
+
+/** A surface's singleton kind, or null for an ordinary file tab (`kind` is optional on those). */
+function singletonKind(s: FileSurface): 'preview' | 'terminal' | 'changes' | 'agents' | null {
+  return s.kind && s.kind !== 'file' ? s.kind : null
+}
+
+/** What each singleton tab is, in one hover line. */
+const SINGLETON_HINT: Record<'preview' | 'terminal' | 'changes' | 'agents', string> = {
+  preview: 'Your app, running',
+  terminal: 'A shell in this project folder',
+  changes: 'Everything changed since your last version',
+  agents: 'The agents this chat handed work to',
+}
+
+/** A tab's glyph. One 14px line-drawn mark per surface — the singletons read as siblings of the file
+ *  tabs rather than as a different species (a bare status dot sat small and off-axis beside them). */
 function SurfaceGlyph({ surface }: { surface: FileSurface }) {
+  // Green means one thing here: something is answering on that URL right now. A preview whose dev
+  // server died keeps its tab (the last paint is still worth reading) but loses the colour.
+  if (surface.kind === 'preview') return <IconWindow className={surface.live ? 'text-emerald-500' : undefined} />
+  if (surface.kind === 'terminal') return <IconTerminal />
+  if (surface.kind === 'changes') return <BranchGlyph size={14} />
+  if (surface.kind === 'agents') return <IconAgents />
   return <ViewIcon view={surface.view} md={isMarkdown(surface.path)} />
 }
 
-// ── The stage: the one surface that matters right now ──────────────────────────────────────────────
+// ── The stage: the selected tab's surface ──────────────────────────────────────────────────────────
 function Stage() {
   const editor = useWorkspace(activeEditor)
   const reduce = useReducedMotion()
-  const staged =
-    editor.surfaces.find((s) => s.path === editor.activeSurfaceId) ??
-    editor.surfaces[editor.surfaces.length - 1] ??
-    null
+  const staged = stagedSurface(editor)
+  // The terminal is the one surface that can't be unmounted on a tab switch — disposing the xterm
+  // throws away the scrollback while the pty keeps running. So it renders as its own always-mounted
+  // layer, hidden by CSS unless it's the staged tab, and it stays mounted for as long as ANY session
+  // in this window holds a terminal tab (switching chats must not clear the shell you were reading).
+  const anyTerminal = useWorkspace((s) =>
+    Object.values(s.editors).some((ed) => ed.surfaces.some((su) => su.kind === 'terminal')),
+  )
+  const termStaged = staged?.kind === 'terminal'
   return (
     <div className="relative min-h-0 flex-1">
-      {/* Cross-fade between staged surfaces (mode="wait" = no double Monaco/iframe mounting). */}
+      {/* Cross-fade between tabs (mode="wait" = no double Monaco/iframe mounting). */}
       <AnimatePresence mode="wait" initial={false}>
-        <motion.div
-          key={staged?.path ?? 'empty'}
-          className="h-full"
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          transition={reduce ? { duration: 0 } : { duration: duration.fast, ease: ease.out }}
-        >
-          {!staged ? (
-            <StageEmpty />
-          ) : staged.kind === 'preview' ? (
-            <StagePreview preview={staged} />
-          ) : (
-            <SurfacePane key={staged.path} surface={staged} className="h-full min-w-0" />
-          )}
-        </motion.div>
+        {!termStaged && (
+          <motion.div
+            key={staged?.path ?? 'empty'}
+            className="h-full"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={reduce ? { duration: 0 } : { duration: duration.fast, ease: ease.out }}
+          >
+            {!staged ? (
+              <StageEmpty />
+            ) : staged.kind === 'preview' ? (
+              <StagePreview preview={staged} />
+            ) : staged.kind === 'changes' ? (
+              <ChangesSurface />
+            ) : staged.kind === 'agents' ? (
+              <AgentsSurface />
+            ) : (
+              <SurfacePane key={staged.path} surface={staged} className="h-full min-w-0" />
+            )}
+          </motion.div>
+        )}
       </AnimatePresence>
+      {anyTerminal && (
+        // Hidden with `invisible` rather than unmounted: content keeps its size (xterm refits from a
+        // real box) and drops out of hit-testing and the focus order, so a background shell can't
+        // swallow keystrokes meant for the conversation.
+        <div className={`absolute inset-0 ${termStaged ? '' : 'invisible'}`} aria-hidden={!termStaged}>
+          <TerminalSurfaceView />
+        </div>
+      )}
     </div>
   )
 }
 
-/** The staged preview — the live app, with the expand/viewport chrome it always had. */
+/** The staged preview — the live app, with its navigation and viewport chrome. Expand now lives in the
+ *  stage bar (it belongs to the stage, not to the preview), so this view no longer owns it. */
 function StagePreview({ preview }: { preview: FileSurface }) {
-  const expanded = useWorkspace((s) => s.previewExpanded)
-  const setExpanded = useWorkspace((s) => s.setPreviewExpanded)
   const setDockWidth = useWorkspace((s) => s.setConversationWidth)
   const persistLayout = useWorkspace((s) => s.persistLayout)
   function applyViewportPreset(viewport: PreviewViewport): void {
@@ -230,28 +320,54 @@ function StagePreview({ preview }: { preview: FileSurface }) {
       url={preview.previewUrl}
       rev={preview.rev}
       className="h-full"
-      expanded={expanded}
-      onExpandedChange={setExpanded}
       onViewportChange={applyViewportPreset}
     />
   )
 }
 
-/** The stage at rest — nothing running, nothing staged. One state instead of the old per-tab three.
- *  Its action adapts to the session: if this session previewed before, one click brings that preview
- *  back (the dev server's killed on window close, but re-running it is a button, not a conversation);
- *  otherwise a raw static preview — but only when the project actually has a servable index.html
- *  (a framework project has none, and the old always-on button just opened a blank placeholder). */
+/** The stage with no tabs open: a picker that names each surface and the job it does, so the panel
+ *  teaches what can live here instead of resting as one blank line of copy. */
 function StageEmpty() {
+  return (
+    <div className="flex h-full flex-col items-center justify-center px-6">
+      <p className="mb-1 text-[13px] font-medium text-text-muted">Nothing on stage yet</p>
+      <p className="mb-4 max-w-[320px] text-center text-xs leading-relaxed text-text-muted/70">
+        The agent puts its work here as it goes. You can also open something yourself.
+      </p>
+      <div className="w-full max-w-[340px] rounded-xl border border-border bg-surface p-1.5 shadow-soft">
+        <SurfacePicker />
+      </div>
+    </div>
+  )
+}
+
+/**
+ * The surface picker: one row per thing that can take the stage, each with the one sentence that says
+ * what job it does. Shown two ways, same component — the empty stage, and the tab strip's add control.
+ * It offers only the surfaces that already exist (preview, files, changes, terminal); it is a map of
+ * the panel, not a place to invent new surface types.
+ */
+function SurfacePicker({ onPicked }: { onPicked?: () => void } = {}) {
   const openPreview = useWorkspace((s) => s.openPreview)
+  const setSearchOpen = useWorkspace((s) => s.setSearchOpen)
+  const openChanges = useWorkspace((s) => s.openChanges)
+  const openTerminal = useWorkspace((s) => s.openTerminal)
+  const openAgents = useWorkspace((s) => s.openAgents)
   const activeId = useWorkspace((s) => s.activeId)
+  // Offered only once this chat has actually delegated something: an empty roster is a tab that
+  // teaches nothing. The fan-out's own row is the usual way in; this is how you get it back.
+  const hasAgents = useWorkspace((s) =>
+    s.activeId ? (s.sessions[s.activeId]?.items.some(isFleetEntry) ?? false) : false,
+  )
   const lastPreview = useWorkspace((s) => (s.activeId ? s.sessions[s.activeId]?.lastPreview : undefined))
+  // Green here too, on the same terms: this session already has a preview and something is serving it.
+  const livePreview = useWorkspace((s) => activeEditor(s).surfaces.some((x) => x.kind === 'preview' && x.live))
   const [staticUrl, setStaticUrl] = useState<string | null>(null)
   const [restarting, setRestarting] = useState(false)
-  const [failed, setFailed] = useState(false)
+  const [previewError, setPreviewError] = useState<string | null>(null)
 
-  // Probe once per active session: is there a static file worth offering? Null ⇒ hide the button
-  // rather than open the "nothing to preview" placeholder.
+  // Probe once per active session: is there a static entry worth offering? Null and no remembered dev
+  // server ⇒ say so honestly rather than opening the "nothing to preview" placeholder.
   useEffect(() => {
     let alive = true
     void window.koda.previewStaticUrl().then((u) => alive && setStaticUrl(u))
@@ -260,86 +376,109 @@ function StageEmpty() {
     }
   }, [activeId])
 
-  async function restart(): Promise<void> {
+  // The dev server dies with the window, so bringing a session's preview back is a button, not a
+  // conversation. Main answers the restart with a preview:show push, which reopens the surface.
+  async function restartPreview(): Promise<void> {
     if (!activeId || !lastPreview) return
     setRestarting(true)
-    setFailed(false)
+    setPreviewError(null)
     try {
-      await window.koda.previewRestart(activeId, lastPreview) // main pushes preview:show → surface reopens
+      await window.koda.previewRestart(activeId, lastPreview)
+      onPicked?.()
     } catch {
-      setFailed(true)
+      setPreviewError(
+        lastPreview.kind === 'dev'
+          ? 'That command did not start. Check the terminal.'
+          : 'That file is no longer there.',
+      )
     } finally {
       setRestarting(false)
     }
   }
 
-  const btn = 'rounded-lg border border-border px-3 py-1.5 text-xs text-text transition-colors hover:bg-surface disabled:opacity-50'
-  const action = lastPreview ? (
-    <div className="flex flex-col items-center gap-1.5">
-      <button
-        onClick={() => void restart()}
-        disabled={restarting}
-        title={lastPreview.kind === 'dev' ? lastPreview.command : lastPreview.relPath}
-        className={btn}
-      >
-        {restarting ? 'Starting preview…' : 'Restart preview'}
-      </button>
-      {failed && (
-        <span className="text-[11px] text-text-muted">
-          {lastPreview.kind === 'dev' ? "Couldn't start it — check the terminal." : 'That file is no longer there.'}
-        </span>
-      )}
-    </div>
-  ) : staticUrl ? (
-    <button onClick={() => openPreview(staticUrl)} className={btn}>
-      Preview index.html
-    </button>
-  ) : undefined
+  const previewReady = !!lastPreview || !!staticUrl
+  const pick = (run: () => void) => (): void => {
+    run()
+    onPicked?.()
+  }
 
   return (
-    <DockEmpty
-      title="Nothing on stage yet"
-      hint="As the agent works, its work shows up here: your app running, a document taking shape, a change landing."
-      action={action}
-    />
+    <div className="flex flex-col">
+      <PickerRow
+        icon={<IconWindow className={livePreview ? 'text-emerald-500' : undefined} />}
+        title={restarting ? 'Starting preview' : 'Preview'}
+        hint={
+          previewReady
+            ? 'Your app running live, reloading as the agent changes it.'
+            : 'Nothing is running yet. Ask the agent to start your app.'
+        }
+        disabled={!previewReady || restarting}
+        onClick={() => {
+          if (lastPreview) void restartPreview()
+          else if (staticUrl) pick(() => openPreview(staticUrl))()
+        }}
+      />
+      {previewError && <p className="px-2.5 pb-1.5 text-[11px] text-text-muted">{previewError}</p>}
+      <PickerRow
+        icon={<ViewIcon view="file" md={false} />}
+        title="A file"
+        hint="Any file in the project, as a document, as code, or as a diff."
+        onClick={pick(() => setSearchOpen(true))}
+      />
+      <PickerRow
+        icon={<BranchGlyph size={14} />}
+        title="Changes"
+        hint="Everything changed since your last version, ready to save."
+        onClick={pick(() => openChanges())}
+      />
+      <PickerRow
+        icon={<IconTerminal />}
+        title="Terminal"
+        hint="A shell in this project folder."
+        onClick={pick(() => openTerminal())}
+      />
+      <PickerRow
+        icon={<IconAgents />}
+        title="Agents"
+        hint={
+          hasAgents
+            ? 'The agents this chat handed work to, and what each one did.'
+            : 'This chat has not handed work to any agents yet.'
+        }
+        disabled={!hasAgents}
+        onClick={pick(() => openAgents())}
+      />
+    </div>
   )
 }
 
-// ── The terminal shelf: summoned under the stage; the xterm stays mounted so the pty + scrollback
-//    survive (the shelf only animates height — never unmounts once spawned). ───────────────────────
-const TERM_SHELF_HEIGHT = 280
-function TerminalShelf() {
-  const termOpen = useWorkspace((s) => s.termOpen)
-  const reduce = useReducedMotion()
-  const [spawned, setSpawned] = useState(false)
-  // Height-clipping alone leaves the collapsed xterm in the focus order (its textarea could still
-  // steal keystrokes). So once the collapse animation settles, flip to visibility:hidden — content
-  // stays visible DURING the collapse, then drops out of hit-testing/focus for real.
-  const [settled, setSettled] = useState(false)
-  useEffect(() => {
-    if (termOpen) {
-      setSpawned(true)
-      setSettled(false) // un-hide before the expand animates
-    }
-  }, [termOpen])
-  if (!spawned) return null
+/** One picker row: glyph, name, and the single sentence that says what the surface is for. */
+function PickerRow({
+  icon,
+  title,
+  hint,
+  onClick,
+  disabled = false,
+}: {
+  icon: React.ReactNode
+  title: string
+  hint: string
+  onClick: () => void
+  disabled?: boolean
+}) {
   return (
-    <motion.div
-      animate={{ height: termOpen ? TERM_SHELF_HEIGHT : 0 }}
-      transition={reduce ? { duration: 0 } : { duration: duration.slow, ease: ease.out }}
-      onAnimationComplete={() => {
-        if (!useWorkspace.getState().termOpen) setSettled(true)
-      }}
-      aria-hidden={!termOpen}
-      className={`shrink-0 overflow-hidden ${termOpen ? 'border-t border-border' : ''} ${
-        !termOpen && settled ? 'invisible' : ''
-      }`}
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className="flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-bg disabled:cursor-default disabled:opacity-55 disabled:hover:bg-transparent"
     >
-      {/* Fixed inner height so xterm keeps its size while the shelf animates. */}
-      <div style={{ height: TERM_SHELF_HEIGHT }}>
-        <TerminalSurfaceView />
-      </div>
-    </motion.div>
+      {/* Fixed 14px slot: every row's glyph starts on the same vertical line, whatever its own size. */}
+      <span className="mt-[3px] grid h-[14px] w-[14px] shrink-0 place-items-center text-text-muted">{icon}</span>
+      <span className="min-w-0">
+        <span className="block text-xs font-medium text-text">{title}</span>
+        <span className="block text-[11.5px] leading-snug text-text-muted">{hint}</span>
+      </span>
+    </button>
   )
 }
 
@@ -483,6 +622,17 @@ function SurfacePane({ surface, className = '' }: { surface: FileSurface; classN
 }
 
 // ── Stage icons (inline strokes, currentColor — no icon dep) ───────────────────────────────────────
+// Preview glyph — a browser window (frame + title bar). It goes green when a server is actually
+// answering on the URL, and only then: the old status dot was green even in the picker's
+// nothing-is-running state, which is the one moment it was certain to be wrong.
+function IconWindow({ className }: { className?: string } = {}) {
+  return (
+    <svg className={className} width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M3 9h18M6.5 6.5h.01M9.5 6.5h.01" />
+    </svg>
+  )
+}
 // Terminal glyph — a chevron prompt + a cursor line, the universal shell mark.
 function IconTerminal() {
   return (
@@ -492,7 +642,42 @@ function IconTerminal() {
     </svg>
   )
 }
-// Pin glyph — outline at rest, filled when the stage is pinned.
+// Agents glyph — two small figures, one behind the other: work handed to more than one worker.
+function IconAgents() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <circle cx="9" cy="8" r="3.2" />
+      <path d="M3.5 19a5.5 5.5 0 0 1 11 0" />
+      <path d="M16 6.2a3 3 0 0 1 0 5.6M18.5 19a5.6 5.6 0 0 0-2.2-4.4" />
+    </svg>
+  )
+}
+// Add glyph — the tab strip's "put something else on stage" control.
+function IconPlus() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" aria-hidden>
+      <path d="M12 5v14M5 12h14" />
+    </svg>
+  )
+}
+// Expand/collapse glyphs — the stage taking the full window, and coming back.
+function IconExpand() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" />
+      <path d="M3 3l6 6M21 3l-6 6M3 21l6-6M21 21l-6-6" />
+    </svg>
+  )
+}
+function IconCollapse() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M9 3v6H3M15 3v6h6M9 21v-6H3M15 21v-6h6" />
+    </svg>
+  )
+}
+// Hold view glyph — outline at rest, filled while the tab holds the view. The name keeps the store's
+// `pinned` field readable from here; the word the user reads is "Hold view".
 function IconPin({ filled }: { filled: boolean }) {
   return (
     <svg width="13" height="13" viewBox="0 0 24 24" fill={filled ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>

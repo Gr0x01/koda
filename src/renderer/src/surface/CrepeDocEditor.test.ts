@@ -1,0 +1,180 @@
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createSaveCoalescer, docEditorGuards } from './CrepeDocEditor'
+
+/**
+ * The document surface's two load-bearing rules: reading state blocks the USER without blocking the
+ * agent, and "saved automatically" is a coalesced write rather than a write per keystroke.
+ *
+ * The wiring assertions read the source. This repo's Vitest lane is plain Node, so the rendered Crepe
+ * editor's edit-and-close path is driven by the built-Electron doc-surface assay. What a source check
+ * can hold is the thing most likely to rot silently: that a typed edit still reaches disk through the
+ * contained writer and never becomes an engine turn, and that review copy still names Koda instead
+ * of one engine.
+ */
+const SOURCE = readFileSync(join(__dirname, 'CrepeDocEditor.tsx'), 'utf8')
+
+/** The body of a top-level function declaration, by brace matching from its signature. */
+function functionBody(src: string, signature: string): string {
+  const start = src.indexOf(signature)
+  expect(start, `${signature} is gone from CrepeDocEditor.tsx`).toBeGreaterThan(-1)
+  let depth = 0
+  for (let i = src.indexOf('{', start); i < src.length; i++) {
+    if (src[i] === '{') depth++
+    else if (src[i] === '}' && --depth === 0) return src.slice(start, i + 1)
+  }
+  throw new Error(`unbalanced braces after ${signature}`)
+}
+
+describe('docEditorGuards', () => {
+  it('lets a document be read, selected, and refreshed without being typeable', () => {
+    expect(docEditorGuards({ readOnly: false, editing: false })).toEqual({
+      userEditable: false,
+      acceptsRefresh: true,
+      selectable: true,
+    })
+  })
+
+  it('opens the user path only once Edit is chosen', () => {
+    expect(docEditorGuards({ readOnly: false, editing: true })).toEqual({
+      userEditable: true,
+      acceptsRefresh: true,
+      selectable: true,
+    })
+  })
+
+  it('keeps a truncated file unwritable in either state', () => {
+    for (const editing of [false, true]) {
+      expect(docEditorGuards({ readOnly: true, editing })).toEqual({
+        userEditable: false,
+        acceptsRefresh: false,
+        selectable: false,
+      })
+    }
+  })
+})
+
+describe('createSaveCoalescer', () => {
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  it('turns a burst of keystrokes into one write, after the doc goes idle', async () => {
+    const save = vi.fn(async () => {})
+    const autosave = createSaveCoalescer(save, 50)
+    for (let i = 0; i < 8; i++) {
+      autosave.schedule()
+      await vi.advanceTimersByTimeAsync(10)
+    }
+    expect(save).not.toHaveBeenCalled() // still typing: nothing has been written yet
+    await vi.advanceTimersByTimeAsync(50)
+    expect(save).toHaveBeenCalledTimes(1)
+  })
+
+  it('writes immediately on flush, so an unmount mid-typing keeps the edit', async () => {
+    const save = vi.fn(async () => {})
+    const autosave = createSaveCoalescer(save, 50)
+    autosave.schedule()
+    await autosave.flush() // the Stage tab switch that unmounts the pane
+    expect(save).toHaveBeenCalledTimes(1)
+    // The flush consumed the pending timer rather than leaving a second write behind it.
+    await vi.advanceTimersByTimeAsync(200)
+    expect(save).toHaveBeenCalledTimes(1)
+  })
+
+  it('drops a pending write on cancel', async () => {
+    const save = vi.fn(async () => {})
+    const autosave = createSaveCoalescer(save, 50)
+    autosave.schedule()
+    autosave.cancel()
+    await vi.advanceTimersByTimeAsync(200)
+    expect(save).not.toHaveBeenCalled()
+  })
+
+  it('queues one more pass when a flush lands mid-write, so nothing typed is lost', async () => {
+    const written: string[] = []
+    let text = 'first'
+    // The in-flight write is held open here so the test can decide when it lands.
+    const gate: { release: (() => void) | null } = { release: null }
+    const save = async (): Promise<void> => {
+      const pending = text
+      await new Promise<void>((resolve) => {
+        gate.release = resolve
+      })
+      written.push(pending)
+    }
+    const autosave = createSaveCoalescer(save, 50)
+    autosave.schedule()
+    await vi.advanceTimersByTimeAsync(50)
+    expect(written).toEqual([]) // the first write is in flight, not yet landed
+
+    text = 'second' // the user keeps typing while that write is out
+    const flushed = autosave.flush()
+    gate.release?.()
+    await vi.advanceTimersByTimeAsync(0) // the queued pass starts and blocks on its own promise
+    gate.release?.()
+    await flushed
+    expect(written).toEqual(['first', 'second'])
+  })
+})
+
+describe('the direct-edit path', () => {
+  it('reaches disk through the contained writer and never through the engine', () => {
+    const save = functionBody(SOURCE, 'async function save()')
+    expect(save).toContain('window.koda.writeFile')
+    expect(save).not.toContain('sendCanvasEdit')
+    // The one engine call in this surface is the selection ask — a deliberate turn the user sends.
+    expect(SOURCE.match(/sendCanvasEdit\(\{/g)).toHaveLength(1)
+    expect(functionBody(SOURCE, 'async function askCanvas(')).toContain('sendCanvasEdit({')
+  })
+
+  it('registers its coalesced writer and keeps the unmount flush alive through cleanup', () => {
+    expect(SOURCE).toContain('registerFileWriter(path, surfacePath, async () => {')
+    expect(SOURCE).toContain('void autosave.flush().catch(() => {}).finally(unregister)')
+  })
+
+  it('keeps the body reachable after the editor is torn down', () => {
+    // Milkdown's markdown listener is debounced 200ms and cancelled on destroy, so the last
+    // keystrokes before a tab switch exist only inside the editor. Reading it in the teardown, before
+    // `destroy()`, is what the unmount flush then writes; without it a fast close loses them.
+    const mountStart = SOURCE.indexOf('const crepe = new Crepe(')
+    const teardown = SOURCE.slice(mountStart, SOURCE.indexOf('}, [path])', mountStart))
+    expect(teardown).toMatch(/finalBodyRef\.current = crepe\.getMarkdown\(\)[\s\S]*crepe\.destroy\(\)/)
+    // And a save prefers the live editor over that snapshot, so an ordinary save is never one behind.
+    expect(functionBody(SOURCE, 'async function save()')).toContain(
+      'crepeRef.current?.getMarkdown() ?? finalBodyRef.current',
+    )
+  })
+
+  it('keeps every write behind the one save that checkpoints', () => {
+    // Revert also drains through autosave; a second writer could race a confirmed sidebar delete.
+    expect(SOURCE.match(/window\.koda\.writeFile\(/g)).toHaveLength(1)
+    expect(functionBody(SOURCE, 'async function revertReview()')).toContain('await autosave.flush()')
+  })
+})
+
+describe('agent-edit review', () => {
+  it('names Koda, not the engine behind it', () => {
+    expect(SOURCE).toContain('Koda changed 1 passage')
+    for (const engine of ['Claude', 'Codex', 'Anthropic', 'OpenAI']) {
+      expect(SOURCE.includes(`>${engine}`), `${engine} appears in doc-surface copy`).toBe(false)
+      expect(SOURCE.includes(`${engine} edited`), `${engine} appears in doc-surface copy`).toBe(false)
+    }
+  })
+
+  it('offers Revert and Accept edit, and no third meaning for Keep', () => {
+    expect(SOURCE).toContain('Accept edit')
+    expect(SOURCE).toContain('Revert')
+    expect(SOURCE).not.toMatch(/>\s*Keep\s*</)
+  })
+
+  it('announces itself to a screen reader', () => {
+    const review = SOURCE.slice(SOURCE.indexOf('Koda changed 1 passage') - 800, SOURCE.indexOf('Koda changed 1 passage'))
+    expect(review).toContain('role="status"')
+  })
+
+  it('still treats the user typing over a pending agent edit as acceptance', () => {
+    // Revert must never be able to discard writing the user did on top of the agent's change.
+    expect(SOURCE).toMatch(/if \(dirty && review !== null\) setReview\(null\)/)
+  })
+})

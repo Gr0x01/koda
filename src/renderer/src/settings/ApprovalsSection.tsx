@@ -35,10 +35,13 @@ export function ApprovalsSection() {
   const value: ApprovalMode = defaultApprovalMode === 'plan' ? 'auto' : defaultApprovalMode
 
   return (
-    <SettingsSection title="Approvals">
+    <SettingsSection
+      title="Approvals"
+      note="You can change this per session from the session header. Destructive git operations and recovery always confirm, in every mode."
+    >
       <SettingsRow
         label="Default mode for new sessions"
-        description="How much the agent checks with you before acting. You can change this per session in the session header. Destructive git operations and recovery always confirm, in every mode."
+        description="How much the agent checks with you before it edits a file or runs a command."
         control={
           <SegmentedControl
             ariaLabel="Default approval mode"
@@ -50,7 +53,7 @@ export function ApprovalsSection() {
       />
       <SettingsRow
         label="Start preview automatically"
-        description="Let the agent start the live-preview dev server on its own. Turn off to confirm each time before Koda runs a server."
+        description="Let the agent start the live-preview dev server without asking you first."
         control={
           <Toggle
             checked={previewAutoStart ?? true}
@@ -74,16 +77,11 @@ export function BrowserTestingRow() {
   return (
     <SettingsRow
       label="Browser testing"
-      description={
-        <>
-          Let the agent open a real browser to confirm your work actually works, clicking through pages,
-          not just looking at them. Uses Google Chrome if you have it; otherwise downloads a browser
-          (~150 MB) once, shared across all your projects.
-          {pw?.enabled && <BrowserTestingStatus status={pw} />}
-        </>
-      }
+      description="Let the agent open a real browser and click through your work to confirm it behaves."
       control={<Toggle checked={pw?.enabled ?? false} onChange={toggle} label="Browser testing" />}
-    />
+    >
+      {pw?.enabled && <BrowserTestingStatus status={pw} />}
+    </SettingsRow>
   )
 }
 
@@ -101,8 +99,8 @@ function BrowserTestingStatus({ status }: { status: PlaywrightStatus }) {
     state === 'ready' ? 'text-emerald-500' : state === 'error' ? 'text-red-500' : 'text-text-muted'
   // Anything not settled (ready) or failed (error) is in flight — installing or still preparing.
   if (state !== 'ready' && state !== 'error')
-    return <BusyText className={`mt-1 ${tone}`}>{text}</BusyText>
-  return <span className={`mt-1 block ${tone}`}>{text}</span>
+    return <BusyText className={`text-[12.5px] ${tone}`}>{text}</BusyText>
+  return <span className={`block text-[12.5px] ${tone}`}>{text}</span>
 }
 
 /** One provisionable runtime row (Node / Python) — owns its status + progress, tracks only its own
@@ -120,15 +118,14 @@ export function RuntimeRow({
   const name = label.replace(/ runtime$/i, '')
 
   return (
-    <>
-      <SettingsRow
-        label={label}
-        description={description}
-        control={<RuntimeControl status={status} installing={installing} onInstall={install} />}
-      />
+    <SettingsRow
+      label={label}
+      description={description}
+      control={<RuntimeControl status={status} installing={installing} onInstall={install} />}
+    >
       {installing && progress && (
-        <div className="mt-1 space-y-1.5">
-          <div className="h-1.5 overflow-hidden rounded-full bg-surface">
+        <div className="space-y-1.5">
+          <div className="h-1.5 overflow-hidden rounded-full bg-border/60">
             <div
               className="h-full rounded-full bg-accent transition-[width] duration-base"
               style={{ width: `${Math.round((progress.progress ?? (progress.phase === 'download' ? 0 : 1)) * 100)}%` }}
@@ -137,8 +134,8 @@ export function RuntimeRow({
           <p className="text-[12px] text-text-muted">{progress.message}</p>
         </div>
       )}
-      {error && <p className="mt-1 text-[12px] text-red-500">Couldn't set up {name}: {error}</p>}
-    </>
+      {error && <p className="text-[12px] text-red-500">Couldn't set up {name}: {error}</p>}
+    </SettingsRow>
   )
 }
 

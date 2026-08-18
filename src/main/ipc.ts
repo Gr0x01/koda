@@ -12,6 +12,7 @@ import {
   AppInfoSchema,
   FeedbackRequestSchema,
   EngineProbeSchema,
+  ProviderModelCatalogsSchema,
   StartSessionRequestSchema,
   StartSessionResponseSchema,
   SendTurnRequestSchema,
@@ -38,10 +39,17 @@ import {
   SetModelEffortSchema,
   ApprovalModeSchema,
   ApprovalRequestsSchema,
-  AssistTitleRequestSchema,
-  AssistTitleResponseSchema,
+  TaskCompletionStatesSchema,
+  SessionNameRequestSchema,
+  SessionNameResponseSchema,
   ReadDirRequestSchema,
   ListDocsResultSchema,
+  LibraryResolveRequestSchema,
+  LibraryResolveResultSchema,
+  LibraryQueryRequestSchema,
+  LibraryQueryResultSchema,
+  LibraryAskRequestSchema,
+  LibraryAskResultSchema,
   ReadDirResultSchema,
   ReadFileRequestSchema,
   ReadFileResultSchema,
@@ -86,6 +94,8 @@ import {
   GitInitResultSchema,
   GitCommitRequestSchema,
   GitCommitPathsRequestSchema,
+  GitProposeMessageRequestSchema,
+  GitProposeMessageResultSchema,
   GitRenameHeadRequestSchema,
   GitRestoreRequestSchema,
   GitDiscardFileRequestSchema,
@@ -159,26 +169,31 @@ import { EngineSessionManager } from './engine/sessions'
 import { DreamScheduler } from './engine/dream'
 import { loadUsageHistory } from './engine/usage-history'
 import { currentProviderStatus, refreshProviderStatus, setStatusWatchHooks } from './engine/status-watch'
-import { assistTitle } from './assist'
 import {
   browseDir,
   createProjectDir,
   createProjectFile,
+  deleteProjectDocument,
   deleteProjectPath,
   duplicateProjectPath,
   importFilesIntoProject,
   diffProjectFile,
   listProjectDocs,
+  resolveProjectDocs,
+  queryLibrary,
   readProjectFile,
+  prepareProjectDocumentDelete,
   renameProjectPath,
   replaceInProject,
   searchProject,
   writeProjectFile,
   containedReal,
   isDisplayableImage,
+  type ProjectDocumentDeleteTarget,
 } from './fs-browse'
+import { askLibrary } from './library-ask'
 import { watchProjectFile, unwatchProjectFile } from './file-watch'
-import { watchProjectDocs, unwatchProjectDocs } from './docs-watch'
+import { notifyProjectDocsMutation, watchProjectDocs, unwatchProjectDocs } from './docs-watch'
 import {
   branchFileDiff,
   commitAll,
@@ -189,6 +204,7 @@ import {
   detectRepo,
   discardBranch,
   getBranchOverview,
+  getChangeEvidence,
   getCommitGraph,
   getMergedStrays,
   getStatus,
@@ -227,11 +243,12 @@ import {
 import {
   loadRecentModels,
   addRecentModel,
+  loadLastPosture,
+  saveLastPosture,
   loadSettings,
   settingsHealth,
   updateSettings,
   resetSettings,
-  loadScratchRetentionDays,
   loadMiniAppsEnabled,
 } from './settings'
 import { deleteProjectApps, listMiniApps, startRegisteredMiniApp, onMiniAppsChanged } from './mini-apps'
@@ -243,7 +260,13 @@ import {
   disposeRemoteControl,
 } from './remote-control'
 import { staticPreviewUrl, previewAssetUrl, startDevServer, showStaticPreview } from './preview'
-import { saveScratchImage, listScratchImages } from './scratch'
+import { listScratchImages } from './scratch'
+import {
+  applyScratchRetentionSetting,
+  pruneProjectScratch,
+  saveScratchWithRetention,
+} from './scratch-retention'
+import { healGuidelinesPair } from './guidelines'
 import { readDocMeta, writeDocMeta } from './docmeta'
 import {
   listGuardrails,
@@ -268,9 +291,19 @@ import { startCodexLogin, cancelCodexLogin } from './engine/codex-auth'
 import { hasApiKey, setApiKey, clearApiKey } from './api-key'
 import { reconcileCodexAuth } from './engine/codex-home'
 import { log } from './logger'
+import {
+  HERMETIC_E2E_BLOCK_REASON,
+  isHermeticE2EProfile,
+  requireRealAccountAccess,
+} from './runtime-profile'
 
 let engineSessions: EngineSessionManager | null = null
 let dreamScheduler: DreamScheduler | null = null
+const libraryAskControllers = new Map<string, AbortController>()
+
+function libraryAskKey(sender: WebContents, requestId: string): string {
+  return `${sender.id}:${requestId}`
+}
 
 /** Dev-menu live-fire of the whole dream, including separately gated REM. */
 export function runDreamNow(): void {
@@ -289,10 +322,18 @@ function rootForSender(sender: WebContents): string {
   return path
 }
 
+/** A successful Koda-owned filesystem mutation invalidates main's Library cache and wakes every open
+ * Library on this project before the IPC result is handed back. */
+async function withProjectDocsRefresh<T>(root: string, mutate: () => Promise<T>): Promise<T> {
+  const result = await mutate()
+  notifyProjectDocsMutation(root)
+  return result
+}
+
 /**
  * Checkpoint before a CONTENT-DESTROYING edit, and refuse the edit outright when no recovery point
- * could be taken. `checkpointProjectEdit` is fail-soft by design and only reports failure through its
- * return value; dropping that boolean leaves the user believing in an undo that no longer exists.
+ * could be taken. The project mutation boundary stays held through `mutate`, so a new agent turn
+ * cannot establish its ownership baseline between the checkpoint and the user's actual write.
  *
  * Only destroying actions route through here — the user loses nothing by the refusal (their content is
  * untouched) and everything by proceeding blind. Additive actions (create, duplicate, import, add a
@@ -302,10 +343,21 @@ function rootForSender(sender: WebContents): string {
  *
  * `refusal` completes the sentence: what did NOT happen, in the user's terms.
  */
-async function requireCheckpoint(root: string, label: string, refusal: string): Promise<void> {
-  if (!(await getEngineSessions().checkpointProjectEdit(root, label))) {
-    throw new Error(`${NO_UNDO_POINT}, so ${refusal}`)
-  }
+async function withRequiredCheckpoint<T>(
+  root: string,
+  label: string,
+  refusal: string,
+  mutate: () => T | Promise<T>,
+  checkpointFile?: ProjectDocumentDeleteTarget,
+): Promise<T> {
+  return getEngineSessions().withExternalProjectMutation(
+    root,
+    { checkpointLabel: label, checkpointFile },
+    (checkpointed) => {
+      if (!checkpointed) throw new Error(`${NO_UNDO_POINT}, so ${refusal}`)
+      return mutate()
+    },
+  )
 }
 
 /** The Settings words for a guardrail item. `subagent` is our word, not the user's — that screen
@@ -354,6 +406,8 @@ export function getEngineSessions(): EngineSessionManager {
 /** Tear down all live sessions on shutdown; safe to call before registration. Also stops the remote
  *  LAN server + cloud relay (their connections must not outlive the app). */
 export async function disposeEngineSessions(): Promise<void> {
+  for (const controller of libraryAskControllers.values()) controller.abort()
+  libraryAskControllers.clear()
   await disposeRemoteControl()
   await engineSessions?.disposeAll()
 }
@@ -414,10 +468,31 @@ export function registerIpcHandlers(): void {
 
   ipcMain.handle(IpcChannels.startSession, async (event, rawArgs: unknown) => {
     const args = StartSessionRequestSchema.parse(rawArgs)
+    const rawRecord = rawArgs && typeof rawArgs === 'object' ? (rawArgs as Record<string, unknown>) : {}
+    const hasFreshPostureOverride = ['engineId', 'model', 'effort'].some((key) =>
+      Object.prototype.hasOwnProperty.call(rawRecord, key),
+    )
     // Pass the owning window so start() registers ownership + resolves the project cwd BEFORE spawn
     // (so the first event routes correctly and a fresh session runs in this window's project).
     const ownerWindowId = BrowserWindow.fromWebContents(event.sender)?.id
-    return StartSessionResponseSchema.parse(await getEngineSessions().start({ ...args, ownerWindowId }))
+    if (args.sessionId) {
+      return StartSessionResponseSchema.parse(
+        await getEngineSessions().start({ ...args, ownerWindowId }),
+      )
+    }
+
+    // Main owns the app-wide next-chat posture. A plain fresh start hydrates it here, which makes a
+    // phone pick survive even when no renderer was open. Callers such as handoff may deliberately pass
+    // all three fields (including explicit undefined to clear a field) as a one-start override.
+    const remembered = hasFreshPostureOverride ? {} : loadLastPosture()
+    const posture = {
+      engineId: args.engineId ?? remembered.engineId ?? ('claude' as const),
+      model: hasFreshPostureOverride ? args.model : remembered.model,
+      effort: hasFreshPostureOverride ? args.effort : remembered.effort,
+    }
+    const started = await getEngineSessions().start({ ...args, ...posture, ownerWindowId })
+    if (hasFreshPostureOverride) saveLastPosture(posture)
+    return StartSessionResponseSchema.parse({ ...started, ...posture })
   })
 
   ipcMain.handle(IpcChannels.sendTurn, async (_event, rawArgs: unknown) => {
@@ -476,12 +551,17 @@ export function registerIpcHandlers(): void {
     try {
       root = rootForSender(event.sender)
     } catch {
-      return { ok: true, data: null, droppedSessions: 0 }
+      return { ok: true, data: null, droppedSessions: 0, unreadableArchiveBodyIds: [] }
     }
     const report: StoreReadReport = { dropped: 0 }
     try {
       const data = getEngineSessions().loadSessionsForProject(root, report)
-      return { ok: true, data, droppedSessions: report.dropped }
+      return {
+        ok: true,
+        data,
+        droppedSessions: report.dropped,
+        unreadableArchiveBodyIds: report.unreadableArchiveBodyIds ?? [],
+      }
     } catch (err) {
       log.warn('ipc', 'session store load failed', err instanceof Error ? err.message : err)
       return { ok: false, backupKept: err instanceof StoreReadError ? err.backupKept : null }
@@ -503,13 +583,14 @@ export function registerIpcHandlers(): void {
     }
   })
 
-  ipcMain.on(IpcChannels.sessionsSave, (event, rawArgs: unknown) => {
+  ipcMain.handle(IpcChannels.sessionsSave, (event, rawArgs: unknown): boolean => {
     const parsed = PersistedSessionsSchema.safeParse(rawArgs)
-    if (!parsed.success) return // bad shape dropped, never thrown (persistence isn't a crash vector)
+    if (!parsed.success) return false // bad shape dropped, never thrown (persistence isn't a crash vector)
     try {
-      getEngineSessions().persistProjectSessions(rootForSender(event.sender), parsed.data)
+      return getEngineSessions().persistProjectSessions(rootForSender(event.sender), parsed.data)
     } catch {
       /* no project for this window yet — nothing to persist */
+      return false
     }
   })
 
@@ -566,11 +647,11 @@ export function registerIpcHandlers(): void {
 
   ipcMain.handle(IpcChannels.archivedWriteBody, (event, rawArgs: unknown) => {
     const parsed = z.object({ id: z.string(), items: z.array(z.unknown()) }).safeParse(rawArgs)
-    if (!parsed.success) return
+    if (!parsed.success) return false
     try {
-      writeArchivedBody(rootForSender(event.sender), parsed.data.id, parsed.data.items)
+      return writeArchivedBody(rootForSender(event.sender), parsed.data.id, parsed.data.items)
     } catch {
-      /* no project for this window yet */
+      return false // no project for this window yet, or the body write failed
     }
   })
 
@@ -627,6 +708,12 @@ export function registerIpcHandlers(): void {
     ApprovalRequestsSchema.parse(getEngineSessions().pendingRequestsForProject(rootForSender(event.sender))),
   )
 
+  ipcMain.handle(IpcChannels.completionList, async (event) =>
+    TaskCompletionStatesSchema.parse(
+      await getEngineSessions().completionStatesForProject(rootForSender(event.sender)),
+    ),
+  )
+
   // Model/effort pick-time push — records intent + broadcasts ModelEffortChanged (no respawn; the
   // renderer reattaches lazily on its next turn). Mirrors approvalSetMode.
   ipcMain.handle(IpcChannels.modelEffortSet, (_event, rawArgs: unknown) => {
@@ -640,10 +727,17 @@ export function registerIpcHandlers(): void {
     const { model } = AddRecentModelSchema.parse(rawArgs)
     return addRecentModel(model)
   })
+  ipcMain.handle(IpcChannels.modelsGetProviderCatalogs, async () =>
+    ProviderModelCatalogsSchema.parse(await getEngineSessions().modelProviderCatalogs()),
+  )
   ipcMain.handle(IpcChannels.codexModels, () => getEngineSessions().codexModels())
   ipcMain.handle(IpcChannels.codexAuthStatus, () => getEngineSessions().codexAuthStatus())
   ipcMain.handle(IpcChannels.codexLoginStart, () =>
-    AuthLoginStartResultSchema.parse(startCodexLogin()),
+    AuthLoginStartResultSchema.parse(
+      isHermeticE2EProfile()
+        ? { ok: false, reason: HERMETIC_E2E_BLOCK_REASON }
+        : startCodexLogin(),
+    ),
   )
   ipcMain.handle(IpcChannels.codexLoginCancel, () => {
     cancelCodexLogin('cancelled')
@@ -653,26 +747,38 @@ export function registerIpcHandlers(): void {
   // it, and — for a default-mode change — also updates the live gate so new sessions in already-open
   // windows start in the new posture without a restart. Returns the full, re-clamped settings.
   ipcMain.handle(IpcChannels.settingsGet, () => KodaSettingsSchema.parse(loadSettings()))
-  ipcMain.handle(IpcChannels.settingsSet, (_event, rawArgs: unknown) => {
+  ipcMain.handle(IpcChannels.settingsSet, async (_event, rawArgs: unknown) => {
     const patch = KodaSettingsPatchSchema.parse(rawArgs)
     // Activation-funnel signal: fire once when onboarding finishes. Order matters — updateSettings
     // persists hasOnboarded:true first, so track()'s hasOnboarded send-gate is already open.
     const justOnboarded = patch.hasOnboarded === true && !loadSettings().hasOnboarded
-    const next = updateSettings(patch)
+    // Every production prune shares the retention lane. Put persistence inside it so an older,
+    // shorter policy cannot keep deleting after a longer/Forever preference has been saved.
+    const next =
+      patch.scratchRetentionDays !== undefined
+        ? await applyScratchRetentionSetting(() => updateSettings(patch))
+        : updateSettings(patch)
     if (justOnboarded) track('onboarding_completed', {})
     if (patch.defaultApprovalMode !== undefined)
       getEngineSessions().setDefaultApprovalMode(next.defaultApprovalMode)
     if (patch.previewAutoStart !== undefined)
       getEngineSessions().setPreviewAutoStart(next.previewAutoStart)
     if (patch.dreamEnabled !== undefined) dream.recheck() // toggled on late-evening should still dream tonight
+    // A retention change was persisted and pruned above; closed projects take the same lane when
+    // Recent images loads on their next open.
     // Settings are app-global — fan the new values out to every window so per-window live gates (the
     // notification pref, each renderer's default posture) re-sync without a restart.
     const settings = KodaSettingsSchema.parse(next)
-    for (const win of BrowserWindow.getAllWindows()) win.webContents.send(IpcChannels.uiSettingsChanged, settings)
+    for (const win of BrowserWindow.getAllWindows()) {
+      win.webContents.send(IpcChannels.uiSettingsChanged, settings)
+    }
     return settings
   })
-  ipcMain.handle(IpcChannels.settingsReset, () => {
-    const settings = KodaSettingsSchema.parse(resetSettings())
+  ipcMain.handle(IpcChannels.settingsReset, async () => {
+    // DEV reset also changes retention back to its default, so it must share the policy lane too.
+    const settings = KodaSettingsSchema.parse(
+      await applyScratchRetentionSetting(() => resetSettings()),
+    )
     for (const win of BrowserWindow.getAllWindows()) win.webContents.send(IpcChannels.uiSettingsChanged, settings)
     return settings
   })
@@ -757,13 +863,7 @@ export function registerIpcHandlers(): void {
   // main (renderer never names a cwd); retention is read live so a settings change applies next save.
   ipcMain.handle(IpcChannels.scratchSave, async (event, rawArgs: unknown) => {
     const { mediaType, dataBase64, fileName } = ScratchSaveRequestSchema.parse(rawArgs)
-    const path = await saveScratchImage(
-      rootForSender(event.sender),
-      mediaType,
-      dataBase64,
-      loadScratchRetentionDays(),
-      fileName,
-    )
+    const path = await saveScratchWithRetention(rootForSender(event.sender), mediaType, dataBase64, fileName)
     return ScratchSaveResultSchema.parse({ path })
   })
 
@@ -807,7 +907,9 @@ export function registerIpcHandlers(): void {
   })
 
   // Page through the window project's recent scratch images (newest first) for the Recent images strip.
-  // Root is resolved in main; a no-project window returns an empty page.
+  // The first page enforces retention before counting, so opening a quiet project cleans it even when
+  // no newer attachment was ever sent. Later pages do not prune: deleting the tail between offsets
+  // would shift pagination. Root is resolved in main; a no-project window returns an empty page.
   ipcMain.handle(IpcChannels.scratchList, async (event, rawArgs: unknown) => {
     const { offset, limit } = ScratchListRequestSchema.parse(rawArgs)
     let root: string
@@ -816,6 +918,7 @@ export function registerIpcHandlers(): void {
     } catch {
       return ScratchListResultSchema.parse({ images: [], total: 0 })
     }
+    if (offset === 0) await pruneProjectScratch(root)
     return ScratchListResultSchema.parse(await listScratchImages(root, offset, limit))
   })
 
@@ -847,7 +950,7 @@ export function registerIpcHandlers(): void {
     if (key) await writeDocMeta(key.root, key.rel, meta)
   })
 
-  // How heavy this project's always-injected memory pair is (status-bar tidy pill + Settings →
+  // How heavy this project's memory navigation pair is (status-bar tidy pill + Settings →
   // Memory). A no-project window has no memory to weigh.
   ipcMain.handle(IpcChannels.memoryWeight, (event) => {
     let root: string
@@ -906,8 +1009,12 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(IpcChannels.guardrailsSave, async (event, rawArgs: unknown) => {
     const req = GuardrailSaveRequestSchema.parse(rawArgs)
     const root = rootForSender(event.sender)
-    const res = await saveGuardrail(root, req, () =>
-      getEngineSessions().checkpointProjectEdit(root, `add ${req.kind}`),
+    const res = await saveGuardrail(root, req, (write) =>
+      getEngineSessions().withExternalProjectMutation(
+        root,
+        { checkpointLabel: `add ${req.kind}` },
+        () => write(),
+      ),
     )
     return GuardrailSaveResultSchema.parse(res)
   })
@@ -915,14 +1022,16 @@ export function registerIpcHandlers(): void {
   // Switch a bundled Koda default off/on for this project. Persists to .koda/guardrails.json; the
   // engine reads the disabled set at the next session spawn. No checkpoint — a toggle is trivially
   // reversible (flip it back), and it's config, not the agent editing the user's content.
-  ipcMain.handle(IpcChannels.guardrailsSetEnabled, (event, rawArgs: unknown) => {
+  ipcMain.handle(IpcChannels.guardrailsSetEnabled, async (event, rawArgs: unknown) => {
     const { key, enabled } = GuardrailSetEnabledRequestSchema.parse(rawArgs)
     const root = rootForSender(event.sender)
     // A pristine principle's toggle fans out to its member rule ids; a CUSTOMIZED principle (has an
     // override) toggles the override itself via its principle key; a skill/subagent key passes through.
     const overridden = key.startsWith('principle:') && key.slice('principle:'.length) in readOverrides(root)
     const keys = overridden ? [key] : principleMemberKeys(key, app.isPackaged ? process.resourcesPath : undefined)
-    setGuardrailsDisabled(root, keys, !enabled)
+    await getEngineSessions().withExternalProjectMutation(root, {}, () =>
+      setGuardrailsDisabled(root, keys, !enabled),
+    )
   })
 
   // Save an edited skill/subagent body into this project (forks a Koda default; overwrites a project
@@ -931,8 +1040,13 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(IpcChannels.guardrailsSaveItemBody, async (event, rawArgs: unknown) => {
     const { kind, name, content } = GuardrailSaveItemBodyRequestSchema.parse(rawArgs)
     const root = rootForSender(event.sender)
-    const res = await saveItemBody(root, { kind, name }, content, () =>
-      requireCheckpoint(root, `edit ${kind} ${name}`, `your ${guardrailItemNoun(kind)} was left as it was.`),
+    const res = await saveItemBody(root, { kind, name }, content, (write) =>
+      withRequiredCheckpoint(
+        root,
+        `edit ${kind} ${name}`,
+        `your ${guardrailItemNoun(kind)} was left as it was.`,
+        write,
+      ),
     )
     return GuardrailSaveResultSchema.parse(res)
   })
@@ -942,8 +1056,8 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(IpcChannels.guardrailsRemoveItem, async (event, rawArgs: unknown) => {
     const ref = GuardrailItemRefSchema.parse(rawArgs)
     const root = rootForSender(event.sender)
-    await removeGuardrailItem(root, ref, () =>
-      requireCheckpoint(root, `remove ${ref.kind} ${ref.name}`, 'nothing was removed.'),
+    await removeGuardrailItem(root, ref, (write) =>
+      withRequiredCheckpoint(root, `remove ${ref.kind} ${ref.name}`, 'nothing was removed.', write),
     )
   })
 
@@ -953,8 +1067,9 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(IpcChannels.guardrailsSetRuleOverride, async (event, rawArgs: unknown) => {
     const { principleId, text } = GuardrailRuleOverrideRequestSchema.parse(rawArgs)
     const root = rootForSender(event.sender)
-    await requireCheckpoint(root, `edit rule ${principleId}`, 'the rule was left as it was.')
-    setRuleOverride(root, app.isPackaged ? process.resourcesPath : undefined, principleId, text)
+    await withRequiredCheckpoint(root, `edit rule ${principleId}`, 'the rule was left as it was.', () =>
+      setRuleOverride(root, app.isPackaged ? process.resourcesPath : undefined, principleId, text),
+    )
   })
 
   // The skills gallery (Settings → Skills): the bundled Apache-2.0 catalog with each skill's active
@@ -994,8 +1109,12 @@ export function registerIpcHandlers(): void {
       userData,
       projectRoot: root,
       resourcesPath,
-      beforeWrite: () =>
-        getEngineSessions().checkpointProjectEdit(root, `${active ? 'add' : 'remove'} skill ${id}`),
+      writeBoundary: <T>(write: () => T | Promise<T>): Promise<T> =>
+        getEngineSessions().withExternalProjectMutation(
+          root,
+          { checkpointLabel: `${active ? 'add' : 'remove'} skill ${id}` },
+          () => write(),
+        ),
     } as const
     await (active ? activateSkill(opts) : deactivateSkill(opts))
   })
@@ -1103,6 +1222,7 @@ export function registerIpcHandlers(): void {
   // 'auto' mode: the renderer confirmed continuing on the API key after a plan-limit rejection. Mark the
   // key effective until the window resets; the renderer drops live sessions so they reattach on API.
   ipcMain.handle(IpcChannels.billingActivateFallback, async (_event, rawArgs: unknown) => {
+    requireRealAccountAccess()
     const { until } = ApiFallbackRequestSchema.parse(rawArgs)
     // Cap how far out the fallback can run — this is the one value that prolongs real-money billing, so a
     // bogus far-future resetsAt can't keep the API key effective indefinitely (weekly windows are ≤7d).
@@ -1113,6 +1233,7 @@ export function registerIpcHandlers(): void {
   })
 
   ipcMain.handle(IpcChannels.billingSaveApiKey, async (_event, rawKey: unknown) => {
+    requireRealAccountAccess()
     const parsed = ApiKeySchema.safeParse(rawKey)
     if (!parsed.success) return BillingSaveResultSchema.parse({ ok: false, error: 'Enter your API key.' })
     const key = parsed.data
@@ -1139,6 +1260,7 @@ export function registerIpcHandlers(): void {
   })
 
   ipcMain.handle(IpcChannels.billingRemoveApiKey, async () => {
+    requireRealAccountAccess()
     clearApiKey()
     updateSettings({ billingMode: 'subscription' })
     broadcastSettings()
@@ -1151,6 +1273,7 @@ export function registerIpcHandlers(): void {
   const codexResourcesPath = (): string | undefined =>
     app.isPackaged ? process.resourcesPath : undefined
   ipcMain.handle(IpcChannels.billingSaveCodexApiKey, async (_event, rawKey: unknown) => {
+    requireRealAccountAccess()
     const parsed = ApiKeySchema.safeParse(rawKey)
     if (!parsed.success) return BillingSaveResultSchema.parse({ ok: false, error: 'Enter your API key.' })
     const key = parsed.data
@@ -1172,6 +1295,7 @@ export function registerIpcHandlers(): void {
   })
 
   ipcMain.handle(IpcChannels.billingRemoveCodexApiKey, async () => {
+    requireRealAccountAccess()
     clearApiKey('codex')
     updateSettings({ codexBillingMode: 'subscription' })
     // Restore the ChatGPT login (backed up when we switched to the key).
@@ -1183,11 +1307,11 @@ export function registerIpcHandlers(): void {
   // ── Remote Control + cloud relay (Settings → Remote) — handlers live with the seam ──
   registerRemoteIpcHandlers(broadcastSettings)
 
-  // Local-assist: clean session title (on-device model, deterministic fallback). assistTitle()
-  // never rejects — it always resolves to a usable string — so this handler can't throw.
-  ipcMain.handle(IpcChannels.assistTitle, async (_event, rawArgs: unknown) => {
-    const { text, avoid } = AssistTitleRequestSchema.parse(rawArgs)
-    return AssistTitleResponseSchema.parse({ title: await assistTitle(text, avoid) })
+  // Name a session through the app-global writer. The request carries evidence, never an execution
+  // directory; model children run from the neutral one-shot cwd. Every miss resolves to the floor.
+  ipcMain.handle(IpcChannels.sessionName, async (_event, rawArgs: unknown) => {
+    const args = SessionNameRequestSchema.parse(rawArgs)
+    return SessionNameResponseSchema.parse(await getEngineSessions().nameSession(args))
   })
 
   // Project Files browser — read-only, contained to the project root in fs-browse. A bad/escaping
@@ -1202,6 +1326,15 @@ export function registerIpcHandlers(): void {
     const root = rootForSender(event.sender)
     const docs = await listProjectDocs(root)
     return ListDocsResultSchema.parse({ root, docs })
+  })
+
+  // Refresh remembered shortcuts by their exact project-relative identities. Unlike fs:listDocs,
+  // this does not walk or inherit the 300-row discovery cap; main still owns the identical Library
+  // eligibility and metadata rules, and silently omits paths that have gone stale.
+  ipcMain.handle(IpcChannels.libraryResolve, async (event, rawArgs: unknown) => {
+    const { rels } = LibraryResolveRequestSchema.parse(rawArgs)
+    const root = rootForSender(event.sender)
+    return LibraryResolveResultSchema.parse({ root, docs: await resolveProjectDocs(root, rels) })
   })
 
   ipcMain.handle(IpcChannels.fsReadFile, async (event, rawArgs: unknown) => {
@@ -1276,14 +1409,28 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(IpcChannels.fsWriteFile, async (event, rawArgs: unknown) => {
     const { path, content } = WriteFileRequestSchema.parse(rawArgs)
     const root = rootForSender(event.sender)
-    const checkpointed = await getEngineSessions().checkpointProjectEdit(root, `edit to ${basename(path)}`)
-    return WriteFileResultSchema.parse({ path: await writeProjectFile(root, path, content), checkpointed })
+    return getEngineSessions().withExternalProjectMutation(
+      root,
+      { checkpointLabel: `edit to ${basename(path)}` },
+      async (checkpointed) =>
+        withProjectDocsRefresh(root, async () =>
+          WriteFileResultSchema.parse({ path: await writeProjectFile(root, path, content), checkpointed }),
+        ),
+    )
   })
 
   // Create a new empty document in Documents/ or a selected contained folder, then return its path.
+  // `source` is the session the user made it from — it lands in the file's own `source:` frontmatter
+  // rather than the docmeta sidecar, because the sidecar is keyed by a hash of the relative path and
+  // so dies on the rename or move that is exactly when "where did this come from" is worth the most.
   ipcMain.handle(IpcChannels.fsCreateFile, async (event, rawArgs: unknown) => {
-    const { name, parent } = CreateFileRequestSchema.parse(rawArgs)
-    return CreateFileResultSchema.parse({ path: await createProjectFile(rootForSender(event.sender), name, parent) })
+    const { name, parent, source } = CreateFileRequestSchema.parse(rawArgs)
+    const root = rootForSender(event.sender)
+    return getEngineSessions().withExternalProjectMutation(root, {}, async () =>
+      withProjectDocsRefresh(root, async () =>
+        CreateFileResultSchema.parse({ path: await createProjectFile(root, name, parent, source) }),
+      ),
+    )
   })
 
   // Rename/move a file/folder. Checkpoint the pre-move tree FIRST (so it's recoverable like an engine
@@ -1293,18 +1440,36 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(IpcChannels.fsRenamePath, async (event, rawArgs: unknown) => {
     const { from, to } = RenamePathRequestSchema.parse(rawArgs)
     const root = rootForSender(event.sender)
-    await getEngineSessions().checkpointProjectEdit(root, `rename ${basename(from)}`)
-    return RenamePathResultSchema.parse({ path: await renameProjectPath(root, from, to) })
+    return getEngineSessions().withExternalProjectMutation(
+      root,
+      { checkpointLabel: `rename ${basename(from)}` },
+      async () =>
+        withProjectDocsRefresh(root, async () =>
+          RenamePathResultSchema.parse({ path: await renameProjectPath(root, from, to) }),
+        ),
+    )
   })
 
   // Delete a file/folder. Checkpoint first so the delete is undoable from the recovery timeline — and
   // REFUSE if that undo point can't be taken, like the bulk replace. A delete with no checkpoint
   // behind it is unrecoverable, and the tree's own copy promises it can be undone.
   ipcMain.handle(IpcChannels.fsDeletePath, async (event, rawArgs: unknown) => {
-    const { path } = DeletePathRequestSchema.parse(rawArgs)
+    const { path, document } = DeletePathRequestSchema.parse(rawArgs)
     const root = rootForSender(event.sender)
-    await requireCheckpoint(root, `delete ${basename(path)}`, 'nothing was deleted.')
-    await deleteProjectPath(root, path)
+    if (document) {
+      const prepared = await prepareProjectDocumentDelete(root, path)
+      await withRequiredCheckpoint(
+        root,
+        `delete ${basename(prepared.path)}`,
+        'nothing was deleted.',
+        () => withProjectDocsRefresh(root, () => deleteProjectDocument(root, prepared)),
+        prepared,
+      )
+      return
+    }
+    await withRequiredCheckpoint(root, `delete ${basename(path)}`, 'nothing was deleted.', () =>
+      withProjectDocsRefresh(root, () => deleteProjectPath(root, path)),
+    )
   })
 
   // Duplicate a file/folder as "<name> copy". Checkpoint first so the copy is undoable. Returns the
@@ -1314,8 +1479,14 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(IpcChannels.fsDuplicatePath, async (event, rawArgs: unknown) => {
     const { path } = DuplicatePathRequestSchema.parse(rawArgs)
     const root = rootForSender(event.sender)
-    await getEngineSessions().checkpointProjectEdit(root, `duplicate ${basename(path)}`)
-    return DuplicatePathResultSchema.parse({ path: await duplicateProjectPath(root, path) })
+    return getEngineSessions().withExternalProjectMutation(
+      root,
+      { checkpointLabel: `duplicate ${basename(path)}` },
+      async () =>
+        withProjectDocsRefresh(root, async () =>
+          DuplicatePathResultSchema.parse({ path: await duplicateProjectPath(root, path) }),
+        ),
+    )
   })
 
   // Import Finder-dragged files into a folder (or Documents/). Checkpoint first so the import is
@@ -1323,8 +1494,39 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(IpcChannels.fsImportFiles, async (event, rawArgs: unknown) => {
     const { destDir, files } = ImportFilesRequestSchema.parse(rawArgs)
     const root = rootForSender(event.sender)
-    await getEngineSessions().checkpointProjectEdit(root, `import ${files.length} file(s)`)
-    return ImportFilesResultSchema.parse({ paths: await importFilesIntoProject(root, destDir, files) })
+    return getEngineSessions().withExternalProjectMutation(
+      root,
+      { checkpointLabel: `import ${files.length} file(s)` },
+      async () =>
+        withProjectDocsRefresh(root, async () =>
+          ImportFilesResultSchema.parse({ paths: await importFilesIntoProject(root, destDir, files) }),
+        ),
+    )
+  })
+
+  // The native File-menu importer starts as a main→renderer command so an open modal can decline it.
+  // Only after the renderer accepts does it invoke this picker; Electron menu accelerators bypass DOM
+  // keydown/inert, so opening the dialog directly in the menu click would mutate behind the Library.
+  ipcMain.handle(IpcChannels.fsImportFilesFromMenu, async (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    if (!win) return null
+    const root = rootForSender(event.sender)
+    const res = await dialog.showOpenDialog(win, { properties: ['openFile', 'multiSelections'] })
+    if (res.canceled || !res.filePaths.length) return null
+    const files = await Promise.all(
+      res.filePaths.map(async (path) => ({
+        name: basename(path),
+        data: new Uint8Array(await readFile(path)),
+      })),
+    )
+    return getEngineSessions().withExternalProjectMutation(
+      root,
+      { checkpointLabel: `import ${files.length} file(s)` },
+      async () =>
+        withProjectDocsRefresh(root, async () =>
+          ImportFilesResultSchema.parse({ paths: await importFilesIntoProject(root, undefined, files) }),
+        ),
+    )
   })
 
   // Reveal a file/folder in Finder. containedReal refuses any path outside the project root (and
@@ -1387,9 +1589,68 @@ export function registerIpcHandlers(): void {
   // Create a new folder (at the root, or inside `parent`) and return its path. No checkpoint.
   ipcMain.handle(IpcChannels.fsCreateDir, async (event, rawArgs: unknown) => {
     const { name, parent, home } = CreateDirRequestSchema.parse(rawArgs)
-    return CreateDirResultSchema.parse({
-      path: await createProjectDir(rootForSender(event.sender), name, parent, home),
-    })
+    const root = rootForSender(event.sender)
+    return getEngineSessions().withExternalProjectMutation(root, {}, async () =>
+      withProjectDocsRefresh(root, async () =>
+        CreateDirResultSchema.parse({ path: await createProjectDir(root, name, parent, home) }),
+      ),
+    )
+  })
+
+  // The Library's ONE read: documents narrowed by kind and by a query over titles, filenames and file
+  // contents. Not `fs:search` with a filter on top — main reconciles the two exclusion sets once, in
+  // `queryLibrary`, so no caller can produce a Library listing `CLAUDE.md`, a vendored skill file or a
+  // dependency README. Read-only, contained + capped in the service like the other fs reads.
+  ipcMain.handle(IpcChannels.libraryQuery, async (event, rawArgs: unknown) => {
+    const req = LibraryQueryRequestSchema.parse(rawArgs)
+    return LibraryQueryResultSchema.parse(await queryLibrary(rootForSender(event.sender), req))
+  })
+
+  // The Library's second door: a question answered across the project's documents AND the conversations
+  // that produced them. Main does the retrieval (deterministic term matching over both corpora, no model
+  // and no index) and the ENGINE writes the answer, through the same `buildEngineEnv()` chokepoint every
+  // other engine spawn uses — Koda never calls a model itself, and never bills a path the user did not
+  // choose. The ask runs on the engine of the CHAT it was launched from, so any capability refusal
+  // names that engine and main reads it off the session itself; a renderer naming an engine would be
+  // this surface picking a billing path on
+  // the user's behalf. No chat behind the ask (the Library opened with none in front) falls back to the
+  // engine the user last explicitly ran on.
+  // A rejection here is a real failure and renders as one; it never renders as "found nothing".
+  ipcMain.handle(IpcChannels.libraryAsk, async (event, rawArgs: unknown) => {
+    const req = LibraryAskRequestSchema.parse(rawArgs)
+    const sessions = getEngineSessions()
+    const root = rootForSender(event.sender)
+    const engineId = req.sessionId ? sessions.sessionEngine(root, req.sessionId) : undefined
+    // A snapshotted owner that has since disappeared is not "no owner": falling through to the last
+    // posture would silently move both the engine and billing path underneath the question.
+    if (req.sessionId && !engineId) throw new Error('the chat this question was asked from is no longer open')
+
+    const controller = new AbortController()
+    const key = req.requestId ? libraryAskKey(event.sender, req.requestId) : undefined
+    if (key) {
+      libraryAskControllers.get(key)?.abort()
+      libraryAskControllers.set(key, controller)
+    }
+    const onDestroyed = (): void => controller.abort()
+    event.sender.once('destroyed', onDestroyed)
+    try {
+      return LibraryAskResultSchema.parse(
+        await askLibrary(root, req, sessions.libraryAskRunner(engineId), controller.signal, {
+          // Re-check after documents are walked, immediately before the session scan. A turn that
+          // completes during retrieval makes the acknowledged renderer snapshot stale and the answer
+          // partial; it can never silently disappear from a supposedly complete corpus.
+          hotSessionsComplete: () => sessions.hotSessionSnapshotComplete(root, req.hotStoreSavedAt),
+        }),
+      )
+    } finally {
+      event.sender.removeListener('destroyed', onDestroyed)
+      if (key && libraryAskControllers.get(key) === controller) libraryAskControllers.delete(key)
+    }
+  })
+
+  ipcMain.on(IpcChannels.libraryAskCancel, (event, rawRequestId: unknown) => {
+    if (typeof rawRequestId !== 'string' || !rawRequestId || rawRequestId.length > 128) return
+    libraryAskControllers.get(libraryAskKey(event.sender, rawRequestId))?.abort()
   })
 
   // Project-wide find (the Find overlay): fuzzy filename + substring content matches, scope-filtered,
@@ -1406,8 +1667,11 @@ export function registerIpcHandlers(): void {
     const root = rootForSender(event.sender)
     // A bulk replace touches many files at once, so unlike a single edit it must NOT proceed without an
     // undo point — the overlay promises "undo from the recovery timeline". Abort if the checkpoint failed.
-    await requireCheckpoint(root, `replace “${query}”`, 'nothing was replaced.')
-    return ReplaceResultSchema.parse(await replaceInProject(root, query, replacement, scope))
+    return withRequiredCheckpoint(root, `replace “${query}”`, 'nothing was replaced.', async () =>
+      withProjectDocsRefresh(root, async () =>
+        ReplaceResultSchema.parse(await replaceInProject(root, query, replacement, scope)),
+      ),
+    )
   })
 
   // ── Source Control (user-git — the real `.git`) ──────────────────────────────
@@ -1417,25 +1681,33 @@ export function registerIpcHandlers(): void {
     GitRepoInfoSchema.parse(await detectRepo(rootForSender(event.sender))),
   )
 
-  ipcMain.handle(IpcChannels.gitStatus, async (event) =>
-    GitStatusResultSchema.parse(await getStatus(rootForSender(event.sender))),
-  )
+  ipcMain.handle(IpcChannels.gitStatus, async (event) => {
+    const root = rootForSender(event.sender)
+    const status = await getStatus(root)
+    await getEngineSessions().refreshCompletionStatesForProject(root)
+    return GitStatusResultSchema.parse(status)
+  })
 
   ipcMain.handle(IpcChannels.gitGraph, async (event, rawArgs: unknown) => {
     const { limit } = GitGraphRequestSchema.parse(rawArgs)
     return GitCommitGraphResultSchema.parse(await getCommitGraph(rootForSender(event.sender), limit))
   })
 
-  ipcMain.handle(IpcChannels.gitInit, async (event) =>
-    GitInitResultSchema.parse(await initRepo(rootForSender(event.sender))),
-  )
+  ipcMain.handle(IpcChannels.gitInit, async (event) => {
+    const root = rootForSender(event.sender)
+    const result = await initRepo(root)
+    await getEngineSessions().refreshCompletionStatesForProject(root)
+    return GitInitResultSchema.parse(result)
+  })
 
   // Commit returns a TAGGED result — a UserGitError (no identity, nothing to commit, …) becomes
   // { ok:false, code } the renderer can branch on, instead of an Electron-wrapped reject string.
   ipcMain.handle(IpcChannels.gitCommit, async (event, rawArgs: unknown) => {
     const { message } = GitCommitRequestSchema.parse(rawArgs)
+    const root = rootForSender(event.sender)
     try {
-      const { sha } = await commitAll(rootForSender(event.sender), message)
+      const { sha } = await commitAll(root, message)
+      await getEngineSessions().refreshCompletionStatesForProject(root)
       return GitCommitResultSchema.parse({ ok: true, sha })
     } catch (err) {
       if (err instanceof UserGitError) {
@@ -1449,8 +1721,10 @@ export function registerIpcHandlers(): void {
   // Same tagged-result contract as gitCommit.
   ipcMain.handle(IpcChannels.gitCommitPaths, async (event, rawArgs: unknown) => {
     const { message, paths } = GitCommitPathsRequestSchema.parse(rawArgs)
+    const root = rootForSender(event.sender)
     try {
-      const { sha } = await commitPaths(rootForSender(event.sender), paths, message)
+      const { sha } = await commitPaths(root, paths, message)
+      await getEngineSessions().refreshCompletionStatesForProject(root)
       return GitCommitResultSchema.parse({ ok: true, sha })
     } catch (err) {
       if (err instanceof UserGitError) {
@@ -1458,6 +1732,24 @@ export function registerIpcHandlers(): void {
       }
       throw err
     }
+  })
+
+  // Describe the save the user is about to make. Read-only (status + diff + recent subjects), then
+  // the selected generated-text writer, with the deterministic floor for every miss.
+  // Never rejects: a description that could fail would be a description that can block a save.
+  ipcMain.handle(IpcChannels.gitProposeMessage, async (event, rawArgs: unknown) => {
+    GitProposeMessageRequestSchema.parse(rawArgs)
+    const root = rootForSender(event.sender)
+    // Status first (cheap, and all the floor needs); the diff is read only if a turn will actually
+    // run, so a save that takes the floor never pays for a whole `git diff` it cannot use.
+    const status = await getStatus(root)
+    return GitProposeMessageResultSchema.parse(
+      await getEngineSessions().proposeVersionMessage({
+        cwd: root,
+        status,
+        readEvidence: () => getChangeEvidence(root, status),
+      }),
+    )
   })
 
   // Reword the just-saved version (amend HEAD). Same tagged-result contract; `not_head` means the
@@ -1479,8 +1771,12 @@ export function registerIpcHandlers(): void {
   // (unsaved changes) and nothing_to_commit (files already match) get specific renderer copy.
   ipcMain.handle(IpcChannels.gitRestoreVersion, async (event, rawArgs: unknown) => {
     const { sha } = GitRestoreRequestSchema.parse(rawArgs)
+    const root = rootForSender(event.sender)
     try {
-      const res = await restoreVersion(rootForSender(event.sender), sha)
+      const res = await getEngineSessions().withExternalProjectMutation(root, {}, () =>
+        restoreVersion(root, sha),
+      )
+      await getEngineSessions().refreshCompletionStatesForProject(root)
       return GitCommitResultSchema.parse({ ok: true, sha: res.sha })
     } catch (err) {
       if (err instanceof UserGitError) {
@@ -1496,16 +1792,24 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(IpcChannels.gitDiscardFile, async (event, rawArgs: unknown) => {
     const { path } = GitDiscardFileRequestSchema.parse(rawArgs)
     const root = rootForSender(event.sender)
-    const checkpointed = await getEngineSessions().checkpointProjectEdit(root, `discard ${basename(path)}`)
-    if (!checkpointed) {
-      return GitDiscardResultSchema.parse({
-        ok: false,
-        code: 'no_checkpoint',
-        message: 'Could not create an undo point — nothing was removed.',
-      })
-    }
     try {
-      await discardFile(root, path)
+      const discarded = await getEngineSessions().withExternalProjectMutation(
+        root,
+        { checkpointLabel: `discard ${basename(path)}` },
+        async (checkpointed) => {
+          if (!checkpointed) return false
+          await discardFile(root, path)
+          return true
+        },
+      )
+      if (!discarded) {
+        return GitDiscardResultSchema.parse({
+          ok: false,
+          code: 'no_checkpoint',
+          message: 'Could not create an undo point — nothing was removed.',
+        })
+      }
+      await getEngineSessions().refreshCompletionStatesForProject(root)
       return GitDiscardResultSchema.parse({ ok: true })
     } catch (err) {
       const code = err instanceof UserGitError && err.code === 'not_a_repo' ? 'not_a_repo' : 'git_failed'
@@ -1668,8 +1972,11 @@ export function registerIpcHandlers(): void {
   // Does this window's project already carry an agent-guidance file? Drives the one-time intake offer
   // (no guidelines ⇒ offer; present ⇒ leave them alone — never clobber a project's existing CLAUDE.md/
   // AGENTS.md). Filenames are constants joined to the contained project root → no traversal vector.
+  // Asked once per project mount, which makes it the natural moment to heal a one-file project into
+  // the shared-guide pair (healGuidelinesPair — a no-op everywhere else).
   ipcMain.handle(IpcChannels.projectHasGuidelines, (event) => {
     const root = rootForSender(event.sender)
+    healGuidelinesPair(root)
     const hasGuidelines = GUIDELINES_FILES.some((f) => existsSync(join(root, f)))
     return ProjectHasGuidelinesResultSchema.parse({ hasGuidelines })
   })

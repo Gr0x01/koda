@@ -11,11 +11,31 @@
  * registry — one-project-per-window). This module just enforces containment within whatever root
  * it's given; it has no notion of "the" project.
  */
-import { existsSync, mkdirSync, realpathSync } from 'node:fs'
-import { cp, mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
-import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path'
+import { constants, existsSync, mkdirSync, realpathSync, type BigIntStats } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import {
+  cp,
+  link,
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  rmdir,
+  stat,
+  unlink,
+  writeFile,
+} from 'node:fs/promises'
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { isLibraryDocumentPath, splitDocumentFrontmatter } from '@shared/document-contract'
 import type {
   DiffFileResult,
+  DocKind,
+  LibraryDoc,
+  LibraryQueryRequest,
+  LibraryQueryResult,
   ProjectDoc,
   ReadDirResult,
   ReadFileResult,
@@ -25,6 +45,18 @@ import type {
   SearchFileResult,
   SearchLineMatch,
 } from '@shared/ipc'
+import {
+  amendDocFrontmatter,
+  docDateStamp,
+  inferDocKind,
+  readDocMetadata,
+  writeDocFrontmatter,
+} from './doc-frontmatter'
+import { readContainedRegularFile } from './contained-read'
+import {
+  sameRequiredFileFingerprint,
+  type RequiredCheckpointFile,
+} from './safety-git/checkpoint'
 import { runGit } from './safety-git/repo'
 
 /** Cap a single file read so a giant/log file can't blow up the IPC payload or the editor. */
@@ -56,7 +88,38 @@ const DOCS_EXCLUDE_DIRS = new Set([
   '.next',
   'target',
   '.tox',
+  // Apple/Swift build output. Measured, not speculative: before these landed, 78 of the 166 documents
+  // this repository offered the Library were Xcode link-file lists, and querying "install" returned ten
+  // `*-DebugDylibInstallName-normal-arm64.txt` rows above the first sentence RB actually wrote.
+  // `DerivedData` is Xcode's build root; `SourcePackages` holds SwiftPM checkouts (other people's
+  // READMEs); `.build` is SwiftPM's CLI equivalent; `Pods`/`Carthage` are vendored dependency trees.
+  'DerivedData',
+  'SourcePackages',
+  '.build',
+  'Pods',
+  'Carthage',
+  // The remaining mainstream generated trees, same reasoning as dist/build/out above.
+  '.gradle',
+  'coverage',
+  'bower_components',
+  '.svelte-kit',
 ])
+
+/**
+ * `.noindex` is Apple's own "this directory is derived, do not index it" marker — Spotlight honours it,
+ * and Xcode stamps it on every intermediate tree (`Intermediates.noindex`, `ModuleCache.noindex`,
+ * `Index.noindex`). It is the one marker that stays true when a project points derived data at a
+ * custom folder, which the name list above cannot anticipate.
+ *
+ * Deliberately NOT here: pruning on `*.xcodeproj`, `Package.resolved` or `Podfile`. Those mark a
+ * SOURCE root, not build output — the marker sits next to the user's own code, so `ios/App/` would
+ * lose its README, and a Swift package repository (`Package.resolved` at the top) would show an empty
+ * Library. That is the difference from the `SKILL.md` / `.claude-plugin/` markers below, which sit in
+ * directories whose entire contents are agent context by definition.
+ */
+function isExcludedDocsDir(name: string): boolean {
+  return DOCS_EXCLUDE_DIRS.has(name) || name.endsWith('.noindex')
+}
 
 /**
  * Files that carry a doc extension but are never the USER's writing, so the flat Documents list skips
@@ -94,6 +157,17 @@ function isNonUserDoc(name: string): boolean {
   return LICENSE_STEMS.has(stem) || stem.endsWith('-ofl') || lower.endsWith('.license')
 }
 
+/** A directory carrying either marker is an agent-tooling bundle, never part of the user's Library.
+ *  Both discovery and exact resolution call this one predicate so a remembered path cannot regain
+ *  eligibility merely by bypassing the walk. */
+function hasLibraryBundleMarker(entries: import('node:fs').Dirent[]): boolean {
+  return entries.some(
+    (entry) =>
+      (entry.isFile() && entry.name === 'SKILL.md') ||
+      (entry.isDirectory() && entry.name === '.claude-plugin'),
+  )
+}
+
 /** Koda's home folder for the user's deliverable documents — where "New document" lands. */
 export const DOCS_HOME = 'Documents'
 
@@ -110,8 +184,33 @@ const SEARCH = {
   previewLead: 30, // chars shown before the match when windowing
 } as const
 
-/** Prose-doc extensions — the "Docs" scope. "Code" is every other text file; "All" is both. */
+/** Prose-doc extensions — the Find overlay's "Docs" scope. "Code" is every other text file; "All" is
+ *  both. Wider than the Library's set below on purpose: Find's job is "show me every place this string
+ *  appears", so a `.txt` staying reachable there costs a user nothing. */
 const DOC_EXTS = new Set(['.md', '.markdown', '.mdx', '.txt', '.rst', '.org'])
+
+/**
+ * What the LIBRARY is willing to call a document — `DOC_EXTS` minus `.txt`.
+ *
+ * `.txt` is the default extension for machine output (build link-file lists, daemon logs, captured
+ * transcripts), and no directory rule can catch them all because a tool writes its dump wherever it
+ * runs. Measured on this repository after the build-directory exclusions above: every remaining `.txt`
+ * in the corpus was a `tailscaled.log*.txt` or a captured engine turn, and none was writing.
+ *
+ * The other half of the reasoning is that Koda's document substrate is markdown end to end — documents
+ * are BORN `.md` (`createProjectFile`), kept as `.md` (`keep-document.ts`), and carry their
+ * title/description/kind in markdown frontmatter. A `.txt` in the Library is permanently an untitled
+ * `note` in a surface whose whole value is authored metadata.
+ *
+ * What this costs: a plain-text note the user dragged in is not in the Library. It stays fully visible
+ * in the Files tree and fully findable in the Find overlay — only the claim "this is one of your
+ * documents" is withdrawn. That is the right side to err on, because noise is unbounded (one build can
+ * emit hundreds of rows) while the omission is one file the user can still reach two other ways.
+ */
+/** Is this a file the Documents list / Library may treat as one of the user's documents? */
+function isLibraryDocName(name: string): boolean {
+  return isLibraryDocumentPath(name)
+}
 
 /** Does this filename fall in the chosen scope? (Docs = a doc extension; Code = anything else.) */
 function inScope(name: string, scope: SearchScope): boolean {
@@ -208,14 +307,9 @@ export async function browseDir(root: string, requested?: string): Promise<ReadD
 
 /** Read a text file. Caps the byte length and refuses binary (a NUL byte in the leading slice). */
 export async function readProjectFile(root: string, requested: string): Promise<ReadFileResult> {
-  const file = containedReal(root, requested)
-  const st = await stat(file)
-  if (!st.isFile()) throw new Error('not a file')
-  const truncated = st.size > MAX_FILE_BYTES
-  const buf = await readFile(file)
-  const slice = buf.subarray(0, MAX_FILE_BYTES)
-  if (slice.includes(0)) return { path: file, content: '', truncated, binary: true }
-  return { path: file, content: slice.toString('utf8'), truncated, binary: false }
+  const { path, bytes, truncated } = await readContainedRegularFile(root, requested, MAX_FILE_BYTES)
+  if (bytes.includes(0)) return { path, content: '', truncated, binary: true }
+  return { path, content: bytes.toString('utf8'), truncated, binary: false }
 }
 
 /** Image extensions the phone's live doc viewer can inline as a `data:` URL, with their media types.
@@ -260,10 +354,9 @@ export async function readProjectImage(
   const ext = extname(requested).replace(/^\./, '').toLowerCase()
   const mediaType = IMAGE_MIME[ext]
   if (!mediaType) return null
-  const file = containedReal(root, requested)
-  const st = await stat(file)
-  if (!st.isFile() || st.size > MAX_IMAGE_BYTES) return null
-  return { mediaType, buf: await readFile(file) }
+  const { bytes, truncated } = await readContainedRegularFile(root, requested, MAX_IMAGE_BYTES)
+  if (truncated) return null
+  return { mediaType, buf: bytes }
 }
 
 /**
@@ -310,17 +403,30 @@ export async function writeProjectFile(root: string, requested: string, content:
   const st = await stat(file)
   if (!st.isFile()) throw new Error('not a file')
   await writeFile(file, content, 'utf8')
+  invalidateDocsCache(root)
   return file
 }
 
 /**
- * Create a new empty document and return its path. New docs land in Koda's `Documents/` home unless
- * the user selected one of its folders. We control the name (a sanitised basename, no traversal) and the `.md`
+ * Create a new document and return its path. New docs land in Koda's `Documents/` home unless the
+ * user selected one of its folders. We control the name (a sanitised basename, no traversal) and the `.md`
  * extension, deduping within the home; `wx` makes the write fail rather than clobber if something
- * raced in. No safety checkpoint here — an empty new file is trivially discardable; the first real
- * save checkpoints.
+ * raced in. No safety checkpoint here — a new file is trivially discardable; the first real save
+ * checkpoints.
+ *
+ * The document is BORN with `title`, `date` and a `kind`, rather than empty. A rule that depends on
+ * the agent reading a playbook first is a rule that gets skipped, and a Library where day-one
+ * documents carry no metadata is the file tree it exists to replace. `description` is left for the
+ * agent: it is the one field that cannot be derived. `source` (provenance) is passed by the caller
+ * that knows which session asked.
  */
-export async function createProjectFile(root: string, name?: string, parent?: string): Promise<string> {
+export async function createProjectFile(
+  root: string,
+  name?: string,
+  parent?: string,
+  source?: string,
+  initial?: { description: string; kind: DocKind; body: string },
+): Promise<string> {
   const realRoot = realpathSync(root)
   await mkdir(join(realRoot, DOCS_HOME), { recursive: true })
   // realpath the home AFTER creating it and range-check against root: a pre-existing `Documents`
@@ -331,8 +437,30 @@ export async function createProjectFile(root: string, name?: string, parent?: st
   if (home !== realRoot && !home.startsWith(realRoot + sep)) throw new Error('path escapes the project root')
   const base = (name ?? 'Untitled').replace(/[/\\]/g, '').replace(/\.(md|markdown)$/i, '').trim() || 'Untitled'
   let file = join(home, `${base}.md`)
-  for (let n = 2; existsSync(file); n++) file = join(home, `${base} ${n}.md`)
-  await writeFile(file, '', { encoding: 'utf8', flag: 'wx' })
+  // The title follows the DEDUPED name — a second "Untitled" is titled "Untitled 2", so the Library
+  // never shows two rows reading the same thing.
+  let title = base
+  for (let n = 2; existsSync(file); n++) {
+    title = `${base} ${n}`
+    file = join(home, `${title}.md`)
+  }
+  const rel = relative(realRoot, file).split(sep).join('/')
+  const frontmatter = writeDocFrontmatter({
+    title,
+    date: docDateStamp(),
+    kind: initial?.kind ?? inferDocKind(rel),
+    source,
+  })
+  const content = initial
+    ? `${amendDocFrontmatter(frontmatter, {
+        description: initial.description,
+        kind: initial.kind,
+      }).trimEnd()}\n\n${initial.body}`
+    : frontmatter
+  // One exclusive write owns the whole creation transaction. A failed keep cannot leave a metadata-
+  // only skeleton that forces the retry onto a deduped second filename.
+  await writeFile(file, content, { encoding: 'utf8', flag: 'wx' })
+  invalidateDocsCache(root)
   return realpathSync(file)
 }
 
@@ -348,66 +476,102 @@ export async function createProjectFile(root: string, name?: string, parent?: st
  *  and it ran on every remote/local docs request — a session open would redo the same walk each time. The
  *  doc SET barely changes between opens, so a short TTL makes the walk run once and reuse; worst case a
  *  just-created doc shows up to TTL late (the phone revalidates on every sheet open anyway). */
-const docsListCache = new Map<string, { at: number; docs: ProjectDoc[] }>()
+const docsListCache = new Map<string, { at: number; detail: ProjectDocsDetail }>()
+// Invalidation must also retire a walk that is already in flight. Deleting only the settled cache
+// entry lets a pre-mutation traversal finish later and repopulate it with its stale snapshot.
+const docsCacheGeneration = new Map<string, number>()
 const DOCS_CACHE_TTL_MS = 10_000
+
+/** What one walk produces. `docs` is the capped, recency-sorted list the sidebar shows; `excerpts` is
+ *  the prose preview each one's head read already yielded (keyed by absolute path, absent when the
+ *  file had no body), so the Library never re-reads the same files; `truncated` means a cap cut the
+ *  set, so anything reading it is looking at a partial view of the project. */
+interface ProjectDocsDetail {
+  docs: ProjectDoc[]
+  excerpts: Map<string, string>
+  truncated: boolean
+}
+
+/** How many head-reads run at once when enriching the walk with frontmatter. Bounded so a 300-doc
+ *  project can't open 300 descriptors at once (macOS's default soft limit is lower than that). */
+const DOC_META_CONCURRENCY = 24
 
 /** Drop the cached doc list for a root so the next `listProjectDocs` does a fresh walk. Called by the
  *  Documents/ watcher (`docs-watch.ts`) on an on-disk change — otherwise a change inside the TTL window
  *  would re-serve the stale list and the sidebar wouldn't update. */
 export function invalidateDocsCache(root: string): void {
+  let key = root
   try {
-    docsListCache.delete(realpathSync(root))
-  } catch {
-    docsListCache.delete(root) // root vanished — clear the raw key just in case
-  }
+    key = realpathSync(root)
+  } catch {} // root vanished — use the raw key just in case
+  docsListCache.delete(key)
+  docsCacheGeneration.set(key, (docsCacheGeneration.get(key) ?? 0) + 1)
 }
 
 export async function listProjectDocs(root: string): Promise<ProjectDoc[]> {
+  return (await listProjectDocsDetailed(root)).docs
+}
+
+/**
+ * The same walk, plus what the Library needs on top of the sidebar's list: each doc's prose excerpt
+ * and whether a cap cut the set. One function so there is exactly ONE walk, ONE exclusion set and ONE
+ * cache behind both surfaces — the Library's correctness rests on its universe being literally the
+ * documents list, not a second traversal that has to be kept in agreement with it.
+ */
+async function listProjectDocsDetailed(root: string): Promise<ProjectDocsDetail> {
   const realRoot = realpathSync(root)
   const hit = docsListCache.get(realRoot)
-  if (hit && Date.now() - hit.at < DOCS_CACHE_TTL_MS) return hit.docs
+  if (hit && Date.now() - hit.at < DOCS_CACHE_TTL_MS) return hit.detail
+  const generation = docsCacheGeneration.get(realRoot) ?? 0
   const docs: ProjectDoc[] = []
   let scanned = 0
+  // Two different facts. `truncated` reports that the RESULT is partial; `stop` is control flow for a
+  // hard cap. One directory Koda cannot read, or one file that vanishes mid-walk, makes the result
+  // partial without being a reason to abandon the rest of the tree — so a single flag serving both
+  // silently drops every document after the first I/O hiccup, and caches the stump for 10s.
   let truncated = false
+  let stop = false
 
   async function walk(dir: string): Promise<void> {
-    if (truncated) return // a cap was hit in a sibling frame — stop the whole walk, not just this dir
+    if (stop) return // a cap was hit in a sibling frame — stop the whole walk, not just this dir
     let dirents: import('node:fs').Dirent[]
     try {
       dirents = await readdir(dir, { withFileTypes: true })
     } catch {
-      return // unreadable dir (permissions) — skip, don't wedge the whole listing
+      truncated = true
+      return // unreadable dir (permissions) — keep readable rows, but mark the universe partial
     }
     // Skip agent-tooling bundles wholesale — their `.md` files are skill/agent/rule content, never the
     // user's writing. Two markers, both Claude Code conventions with no user-folder collision:
     //   • a SKILL.md → this dir is a skill bundle (catches a bundled/`.claude/skills` catalog).
     //   • a `.claude-plugin/` dir → this dir is a plugin root (its agents/, skills/, rules/ subtrees).
-    if (
-      dirents.some(
-        (e) =>
-          (e.isFile() && e.name === 'SKILL.md') || (e.isDirectory() && e.name === '.claude-plugin'),
-      )
-    )
-      return
+    if (hasLibraryBundleMarker(dirents)) return
     for (const d of dirents) {
-      if (truncated) return
+      if (stop) return
       if (d.isSymbolicLink()) continue // never follow symlinks (escape / cycle risk)
       const full = join(dir, d.name)
       if (d.isDirectory()) {
-        if (DOCS_EXCLUDE_DIRS.has(d.name)) continue
+        if (isExcludedDocsDir(d.name)) continue
         await walk(full)
         continue
       }
-      if (!d.isFile() || !inScope(d.name, 'docs') || isNonUserDoc(d.name)) continue
+      if (!d.isFile() || !isLibraryDocName(d.name) || isNonUserDoc(d.name)) continue
       if (++scanned > DOCS.maxFilesScanned) {
         truncated = true
+        stop = true
         return
       }
       let mtimeMs: number
       try {
-        mtimeMs = (await stat(full)).mtimeMs
+        const current = await lstat(full)
+        if (!current.isFile()) {
+          truncated = true // the file changed shape after readdir; do not follow it
+          continue
+        }
+        mtimeMs = current.mtimeMs
       } catch {
-        continue // vanished between readdir and stat — skip it
+        truncated = true
+        continue // vanished between readdir and stat — skip it, but do not call the walk complete
       }
       const rel = relative(realRoot, full).split(sep).join('/')
       docs.push({ path: full, rel, name: d.name, mtimeMs })
@@ -416,29 +580,128 @@ export async function listProjectDocs(root: string): Promise<ProjectDoc[]> {
 
   await walk(realRoot)
   docs.sort((a, b) => b.mtimeMs - a.mtimeMs)
-  const result = docs.slice(0, DOCS.maxDocs)
-  docsListCache.set(realRoot, { at: Date.now(), docs: result })
-  return result
+  const kept = docs.slice(0, DOCS.maxDocs)
+  // Metadata is read AFTER the sort and the cap, so the added cost is bounded by what's returned
+  // (≤ maxDocs head reads) rather than by how many docs the tree holds. The walk itself is untouched.
+  const excerpts = new Map<string, string>()
+  await mapConcurrent(kept, DOC_META_CONCURRENCY, async (doc) => {
+    const { fm, excerpt } = await readDocMetadata(doc.path, 600, realRoot)
+    if (fm.title) doc.title = fm.title
+    if (fm.description) doc.description = fm.description
+    if (fm.kind) doc.kind = fm.kind
+    if (fm.source) doc.source = fm.source
+    if (excerpt) excerpts.set(doc.path, excerpt)
+  })
+  const detail: ProjectDocsDetail = { docs: kept, excerpts, truncated: truncated || docs.length > kept.length }
+  // A successful mutation may have invalidated this root while readdir/metadata I/O was pending.
+  // Return this caller's coherent snapshot, but never let it become the next caller's cache hit.
+  if ((docsCacheGeneration.get(realRoot) ?? 0) === generation)
+    docsListCache.set(realRoot, { at: Date.now(), detail })
+  return detail
+}
+
+/** Run `fn` over `items` with at most `limit` in flight. `fn` must swallow its own failures — a
+ *  rejection propagates and fails the whole listing, which is why `readDocMetadata` is fail-soft. */
+async function mapConcurrent<T>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<void>,
+): Promise<void> {
+  let next = 0
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const i = next++
+      if (i >= items.length) return
+      await fn(items[i], i)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
 }
 
 /**
- * The first ~`maxChars` of a doc — the phone's page-preview cards render this miniature so the user
- * recognizes their document by its content, not its filename. Contained like every other access;
- * fail-soft (missing/unreadable → undefined) because a preview is decoration, never worth an error.
- * Partial read (never the whole file) so a huge doc costs one small disk hit per listing.
+ * The Library's single read: the documents list, narrowed by kind and by a query that matches titles,
+ * filenames and file contents.
+ *
+ * The load-bearing decision is the UNIVERSE. `searchProject` only skips `.git`, `node_modules` and
+ * `.koda`, while the documents walk also skips DOCS_EXCLUDE_DIRS, prunes skill-bundle and plugin
+ * directories by marker, and drops non-user files by name (CLAUDE.md, AGENTS.md, SKILL.md, vendored
+ * licenses). A Library built on the search walk therefore surfaces `CLAUDE.md`, vendored skill files
+ * and dependency READMEs that the Documents pane correctly hides, and reads as broken to exactly the
+ * user this surface is for. Rather than filtering search results back down — a second copy of the
+ * rules, free to drift — this searches WITHIN the documents list. The exclusions cannot disagree
+ * because there is only one set of them, and the 10s-cached walk means typing costs no tree traversal.
+ *
+ * Content scanning uses the Find overlay's matcher (`scanFileContents`: case-insensitive substring,
+ * line-numbered windowed previews) with one difference: the frontmatter block is not content. A
+ * document's `title:` is the thing a user is MOST likely to type, so scanning the raw file made the
+ * likeliest query answer itself with the plumbing — a match preview reading `title: Phone tiers`, and
+ * an ask citation quoting it as if the document had said it. `readDocMetadata` already refuses to put
+ * that block in an excerpt for the same reason; this closes the other door. The title still matches,
+ * through `fuzzyScore` on the authored title below, which is where a title match belongs.
+ */
+export async function queryLibrary(root: string, req: LibraryQueryRequest = {}): Promise<LibraryQueryResult> {
+  const realRoot = realpathSync(root)
+  const { docs, excerpts, truncated: universeTruncated } = await listProjectDocsDetailed(realRoot)
+  const query = req.query ?? ''
+  const needle = query.trim().toLowerCase()
+  const limit = Math.max(1, Math.min(req.limit ?? DOCS.maxDocs, DOCS.maxDocs))
+  const kinds = req.kinds?.length ? new Set(req.kinds) : undefined
+  let truncated = universeTruncated
+
+  const rows: LibraryDoc[] = []
+  let totalMatches = 0
+  for (const doc of docs) {
+    // resolvedKind is applied HERE, once, before filtering — a renderer re-deriving the folder
+    // fallback becomes the second source of truth this design exists to remove.
+    const resolvedKind = doc.kind ?? inferDocKind(doc.rel)
+    if (kinds && !kinds.has(resolvedKind)) continue
+    let nameMatch = false
+    let score = 0
+    let matches: SearchLineMatch[] = []
+    if (needle) {
+      // The filename AND the authored title, because the Library shows the title: a document titled
+      // "Phone tiers" in `notes-3.md` has to be findable by what it says it is.
+      const byName = fuzzyScore(needle, doc.name)
+      const byTitle = doc.title ? fuzzyScore(needle, doc.title) : null
+      const best = byName === null ? byTitle : byTitle === null ? byName : Math.max(byName, byTitle)
+      nameMatch = best !== null
+      score = best ?? 0
+      if (totalMatches < SEARCH.maxTotalMatches) {
+        const scan = await scanFileContents(doc.path, needle, { skipFrontmatter: true, root: realRoot })
+        matches = scan.binary ? [] : scan.matches
+        if (scan.truncated) truncated = true
+        totalMatches += matches.length
+        if (totalMatches >= SEARCH.maxTotalMatches) truncated = true
+      } else {
+        truncated = true
+      }
+      if (!nameMatch && matches.length === 0) continue
+    }
+    rows.push({ ...doc, resolvedKind, excerpt: excerpts.get(doc.path), nameMatch, score, matches })
+  }
+
+  // Ranked in main because `limit` cuts the list here: a name match first (best score wins), then
+  // everything found by its contents, in the recency order the unfiltered library already uses.
+  rows.sort((a, b) => {
+    if (a.nameMatch !== b.nameMatch) return a.nameMatch ? -1 : 1
+    if (a.nameMatch && a.score !== b.score) return b.score - a.score
+    return b.mtimeMs - a.mtimeMs
+  })
+  if (rows.length > limit) truncated = true
+  return { root: realRoot, query, truncated, docs: rows.slice(0, limit) }
+}
+
+/**
+ * The first ~`maxChars` of a doc's PROSE — the phone's page-preview cards render this miniature so the
+ * user recognizes their document by its content, not its filename. Frontmatter is skipped: once
+ * documents carry `title`/`description`/`kind`, a preview that started at byte 0 would open with the
+ * metadata block on every card. Contained like every other access; fail-soft (missing/unreadable →
+ * undefined) because a preview is decoration, never worth an error. Partial read (never the whole
+ * file) so a huge doc costs one small disk hit per listing.
  */
 export async function docExcerpt(root: string, rel: string, maxChars = 600): Promise<string | undefined> {
   try {
-    const target = containedReal(root, rel)
-    const fh = await open(target, 'r')
-    try {
-      // ×4: UTF-8 worst case, so maxChars of text survives the byte→string cut.
-      const buf = Buffer.alloc(maxChars * 4)
-      const { bytesRead } = await fh.read(buf, 0, buf.length, 0)
-      return buf.subarray(0, bytesRead).toString('utf8').slice(0, maxChars)
-    } finally {
-      await fh.close()
-    }
+    return (await readDocMetadata(containedReal(root, rel), maxChars, root)).excerpt
   } catch {
     return undefined
   }
@@ -457,7 +720,288 @@ export async function renameProjectPath(root: string, from: string, to: string):
   if (src === dest) return src // no-op (renamed to the same name) — nothing to do
   if (existsSync(dest)) throw new Error('a file or folder with that name already exists')
   await rename(src, dest)
+  invalidateDocsCache(root)
   return dest
+}
+
+export type ProjectDocumentDeleteTarget = RequiredCheckpointFile
+
+/** Exact shortcut refreshes are intentionally independent of the recency discovery cap (300), but
+ *  still bounded when this service is called outside its validated IPC handler. */
+const LIBRARY_RESOLVE_MAX = 1000
+
+/** Resolve a file lexically: parents may resolve, but the leaf is lstat'd and never followed. */
+async function resolveLexicalRegularProjectFile(
+  root: string,
+  requested: string,
+): Promise<RequiredCheckpointFile> {
+  const realRoot = realpathSync(root)
+  const candidate = resolve(realRoot, requested)
+  const realParent = realpathSync(dirname(candidate))
+  if (realParent !== realRoot && !realParent.startsWith(realRoot + sep))
+    throw new Error('path escapes the project root')
+  const path = join(realParent, basename(candidate))
+  const nativeRel = relative(realRoot, path)
+  if (!nativeRel || nativeRel === '..' || nativeRel.startsWith(`..${sep}`) || isAbsolute(nativeRel))
+    throw new Error('path escapes the project root')
+
+  const current = await lstat(path, { bigint: true })
+  if (!current.isFile()) throw new Error('not a regular file')
+  return {
+    path,
+    rel: nativeRel.split(sep).join('/'),
+    fingerprint: {
+      dev: current.dev,
+      ino: current.ino,
+      type: 'regular-file',
+      size: current.size,
+      mtimeNs: current.mtimeNs,
+      ctimeNs: current.ctimeNs,
+    },
+  }
+}
+
+/** The exact resolver and document-only destructive path share this eligibility gate. Otherwise a
+ *  remembered shortcut could expose actions for a path the Library walk correctly prunes. */
+async function assertLibraryDocumentTarget(
+  root: string,
+  target: RequiredCheckpointFile,
+): Promise<void> {
+  const parts = target.rel.split('/')
+  const name = parts.pop() ?? ''
+  if (!isLibraryDocName(name) || isNonUserDoc(name) || parts.some(isExcludedDocsDir))
+    throw new Error('not a Library document')
+
+  // Match the Library walk's bundle pruning too: a Markdown sibling inside a skill/plugin bundle is
+  // agent context, not a user document, even when its extension and directory names look ordinary.
+  let dir = realpathSync(root)
+  for (let depth = 0; depth <= parts.length; depth++) {
+    const entries = await readdir(dir, { withFileTypes: true })
+    if (hasLibraryBundleMarker(entries)) throw new Error('not a Library document')
+    if (depth < parts.length) dir = join(dir, parts[depth])
+  }
+}
+
+/**
+ * Resolve remembered project-relative document identities without doing a tree walk. Results stay in
+ * request order, duplicate identities collapse to their first occurrence, and stale/ineligible paths
+ * are omitted. That omission is deliberate: the renderer owns the remembered shortcut and can render
+ * it as stale, while main owns whether any current filesystem object is eligible for file actions.
+ */
+export async function resolveProjectDocs(root: string, rels: string[]): Promise<ProjectDoc[]> {
+  if (rels.length > LIBRARY_RESOLVE_MAX)
+    throw new Error(`too many document paths (maximum ${LIBRARY_RESOLVE_MAX})`)
+  const realRoot = realpathSync(root)
+  const docs: Array<ProjectDoc | undefined> = new Array(rels.length)
+
+  await mapConcurrent(rels, DOC_META_CONCURRENCY, async (requested, index) => {
+    if (!requested) return
+    try {
+      const target = await resolveLexicalRegularProjectFile(realRoot, requested)
+      await assertLibraryDocumentTarget(realRoot, target)
+      const { fm } = await readDocMetadata(target.path, 600, realRoot)
+      // Metadata reads are fail-soft by design, but an exact resolver must not return a path that was
+      // swapped while its row was being enriched. A later refresh may pick up the replacement if it is
+      // independently eligible.
+      const after = await resolveLexicalRegularProjectFile(realRoot, target.path)
+      if (!sameRequiredFileFingerprint(after.fingerprint, target.fingerprint)) return
+      docs[index] = {
+        path: target.path,
+        rel: target.rel,
+        name: basename(target.path),
+        mtimeMs: Number(target.fingerprint.mtimeNs) / 1_000_000,
+        ...(fm.title ? { title: fm.title } : {}),
+        ...(fm.description ? { description: fm.description } : {}),
+        ...(fm.kind ? { kind: fm.kind } : {}),
+        ...(fm.source ? { source: fm.source } : {}),
+      }
+    } catch {
+      // Missing, escaping, symlinked, unreadable and excluded rows are all stale from the shortcut's
+      // perspective. One bad remembered path must not blank the rest of the shelf.
+    }
+  })
+
+  const seen = new Set<string>()
+  return docs.filter((doc): doc is ProjectDoc => {
+    if (!doc || seen.has(doc.path)) return false
+    seen.add(doc.path)
+    return true
+  })
+}
+
+/** Validate the one sidebar-document file before its recovery checkpoint is taken. */
+export async function prepareProjectDocumentDelete(
+  root: string,
+  requested: string,
+): Promise<ProjectDocumentDeleteTarget> {
+  const target = await resolveLexicalRegularProjectFile(root, requested)
+  await assertLibraryDocumentTarget(root, target)
+  return target
+}
+
+/**
+ * `rename` may update ctime even when the file's bytes and inode did not change, so the post-rename
+ * comparison deliberately uses the stable identity facts and mtime rather than the prepared ctime.
+ */
+function samePreparedFileAfterRename(
+  current: RequiredCheckpointFile['fingerprint'],
+  prepared: RequiredCheckpointFile['fingerprint'],
+): boolean {
+  return (
+    current.dev === prepared.dev &&
+    current.ino === prepared.ino &&
+    current.type === prepared.type &&
+    current.size === prepared.size &&
+    current.mtimeNs === prepared.mtimeNs
+  )
+}
+
+function fingerprintOf(current: BigIntStats): RequiredCheckpointFile['fingerprint'] {
+  return {
+    dev: current.dev,
+    ino: current.ino,
+    type: 'regular-file',
+    size: current.size,
+    mtimeNs: current.mtimeNs,
+    ctimeNs: current.ctimeNs,
+  }
+}
+
+async function removeEmptyQuarantine(dir: string): Promise<void> {
+  try {
+    await rmdir(dir)
+  } catch {
+    // Never recursively clean an exclusive quarantine: an outside writer could have placed an
+    // unverified entry there. An empty-dir cleanup miss is safer than deleting something we did not
+    // prepare.
+  }
+}
+
+async function createDocumentQuarantine(parent: string): Promise<string> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    // `.noindex` routes a preserved quarantine through the Library's existing derived-directory
+    // exclusion, so a refused delete never makes the guarded replacement appear as a second document.
+    const dir = join(parent, `.koda-delete-${randomUUID()}.noindex`)
+    try {
+      await mkdir(dir, { mode: 0o700 })
+      return dir
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    }
+  }
+  throw new Error('could not create an exclusive document quarantine')
+}
+
+/** Restore a regular quarantined entry without ever overwriting a newly-created original path. A
+ *  same-directory hard link is an atomic create-if-absent; once it lands, removing the quarantine
+ *  name cannot lose the object. Non-regular or contended entries stay preserved at the returned path. */
+async function restoreQuarantinedEntry(
+  original: string,
+  quarantined: string,
+  quarantineDir: string,
+): Promise<'restored' | 'preserved'> {
+  try {
+    const current = await lstat(quarantined)
+    if (!current.isFile()) return 'preserved'
+    await link(quarantined, original)
+  } catch {
+    return 'preserved'
+  }
+  try {
+    await unlink(quarantined)
+  } catch {
+    // The object is already restored under `original`; retaining an extra quarantine link is safe.
+  }
+  await removeEmptyQuarantine(quarantineDir)
+  return 'restored'
+}
+
+export interface ProjectDocumentDeleteTestHooks {
+  /** Deterministic race seam: production never supplies this. */
+  afterFinalPrecheck?: () => void | Promise<void>
+}
+
+/**
+ * Delete exactly the prepared, checkpointed document. The candidate is first moved atomically into an
+ * exclusive same-directory quarantine, then its inode is compared with the still-open prechecked file
+ * before anything is unlinked. A last-moment replacement is restored without clobbering, or preserved
+ * under the quarantine path when an atomic restore is not safe.
+ */
+export async function deleteProjectDocument(
+  root: string,
+  prepared: ProjectDocumentDeleteTarget,
+  testHooks: ProjectDocumentDeleteTestHooks = {},
+): Promise<void> {
+  const current = await resolveLexicalRegularProjectFile(root, prepared.path)
+  if (
+    current.path !== prepared.path ||
+    current.rel !== prepared.rel ||
+    !sameRequiredFileFingerprint(current.fingerprint, prepared.fingerprint)
+  )
+    throw new Error('document changed before it could be deleted')
+
+  const handle = await open(current.path, constants.O_RDONLY | constants.O_NOFOLLOW).catch(() => {
+    throw new Error('document changed before it could be deleted')
+  })
+  let quarantineDir: string | undefined
+  let quarantined: string | undefined
+  try {
+    const heldBefore = await handle.stat({ bigint: true })
+    if (!heldBefore.isFile()) throw new Error('document changed before it could be deleted')
+    const heldBeforeFingerprint = fingerprintOf(heldBefore)
+    if (!sameRequiredFileFingerprint(heldBeforeFingerprint, prepared.fingerprint))
+      throw new Error('document changed before it could be deleted')
+
+    await testHooks.afterFinalPrecheck?.()
+
+    quarantineDir = await createDocumentQuarantine(dirname(current.path))
+    quarantined = join(quarantineDir, basename(current.path))
+    try {
+      await rename(current.path, quarantined)
+    } catch {
+      await removeEmptyQuarantine(quarantineDir)
+      throw new Error('document changed before it could be deleted')
+    }
+
+    let verified = false
+    try {
+      const [moved, heldAfter] = await Promise.all([
+        lstat(quarantined, { bigint: true }),
+        handle.stat({ bigint: true }),
+      ])
+      if (moved.isFile() && heldAfter.isFile()) {
+        const movedFingerprint = fingerprintOf(moved)
+        const heldFingerprint = fingerprintOf(heldAfter)
+        verified =
+          sameRequiredFileFingerprint(movedFingerprint, heldFingerprint) &&
+          samePreparedFileAfterRename(movedFingerprint, prepared.fingerprint)
+      }
+    } catch {
+      verified = false
+    }
+
+    if (!verified) {
+      const restoration = await restoreQuarantinedEntry(current.path, quarantined, quarantineDir)
+      if (restoration === 'restored')
+        throw new Error('document changed before it could be deleted; the replacement was restored')
+      throw new Error(
+        `document changed before it could be deleted; the replacement was preserved at ${quarantined}`,
+      )
+    }
+
+    try {
+      await unlink(quarantined)
+    } catch {
+      const restoration = await restoreQuarantinedEntry(current.path, quarantined, quarantineDir)
+      if (restoration === 'restored')
+        throw new Error('document could not be deleted; the checkpointed file was restored')
+      throw new Error(`document could not be deleted; the checkpointed file remains at ${quarantined}`)
+    }
+    await removeEmptyQuarantine(quarantineDir)
+    invalidateDocsCache(root)
+  } finally {
+    await handle.close()
+  }
 }
 
 /**
@@ -468,6 +1012,7 @@ export async function deleteProjectPath(root: string, target: string): Promise<v
   const real = containedReal(root, target)
   if (real === realpathSync(root)) throw new Error('cannot delete the project root')
   await rm(real, { recursive: true, force: false })
+  invalidateDocsCache(root)
 }
 
 /**
@@ -487,6 +1032,7 @@ export async function createProjectDir(
   let dir = join(parentDir, base)
   for (let n = 2; existsSync(dir); n++) dir = join(parentDir, `${base} ${n}`)
   await mkdir(dir)
+  invalidateDocsCache(root)
   return realpathSync(dir)
 }
 
@@ -525,6 +1071,7 @@ export async function duplicateProjectPath(root: string, target: string): Promis
   let dest = join(dir, `${stem} copy${ext}`)
   for (let n = 2; existsSync(dest); n++) dest = join(dir, `${stem} copy ${n}${ext}`)
   await cp(src, dest, { recursive: true })
+  invalidateDocsCache(root)
   return realpathSync(dest)
 }
 
@@ -549,6 +1096,7 @@ export async function importFilesIntoProject(
     await writeFile(dest, f.data, { flag: 'wx' })
     out.push(realpathSync(dest))
   }
+  if (out.length) invalidateDocsCache(root)
   return out
 }
 
@@ -573,10 +1121,15 @@ export async function searchProject(
   const files: SearchFileResult[] = []
   let scanned = 0
   let totalMatches = 0
+  // `truncated` reports a partial RESULT; `stop` ends the walk. Only the three real ceilings below stop
+  // it. A per-file signal (an unreadable file, hits beyond the per-file cap) makes the answer partial
+  // and must not abandon the tree: files with a long matching line are ordinary, so one flag serving
+  // both ends the search a few files in and reports "No matches" for a project full of them.
   let truncated = false
+  let stop = false
 
   async function walk(dir: string): Promise<void> {
-    if (truncated) return
+    if (stop) return
     let dirents: import('node:fs').Dirent[]
     try {
       dirents = await readdir(dir, { withFileTypes: true })
@@ -588,7 +1141,7 @@ export async function searchProject(
       a.isDirectory() !== b.isDirectory() ? (a.isDirectory() ? -1 : 1) : a.name.localeCompare(b.name),
     )
     for (const d of dirents) {
-      if (truncated) return
+      if (stop) return
       if (d.isSymbolicLink()) continue // never follow symlinks (escape / cycle risk)
       const full = join(dir, d.name)
       if (d.isDirectory()) {
@@ -599,19 +1152,25 @@ export async function searchProject(
       if (!d.isFile() || !inScope(d.name, scope)) continue
       if (++scanned > SEARCH.maxFilesScanned || files.length >= SEARCH.maxFileResults) {
         truncated = true
+        stop = true
         return
       }
       const rel = relative(realRoot, full).split(sep).join('/')
       const nameScore = fuzzyScore(needle, d.name)
       const nameMatch = nameScore !== null
-      const matches = await scanFileContents(full, needle)
-      if (matches === 'binary') {
+      const scan = await scanFileContents(full, needle, { root: realRoot })
+      if (scan.truncated) truncated = true
+      if (scan.binary) {
         // Binary file: still report it on a filename match (you can open it), just no line hits.
         if (nameMatch) files.push({ path: full, rel, name: d.name, nameMatch, score: nameScore, matches: [] })
         continue
       }
+      const matches = scan.matches
       totalMatches += matches.length
-      if (totalMatches >= SEARCH.maxTotalMatches) truncated = true
+      if (totalMatches >= SEARCH.maxTotalMatches) {
+        truncated = true
+        stop = true
+      }
       if (nameMatch || matches.length)
         files.push({ path: full, rel, name: d.name, nameMatch, score: nameScore ?? 0, matches })
     }
@@ -681,6 +1240,7 @@ export async function replaceInProject(
   }
 
   await walk(realRoot)
+  if (filesChanged) invalidateDocsCache(root)
   return { files: filesChanged, replacements }
 }
 
@@ -712,27 +1272,55 @@ function replaceCaseInsensitive(text: string, needle: string, replacement: strin
 }
 
 /** Scan one file's contents for the needle. Returns `'binary'` (NUL in the leading slice) or the
- *  line hits (windowed preview, capped per file). Reads at most MAX_FILE_BYTES, like readProjectFile. */
-async function scanFileContents(full: string, needle: string): Promise<SearchLineMatch[] | 'binary'> {
+ *  line hits (windowed preview, capped per file). Reads at most MAX_FILE_BYTES, like readProjectFile.
+ *
+ *  `skipFrontmatter` (the Library) scans the BODY only, so a document's metadata block is never
+ *  reported as something the document says. Reported line numbers stay absolute — the skipped block's
+ *  line count is added back — because a caller uses them to open the file at the hit. */
+async function scanFileContents(
+  full: string,
+  needle: string,
+  opts: { skipFrontmatter?: boolean; root: string },
+): Promise<{ matches: SearchLineMatch[]; binary: boolean; truncated: boolean }> {
   let buf: Buffer
+  let truncated: boolean
   try {
-    buf = await readFile(full)
+    const safe = await readContainedRegularFile(opts.root, full, MAX_FILE_BYTES)
+    buf = safe.bytes
+    truncated = safe.truncated
   } catch {
-    return []
+    return { matches: [], binary: false, truncated: true }
   }
-  const slice = buf.subarray(0, MAX_FILE_BYTES)
-  if (slice.includes(0)) return 'binary'
-  const text = slice.toString('utf8')
+  if (buf.includes(0)) return { matches: [], binary: true, truncated }
+  const raw = buf.toString('utf8')
+  // The SAME split and the SAME is-this-metadata test the doc reader uses, rather than a second regex
+  // free to disagree with them. `isDocFrontmatterBlock` is what keeps a body that opens with a
+  // rule-delimited pull quote — fence-identical to frontmatter — from having its first lines skipped.
+  const split = splitDocumentFrontmatter(raw)
+  const skipBlock = Boolean(opts.skipFrontmatter) && (split.kind === 'koda' || split.kind === 'yaml')
+  const text = skipBlock ? split.body : raw
+  const lineOffset = skipBlock ? countNewlines(raw.slice(0, raw.length - text.length)) : 0
   const matches: SearchLineMatch[] = []
   const lines = text.split('\n')
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
     const idx = line.toLowerCase().indexOf(needle)
     if (idx === -1) continue
-    matches.push({ line: i + 1, preview: previewLine(line, idx) })
-    if (matches.length >= SEARCH.maxMatchesPerFile) break
+    // A long line is windowed around its match by `previewLine`, not dropped, so the hit IS reported —
+    // that is a display window, not a partial result, and marking it truncated made almost every file
+    // in an ordinary project claim the search had given up.
+    if (matches.length < SEARCH.maxMatchesPerFile)
+      matches.push({ line: lineOffset + i + 1, preview: previewLine(line, idx) })
+    else truncated = true
   }
-  return matches
+  return { matches, binary: false, truncated }
+}
+
+/** How many lines a skipped prefix occupied, so a reported line number still opens the right line. */
+function countNewlines(text: string): number {
+  let n = 0
+  for (let i = text.indexOf('\n'); i !== -1; i = text.indexOf('\n', i + 1)) n++
+  return n
 }
 
 /** Trim + window a matched line for display: drop leading whitespace, and if it's still long, slice a

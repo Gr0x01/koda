@@ -15,6 +15,7 @@ import { join } from 'node:path'
 import { IpcChannels } from '@shared/channels'
 import type { UpdateStatus } from '@shared/ipc'
 import { loadWhatsNewSeenVersion, setWhatsNewSeenVersion } from './settings'
+import { governProbe, type GovernedProbe } from './probe-governor'
 import { log } from './logger'
 
 // Re-check on this cadence after the launch check. A running app that stays open for days still learns
@@ -28,6 +29,19 @@ let downloadingVersion = ''
 // The durable fact: this build is downloaded and staged on disk, installable right now. Kept apart
 // from `status` because `status` also carries transient check outcomes.
 let staged: { version: string } | null = null
+// The re-check's power-aware gate (probe-governor.ts). Nobody can act on an update offer while the
+// screen is locked, and a check that finds one pulls a whole .app down the wire.
+let checkProbe: GovernedProbe | null = null
+
+export type UpdateChannel = 'latest' | 'nightly'
+
+/** A prerelease follows only its named prerelease feed. Stable builds never opt into prereleases, so
+ *  publishing a nightly cannot make an ordinary Koda install discover it. */
+export function updateChannelForVersion(version: string): UpdateChannel {
+  return version.match(/^[0-9]+\.[0-9]+\.[0-9]+-([0-9A-Za-z-]+)(?:\.|$)/)?.[1] === 'nightly'
+    ? 'nightly'
+    : 'latest'
+}
 
 function broadcast(next: UpdateStatus): void {
   // A staged update outlives every later check. The 6-hourly re-check emits checking / up-to-date /
@@ -53,6 +67,12 @@ export function initUpdater(): void {
   }
 
   autoUpdater.autoDownload = true // background download the moment one is found
+  const channel = updateChannelForVersion(app.getVersion())
+  autoUpdater.channel = channel
+  autoUpdater.allowPrerelease = channel === 'nightly'
+  // Setting a channel makes electron-updater enable downgrades. Koda's feeds are monotonic; an older
+  // nightly must never replace a newer installed build, even if GitHub returns releases out of order.
+  autoUpdater.allowDowngrade = false
   // Install ONLY on the user's explicit "Restart to update" — never on quit. (autoInstallOnAppQuit is
   // also dead here: Koda's before-quit force-exits via app.exit(), which skips the `quit` event the
   // hook needs; and on macOS the Squirrel install path relaunches the app, which the "never silent"
@@ -90,13 +110,21 @@ export function initUpdater(): void {
   })
 
   void checkForUpdatesNow()
-  setInterval(() => void checkForUpdatesNow(), CHECK_INTERVAL_MS)
+  checkProbe = governProbe('update-check', CHECK_INTERVAL_MS, {
+    // A Mac that slept through the night comes back a check overdue; catch it up rather than making
+    // the user wait out the rest of a six-hour window for news that already exists.
+    wake: () => void checkForUpdatesNow(),
+  })
+  setInterval(() => {
+    if (checkProbe?.due()) void checkForUpdatesNow()
+  }, CHECK_INTERVAL_MS)
 }
 
 /** Manual "Check for updates" (Settings). No-op-safe in dev + mid-download (autoUpdater ignores a
  *  re-check while one is in flight). Always returns the current status for the caller to render. */
 export async function checkForUpdatesNow(): Promise<UpdateStatus> {
   if (!app.isPackaged) return status
+  checkProbe?.ran() // a manual "Check for updates" is this probe's run; the stretch counts from here
   try {
     await autoUpdater.checkForUpdates()
   } catch (err) {

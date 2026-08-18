@@ -2,12 +2,12 @@ import { useEffect, useState, type ReactNode } from 'react'
 import { undoPointRefusal, type GuardrailsLayer, type SkillState } from '@shared/ipc'
 import { AnimatePresence, duration, ease, motion } from '../motion'
 import { useWorkspace } from '../workspace/store'
-import { SegmentedControl, SettingsRow, SettingsSection, Toggle } from './controls'
+import { SegmentedControl, SettingsNote, SettingsRow, SettingsSection, Toggle } from './controls'
 import { Button } from '../ui'
 
 // ── Guardrails (the behavior layer) ────────────────────────────────────────────────
-// What shapes the agent — its always-on judgment (rules), focused playbooks (skills), and specialist
-// helpers (subagents). Visible on purpose: it's the product's soul, not a dangerous knob. Koda ships a
+// What shapes the agent — a small core, focused playbooks, and specialist helpers. Visible on purpose:
+// it's the product's soul, not a dangerous knob. Koda ships a
 // curated, protected set; this project's own items are editable, and "+ New" hands authoring to the agent.
 type GuardrailScope = 'koda' | 'project'
 type ScopeFilter = 'all' | GuardrailScope
@@ -157,8 +157,9 @@ export function GuardrailsSection() {
       <div className="space-y-2.5">
         <h2 className="font-display text-[15px] font-semibold text-text">Guardrails</h2>
         <p className="text-[13px] leading-relaxed text-text-muted">
-          What shapes your agent: its always-on judgment, the skills it reaches for, and the specialist
-          helpers it delegates to. Koda ships a curated set that works in every project.{' '}
+          What shapes your agent: a small core it carries into every turn, focused playbooks it opens
+          only when the work calls for them, and specialists it can hand a bounded job to. Koda ships a
+          curated set that works in every project.{' '}
           <span className="text-text">Flip any off, open one to edit it, or add your own.</span> Nothing
           is lost: anything you change can be restored. Safety rules ask first.
         </p>
@@ -173,8 +174,8 @@ export function GuardrailsSection() {
       </div>
 
       <GuardrailGroup
-        title="Rules"
-        subtitle="Always-on judgment that shapes every response."
+        title="Core"
+        subtitle="The few judgments that travel with every turn."
         newKind="rule"
         canAuthor={canAuthor}
         isEmpty={rules.length === 0}
@@ -186,8 +187,8 @@ export function GuardrailsSection() {
       </GuardrailGroup>
 
       <GuardrailGroup
-        title="Skills"
-        subtitle="Focused playbooks the agent uses when a task calls for one."
+        title="Playbooks"
+        subtitle="Focused procedures opened only when this kind of work calls for one."
         newKind="skill"
         canAuthor={canAuthor}
         isEmpty={skills.length === 0}
@@ -199,8 +200,8 @@ export function GuardrailsSection() {
       </GuardrailGroup>
 
       <GuardrailGroup
-        title="Subagents"
-        subtitle="Specialist helpers the agent hands focused work to."
+        title="Specialists"
+        subtitle="Focused helpers the agent can hand a bounded piece of work to."
         newKind="subagent"
         canAuthor={canAuthor}
         isEmpty={subagents.length === 0}
@@ -220,7 +221,7 @@ export function GuardrailsSection() {
 type SkillScopeValue = 'off' | 'project' | 'everywhere'
 
 /**
- * The skills gallery (Settings → Skills): the bundled, curated Apache-2.0 subset of Anthropic's Agent
+ * The playbook library (Settings → Playbook library): the bundled, curated subset of reusable agent
  * Skills. A few ship on; the rest are one pick away. Per "curate, not configure" this is a calm grouped
  * list, not a marketplace. Scope picks apply on the next message (the engine reads skills at spawn).
  */
@@ -285,12 +286,12 @@ export function SkillsSection() {
   return (
     <>
       <div className="space-y-2.5">
-        <h2 className="font-display text-[15px] font-semibold text-text">Skills</h2>
+        <h2 className="font-display text-[15px] font-semibold text-text">Playbook library</h2>
         <p className="text-[13px] leading-relaxed text-text-muted">
-          Capabilities your agent reaches for when a task calls for one — designing a poster, theming a
+          Optional playbooks your agent opens when a task calls for one: designing a poster, theming a
           page, co-authoring a doc. Koda turns a few on by default.{' '}
           <span className="text-text">Add any to just this project or everywhere.</span> Changes apply to
-          your next message. These are Anthropic's open-source skills.
+          your next message.
         </p>
       </div>
 
@@ -391,12 +392,12 @@ function GuardrailGroup({
 
   const placeholder =
     newKind === 'rule'
-      ? 'Type or paste a rule: a short line of guidance. Save adds it as-is, or let the agent shape it.'
-      : `Paste a ${newKind} (include its name: line at the top), or describe one for the agent to scaffold.`
+      ? 'Type or paste core guidance. Save adds it as-is, or let the agent shape it.'
+      : `Paste a ${newKind === 'skill' ? 'playbook' : 'specialist'} (include its name: line at the top), or describe one for the agent to scaffold.`
 
   return (
     <section>
-      <div className="flex items-baseline justify-between px-1 pb-2">
+      <div className="flex items-baseline justify-between">
         <h3 className="font-display text-[11px] font-semibold uppercase tracking-wider text-text-muted">
           {title}
         </h3>
@@ -406,10 +407,10 @@ function GuardrailGroup({
           </Button>
         )}
       </div>
-      <p className="px-1 pb-2 text-[12px] leading-snug text-text-muted">{subtitle}</p>
-      <div className="divide-y divide-border overflow-hidden rounded-2xl border border-border bg-surface shadow-soft">
+      <p className="mt-1.5 text-[12.5px] leading-snug text-text-muted">{subtitle}</p>
+      <div className="mt-1.5">
         {composing && (
-          <div className="space-y-2.5 px-4 py-3.5">
+          <div className="space-y-2.5 py-3">
             <textarea
               autoFocus
               value={text}
@@ -440,7 +441,7 @@ function GuardrailGroup({
           </div>
         )}
         {isEmpty && !composing ? (
-          <div className="px-4 py-3.5 text-[12.5px] text-text-muted">Nothing here yet.</div>
+          <SettingsNote>Nothing here yet.</SettingsNote>
         ) : (
           children
         )}
@@ -467,7 +468,7 @@ interface RowProps {
 }
 
 /**
- * One row for every guardrail — rule, skill, or subagent (the single shape). A calm name + provenance
+ * One row for every guardrail — core item, playbook, or specialist (the single shape). A calm name + provenance
  * badge + summary with one on/off toggle; clicking the row opens an inline editor where the content
  * edits in place and the contextual reset (Restore default / Delete) lives. Saving a Koda default forks
  * it into the project. A protected (safety) row confirms before switching off.
@@ -523,9 +524,10 @@ function GuardrailRow(p: RowProps) {
 
   return (
     <div className={p.enabled ? '' : 'opacity-60'}>
+      {/* Negative margin so the hover band breathes past the text without a permanent box around it. */}
       <div
         onClick={() => setOpen((o) => !o)}
-        className="group cursor-pointer px-4 py-3.5 transition-colors hover:bg-bg/40"
+        className="group -mx-2.5 cursor-pointer rounded-lg px-2.5 py-3 transition-colors hover:bg-surface"
       >
         {/* Controls ride the name line so they vertically center on it (items-center), independent of
             the description height below. Resting state is bare; the row reveals "Open ›" on hover, and
@@ -559,7 +561,7 @@ function GuardrailRow(p: RowProps) {
           </div>
         </div>
         {p.subtitle && (
-          <div className="mt-0.5 line-clamp-2 text-[12.5px] leading-snug text-text-muted">{p.subtitle}</div>
+          <div className="mt-1 line-clamp-2 text-[12.5px] leading-snug text-text-muted">{p.subtitle}</div>
         )}
         {failed && !open && (
           <div role="status" className="mt-1 text-[12px] text-text-muted">
@@ -577,7 +579,7 @@ function GuardrailRow(p: RowProps) {
             transition={{ duration: duration.fast, ease: ease.out }}
             className="overflow-hidden"
           >
-            <div className="mx-4 mb-3 flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[12px] text-text-muted">
+            <div className="mb-3 flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[12px] text-text-muted">
               <span className="flex-1">This includes a safety guard. Turning it off removes it.</span>
               {/* Inline amber callout actions: amber-specific color (Turn off) and plain hover (Keep).
                   Neither maps faithfully to a variant — left as raw buttons. */}
@@ -607,7 +609,8 @@ function GuardrailRow(p: RowProps) {
             transition={{ duration: duration.base, ease: ease.out }}
             className="overflow-hidden"
           >
-            <div className="space-y-2.5 border-t border-border bg-bg/40 px-4 py-3.5">
+            {/* The open editor IS a bounded object, so it keeps an edge where the resting row has none. */}
+            <div className="mb-1 space-y-2.5 rounded-xl border border-border bg-bg/40 p-3.5">
               <textarea
                 autoFocus
                 value={draft}

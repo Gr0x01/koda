@@ -1,9 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { docMention, docMentionLabel, expandDocMentionLabels } from './doc-mentions'
+import { docMention, docMentionLabel, expandDocMentionLabels, hasDocMention } from './doc-mentions'
 
 const docs = [
-  { name: 'Goal sessions.md', rel: 'Documents/Goal sessions.md' },
-  { name: 'release-plan.md', rel: 'Documents/release/release-plan.md' },
+  { path: '/p/Documents/Goal sessions.md', name: 'Goal sessions.md', rel: 'Documents/Goal sessions.md' },
+  {
+    path: '/p/Documents/release/release-plan.md',
+    name: 'release-plan.md',
+    rel: 'Documents/release/release-plan.md',
+  },
 ]
 
 describe('document mentions', () => {
@@ -25,11 +29,29 @@ describe('document mentions', () => {
   })
 
   it('round-trips legal filenames containing quotes and backslashes', () => {
-    const odd = [{ name: 'Bob "draft" \\ notes.md', rel: 'Documents/Bob "draft" \\ notes.md' }]
+    const odd = [
+      { path: '/p/Documents/Bob "draft" \\ notes.md', name: 'Bob "draft" \\ notes.md', rel: 'Documents/Bob "draft" \\ notes.md' },
+    ]
     const mention = docMention(docMentionLabel(odd[0].name))
     expect(mention).toBe('@"Bob \\"draft\\" \\\\ notes"')
     expect(expandDocMentionLabels(`Read ${mention}.`, odd)).toBe(
       'Read @"Documents/Bob \\"draft\\" \\\\ notes.md".',
     )
+  })
+})
+
+describe('hasDocMention — the gate before paying for the document list', () => {
+  it('sees a token worth resolving, quoted or bare', () => {
+    expect(hasDocMention('read @release-plan')).toBe(true)
+    expect(hasDocMention('read @"Goal sessions"')).toBe(true)
+    // Slash-shaped too: resolving it is the only way to learn it names nothing.
+    expect(hasDocMention('npm i @tanstack/react-query')).toBe(true)
+  })
+
+  it('stays false for text with no reference in it', () => {
+    expect(hasDocMention('plain text')).toBe(false)
+    expect(hasDocMention('mail rb@example.com')).toBe(false)
+    expect(hasDocMention('have a look at @')).toBe(false)
+    expect(hasDocMention('')).toBe(false)
   })
 })

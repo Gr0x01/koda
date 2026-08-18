@@ -8,8 +8,12 @@ const CrepeDocEditor = lazyWithRetry(() => import('./CrepeDocEditor'))
 /**
  * A markdown file rendered as a WYSIWYG document (the everyday-user surface). The file stays canonical
  * markdown on disk; this is the rich VIEW. Reads through the contained `fs:readFile` IPC, then hands a
- * non-binary file to the lazy, themed Crepe editor. A truncated file opens read-only (we only loaded a
- * leading slice, so saving would destroy the rest).
+ * non-binary file to the lazy, themed Crepe editor.
+ *
+ * `readOnly` here means one thing only: this file CANNOT be written back, because we loaded a leading
+ * slice of it and saving would destroy the rest. It is not "the user isn't editing yet" — every
+ * document opens in reading state and the editor owns that; see `docEditorGuards`. Passing truncation
+ * as the same flag would leave a large file with an Edit action that could only ever lose text.
  *
  * The "show real markdown" path is the existing Monaco `file` view — the per-pane toggle in SurfaceHost.
  */
@@ -56,7 +60,8 @@ export function DocSurfaceView({
         ) : (
           <Suspense fallback={<p className="px-4 py-3 text-xs text-text-muted">Loading editor…</p>}>
             <CrepeDocEditor
-              path={path}
+              path={file.path}
+              surfacePath={path}
               initialContent={file.content}
               readOnly={file.truncated}
               sessionId={sessionId}

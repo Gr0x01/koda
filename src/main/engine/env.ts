@@ -15,7 +15,6 @@
 import { homedir } from 'node:os'
 import { userPath } from './user-path'
 import { engineProfile, type EngineId } from './profile'
-import { codexHome } from './codex-home'
 
 export interface EngineEnvOptions {
   /** Which engine this spawn is for — selects the EngineProfile. Defaults to 'claude'. */
@@ -41,23 +40,13 @@ export function buildEngineEnv(
   // Finder-launched .app gets HOME from launchd, but make the guarantee real, not assumed.
   if (!env.HOME) env.HOME = homedir()
 
-  // Codex gets its OWN isolated home (not the user's ~/.codex) so Koda's bundled skills/subagents
-  // plugin installs there without polluting their standalone Codex. Set for EVERY Codex spawn (login,
-  // auth probe, driver) so they all agree on the home. CODEX_HOME was stripped above (profile), so
-  // this is the sole source. See codex-home.ts.
-  if (opts.engineId === 'codex') env.CODEX_HOME = codexHome()
-
   // Freeze the bundled copy at its pinned version — never let it self-update out from under us.
   // (Claude: DISABLE_AUTOUPDATER=1; Codex: none — it never self-replaces.)
   Object.assign(env, profile.disableUpdaterEnv)
 
-  // Claude delegation stays deliberately flat and small. Per-Agent foreground enforcement rides the
-  // bundled pack's PreToolUse hook; the global DISABLE_BACKGROUND_TASKS flag cannot be used because it
-  // also disables Koda's explicit `background: true` scout/worker profiles.
-  if ((opts.engineId ?? 'claude') === 'claude') {
-    env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS = '3'
-    env.CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH = '1'
-  }
+  // The engine's own env (Codex's isolated home, Claude's delegation caps). This chokepoint enforces
+  // the shared rules and never asks which engine it is serving — the profile answers that.
+  Object.assign(env, profile.extraEnv())
 
   // Give the agent's Bash tool the user's real login-shell PATH. A Finder-launched .app otherwise
   // inherits launchd's minimal PATH and can't find node/npm/python the user has installed.

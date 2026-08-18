@@ -27,6 +27,7 @@ import type { AuthProgress, AuthVerdict } from '@shared/ipc'
 import { resolveEnginePath } from './engine/binary'
 import { buildEngineEnv } from './engine/env'
 import { log } from './logger'
+import { HERMETIC_E2E_BLOCK_REASON, isHermeticE2EProfile } from './runtime-profile'
 
 const execFileP = promisify(execFile)
 
@@ -93,6 +94,9 @@ function classify(s: AuthStatusRaw, deliberate = false): AuthVerdict {
  *  spawns with it, so `auth status` reports the API identity instead of the subscription that the clean
  *  env would otherwise surface. The default (no opts) is the subscription path — unchanged. */
 export async function detectAuthNow(opts: { apiKey?: string } = {}): Promise<AuthVerdict> {
+  if (isHermeticE2EProfile()) {
+    return { mode: 'logged-out', apiKeyTrap: false, email: null, plan: null, detail: 'Not signed in.' }
+  }
   const env = opts.apiKey
     ? buildEngineEnv(process.env, { apiMode: true, apiKey: opts.apiKey })
     : buildEngineEnv(process.env)
@@ -123,6 +127,7 @@ function cleanup(): void {
 /** Spawn `claude auth login --claudeai` and stream progress. Returns immediately; the wizard subscribes
  *  to auth:progress. Single-flighted — a second start while one is live is a no-op ack. */
 export function startSubscriptionLogin(): { ok: boolean; reason?: string } {
+  if (isHermeticE2EProfile()) return { ok: false, reason: HERMETIC_E2E_BLOCK_REASON }
   if (login) return { ok: false, reason: 'already in progress' }
   aborting = false
   lastErr = ''
@@ -184,6 +189,10 @@ export function startSubscriptionLogin(): { ok: boolean; reason?: string } {
 
 /** Write the code the user pasted from the browser to the waiting child's stdin. */
 export function submitAuthCode(code: string): void {
+  if (isHermeticE2EProfile()) {
+    broadcast({ state: 'failed', message: HERMETIC_E2E_BLOCK_REASON })
+    return
+  }
   const c = login
   if (!c?.stdin?.writable) {
     // No live child waiting on stdin — tell the UI rather than leave it stuck on "verifying".

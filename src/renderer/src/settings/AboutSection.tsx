@@ -14,18 +14,25 @@ export function AboutSection() {
   }, [])
 
   return (
-    <SettingsSection title="About">
+    <SettingsSection
+      title="About"
+      note="What this build is made of, and where its logs live when something goes wrong."
+    >
       <SettingsRow label="Koda" control={<Mono>{info ? `v${info.appVersion}` : '…'}</Mono>} />
       <SettingsRow
         label="Engine"
-        description="The bundled Claude Code that powers every session."
+        description="The bundled Claude Code build that runs every session."
         control={<Mono>{engine ? `${engine.version} · ${engine.source}` : '…'}</Mono>}
       />
-      <SettingsRow label="Electron" control={<Mono>{info ? info.electron : '…'}</Mono>} />
+      <SettingsRow
+        label="Electron"
+        description="The runtime Koda's window is drawn on."
+        control={<Mono>{info ? info.electron : '…'}</Mono>}
+      />
       <UpdatesRow />
       <SettingsRow
         label="Logs"
-        description="Per-launch diagnostic logs, handy when reporting a bug."
+        description="One diagnostic log per launch, worth attaching when you report a bug."
         control={<Mono>~/Library/Logs/Koda</Mono>}
       />
     </SettingsSection>
@@ -49,7 +56,7 @@ function UpdatesRow() {
     return (
       <SettingsRow
         label="Updates"
-        description="Koda checks for new versions automatically in installed builds."
+        description="Installed builds check for new versions on their own, so this dev build has nothing to check."
         control={<Mono>dev build</Mono>}
       />
     )
@@ -58,14 +65,14 @@ function UpdatesRow() {
   const busy = status.state === 'checking'
   const description =
     status.state === 'ready'
-      ? `Version ${status.version} is ready. Restart when you like — nothing installs on its own.`
+      ? `Version ${status.version} is downloaded and installs when you restart.`
       : status.state === 'downloading'
         ? undefined
         : status.state === 'error'
-          ? "Couldn't check just now. It'll try again on its own."
+          ? "Koda couldn't check for updates just now and will try again on its own."
           : status.state === 'up-to-date'
             ? "You're on the latest version."
-            : 'Koda checks for new versions automatically and downloads them in the background.'
+            : 'Koda checks for new versions on its own and downloads them in the background.'
 
   return (
     <SettingsRow
@@ -122,7 +129,7 @@ export function DeveloperSection() {
     setIntakeNote(
       r === 'no-project'
         ? 'No project is open.'
-        : 'This project has sessions or guidelines — open a fresh folder to see intake.',
+        : 'This project has sessions or guidelines already, so open a fresh folder to see intake.',
     )
   }
 
@@ -132,20 +139,23 @@ export function DeveloperSection() {
   }
 
   return (
-    <SettingsSection title="Developer">
+    <SettingsSection
+      title="Developer"
+      note="Dev-build only, for retesting the onboarding flows without hand-editing settings."
+    >
       <SettingsRow
         label="Replay onboarding"
-        description="Show the first-run wizard again. Sign-in and installed tools show as done."
+        description="Show the first-run wizard again, with sign-in and installed tools already marked done."
         control={<Button variant="secondary" onClick={replayWizard}>Replay</Button>}
       />
       <SettingsRow
         label="Re-offer project setup"
-        description={intakeNote ?? "Clear this project's intake dismissal and re-run the offer."}
+        description={intakeNote ?? "Clear this project's intake dismissal so the offer runs again."}
         control={<Button variant="secondary" onClick={reOfferIntake}>Reset</Button>}
       />
       <SettingsRow
         label="Reset all settings"
-        description="Wipe every preference to defaults and reload the window. Re-shows onboarding too."
+        description="Wipe every preference back to its default and reload the window, onboarding included."
         control={<Button variant="secondary" onClick={resetAll}>Reset all</Button>}
       />
     </SettingsSection>
