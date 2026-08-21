@@ -1,16 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Crepe } from '@milkdown/crepe'
-import { editorViewCtx } from '@milkdown/kit/core'
-import { replaceAll } from '@milkdown/kit/utils'
 import { splitDocumentFrontmatter } from '@shared/document-contract'
 import { useWorkspace } from '../workspace/store'
 import { Collapse } from '../motion'
-import { IconButton } from '../ui'
+import { IconButton, reloadForModuleGraphError, noteModuleGraphRecovered } from '../ui'
 import { useTableColumnResize } from './useTableColumnResize'
 import { buildDocBlockMenu, docBlockPlugins } from './blocks'
 import { DocOutline, docHeadingEls, headingSlug } from './DocOutline'
 import { DocPageChrome } from './DocPageChrome'
 import { TranscriptFind } from './TranscriptFind'
+import { Crepe, editorViewCtx, replaceAll } from './milkdown-runtime'
 import './doc-theme.css'
 import { windowHasOpenModal } from '../window-modal'
 import { registerFileWriter } from '../workspace/file-writer-registry'
@@ -196,7 +194,8 @@ function CrepeDocEditor({
   const baselineRef = useRef(body)
   const [dirty, setDirty] = useState(false)
   const [saving, setSaving] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [initError, setInitError] = useState<string | null>(null)
+  const [saveError, setSaveError] = useState<string | null>(null)
   // `save` reports failures in the pane instead of rejecting every fire-and-forget autosave. The
   // writer registry still needs a hard failure signal so a confirmed delete can stop before main.
   const lastSaveErrorRef = useRef<unknown>(null)
@@ -371,9 +370,22 @@ function CrepeDocEditor({
         // Baseline against the normalised form so the doc doesn't open pre-dirtied.
         baselineRef.current = crepe.getMarkdown()
         crepeRef.current = crepe
+        setInitError(null)
         setReady(true)
+        // A clean mount means Vite's graph settled — release the shared reload budget so a later,
+        // unrelated churn recovers with a full budget instead of one this open already spent.
+        noteModuleGraphRecovered()
       })
-      .catch((e) => !disposed && setError(String(e)))
+      .catch(async (e) => {
+        if (disposed) return
+        // A dependency pre-bundle replacement can leave Crepe and Koda's custom plugins on opposite
+        // sides of Vite's module graph. One guarded full reload is the same recovery used for a stale
+        // lazy chunk; the runtime seam above prevents the graph from splitting again after it reloads.
+        if (await reloadForModuleGraphError(e)) return
+        if (disposed) return
+        setInitError(String(e))
+        window.koda.logFromRenderer({ level: 'error', args: [`Document editor failed (${path}): ${String(e)}`] })
+      })
     return () => {
       disposed = true
       // Hand the body to the unmount flush while the editor still exists. This must stay ahead of
@@ -392,6 +404,9 @@ function CrepeDocEditor({
   useEffect(() => {
     setEditing(false)
     setNoUndo(false)
+    setReady(false)
+    setInitError(null)
+    setSaveError(null)
     finalBodyRef.current = null
     autosave.cancel()
   }, [path, autosave])
@@ -530,11 +545,11 @@ function CrepeDocEditor({
     if (markdown === null) return
     if (markdown === baselineRef.current) {
       lastSaveErrorRef.current = null
-      setError(null)
+      setSaveError(null)
       return
     }
     setSaving(true)
-    setError(null)
+    setSaveError(null)
     try {
       const res = await window.koda.writeFile({ path, content: frontmatter + markdown })
       baselineRef.current = markdown
@@ -543,7 +558,7 @@ function CrepeDocEditor({
       lastSaveErrorRef.current = null
     } catch (e) {
       lastSaveErrorRef.current = e
-      setError(String(e))
+      setSaveError(String(e))
       // The error line can only be read while this pane is mounted, and the flush that matters most
       // runs as it unmounts — so a failed save leaves a trace the user can be pointed at later.
       window.koda.logFromRenderer({ level: 'error', args: [`Document save failed (${path}): ${String(e)}`] })
@@ -758,9 +773,13 @@ function CrepeDocEditor({
       </div>
       {!readOnly && (
         <div className="flex items-center justify-between gap-3 border-t border-border px-4 py-1.5">
-          {error ? (
+          {initError ? (
             <span role="status" className="truncate text-[11px] text-red-400">
-              Couldn't save: {error}
+              Couldn't open editor: {initError}
+            </span>
+          ) : saveError ? (
+            <span role="status" className="truncate text-[11px] text-red-400">
+              Couldn't save: {saveError}
             </span>
           ) : noUndo ? (
             <span role="status" className="truncate text-[11px] text-amber-600 dark:text-amber-400">
@@ -772,7 +791,14 @@ function CrepeDocEditor({
             </span>
           )}
           <div className="flex shrink-0 items-center gap-2">
-            {error && (
+            {initError ? (
+              <button
+                onClick={() => window.location.reload()}
+                className="rounded-lg bg-accent px-3 py-1 text-[11px] font-medium text-white transition-opacity hover:opacity-90"
+              >
+                Reload
+              </button>
+            ) : saveError ? (
               <button
                 onClick={() => void autosave.flush()}
                 disabled={saving}
@@ -780,18 +806,20 @@ function CrepeDocEditor({
               >
                 {saving ? 'Saving…' : 'Retry'}
               </button>
-            )}
+            ) : null}
             {/* A failed save drops the "saved automatically" half of the label: the error beside it is
                 the truth, and two claims that contradict each other are worse than either alone. */}
-            <button
-              onClick={() => (editing ? stopEditing() : setEditing(true))}
-              aria-pressed={editing}
-              className={`rounded-lg px-3 py-1 text-[11px] font-medium transition-colors ${
-                editing ? 'bg-accent/10 text-accent' : 'text-text-muted hover:bg-bg hover:text-text'
-              }`}
-            >
-              {!editing ? 'Edit' : error ? 'Editing' : 'Editing · saved automatically'}
-            </button>
+            {!initError && (
+              <button
+                onClick={() => (editing ? stopEditing() : setEditing(true))}
+                aria-pressed={editing}
+                className={`rounded-lg px-3 py-1 text-[11px] font-medium transition-colors ${
+                  editing ? 'bg-accent/10 text-accent' : 'text-text-muted hover:bg-bg hover:text-text'
+                }`}
+              >
+                {!editing ? 'Edit' : saveError ? 'Editing' : 'Editing · saved automatically'}
+              </button>
+            )}
           </div>
         </div>
       )}

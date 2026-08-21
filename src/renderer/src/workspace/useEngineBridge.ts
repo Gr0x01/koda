@@ -6,6 +6,7 @@ import type {
   PersistedSessions,
   SessionsLoadResult,
   TaskCompletionState,
+  StageReceipt,
 } from '@shared/ipc'
 import {
   setNotifyEnabled,
@@ -27,6 +28,7 @@ import { windowHasOpenModal } from '../window-modal'
 export function useEngineBridge(): void {
   const applyEngineEvent = useWorkspace((s) => s.applyEngineEvent)
   const applyCompletionState = useWorkspace((s) => s.applyCompletionState)
+  const applyStageReceipt = useWorkspace((s) => s.applyStageReceipt)
   const applyAsideEvent = useWorkspace((s) => s.applyAsideEvent)
   const applyProviderStatus = useWorkspace((s) => s.applyProviderStatus)
   const addPending = useWorkspace((s) => s.addPending)
@@ -59,6 +61,17 @@ export function useEngineBridge(): void {
     window.koda.listCompletionStates().then((states) => states.forEach(applyCompletionState)).catch(console.error)
     return off
   }, [applyCompletionState])
+
+  // Presentation is replaceable UI intent, not transcript. Subscribe before catch-up; receipt ids make
+  // a live delivery racing the list harmless. Adoption also carries these for sessions not yet hydrated.
+  useEffect(() => {
+    const off = window.koda.onStageReceipt((receipt: StageReceipt) => applyStageReceipt(receipt))
+    window.koda
+      .listStageReceipts()
+      .then((receipts) => receipts.forEach((receipt) => applyStageReceipt(receipt, { catchup: true })))
+      .catch(console.error)
+    return off
+  }, [applyStageReceipt])
 
   // Side-question ("btw" / aside) answer stream → the matching session's aside overlay.
   useEffect(() => window.koda.onAsideEvent((e) => applyAsideEvent(e)), [applyAsideEvent])

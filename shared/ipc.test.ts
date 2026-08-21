@@ -3,9 +3,46 @@ import {
   DurableAttachmentPayloadSchema,
   MAX_DURABLE_TURN_ATTACHMENT_BASE64_CHARS,
   SendTurnRequestSchema,
+  StageReceiptSchema,
+  ResolveStageLinkRequestSchema,
   TurnFailureTargetSchema,
   undoPointRefusal,
 } from './ipc'
+
+describe('Stage presentation contracts', () => {
+  it('accepts portable receipts and rejects absolute or traversing paths', () => {
+    const base = {
+      kind: 'present-file' as const,
+      id: 'receipt-1',
+      sessionId: 'session-1',
+      view: 'file' as const,
+    }
+    expect(StageReceiptSchema.safeParse({ ...base, path: 'src/app.ts', line: 12, column: 3 }).success).toBe(true)
+    expect(StageReceiptSchema.safeParse({ ...base, path: '/tmp/app.ts' }).success).toBe(false)
+    expect(StageReceiptSchema.safeParse({ ...base, path: '../app.ts' }).success).toBe(false)
+    expect(StageReceiptSchema.safeParse({ ...base, path: 'src/app.ts', column: 3 }).success).toBe(false)
+  })
+
+  it('bounds local href input at the IPC boundary', () => {
+    expect(ResolveStageLinkRequestSchema.safeParse({ sessionId: 's1', href: 'src/app.ts#L4' }).success).toBe(true)
+    expect(ResolveStageLinkRequestSchema.safeParse({ sessionId: 's1', href: 'x'.repeat(8193) }).success).toBe(false)
+  })
+
+  it('makes the portable safety baseline part of every explicit diff receipt', () => {
+    const diff = {
+      kind: 'present-file' as const,
+      id: 'receipt-diff',
+      sessionId: 'session-1',
+      path: 'src/app.ts',
+      view: 'diff' as const,
+    }
+    expect(StageReceiptSchema.safeParse(diff).success).toBe(false)
+    expect(StageReceiptSchema.safeParse({ ...diff, checkpointId: 'abcdef1' }).success).toBe(true)
+    expect(
+      StageReceiptSchema.safeParse({ ...diff, view: 'file', checkpointId: 'abcdef1' }).success,
+    ).toBe(false)
+  })
+})
 
 /**
  * The renderer's half of the "your undo net failed" contract (debt item 17). Main refuses a destroying

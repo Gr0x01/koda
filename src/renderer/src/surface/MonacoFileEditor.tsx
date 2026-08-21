@@ -20,6 +20,7 @@ export function MonacoFileEditor({
   initialContent,
   readOnly = false,
   gotoLine,
+  gotoColumn,
   gotoNonce,
   className = '',
 }: {
@@ -31,6 +32,8 @@ export function MonacoFileEditor({
   readOnly?: boolean
   /** Reveal + select this 1-based line on mount (a search hit opened the file here). */
   gotoLine?: number
+  /** Optional 1-based column paired with gotoLine. */
+  gotoColumn?: number
   /** Re-trigger the reveal when the file was already open (bumped per open — see store.openFile). */
   gotoNonce?: number
   className?: string
@@ -106,24 +109,24 @@ export function MonacoFileEditor({
   // mounts async, so a line requested before mount is applied here too).
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null)
 
-  function reveal(line?: number): void {
+  function reveal(line?: number, column?: number): void {
     const ed = editorRef.current
     if (!ed || !line) return
     ed.revealLineInCenter(line)
-    ed.setPosition({ lineNumber: line, column: 1 })
+    ed.setPosition({ lineNumber: line, column: column ?? 1 })
     ed.focus()
   }
 
   const onMount: OnMount = (editor, monaco) => {
     editorRef.current = editor
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => void flushSave())
-    reveal(gotoLine) // apply a line requested before the editor finished mounting
+    reveal(gotoLine, gotoColumn) // apply a location requested before the editor finished mounting
   }
 
   // Re-reveal when the target line changes, or when the same file is re-opened at a line (nonce).
   useEffect(() => {
-    reveal(gotoLine)
-  }, [gotoLine, gotoNonce])
+    reveal(gotoLine, gotoColumn)
+  }, [gotoLine, gotoColumn, gotoNonce])
 
   // The file changed on disk (FileSurfaceView re-read it → new `initialContent`). Swap it into the live
   // editor so the open file tracks the change, preserving cursor + scroll. Guards, both via refs so this

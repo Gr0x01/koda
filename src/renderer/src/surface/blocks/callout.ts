@@ -14,13 +14,15 @@
  */
 import type { Ctx } from '@milkdown/kit/ctx'
 import type { Blockquote, Paragraph, Root, Text } from 'mdast'
-import { commandsCtx } from '@milkdown/kit/core'
 import {
+  $inputRule,
+  $nodeSchema,
+  $remark,
+  commandsCtx,
   clearTextInCurrentBlockCommand,
+  wrappingInputRule,
   wrapInBlockTypeCommand,
-} from '@milkdown/kit/preset/commonmark'
-import { wrappingInputRule } from '@milkdown/kit/prose/inputrules'
-import { $inputRule, $nodeSchema, $remark } from '@milkdown/kit/utils'
+} from '../milkdown-runtime'
 import { visit } from 'unist-util-visit'
 
 export type CalloutKind = 'note' | 'tip' | 'important' | 'warning' | 'caution'

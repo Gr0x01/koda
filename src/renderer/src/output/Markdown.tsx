@@ -3,6 +3,7 @@ import ReactMarkdown, { defaultUrlTransform, type Components } from 'react-markd
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import { copyText } from './copy'
+import { classifyStageHref } from '@shared/stage-links'
 
 /**
  * Optional interceptor for local-file links inside assistant markdown. When a
@@ -12,6 +13,21 @@ import { copyText } from './copy'
  * this shared component stays pure — mobile and other callers provide nothing.
  */
 export const LocalLinkContext = createContext<((href: string) => boolean) | null>(null)
+
+/** Preserve Koda-local anchor identities until LocalLinkContext sees them. react-markdown's default
+ * sanitizer treats `file://`, `koda://`, and `src/a.ts:12` as unknown protocols and otherwise erases
+ * the href before our click handler can route it. Unknown/active schemes still use the safe default. */
+export function markdownUrlTransform(url: string, key: string): string {
+  if (key === 'href') {
+    if (/^(?:file:\/\/|koda:\/\/session\/)/i.test(url)) return url
+    // Keep active browser schemes on react-markdown's deny path even when a numeric payload makes
+    // them look like a source location (for example `javascript:12`).
+    if (!/^(?:javascript|vbscript|data):/i.test(url) && /^[^?#]+:\d+(?::\d+)?(?:#L\d+(?:C\d+)?)?$/i.test(url))
+      return url
+  }
+  if (key === 'src' && url.startsWith('data:image/')) return url
+  return defaultUrlTransform(url)
+}
 
 /**
  * The single render path for assistant markdown — used both live (streaming
@@ -36,7 +52,7 @@ export const Markdown = memo(function Markdown({ children }: { children: string 
         // The default transform drops `data:` URLs as unsafe — but the offline docs replica inlines a
         // doc's images as `data:image/…` (the Mac files aren't reachable from the phone). Let those
         // through; everything else keeps the default protocol allowlist.
-        urlTransform={(url) => (url.startsWith('data:image/') ? url : defaultUrlTransform(url))}
+        urlTransform={markdownUrlTransform}
       >
         {children}
       </ReactMarkdown>
@@ -50,14 +66,14 @@ function MarkdownLink({ href, children }: { href?: string; children: ReactNode }
     <a
       href={href}
       onClick={(e) => {
-        e.preventDefault()
         if (!href) return
-        // Web/mail links always go out to the browser. A local-file link (a doc the agent
-        // wrote and linked in its reply) is handed to the Stage handler first; only if there's
-        // no handler, or it declines, does it fall back to window.open (main's handler → shell).
-        const external = /^(https?:|mailto:)/i.test(href)
-        if (!external && openLocal?.(href)) return
-        window.open(href, '_blank')
+        const link = classifyStageHref(href)
+        // Same-document anchors retain native browser behavior. Every other link is claimed here so
+        // an untrusted file/custom scheme can never fall through to window.open without main's check.
+        if (link.kind === 'anchor') return
+        e.preventDefault()
+        if (link.kind === 'external') return void window.open(href, '_blank')
+        if (link.kind === 'file' || link.kind === 'session') openLocal?.(href)
       }}
       className="text-accent underline underline-offset-2 hover:opacity-80"
     >

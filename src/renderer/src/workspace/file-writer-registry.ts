@@ -44,20 +44,35 @@ export function registerFileWriter(
  *
  * The returned lexical paths are the Stage surfaces made stale by a successful canonical delete.
  */
-export async function flushFileWritersUnder(target: string): Promise<string[]> {
-  const root = target.replace(/\/+$/, '')
-  const underTarget = (path: string): boolean => path === root || path.startsWith(`${root}/`)
+async function flushFileWritersMatching(
+  matches: (writer: RegisteredFileWriter) => boolean,
+): Promise<string[]> {
   const affectedSurfacePaths = new Set<string>()
 
   for (const registered of [...writers.values()]) {
     for (const writer of [...registered]) {
-      if (!underTarget(writer.canonicalPath) && !underTarget(writer.surfacePath)) continue
+      if (!matches(writer)) continue
       await writer.flush()
       affectedSurfacePaths.add(writer.surfacePath)
     }
   }
 
   return [...affectedSurfacePaths]
+}
+
+export async function flushFileWritersUnder(target: string): Promise<string[]> {
+  const root = target.replace(/\/+$/, '')
+  const underTarget = (path: string): boolean => path === root || path.startsWith(`${root}/`)
+  return flushFileWritersMatching((writer) => underTarget(writer.canonicalPath) || underTarget(writer.surfacePath))
+}
+
+/**
+ * Drain every mounted editor before a renderer reload. Unlike a path-scoped delete, a reload tears
+ * down every JavaScript-owned buffer at once; one refused save blocks that reload instead of losing
+ * the only copy of recent typing.
+ */
+export async function flushAllFileWriters(): Promise<void> {
+  await flushFileWritersMatching(() => true)
 }
 
 /**

@@ -71,13 +71,13 @@ export function buildSessionCapabilitySnapshot(observation: CapabilityObservatio
 
   const kodaToolCount = tools.filter((name) => name.startsWith(`mcp__${KODA_SERVER}__`)).length
   const browserToolCount = tools.filter((name) => name.startsWith(`mcp__${PLAYWRIGHT_SERVER}__`)).length
+  // Claude ≥2.1.221 lists only user-invocable skills in init, so this count survives on the pack's
+  // invocable skills (frontend-design, goal, review-architecture). If every pack skill ever becomes
+  // non-invocable, this check goes permanently degraded — re-anchor it before making that change.
   const kodaPlaybookCount = skills.filter((name) =>
     KODA_PLAYBOOK_PREFIXES.some((prefix) => name.startsWith(prefix)),
   ).length
   const capabilityDirectoryReady = tools.includes(`mcp__${KODA_SERVER}__capabilities`)
-  const browserPlaybookReady = skills.some(
-    (name) => name === 'browser-verify' || name.endsWith(':browser-verify'),
-  )
 
   const capabilities: SessionCapability[] = []
   capabilities.push(
@@ -110,8 +110,13 @@ export function buildSessionCapabilitySnapshot(observation: CapabilityObservatio
               : 'No Koda playbooks were observed in this workspace.',
           ),
   )
+  // Browser testing is judged by its TOOLS only. The browser-verify playbook is deliberately not
+  // user-invocable, and Claude ≥2.1.221 inventories only user-invocable skills in system/init — so a
+  // skill-presence leg here can never pass and turns into a permanent false "didn't load" warning.
+  // Koda itself owns that skill's wiring deterministically (shipped in the pack, denied only when
+  // Playwright is unwired), so tool evidence is the runtime truth worth gating on.
   capabilities.push(
-    browserToolCount > 0 && browserPlaybookReady && !observation.probeFailed?.mcp
+    browserToolCount > 0 && !observation.probeFailed?.mcp
         ? capability('browser-testing', 'Browser testing', 'ready')
         : !observation.expected.browserTesting
           ? capability('browser-testing', 'Browser testing', 'disabled')
@@ -121,9 +126,7 @@ export function buildSessionCapabilitySnapshot(observation: CapabilityObservatio
             'degraded',
             observation.probeFailed?.mcp
               ? 'The engine could not inspect its MCP servers.'
-              : browserToolCount === 0
-                ? 'Playwright was enabled but exposed no browser tools.'
-                : 'Browser tools loaded without Koda\'s browser-verification playbook.',
+              : 'Playwright was enabled but exposed no browser tools.',
           ),
   )
 

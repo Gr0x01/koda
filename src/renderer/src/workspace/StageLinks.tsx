@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { LocalLinkContext } from '../output/Markdown'
 import { AnimatePresence, duration, ease, motion } from '../motion'
 import { useWorkspace } from './store'
-import { followRefusalCopy, followSession, parseSessionHref } from './session-href'
+import { followRefusalCopy, followSession } from './session-href'
+import { classifyStageHref } from '@shared/stage-links'
 
 /**
  * Desktop-only: makes local-file links inside assistant markdown open in the Stage
@@ -19,7 +20,7 @@ import { followRefusalCopy, followSession, parseSessionHref } from './session-hr
  */
 export function StageLinkProvider({ children }: { children: ReactNode }) {
   const openFile = useWorkspace((s) => s.openFile)
-  const projectPath = useWorkspace((s) => s.projectPath)
+  const activeId = useWorkspace((s) => s.activeId)
   const [refusal, setRefusal] = useState<string | null>(null)
   const refusalTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -38,20 +39,35 @@ export function StageLinkProvider({ children }: { children: ReactNode }) {
 
   const handle = useCallback(
     (href: string): boolean => {
-      const sessionId = parseSessionHref(href)
-      if (sessionId) {
-        void followSession(sessionId, useWorkspace.getState).then((outcome) => {
+      const link = classifyStageHref(href)
+      if (link.kind === 'session') {
+        void followSession(link.sessionId, useWorkspace.getState).then((outcome) => {
           const refused = followRefusalCopy(outcome)
           if (refused) reportRefusal(refused)
         })
         return true
       }
-      const abs = resolveInProject(href, projectPath)
-      if (!abs) return false
-      openFile(abs)
+      if (link.kind !== 'file') return false
+      void window.koda
+        .resolveStageLink({ ...(activeId ? { sessionId: activeId } : {}), href })
+        .then((target) => {
+          if (target.kind !== 'file') {
+            if (target.reason) reportRefusal(target.reason)
+            return
+          }
+          const state = useWorkspace.getState()
+          const cwd = activeId ? state.sessions[activeId]?.cwd : state.projectPath
+          const absolute = target.absolutePath ?? (cwd ? `${cwd.replace(/\/+$/, '')}/${target.path}` : null)
+          if (!absolute) return reportRefusal("Koda couldn't place that file on this Stage.")
+          openFile(absolute, target.line, {
+            ...(target.line !== undefined ? { view: 'file' as const } : {}),
+            gotoColumn: target.column,
+          })
+        })
+        .catch(() => reportRefusal("Koda couldn't open that local link."))
       return true
     },
-    [openFile, projectPath, reportRefusal],
+    [activeId, openFile, reportRefusal],
   )
 
   return (
@@ -87,53 +103,3 @@ export function StageLinkProvider({ children }: { children: ReactNode }) {
 
 /** Long enough to read a short sentence twice, short enough that it never becomes furniture. */
 const REFUSAL_LINGER_MS = 5000
-
-/**
- * Resolve a markdown href to an absolute path inside `root`, or null if it isn't a
- * local file we should claim (leaving it to fall back to window.open). Handles
- * file:// URLs, absolute paths, and root-relative paths (how the agent writes doc
- * links). Anything resolving outside the project is declined.
- */
-function resolveInProject(href: string, root: string | null): string | null {
-  if (!root) return null
-  let p = href
-  if (p.startsWith('file://')) {
-    try {
-      p = new URL(p).pathname
-    } catch {
-      return null
-    }
-  } else if (/^[a-z][a-z0-9+.-]*:/i.test(p)) {
-    // Any other URL scheme (http, mailto, data, javascript…) is not a local file. Koda's own
-    // `koda://session/…` door is claimed by the caller BEFORE this runs — don't add a second branch
-    // for it here, this function resolves paths and nothing else.
-    return null
-  }
-  // Drop any in-doc anchor / query the shell wouldn't understand, then decode
-  // percent-escapes (a `Build%20plan.md` href maps to a real space on disk).
-  p = decode(p.split('#')[0].split('?')[0])
-  if (!p) return null
-
-  const abs = normalize(p.startsWith('/') ? p : `${root}/${p}`)
-  // Stay inside the project — never let a link reach elsewhere on disk.
-  return abs === root || abs.startsWith(root + '/') ? abs : null
-}
-
-function decode(p: string): string {
-  try {
-    return decodeURIComponent(p)
-  } catch {
-    return p // a literal % that isn't a valid escape — take the path as-is
-  }
-}
-
-/** Collapse `.` / `..` segments in a POSIX path (no fs access in the renderer). */
-function normalize(path: string): string {
-  const out: string[] = []
-  for (const seg of path.split('/')) {
-    if (seg === '' || seg === '.') continue
-    if (seg === '..') out.pop()
-    else out.push(seg)
-  }
-  return '/' + out.join('/')
-}

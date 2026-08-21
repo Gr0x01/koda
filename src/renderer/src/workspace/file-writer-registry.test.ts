@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from 'vitest'
-import { createSerialFlush, flushFileWritersUnder, registerFileWriter } from './file-writer-registry'
+import {
+  createSerialFlush,
+  flushAllFileWriters,
+  flushFileWritersUnder,
+  registerFileWriter,
+} from './file-writer-registry'
 
 describe('file writer registry', () => {
   it('flushes the target and its descendants, but not an unrelated path', async () => {
@@ -73,6 +78,25 @@ describe('file writer registry', () => {
     try {
       await expect(flushFileWritersUnder('/project/Documents/note.md')).rejects.toThrow('disk full')
       expect(afterFailure).not.toHaveBeenCalled()
+    } finally {
+      cleanups.forEach((cleanup) => cleanup())
+    }
+  })
+
+  it('drains writers across unrelated paths before a renderer reload', async () => {
+    const calls: string[] = []
+    const cleanups = [
+      registerFileWriter(
+        '/project/Documents/note.md',
+        '/project/Documents/note.md',
+        async () => void calls.push('doc'),
+      ),
+      registerFileWriter('/project/src/app.ts', '/project/src/app.ts', async () => void calls.push('code')),
+    ]
+
+    try {
+      await flushAllFileWriters()
+      expect(calls).toEqual(['doc', 'code'])
     } finally {
       cleanups.forEach((cleanup) => cleanup())
     }

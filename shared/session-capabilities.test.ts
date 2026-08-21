@@ -88,6 +88,24 @@ describe('effective session capabilities', () => {
     ])
   })
 
+  it('judges browser testing by its tools alone — init omits non-invocable skills like browser-verify', () => {
+    const snapshot = buildSessionCapabilitySnapshot({
+      engine: 'claude',
+      cwd: '/project',
+      source: 'engine-init',
+      expected: { kodaTools: true, playbooks: true, browserTesting: true },
+      tools: ['mcp__koda_broker__capabilities', 'mcp__playwright__browser_navigate'],
+      skills: ['koda:goal'],
+      mcpServers: [
+        { name: 'koda_broker', status: 'connected', tools: [] },
+        { name: 'playwright', status: 'connected', tools: [] },
+      ],
+    })
+    expect(snapshot.capabilities.find((entry) => entry.id === 'browser-testing')?.status).toBe(
+      'ready',
+    )
+  })
+
   it('selects Codex skills from the exact workspace instead of the first cached cwd', () => {
     const result = {
       data: [

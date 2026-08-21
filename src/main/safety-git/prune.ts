@@ -233,7 +233,7 @@ export async function pruneStore(projectDir: string, now: number): Promise<Map<s
   }
 
   // Moments: GFS thinning. Re-SHAs kept moments too (linear-chain cascade), so labels are remapped
-  // and the caller re-pins any live diff baseline through the returned map.
+  // and the caller re-pins every live safety handle through the returned map.
   const moments = await listCommits(projectDir, 'refs/heads/master')
   const retained = selectRetainedMoments(moments, now)
   if (retained.length < moments.length) {

@@ -9,6 +9,7 @@ import type {
   RenameRequested,
   EngineEvent,
   TaskCompletionState,
+  StageReceipt,
   HeadlessAppeared,
   KodaApi,
   KodaSettings,
@@ -97,6 +98,13 @@ const api: KodaApi = {
     return () => ipcRenderer.removeListener(IpcChannels.completionState, handler)
   },
   listCompletionStates: () => ipcRenderer.invoke(IpcChannels.completionList),
+  onStageReceipt: (listener) => {
+    const handler = (_e: IpcRendererEvent, receipt: StageReceipt) => listener(receipt)
+    ipcRenderer.on(IpcChannels.stageReceipt, handler)
+    return () => ipcRenderer.removeListener(IpcChannels.stageReceipt, handler)
+  },
+  listStageReceipts: () => ipcRenderer.invoke(IpcChannels.stageReceiptList),
+  resolveStageLink: (args) => ipcRenderer.invoke(IpcChannels.stageResolveLink, args),
   askAside: (args) => ipcRenderer.invoke(IpcChannels.askAside, args),
   cancelAside: (args) => ipcRenderer.invoke(IpcChannels.cancelAside, args),
   onAsideEvent: (listener) => {

@@ -58,6 +58,12 @@ export type EnsureToolFn = (sessionId: string, toolId: string) => Promise<Ensure
  *  `command` is staged at the prompt for the user to run — never executed. */
 export type OpenTerminalFn = (sessionId: string, command?: string) => Promise<void>
 
+/** Put one existing workspace file on Koda's Stage. The manager owns path resolution and broadcast. */
+export type PresentFileFn = (
+  sessionId: string,
+  args: { path: string; view?: 'auto' | 'document' | 'file' | 'diff'; line?: number; column?: number },
+) => Promise<unknown>
+
 /** "Keep this as a document" (document-workspace.md, the magic layer §1): the user asked for the
  *  conversation to become a durable document, and the agent supplies the words. The broker drives; the
  *  manager resolves session → project root and keep-document.ts writes it through `createProjectFile`,
@@ -88,6 +94,7 @@ const TOOL_PREVIEW_FILE = 'preview_file'
 const TOOL_VIEW_PREVIEW = 'view_preview'
 const TOOL_ENSURE_TOOL = 'ensure_tool'
 const TOOL_OPEN_TERMINAL = 'open_terminal'
+const TOOL_PRESENT_FILE = 'present_file'
 const TOOL_APP_INSTALL = 'app_install'
 const TOOL_APP_START = 'app_start'
 const TOOL_APP_STOP = 'app_stop'
@@ -125,6 +132,13 @@ const CAPABILITY_DIRECTORY: CapabilityDirectoryDefinition[] = [
     label: 'Preview',
     outcome: 'Show a static HTML artifact or run, embed, and inspect a live web app.',
     tools: [TOOL_PREVIEW_FILE, TOOL_PREVIEW, TOOL_VIEW_PREVIEW],
+  },
+  {
+    id: 'stage',
+    label: 'Stage',
+    outcome: 'Show a file you created or changed in Koda, with an optional source location.',
+    tools: [TOOL_PRESENT_FILE],
+    note: 'Use preview_file for static HTML and preview for a running app.',
   },
   {
     id: 'environment',
@@ -209,6 +223,8 @@ export class PermissionBroker {
     private readonly miniApps: MiniAppsFns,
     /** "Keep this as a document": write the conversation the user asked to keep into their Documents/. */
     private readonly keepDocument: KeepDocumentFn,
+    /** Explicit presentation: show an existing workspace file on every Koda control head. */
+    private readonly presentFile: PresentFileFn,
   ) {}
 
   /**
@@ -364,6 +380,22 @@ export class PermissionBroker {
             properties: {
               command: { type: 'string', description: 'Optional shell command to stage at the prompt (not run) for the user to review and execute.' },
             },
+            additionalProperties: false,
+          },
+        },
+        {
+          name: TOOL_PRESENT_FILE,
+          description:
+            "Put an existing project file on Koda's Stage so the user can see it. Use this for the primary artifact you made or changed; Koda also supplies a completed-turn file list as a fallback. Paths are project-relative. Markdown defaults to the rendered document view; other files default to the file view. A line/column target forces the file view. Diff view uses this turn's recovery point and is unavailable if that checkpoint failed. For static HTML use preview_file, and for a running app use preview.",
+          inputSchema: {
+            type: 'object',
+            properties: {
+              path: { type: 'string', description: 'Normalized project-relative file path.' },
+              view: { type: 'string', enum: ['auto', 'document', 'file', 'diff'] },
+              line: { type: 'integer', minimum: 1 },
+              column: { type: 'integer', minimum: 1 },
+            },
+            required: ['path'],
             additionalProperties: false,
           },
         },
@@ -566,6 +598,26 @@ export class PermissionBroker {
         try {
           await this.openTerminal(sessionId, command)
           return { content: [{ type: 'text', text: JSON.stringify({ opened: true, staged: !!command }) }] }
+        } catch (err) {
+          return toolError(err)
+        }
+      }
+      if (req.params.name === TOOL_PRESENT_FILE) {
+        const path = String(args.path ?? '').trim()
+        if (!path) return toolError(new Error('path is required'))
+        const view = typeof args.view === 'string' ? args.view : undefined
+        if (view && !['auto', 'document', 'file', 'diff'].includes(view))
+          return toolError(new Error('view must be auto, document, file, or diff'))
+        const line = typeof args.line === 'number' ? args.line : undefined
+        const column = typeof args.column === 'number' ? args.column : undefined
+        try {
+          const receipt = await this.presentFile(sessionId, {
+            path,
+            view: view as 'auto' | 'document' | 'file' | 'diff' | undefined,
+            ...(line !== undefined ? { line } : {}),
+            ...(column !== undefined ? { column } : {}),
+          })
+          return { content: [{ type: 'text', text: JSON.stringify({ shown: true, receipt }) }] }
         } catch (err) {
           return toolError(err)
         }

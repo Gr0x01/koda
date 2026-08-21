@@ -35,7 +35,18 @@ export default defineConfig({
     // ("Failed to fetch dynamically imported module") until a full page reload. Listing them here
     // pre-bundles at server start so discover-and-reoptimize never happens while you're working.
     optimizeDeps: {
-      include: ['monaco-editor', '@monaco-editor/react', '@milkdown/crepe', '@milkdown/kit'],
+      include: [
+        'monaco-editor',
+        '@monaco-editor/react',
+        '@milkdown/crepe',
+        '@milkdown/kit',
+        // The doc runtime imports these export-map entries directly. Listing only the umbrella package
+        // lets Vite discover a new entry after the lazy editor opens and replace the dependency graph.
+        '@milkdown/kit/core',
+        '@milkdown/kit/preset/commonmark',
+        '@milkdown/kit/prose/inputrules',
+        '@milkdown/kit/utils',
+      ],
     },
     // Monaco's workers are imported via Vite's `?worker` suffix. ES-format keeps each one a real,
     // same-origin chunk (no inlined blob: worker) — required by the renderer's strict CSP, which has

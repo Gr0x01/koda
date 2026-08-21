@@ -1,0 +1,4 @@
+interface:
+  display_name: "Goal"
+  short_description: "Carry an objective through verified completion"
+  default_prompt: "Use $goal to carry this objective through verified completion."

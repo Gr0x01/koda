@@ -40,6 +40,9 @@ import {
   ApprovalModeSchema,
   ApprovalRequestsSchema,
   TaskCompletionStatesSchema,
+  StageReceiptsSchema,
+  ResolveStageLinkRequestSchema,
+  StageLinkTargetSchema,
   SessionNameRequestSchema,
   SessionNameResponseSchema,
   ReadDirRequestSchema,
@@ -219,12 +222,14 @@ import {
 } from './user-git'
 import { checkpointChanges, checkpointFileDiff } from './safety-git/changes'
 import {
+  contextForSession,
   projectPathForWindow,
   removeSessionFromWindow,
   setProjectPath,
   takeNewProjectIntent,
   windowForProject,
 } from './window-registry'
+import { resolveStageLink as resolveWorkspaceStageLink } from './stage-presentation'
 import {
   appStateHealth,
   deleteArchivedBody,
@@ -683,9 +688,18 @@ export function registerIpcHandlers(): void {
   })
 
   ipcMain.handle(IpcChannels.safetyFileDiff, async (event, rawArgs: unknown) => {
-    const { checkpointId, path } = SafetyFileDiffRequestSchema.parse(rawArgs)
+    const { checkpointId, path, sessionId } = SafetyFileDiffRequestSchema.parse(rawArgs)
+    let root = rootForSender(event.sender)
+    if (sessionId) {
+      const win = BrowserWindow.fromWebContents(event.sender)
+      const owner = contextForSession(sessionId)
+      const sessionRoot = getEngineSessions().getSessionCwd(sessionId)
+      if (!win || owner?.win.id !== win.id || !sessionRoot)
+        throw new Error('that session does not belong to this window')
+      root = sessionRoot
+    }
     return SafetyFileDiffResultSchema.parse(
-      await checkpointFileDiff(rootForSender(event.sender), checkpointId, path),
+      await checkpointFileDiff(root, checkpointId, path),
     )
   })
 
@@ -713,6 +727,21 @@ export function registerIpcHandlers(): void {
       await getEngineSessions().completionStatesForProject(rootForSender(event.sender)),
     ),
   )
+
+  ipcMain.handle(IpcChannels.stageReceiptList, (event) =>
+    StageReceiptsSchema.parse(getEngineSessions().stageReceiptsForProject(rootForSender(event.sender))),
+  )
+
+  ipcMain.handle(IpcChannels.stageResolveLink, (event, rawArgs: unknown) => {
+    const { sessionId, href } = ResolveStageLinkRequestSchema.parse(rawArgs)
+    if (!sessionId)
+      return StageLinkTargetSchema.parse(resolveWorkspaceStageLink(rootForSender(event.sender), href))
+    const win = BrowserWindow.fromWebContents(event.sender)
+    const owner = contextForSession(sessionId)
+    if (!win || owner?.win.id !== win.id)
+      return StageLinkTargetSchema.parse({ kind: 'declined', reason: 'That session belongs to another window.' })
+    return StageLinkTargetSchema.parse(getEngineSessions().resolveStageLink(sessionId, href))
+  })
 
   // Model/effort pick-time push — records intent + broadcasts ModelEffortChanged (no respawn; the
   // renderer reattaches lazily on its next turn). Mirrors approvalSetMode.

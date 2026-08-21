@@ -1,7 +1,9 @@
 import { Component, type ReactNode } from 'react'
+import type { RendererLog } from '@shared/ipc'
 import { Button } from './Button'
 import { PixelGlyph } from './PixelGlyph'
 import { motion, cardVariants, duration, ease } from '../motion'
+import { flushAllFileWriters } from '../workspace/file-writer-registry'
 
 // A failed dynamic import ("Failed to fetch dynamically imported module" / "error loading dynamically
 // imported module"). It happens when Vite invalidates the module graph mid-session (dep re-optimize)
@@ -12,19 +14,79 @@ export function isChunkLoadError(error: unknown): boolean {
   return /dynamically imported module|importing a module script failed/i.test(msg)
 }
 
-// Auto-reload at most once per this window. A reload recovers the transient case invisibly; if the
-// module is *genuinely* broken it'll fail again immediately, and the second failure (inside the
-// window) falls through to the recovery card instead of looping forever.
-const RELOAD_KEY = 'koda:chunk-reload-at'
-const RELOAD_WINDOW_MS = 10_000
+/** A stale Vite dependency graph can fail either while fetching a chunk or after two generations have
+ *  loaded. Milkdown exposes the latter as a missing symbol-keyed initialization timer. Both have the
+ *  same recovery: clear the renderer's module graph with one guarded reload. */
+export function isModuleGraphError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error)
+  return isChunkLoadError(error) || /Timer ["']InitReady["'] not found/i.test(msg)
+}
 
-// Would this error trigger the silent auto-reload? Pure read — computed the same way in the render
-// phase (getDerivedStateFromError) and the commit phase (componentDidCatch), which see the same
-// stored timestamp, so both agree on whether we're recovering silently or surfacing the card.
+// Auto-reload a module-graph failure, but bounded by SUCCESS, never by time. One reload clears the
+// ordinary transient case invisibly. The case that stranded the doc editor is a BURST: while the agent
+// hot-reloads Koda's own source in dev, the renderer full-reloads again and again, and each rebuild can
+// land Milkdown on two dependency generations before Vite has settled — so a single reload isn't
+// enough. A few attempts are allowed, but only a clean editor mount proves the graph actually settled
+// and restores the budget. A quiet stretch is NOT evidence of recovery: a user retrying by hand (⌘K,
+// pick a doc, watch it vanish) arrives minutes apart, so a time-based reset hands every retry a fresh
+// budget and turns a persistently split graph into an endless silent reload loop where the recovery
+// card can never appear. Counting attempts since the last clean mount surfaces the card on the fourth
+// failure no matter how slowly the user retries.
+const RELOAD_KEY = 'koda:chunk-reload'
+const MAX_RELOADS = 3
+
+// sessionStorage so the count survives the reloads it meters, then dies with the window.
+function reloadCount(): number {
+  try {
+    return Number(sessionStorage.getItem(RELOAD_KEY)) || 0
+  } catch {
+    return 0
+  }
+}
+
+// Would this error trigger a silent auto-reload? Pure read — computed the same way in the render phase
+// (getDerivedStateFromError) and the commit phase (componentDidCatch), which see the same stored budget,
+// so both agree on whether we're recovering silently or surfacing the card.
 function willAutoReload(error: unknown): boolean {
-  if (!isChunkLoadError(error)) return false
-  const last = Number(sessionStorage.getItem(RELOAD_KEY) || 0)
-  return Date.now() - last > RELOAD_WINDOW_MS
+  if (!isModuleGraphError(error)) return false
+  return reloadCount() < MAX_RELOADS
+}
+
+/** A clean editor mount means the graph settled, so clear the budget: the NEXT unrelated burst then
+ *  starts fresh instead of inheriting attempts already spent. Called from the surfaces that recover
+ *  this way, so a converged recovery doesn't count against a later one. */
+export function noteModuleGraphRecovered(): void {
+  try {
+    sessionStorage.removeItem(RELOAD_KEY)
+  } catch {
+    // sessionStorage can be unavailable (private mode / teardown); recovery just loses its memory.
+  }
+}
+
+/** Recover a known transient module-graph failure without looping or discarding a live editor buffer.
+ *  Feature-local async failures do not reach React error boundaries, so they call this same guarded
+ *  path directly. A refused writer keeps the renderer alive for an explicit recovery instead. */
+export async function reloadForModuleGraphError(error: unknown): Promise<boolean> {
+  if (!willAutoReload(error)) return false
+  try {
+    await flushAllFileWriters()
+  } catch (saveError) {
+    console.error('renderer reload blocked because an editor could not save:', saveError)
+    return false
+  }
+  // A concurrent recovery may have spent the budget while the writer drain was in flight.
+  if (!willAutoReload(error)) return false
+  const spent = reloadCount() + 1
+  sessionStorage.setItem(RELOAD_KEY, String(spent))
+  // The reload wipes the renderer before anything renders the cause, so leave it in the main log
+  // trail: without this line a silent recovery is indistinguishable from a plain window reload.
+  // Typed locally because the phone client shares this boundary and has no desktop preload.
+  ;(window as { koda?: { logFromRenderer?: (entry: RendererLog) => void } }).koda?.logFromRenderer?.({
+    level: 'warn',
+    args: [`module-graph error, auto-reload ${spent}/${MAX_RELOADS}: ${String(error)}`],
+  })
+  window.location.reload()
+  return true
 }
 
 type Phase = 'ok' | 'reloading' | 'crashed'
@@ -51,10 +113,9 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, { phase: P
 
   componentDidCatch(error: unknown): void {
     console.error('renderer crashed (ErrorBoundary):', error)
-    if (willAutoReload(error)) {
-      sessionStorage.setItem(RELOAD_KEY, String(Date.now()))
-      window.location.reload()
-    }
+    void reloadForModuleGraphError(error).then((reloading) => {
+      if (!reloading) this.setState({ phase: 'crashed' })
+    })
   }
 
   render(): ReactNode {
@@ -92,7 +153,18 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, { phase: P
               A part of the app failed to load. Your work is saved. Reloading usually clears it.
             </p>
           </div>
-          <Button onClick={() => window.location.reload()}>Reload</Button>
+          {/* A human click is loop-safe budget repayment: chunk blips spend the budget but only a
+              clean doc mount repays it, so without this a long-lived window that burned three blips
+              would show this card for every later blip. A genuinely broken module still converges —
+              each refilled budget burns its silent reloads and lands back here, waiting on a click. */}
+          <Button
+            onClick={() => {
+              noteModuleGraphRecovered()
+              window.location.reload()
+            }}
+          >
+            Reload
+          </Button>
         </motion.div>
       </div>
     )

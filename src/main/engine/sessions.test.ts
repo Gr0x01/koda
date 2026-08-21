@@ -20,6 +20,82 @@ import { latestReplayTurnFailure, transcriptFromReplay, turnFailureOf } from '@s
 import { EngineSessionManager } from './sessions'
 import { updateSettings } from '../settings'
 
+describe('live safety-handle maintenance', () => {
+  it('makes an explicit diff receipt carry this turn safety baseline', async () => {
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), 'koda-present-diff-')))
+    writeFileSync(join(cwd, 'a.ts'), 'export const a = 1\n')
+    const checkpointId = 'c'.repeat(40)
+    const mgr = new EngineSessionManager() as unknown as {
+      projectDirs: Map<string, string>
+      diffBaselines: Map<string, string>
+      send: ReturnType<typeof vi.fn>
+      presentFile: (sessionId: string, args: { path: string; view: 'diff' }) => Promise<unknown>
+    }
+    const sessionId = 'present-diff-session'
+    try {
+      mgr.projectDirs.set(sessionId, cwd)
+      mgr.send = vi.fn()
+      await expect(mgr.presentFile(sessionId, { path: 'a.ts', view: 'diff' })).rejects.toThrow(
+        'this turn has no safety checkpoint',
+      )
+
+      mgr.diffBaselines.set(sessionId, checkpointId)
+      await expect(mgr.presentFile(sessionId, { path: 'a.ts', view: 'diff' })).resolves.toMatchObject({
+        kind: 'present-file',
+        path: 'a.ts',
+        view: 'diff',
+        checkpointId,
+      })
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('remaps every live owner and re-emits projected receipts after a store rewrite', () => {
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), 'koda-live-safety-remap-')))
+    const oldId = 'a'.repeat(40)
+    const newId = 'b'.repeat(40)
+    type Receipt =
+      | { kind: 'present-file'; id: string; sessionId: string; path: string; view: 'diff'; checkpointId: string }
+      | { kind: 'turn-changes'; id: string; sessionId: string; checkpointId: string; files: []; complete: true; overlapObserved: false }
+    const mgr = new EngineSessionManager() as unknown as {
+      projectDirs: Map<string, string>
+      diffBaselines: Map<string, string>
+      completionTurns: Map<string, { cwd: string; safetyCommit: string | null }>
+      projectMutationScopes: Set<{ cwd: string; sessionId: string; checkpointId: string }>
+      stageReceipts: Map<string, Receipt[]>
+      send: ReturnType<typeof vi.fn>
+      remapLiveSafetyHandles: (cwd: string, remap: Map<string, string>) => void
+    }
+    const sessionId = 'remap-session'
+    try {
+      mgr.projectDirs.set(sessionId, cwd)
+      mgr.diffBaselines.set(sessionId, oldId)
+      mgr.completionTurns.set(sessionId, { cwd, safetyCommit: oldId })
+      const scope = { cwd, sessionId, checkpointId: oldId }
+      mgr.projectMutationScopes.add(scope)
+      mgr.stageReceipts.set(sessionId, [
+        { kind: 'present-file', id: 'present-old', sessionId, path: 'a.ts', view: 'diff', checkpointId: oldId },
+        { kind: 'turn-changes', id: 'turn-old', sessionId, checkpointId: oldId, files: [], complete: true, overlapObserved: false },
+      ])
+      mgr.send = vi.fn()
+
+      mgr.remapLiveSafetyHandles(cwd, new Map([[oldId, newId]]))
+
+      expect(mgr.diffBaselines.get(sessionId)).toBe(newId)
+      expect(mgr.completionTurns.get(sessionId)?.safetyCommit).toBe(newId)
+      expect(scope.checkpointId).toBe(newId)
+      expect(mgr.stageReceipts.get(sessionId)).toEqual([
+        expect.objectContaining({ kind: 'present-file', checkpointId: newId }),
+        expect.objectContaining({ kind: 'turn-changes', checkpointId: newId }),
+      ])
+      expect(mgr.send).toHaveBeenCalledTimes(2)
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('completion project-mutation boundary', () => {
   it('marks the owning turn as mutating and every other writer as overlapping', () => {
     type Turn = {

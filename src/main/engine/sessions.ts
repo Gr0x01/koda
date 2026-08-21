@@ -18,12 +18,15 @@ import { IpcChannels } from '@shared/channels'
 import {
   EngineEventSchema,
   TaskCompletionStateSchema,
+  StageReceiptSchema,
   ApprovalRequestSchema,
   ApprovalCancelledSchema,
   ApprovalResolvedSchema,
   AsideEventSchema,
   type EngineEvent,
   type TaskCompletionState,
+  type StageReceipt,
+  type StageLinkTarget,
   type ApprovalMode,
   type ApprovalRequest,
   type ToolDecision,
@@ -38,6 +41,8 @@ import {
   type ReplayEntry,
   type RateLimitInfo,
   type RemoteTerminalAttention,
+  type RemoteTerminalStartResult,
+  type RemoteTerminalState,
   type RemoteUsageSnapshot,
   type RemoteTurnReceipt,
   type AttachmentProvenance,
@@ -73,9 +78,11 @@ import {
   completionGitSnapshot,
 } from '../user-git'
 import {
+  commitOwnedCompletion,
   reconcileCompletionState,
   type CompletionTurnBoundary,
   type CompletionUncertainty,
+  type OwnedCompletionCommitResult,
 } from '../completion-state'
 import { browseDir, containedReal, docExcerpt, listProjectDocs, readProjectFile, readProjectImage, writeProjectFile } from '../fs-browse'
 import { installApp, startApp, stopApp, appStatus, projectHasMiniApp } from '../mini-apps'
@@ -85,6 +92,13 @@ import { noteRateLimit } from './usage-reset-notifier'
 import { authoritativeUsageTypes, pollAccountUsage } from './usage-poll'
 import { isE2EProfile, isHermeticE2EProfile, requireRealAccountAccess } from '../runtime-profile'
 import { noteProviderError, noteTurnOk } from './status-watch'
+import {
+  inputRemoteTerminal,
+  killRemoteTerminal,
+  pollRemoteTerminal,
+  resizeRemoteTerminal,
+  startRemoteTerminal,
+} from '../terminal'
 import { friendlyEngineError } from '@shared/engine-error'
 import { compactTranscriptToolOutput } from '@shared/tool-output'
 import {
@@ -168,6 +182,8 @@ import {
 import { addSessionToWindow, contextForSession, projectPathForWindow, removeSessionFromWindow, windowForProject } from '../window-registry'
 import { log } from '../logger'
 import { appendRemoteReplay, loadRemoteReplay, replaceRemoteReplay } from '../remote-replay-store'
+import { preparePresentFile, resolveStageLink, type PresentFileArgs } from '../stage-presentation'
+import { checkpointFileDiffText } from '../safety-git/changes'
 
 /** The engine's structured error prefix when our in-process MCP server is unreachable, e.g.
  *  `MCP server "koda_broker" is not connected` or `… transport dropped mid-call; response for tool
@@ -260,7 +276,8 @@ export interface ProjectMutationScope {
   readonly checkpointId: string
 }
 
-interface LiveProjectMutationScope extends ProjectMutationScope {
+interface LiveProjectMutationScope extends Omit<ProjectMutationScope, 'checkpointId'> {
+  checkpointId: string
   ambiguous: boolean
   turnStarted: boolean
 }
@@ -374,6 +391,9 @@ export class EngineSessionManager {
    * until a whole-project Git probe proves there is no loose work left to attribute. */
   private readonly completionUncertainty = new Map<string, CompletionUncertainty>()
   private readonly completionStates = new Map<string, TaskCompletionState>()
+  /** Latest replaceable presentation facts for each live session. Separate from transcript/replay:
+   * clients can catch up after a renderer/phone reconnect without turning UI intent into chat history. */
+  private readonly stageReceipts = new Map<string, StageReceipt[]>()
   /** Scheduler-owned project passes that span an engine turn. They never hold checkpointChains while
    *  the engine runs; noteProjectMutation + sendTurn turn-start detection mark competing ownership. */
   private readonly projectMutationScopes = new Set<LiveProjectMutationScope>()
@@ -617,6 +637,9 @@ export class EngineSessionManager {
       // field the agent could never supply itself. No window required — a phone-driven session may keep
       // a document too, so this resolves the root the same way the mini-app verbs do.
       (sessionId, args) => keepDocument(this.projectPathFor(sessionId), args, sessionId),
+      // Explicit presentation is Koda-owned and engine-neutral. The broker only validates/routes; the
+      // manager resolves session → workspace and broadcasts the portable receipt to every head.
+      (sessionId, args) => this.presentFile(sessionId, args),
     )
     // Seed the DEFAULT posture new sessions start at (per-session overrides come from the renderer).
     this.gate.setDefaultMode(loadApprovalMode())
@@ -1171,8 +1194,12 @@ export class EngineSessionManager {
     if (retainedCompletionBoundary && overlappingWriters)
       retainedCompletionBoundary.overlappingWriters = true
     this.lastActivityAt.set(sessionId, Date.now()) // float this session to the top of the launcher
-    if (!continuingLogicalTurn)
+    if (!continuingLogicalTurn) {
+      // Existing tabs stay in the retained workbench; reconnect catch-up just stops treating the
+      // previous turn's replaceable presentation intent as current.
+      this.stageReceipts.delete(sessionId)
       this.turnReplies.delete(sessionId) // fresh turn, fresh reply accumulator (lastAssistantReply)
+    }
     this.noteEngineActivity(sessionId) // feeds the dream scheduler's quiet clock (dream turns excluded)
     // Split attachment provenance before recording the user turn. Exact bytes are live send material,
     // not ordinary transcript history: successful replay keeps only media type/name. A bounded copy is
@@ -1511,11 +1538,29 @@ export class EngineSessionManager {
       if (result.unresolvedReason) this.completionUncertainty.set(sessionId, result.unresolvedReason)
       else this.completionUncertainty.delete(sessionId)
       if (this.completionTurns.get(sessionId) === turn) this.completionTurns.delete(sessionId)
+      this.pushStageReceipt({
+        kind: 'turn-changes',
+        id: randomUUID(),
+        sessionId,
+        ...(turn.safetyCommit ? { checkpointId: turn.safetyCommit } : {}),
+        files: result.turnChanges.files,
+        complete: result.turnChanges.complete,
+        overlapObserved: turn.overlappingWriters,
+      })
       this.pushCompletionState(result.state)
     }).catch((err) => {
       log.warn('completion', 'turn reconciliation failed', err instanceof Error ? err.message : err)
       if (this.completionTurns.get(sessionId) === turn) this.completionTurns.delete(sessionId)
       this.completionUncertainty.set(sessionId, 'git-probe-failed')
+      this.pushStageReceipt({
+        kind: 'turn-changes',
+        id: randomUUID(),
+        sessionId,
+        ...(turn.safetyCommit ? { checkpointId: turn.safetyCommit } : {}),
+        files: [],
+        complete: false,
+        overlapObserved: turn.overlappingWriters,
+      })
       this.pushCompletionState({
         sessionId,
         state: 'needs-check',
@@ -1599,6 +1644,63 @@ export class EngineSessionManager {
    *  window's project root, so a diff MUST resolve against this, not the sender window. */
   getSessionCwd(sessionId: string): string | undefined {
     return this.projectDirs.get(sessionId)
+  }
+
+  private pushStageReceipt(candidate: StageReceipt): void {
+    const parsed = StageReceiptSchema.safeParse(candidate)
+    if (!parsed.success) {
+      log.warn('stage', 'refused invalid presentation receipt', parsed.error.issues[0]?.message)
+      return
+    }
+    const prior = this.stageReceipts.get(parsed.data.sessionId) ?? []
+    this.stageReceipts.set(parsed.data.sessionId, [
+      ...prior.filter((receipt) => receipt.kind !== parsed.data.kind),
+      parsed.data,
+    ])
+    this.send(IpcChannels.stageReceipt, parsed.data.sessionId, parsed.data)
+  }
+
+  /** Latest replaceable Stage intent for one live session (phone launcher projection). */
+  stageReceiptsForSession(sessionId: string): StageReceipt[] {
+    return [...(this.stageReceipts.get(sessionId) ?? [])]
+  }
+
+  /** Renderer-reload catch-up, scoped by main-owned project/session identity. */
+  stageReceiptsForProject(projectPath: string): StageReceipt[] {
+    const root = realpathOrSelf(projectPath)
+    return [...this.stageReceipts.entries()].flatMap(([sessionId, receipts]) =>
+      realpathOrSelf(this.projectDirs.get(sessionId) ?? '') === root ? receipts : [],
+    )
+  }
+
+  /** Broker implementation for `present_file`. Paths stay portable in the receipt; each UI head
+   * projects them through the session workspace it already owns. */
+  async presentFile(sessionId: string, args: PresentFileArgs): Promise<StageReceipt> {
+    const cwd = this.projectDirs.get(sessionId)
+    if (!cwd) throw new Error('unknown session workspace')
+    const prepared = preparePresentFile(cwd, args)
+    const checkpointId = prepared.view === 'diff' ? this.diffBaselines.get(sessionId) : undefined
+    if (prepared.view === 'diff' && !checkpointId)
+      throw new Error('diff view is unavailable because this turn has no safety checkpoint; use file view')
+    const receipt = StageReceiptSchema.parse({
+      kind: 'present-file',
+      id: randomUUID(),
+      sessionId,
+      path: prepared.path,
+      view: prepared.view,
+      ...(checkpointId ? { checkpointId } : {}),
+      ...(prepared.line !== undefined ? { line: prepared.line } : {}),
+      ...(prepared.column !== undefined ? { column: prepared.column } : {}),
+    })
+    this.pushStageReceipt(receipt)
+    return receipt
+  }
+
+  /** Shared desktop/phone local-link authority. Callers name a session, never a root. */
+  resolveStageLink(sessionId: string, href: string): StageLinkTarget {
+    const cwd = this.projectDirs.get(sessionId)
+    if (!cwd) return { kind: 'declined', reason: 'That session is no longer available.' }
+    return resolveStageLink(cwd, href)
   }
 
   /** Mark every live turn sharing a project whenever one writer crosses the mutation boundary. The
@@ -1689,13 +1791,18 @@ export class EngineSessionManager {
   }
 
   /** Finish a scheduler scope inside the project chain. Completion reconciliation stays open until
-   * the callback lands the digest, and any Koda-observed competing writer is recorded on the boundary.
-   * This overlap signal is attribution evidence only — never permission to roll back the live tree,
-   * and never a user-facing warning. */
+   * the callback lands every scheduler-owned write. When `version` is present, that same evidence may
+   * create one path-scoped user-Git commit before the scope closes; mixed, overlapping, out-of-scope,
+   * or unverifiable work remains loose. This never authorizes rollback or repository initialization. */
   async finishProjectMutationScope<T>(
     scope: ProjectMutationScope,
     mutate: () => T | Promise<T>,
-  ): Promise<{ overlapObserved: boolean; result: T }> {
+    version?: { message: string; pathPrefix: string; author?: string },
+  ): Promise<{
+    overlapObserved: boolean
+    result: T
+    commit?: OwnedCompletionCommitResult
+  }> {
     const live = [...this.projectMutationScopes].find((candidate) => candidate === scope)
     if (!live) throw new Error('project mutation scope is no longer active')
     let finished = false
@@ -1713,7 +1820,23 @@ export class EngineSessionManager {
         if (overlapObserved) this.markCompletionOverlap(live.sessionId)
         this.noteProjectMutation(live.cwd, live.sessionId)
         const result = await mutate()
-        return { overlapObserved, result }
+        const commit: OwnedCompletionCommitResult | undefined = version
+          ? boundary
+            ? await commitOwnedCompletion(
+                live.sessionId,
+                boundary,
+                {
+                  message: version.message,
+                  pathPrefix: version.pathPrefix,
+                  author: version.author,
+                  overlapObserved,
+                },
+                this.completionPaths.get(live.sessionId),
+                this.completionUncertainty.get(live.sessionId),
+              )
+            : { kind: 'needs-attention', reason: 'evidence-failed', paths: [] }
+          : undefined
+        return { overlapObserved, result, ...(commit ? { commit } : {}) }
       })
       finished = true
       return output
@@ -1804,25 +1927,47 @@ export class EngineSessionManager {
    * restore. Deferred a few seconds so the first turn's diff baseline settles first. maintainStore is
    * itself fail-safe; the extra catch guards the scheduling.
    *
-   * A migrate/thin rewrite re-SHAs the master tip and gc's the old object — which would strand a live
-   * session's `diffBaselines` SHA (pinned to that tip at turn start) and break its live-edits diff for
-   * the rest of the turn. So re-pin those baselines through the rewrite's original→final remap: the
-   * in-memory baseline is exactly the "SHA held across a rewrite" that prune.ts's contract says must
-   * be re-resolved rather than trusted.
+   * A migrate/thin rewrite re-SHAs the master tip and gc's the old object. Every in-memory handle held
+   * across that rewrite must move together: live diffs, completion boundaries, scheduler scopes, and
+   * projected Stage receipts. `remapLiveSafetyHandles` is the one inventory for that lifecycle.
    */
   private scheduleMaintenance(cwd: string): void {
     setTimeout(() => {
       void this.runExclusive(cwd, async () => {
         const remap = await maintainStore(cwd)
         if (remap.size === 0) return
-        for (const [sessionId, base] of this.diffBaselines) {
-          const mapped = remap.get(base)
-          if (mapped && this.projectDirs.get(sessionId) === cwd) {
-            this.diffBaselines.set(sessionId, mapped)
-          }
-        }
+        this.remapLiveSafetyHandles(cwd, remap)
       }).catch(() => {})
     }, 5_000)
+  }
+
+  /** Re-pin every live reference to a safety commit after maintenance rewrites the moment chain. A
+   * projected receipt gets a fresh id and is re-emitted so desktop/phone replace their stale handle. */
+  private remapLiveSafetyHandles(cwd: string, remap: Map<string, string>): void {
+    const root = realpathOrSelf(cwd)
+    const inProject = (sessionId: string): boolean =>
+      realpathOrSelf(this.projectDirs.get(sessionId) ?? '') === root
+
+    for (const [sessionId, base] of this.diffBaselines) {
+      const mapped = remap.get(base)
+      if (mapped && inProject(sessionId)) this.diffBaselines.set(sessionId, mapped)
+    }
+    for (const [sessionId, turn] of this.completionTurns) {
+      const mapped = turn.safetyCommit ? remap.get(turn.safetyCommit) : undefined
+      if (mapped && inProject(sessionId)) turn.safetyCommit = mapped
+    }
+    for (const scope of this.projectMutationScopes) {
+      const mapped = remap.get(scope.checkpointId)
+      if (mapped && realpathOrSelf(scope.cwd) === root) scope.checkpointId = mapped
+    }
+    for (const [sessionId, receipts] of [...this.stageReceipts]) {
+      if (!inProject(sessionId)) continue
+      for (const receipt of [...receipts]) {
+        const mapped = receipt.checkpointId ? remap.get(receipt.checkpointId) : undefined
+        if (!mapped) continue
+        this.pushStageReceipt({ ...receipt, id: randomUUID(), checkpointId: mapped })
+      }
+    }
   }
 
   /** Serialize work on one project dir (the safety.git index can't take concurrent writers). */
@@ -1902,6 +2047,7 @@ export class EngineSessionManager {
    *  from true end sites only; never from a respawn path (ApprovalGate.forgetSession). Also drops any
    *  stray `awaitTurnEnd` waiter — a true end means no future TurnComplete will ever come for this id. */
   forgetSession(sessionId: string): void {
+    killRemoteTerminal(sessionId)
     this.gate.forgetSession(sessionId)
     this.sessionGenerations.delete(sessionId)
     const admission = this.turnAdmissions.get(sessionId)
@@ -1935,6 +2081,7 @@ export class EngineSessionManager {
     this.completionPaths.delete(sessionId)
     this.completionUncertainty.delete(sessionId)
     this.completionStates.delete(sessionId)
+    this.stageReceipts.delete(sessionId)
     this.pendingRestoreNotices.delete(sessionId)
     this.armedRestoreNotices.delete(sessionId)
     for (const scope of this.projectMutationScopes)
@@ -3361,6 +3508,7 @@ export class EngineSessionManager {
         activeSubagentToolUseIds: [...(this.activeSubagents.get(id)?.keys() ?? [])],
         activeWorkflows: this.activeWorkflowSnapshots(id),
         capabilities: this.sessionCapabilities.get(id),
+        stageReceipts: this.stageReceiptsForSession(id),
         events: [...(this.remoteEventLog.get(id) ?? [])],
       })
       if (durableLockedLabel) this.deferredDreamLabels.delete(id)
@@ -3479,8 +3627,15 @@ export class EngineSessionManager {
   }
 
   /** Unified diff text for one changed file (path-contained inside the session's project). */
-  async remoteFileDiff(sessionId: string, path: string): Promise<{ diff: string; truncated: boolean }> {
-    return diffTextOf(this.remoteCwd(sessionId), path)
+  async remoteFileDiff(
+    sessionId: string,
+    path: string,
+    checkpointId?: string,
+  ): Promise<{ diff: string; truncated: boolean }> {
+    const cwd = this.remoteCwd(sessionId)
+    return checkpointId
+      ? checkpointFileDiffText(cwd, checkpointId, path)
+      : diffTextOf(cwd, path)
   }
 
   /** Commit exactly these paths from the phone — same pathspec-scoped save the desktop Stage uses,
@@ -3625,6 +3780,36 @@ export class EngineSessionManager {
       },
       async () => ({ path: relative(cwd, await writeProjectFile(cwd, path, content)) }),
     )
+  }
+
+  /** The phone and Mac window share the same workspace shell. The phone names only a live session;
+   * this manager resolves its authoritative cwd before the terminal core sees it. */
+  remoteTerminalStart(
+    sessionId: string,
+    size: { cols: number; rows: number },
+  ): RemoteTerminalStartResult {
+    return startRemoteTerminal(sessionId, this.remoteCwd(sessionId), size.cols, size.rows)
+  }
+
+  remoteTerminalPoll(sessionId: string, after: number): RemoteTerminalState {
+    return pollRemoteTerminal(sessionId, after)
+  }
+
+  remoteTerminalInput(
+    sessionId: string,
+    inputToken: string,
+    inputSeq: number,
+    data: string,
+  ): void {
+    inputRemoteTerminal(sessionId, inputToken, inputSeq, data)
+  }
+
+  remoteTerminalResize(
+    sessionId: string,
+    inputToken: string,
+    size: { cols: number; rows: number },
+  ): void {
+    resizeRemoteTerminal(sessionId, inputToken, size.cols, size.rows)
   }
 
   /** One of a doc's local images, base64 + media type, so the phone's live doc viewer can inline it

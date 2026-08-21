@@ -198,6 +198,47 @@ test('the Library stars without a chat, hands the document to the Stage, and res
   }
 })
 
+test('the Stage bar stars the open document and the shelf follows without a Library trip', async () => {
+  const project = realpathSync(mkdtempSync(join(tmpdir(), 'koda-doc-stagestar-')))
+  writeFileSync(join(project, 'Reading notes.md'), '# Reading notes\n\nBody.\n')
+  const app = await launchSeeded(project)
+  const pageErrors: string[] = []
+  try {
+    const win = await app.firstWindow()
+    win.on('pageerror', (e) => pageErrors.push(e.message))
+    await win.getByRole('button', { name: 'New chat' }).waitFor({ timeout: 20_000 })
+
+    await win.keyboard.press('Meta+p')
+    const find = win.getByPlaceholder('Find in this project')
+    await find.waitFor({ timeout: 20_000 })
+    await find.fill('Reading notes.md')
+    await win.getByRole('button', { name: 'Reading notes.md', exact: true }).first().waitFor({ timeout: 20_000 })
+    await win.keyboard.press('Enter')
+    await expect(win.locator('.milkdown .ProseMirror')).toBeVisible({ timeout: 20_000 })
+
+    // The star sits in the Stage bar itself: keeping the document you are reading must not require a
+    // trip back through the Library.
+    const star = win.getByRole('button', { name: 'Star this document' })
+    await expect(star).toHaveAttribute('aria-pressed', 'false', { timeout: 10_000 })
+    await star.click()
+    await expect(star).toHaveAttribute('aria-pressed', 'true')
+    await expect(win.getByRole('heading', { name: 'Documents', exact: true })).toBeVisible({ timeout: 10_000 })
+    // Scoped to the shelf section, exact name: the Stage tab, its close control, and the row's own
+    // actions menu all carry the same document name.
+    const shelf = win.locator('section[aria-labelledby="documents-shelf-heading"]')
+    await expect(shelf.getByRole('button', { name: 'Reading notes', exact: true })).toBeVisible({ timeout: 20_000 })
+
+    // The same control unstars, and the shelf leaves with its last document.
+    await star.click()
+    await expect(star).toHaveAttribute('aria-pressed', 'false')
+    await expect(win.getByRole('heading', { name: 'Documents', exact: true })).toHaveCount(0, { timeout: 10_000 })
+
+    expect(pageErrors, `page errors:\n${pageErrors.join('\n')}`).toHaveLength(0)
+  } finally {
+    await app.close()
+  }
+})
+
 test('the labelled session map flows into Documents and its actions stay quiet, complete, safe, and keyboard-reachable', async () => {
   const project = realpathSync(mkdtempSync(join(tmpdir(), 'koda-doc-shelf-')))
   // Keep this profile name short: Chromium creates a Unix-domain SingletonSocket below TMPDIR, and

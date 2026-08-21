@@ -9,8 +9,10 @@ const { warn } = vi.hoisted(() => ({ warn: vi.fn() }))
 vi.mock('./logger', () => ({ log: { info: () => {}, warn, error: () => {}, debug: () => {} } }))
 
 const {
+  commitPaths,
   completionGitSnapshot,
   completionStatusForPaths,
+  detectRepo,
   getCommitGraph,
   getMergedStrays,
   getWorktrees,
@@ -105,6 +107,53 @@ describe('getWorktrees — worktree probe failures are not silent zeros', () => 
       branch: 'merged-but-unreadable',
       worktreePath: wt,
     })
+  })
+})
+
+/**
+ * A linked worktree is its own `--show-toplevel` root and reports a perfectly ordinary branch, so
+ * only git-dir vs git-common-dir separates it from the canonical checkout — and that separation is
+ * what keeps an unattended commit off a checkout the user is reviewing in. The subdir case is the
+ * trap: git prints `--git-common-dir` relative to the process cwd, so resolving it anywhere but the
+ * project dir reads a plain nested project as a worktree.
+ */
+describe('detectRepo — canonical checkout vs linked worktree', () => {
+  it('flags a linked worktree and leaves the canonical checkout unflagged', async () => {
+    const wt = join(dir, 'feature')
+    await git(repo, ['worktree', 'add', '-q', '-b', 'feature', wt])
+
+    expect(await detectRepo(repo)).toMatchObject({
+      isRepo: true,
+      isSubdir: false,
+      branch: 'main',
+      isLinkedWorktree: false,
+    })
+    expect(await detectRepo(wt)).toMatchObject({
+      isRepo: true,
+      isSubdir: false,
+      branch: 'feature',
+      isLinkedWorktree: true,
+    })
+  })
+
+  it('does not read a nested project inside the canonical checkout as a worktree', async () => {
+    const nested = join(repo, 'apps', 'demo')
+    await mkdir(nested, { recursive: true })
+
+    expect(await detectRepo(nested)).toMatchObject({ isSubdir: true, isLinkedWorktree: false })
+  })
+})
+
+describe('commitPaths — unattended author', () => {
+  it('records the unattended writer as author while the user stays the committer', async () => {
+    await writeFile(join(repo, 'b.txt'), 'dream\n')
+
+    await commitPaths(repo, ['b.txt'], 'Dream: tidy project memory', {
+      author: 'Koda Dream <dream@koda.local>',
+    })
+
+    const { stdout } = await execFileP('git', ['log', '-1', '--format=%an <%ae>%n%cn'], { cwd: repo })
+    expect(stdout.trim().split('\n')).toEqual(['Koda Dream <dream@koda.local>', 'Koda Test'])
   })
 })
 

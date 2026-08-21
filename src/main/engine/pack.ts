@@ -28,6 +28,7 @@ export interface PackLocation {
  * short description, default prompt) — OpenAI's own curated skills do 20/20; match that convention
  * when adding a skill here. Claude ignores the `agents/` folder. */
 export const CODEX_PACK_SKILLS = [
+  'goal',
   'memory',
   'documents',
   'shape-new-work',
@@ -77,7 +78,7 @@ export function kodaPlaybooksExpected(
 export const DEEP_REVIEW_PLUGIN_NAME = 'deep-review'
 
 /** Bump when same-app-version dogfood must rematerialize the Codex plugin after pack wiring changes. */
-export const CODEX_PACK_REVISION = 37
+export const CODEX_PACK_REVISION = 38
 
 export function codexPackMarker(appVersion: string, deepReviewVersion: string | null): string {
   const deepReviewRevision = deepReviewVersion ? encodeURIComponent(deepReviewVersion) : 'none'

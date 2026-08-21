@@ -50,6 +50,7 @@ import type {
   SessionCapabilitySnapshot,
   SessionNameKind,
   TaskCompletionState,
+  StageReceipt,
   WorkspaceLayoutSizes,
 } from '@shared/ipc'
 import { expandDocMentionLabels, hasDocMention } from '../doc-mentions'
@@ -225,13 +226,18 @@ export type WorkspaceLayout =
  * by absolute path, so opening the same file twice just re-focuses its tab. Transient — not persisted
  * in v0 (the engine's files on disk are the source of truth; reopening is cheap).
  */
+export type FileDiffSource =
+  | { kind: 'working-tree' }
+  | { kind: 'session'; sessionId: string }
+  | { kind: 'checkpoint'; sessionId: string; checkpointId: string; path: string }
+
 export interface FileSurface {
   /** 'file' (default) = a file pane keyed by its path. Everything else is a SINGLETON surface with no
    *  real file path — the running app ('preview'), the project shell ('terminal'), and the working-tree
    *  review ('changes'). Each takes a reserved sentinel `path` so the whole tab machinery (dedup,
    *  select, close, the cap) works on it unchanged while never colliding with an absolute path. One
    *  method for everything that can take the stage: no shelf, no drawer, no sheet of its own. */
-  kind?: 'file' | 'preview' | 'terminal' | 'changes' | 'agents'
+  kind?: 'file' | 'preview' | 'terminal' | 'changes' | 'turn-changes' | 'agents'
   /** Absolute path — also the stable tab identity (dedup on open). For a singleton surface this is its
    *  reserved sentinel id, not a filesystem path. */
   path: string
@@ -254,12 +260,25 @@ export interface FileSurface {
   /** A line to reveal when the file opens in the Monaco editor (1-based) — set when a search hit
    *  opens the file. Ignored by the doc/diff views. */
   gotoLine?: number
+  /** Optional 1-based column paired with gotoLine. */
+  gotoColumn?: number
   /** Bumped each time the file is (re-)opened at a line, so the editor re-reveals even when the tab
    *  was already open (an effect dep — see MonacoFileEditor). */
   gotoNonce?: number
   /** The session whose edit opened this as a diff — selects main's pinned turn-start baseline so the
    *  diff is cumulative-this-turn. Undefined for Files-browser opens (diff falls back to HEAD). */
   sessionId?: string
+  /** One explicit owner for what a diff means. Checkpoint paths stay workspace-relative even though
+   * the surface itself is keyed by an absolute path. */
+  diffSource?: FileDiffSource
+  /** Receipt identity makes live + catch-up delivery idempotent. */
+  receiptId?: string
+  /** Safety base carried by the This-turn list; each opened row adds its own relative path. */
+  receiptCheckpointId?: string
+  /** Exact completed-turn file evidence for the read-only "This turn" singleton. */
+  receiptFiles?: Extract<StageReceipt, { kind: 'turn-changes' }>['files']
+  receiptComplete?: boolean
+  receiptOverlapObserved?: boolean
 }
 
 /**
@@ -414,6 +433,7 @@ function stageSingleton(
 export const PREVIEW_SURFACE_ID = '\u0000preview'
 export const TERMINAL_SURFACE_ID = '\u0000terminal'
 export const CHANGES_SURFACE_ID = '\u0000changes'
+export const TURN_CHANGES_SURFACE_ID = '\u0000turn-changes'
 const AGENTS_SURFACE_ID = '\u0000agents'
 
 /** The renderer writes the shared persisted schema minus the retired inline archive field. Main keys
@@ -1024,7 +1044,9 @@ interface WorkspaceStore {
   /** Open a file in the artifact zone (focuses its tab if already open). `gotoLine` (from a search
    *  hit) reveals that line in the Monaco editor view. `view` forces a starting view (e.g. open a
    *  `.md` skill/subagent as raw Markdown, not the WYSIWYG doc — those files are technical). */
-  openFile: (path: string, gotoLine?: number, opts?: { view?: FileSurface['view'] }) => void
+  openFile: (path: string, gotoLine?: number, opts?: { view?: FileSurface['view']; gotoColumn?: number; diffSource?: FileDiffSource }) => void
+  /** Apply main-owned presentation intent to the receipt's own session workbench. */
+  applyStageReceipt: (receipt: StageReceipt, opts?: { catchup?: boolean }) => void
   /** Create a new empty document in Documents/, or in the selected Documents folder. */
   newDocument: (parent?: string) => Promise<void>
   /** Create a new folder — at the project root, or inside `parent` (which is then expanded), or in
@@ -1751,6 +1773,10 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         patchSession(sid, (s) => (s.busy ? s : { ...s, busy: true }))
       switch (e.type) {
         case 'SessionStarted': {
+          // Claude ≥2.1.221 emits init lazily — the FIRST SessionStarted lands after the user's first
+          // message is already in items, so "items exist" no longer distinguishes a fresh session from
+          // a respawn. A prior start having reported a model is the discriminator that still does.
+          const previouslyStarted = get().sessions[sid]?.activeModel !== undefined
           // Record the model the engine actually reports running — ground truth for the model pill
           // (confirms a switch landed, or shows the engine default when the user picked nothing).
           // Capture the engine's native id (Codex thread id) so a later reattach can resume THAT thread.
@@ -1769,7 +1795,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           // No banner in a fresh session — the composer's model pill owns model truth, and a spawn-time
           // readout can contradict it (the engine may boot on a default before the user's pick applies
           // at turn 1). A restart UNDER an existing conversation is the only start that's news.
-          else if (get().sessions[sid]?.items.some((it) => it.kind !== 'notice'))
+          else if (previouslyStarted)
             pushItem(sid, {
               kind: 'notice',
               text: e.model ? `continuing on ${prettyModel(e.model)}` : 'session restarted',
@@ -2519,6 +2545,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
               sessionId: s.id,
               snapshot: s.capabilities,
             })
+          for (const receipt of s.stageReceipts ?? []) get().applyStageReceipt(receipt, { catchup: true })
           repairAdoptedTitle(s.id, incomingLabel, s.userNamed)
           continue
         }
@@ -2607,6 +2634,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
             sessionId: s.id,
             snapshot: s.capabilities,
           })
+        for (const receipt of s.stageReceipts ?? []) get().applyStageReceipt(receipt, { catchup: true })
         // A settled label from main wins verbatim. Otherwise a first replayed prompt replaces the
         // phone placeholder immediately and the configured writer refines it in the background.
         repairAdoptedTitle(s.id, incomingLabel, s.userNamed)
@@ -3685,6 +3713,8 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         // editable Monaco file. The per-pane toggle exposes the raw-markdown view for a doc. An
         // explicit `view` overrides this (e.g. technical `.claude/**` files open as raw markdown).
         const view: FileSurface['view'] = opts?.view ?? (isMarkdown(path) ? 'doc' : 'file')
+        const openedDiffSource: FileDiffSource | undefined =
+          view === 'diff' ? (opts?.diffSource ?? { kind: 'working-tree' }) : undefined
         const surfaces = existing
           ? // Already open — refocus, apply any forced view, and re-trigger a line reveal (bump nonce).
             ed.surfaces.map((s) =>
@@ -3692,11 +3722,23 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
                 ? {
                     ...s,
                     ...(opts?.view ? { view: opts.view } : {}),
-                    ...(gotoLine ? { gotoLine, gotoNonce: (s.gotoNonce ?? 0) + 1 } : {}),
+                    ...(opts?.view ? { diffSource: openedDiffSource } : {}),
+                    ...(gotoLine
+                      ? { gotoLine, gotoColumn: opts?.gotoColumn, gotoNonce: (s.gotoNonce ?? 0) + 1 }
+                      : {}),
                   }
                 : s,
             )
-          : addSurface(ed, { path, title: basename(path), view, rev: 0, gotoLine, gotoNonce: 0 })
+          : addSurface(ed, {
+              path,
+              title: basename(path),
+              view,
+              rev: 0,
+              gotoLine,
+              gotoColumn: opts?.gotoColumn,
+              gotoNonce: 0,
+              diffSource: openedDiffSource,
+            })
         return {
           // A user open is explicit intent — it takes the stage and releases a pin (the pin guards
           // against the AGENT yanking the stage, never against the user's own hand).
@@ -3883,6 +3925,106 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       })
     },
 
+    applyStageReceipt: (receipt, opts) =>
+      set((state) => {
+        const session = state.sessions[receipt.sessionId]
+        if (!session) return {}
+        const key = receipt.sessionId
+        const ed = state.editors[key] ?? EMPTY_EDITOR
+
+        if (receipt.kind === 'present-file') {
+          const path = workspaceAbsolute(session.cwd, receipt.path)
+          const existing = ed.surfaces.find((surface) => surface.path === path)
+          if (existing?.receiptId === receipt.id) return {}
+          const view: FileSurface['view'] =
+            receipt.view === 'document' ? 'doc' : receipt.view
+          const diffSource: FileDiffSource | undefined =
+            receipt.view === 'diff'
+              ? {
+                  kind: 'checkpoint',
+                  sessionId: receipt.sessionId,
+                  checkpointId: receipt.checkpointId!,
+                  path: receipt.path,
+                }
+              : undefined
+          const surfaces = existing
+            ? ed.surfaces.map((surface) =>
+                surface.path === path
+                  ? {
+                      ...surface,
+                      view,
+                      rev: surface.rev + 1,
+                      sessionId: receipt.sessionId,
+                      diffSource,
+                      receiptId: receipt.id,
+                      gotoLine: receipt.line,
+                      gotoColumn: receipt.column,
+                      gotoNonce: (surface.gotoNonce ?? 0) + 1,
+                    }
+                  : surface,
+              )
+            : addSurface(ed, {
+                path,
+                title: basename(path),
+                view,
+                rev: 0,
+                sessionId: receipt.sessionId,
+                diffSource,
+                receiptId: receipt.id,
+                gotoLine: receipt.line,
+                gotoColumn: receipt.column,
+                gotoNonce: 0,
+              })
+          const select = !opts?.catchup && ed.stageShown !== false && !stageHeld(ed)
+          return withEditor(state.editors, key, {
+            ...ed,
+            surfaces,
+            activeSurfaceId: select ? path : ed.activeSurfaceId,
+          })
+        }
+
+        const existing = ed.surfaces.find((surface) => surface.path === TURN_CHANGES_SURFACE_ID)
+        if (existing?.receiptId === receipt.id) return {}
+        if (receipt.files.length === 0) {
+          if (!existing) return {}
+          const surfaces = ed.surfaces.filter((surface) => surface.path !== TURN_CHANGES_SURFACE_ID)
+          return withEditor(state.editors, key, {
+            ...ed,
+            surfaces,
+            activeSurfaceId:
+              ed.activeSurfaceId === TURN_CHANGES_SURFACE_ID
+                ? (surfaces[surfaces.length - 1]?.path ?? null)
+                : ed.activeSurfaceId,
+          })
+        }
+        const surface: FileSurface = {
+          kind: 'turn-changes',
+          path: TURN_CHANGES_SURFACE_ID,
+          title: 'This turn',
+          view: 'file',
+          rev: existing ? existing.rev + 1 : 0,
+          sessionId: receipt.sessionId,
+          receiptCheckpointId: receipt.checkpointId,
+          receiptId: receipt.id,
+          receiptFiles: receipt.files,
+          receiptComplete: receipt.complete,
+          receiptOverlapObserved: receipt.overlapObserved,
+        }
+        const surfaces = existing
+          ? ed.surfaces.map((item) => (item.path === TURN_CHANGES_SURFACE_ID ? surface : item))
+          : addSurface(ed, surface)
+        const select =
+          !opts?.catchup &&
+          ed.stageShown !== false &&
+          ed.activeSurfaceId === null &&
+          !stageHeld(ed)
+        return withEditor(state.editors, key, {
+          ...ed,
+          surfaces,
+          activeSurfaceId: select ? TURN_CHANGES_SURFACE_ID : ed.activeSurfaceId,
+        })
+      }),
+
     showEditDiff: (path, sessionId) =>
       // Re-stamps `sessionId` each edit (last-writer-wins) → the diff is "cumulative since the most
       // recent editing session's turn start". If two sessions edit one file, or the file is re-edited
@@ -3895,9 +4037,24 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         const existing = ed.surfaces.find((s) => s.path === path)
         const surfaces = existing
           ? ed.surfaces.map((s) =>
-              s.path === path ? { ...s, view: 'diff' as const, rev: s.rev + 1, sessionId } : s,
+              s.path === path
+                ? {
+                    ...s,
+                    view: 'diff' as const,
+                    rev: s.rev + 1,
+                    sessionId,
+                    diffSource: { kind: 'session' as const, sessionId },
+                  }
+                : s,
             )
-          : addSurface(ed, { path, title: basename(path), view: 'diff' as const, rev: 0, sessionId })
+          : addSurface(ed, {
+              path,
+              title: basename(path),
+              view: 'diff' as const,
+              rev: 0,
+              sessionId,
+              diffSource: { kind: 'session', sessionId },
+            })
         return withEditor(state.editors, sessionId, {
           ...ed,
           surfaces,
@@ -3922,7 +4079,9 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         const existing = ed.surfaces.find((s) => s.path === path)
         const surfaces = existing
           ? ed.surfaces.map((s) =>
-              s.path === path ? { ...s, view: 'doc' as const, rev: s.rev + 1, sessionId } : s,
+              s.path === path
+                ? { ...s, view: 'doc' as const, rev: s.rev + 1, sessionId, diffSource: undefined }
+                : s,
             )
           : addSurface(ed, { path, title: basename(path), view: 'doc' as const, rev: 0, sessionId })
         return withEditor(state.editors, sessionId, {
@@ -3939,7 +4098,20 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         const ed = state.editors[key] ?? EMPTY_EDITOR
         return withEditor(state.editors, key, {
           ...ed,
-          surfaces: ed.surfaces.map((s) => (s.path === path ? { ...s, view } : s)),
+          surfaces: ed.surfaces.map((s) =>
+            s.path === path
+              ? {
+                  ...s,
+                  view,
+                  diffSource:
+                    view === 'diff'
+                      ? (s.diffSource ?? (s.sessionId
+                          ? { kind: 'session' as const, sessionId: s.sessionId }
+                          : { kind: 'working-tree' as const }))
+                      : s.diffSource,
+                }
+              : s,
+          ),
         })
       }),
 
@@ -4382,6 +4554,12 @@ function intakeSkipKey(projectPath: string): string {
 function basename(path: string): string {
   const parts = path.split('/')
   return parts[parts.length - 1] || path
+}
+
+/** Project/session roots are main-owned and receipts are schema-validated POSIX relatives. This join
+ * is projection only; every subsequent file read/diff is contained again in main. */
+function workspaceAbsolute(cwd: string, rel: string): string {
+  return `${cwd.replace(/\/+$/, '')}/${rel}`
 }
 
 /** The containing directory of an absolute path (no trailing slash). */

@@ -17,6 +17,11 @@ export const IpcChannels = {
   // live repository hygiene, not conversation history, and must not replay stale after a restart.
   completionState: 'completion:state',
   completionList: 'completion:list',
+  // Main-owned presentation receipts. Unlike transcript events these are replaceable Stage intent:
+  // the latest explicit artifact and latest completed-turn file set for each live session.
+  stageReceipt: 'stage:receipt',
+  stageReceiptList: 'stage:listReceipts',
+  stageResolveLink: 'stage:resolveLink',
   // Side questions ("btw" / aside) — a throwaway one-shot fork of the live session; the answer streams
   // back over `asideEvent` and never enters the conversation.
   askAside: 'aside:ask',

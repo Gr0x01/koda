@@ -37,6 +37,28 @@ export interface CheckpointChanges {
 
 /** Cap the file list so a massive revert preview can't bloat the payload. */
 const MAX_CHANGED_FILES = 500
+const MAX_DIFF_TEXT = 200_000
+
+/** Snapshot the current worktree into one throwaway safety-git index. Both the changed-file list and
+ * phone unified diff must use this exact owner; duplicating the setup is how one route drifted to
+ * user Git while desktop stayed on the safety store. */
+async function withWorkingTreeIndex<T>(
+  projectDir: string,
+  checkpointId: string,
+  read: (env: { GIT_INDEX_FILE: string }) => Promise<T>,
+): Promise<T> {
+  const tmpIndex = join(safetyGitDir(projectDir), `changes-index-${process.pid}-${Date.now()}`)
+  const env = { GIT_INDEX_FILE: tmpIndex }
+  try {
+    // Seed first so files tracked by the checkpoint remain visible even when a later ignore rule
+    // would make an empty index skip them.
+    await runGit(projectDir, ['read-tree', checkpointId], { extraEnv: env })
+    await runGit(projectDir, ['add', '-A'], { extraEnv: env })
+    return await read(env)
+  } finally {
+    await rm(tmpIndex, { force: true })
+  }
+}
 
 function statusOf(letter: string): ChangedFile['status'] {
   if (letter === 'A') return 'added'
@@ -53,17 +75,7 @@ export async function checkpointChanges(
   projectDir: string,
   checkpointId: string,
 ): Promise<CheckpointChanges> {
-  const tmpIndex = join(safetyGitDir(projectDir), `changes-index-${process.pid}-${Date.now()}`)
-  const env = { GIT_INDEX_FILE: tmpIndex }
-  try {
-    // Seed the scratch index from the checkpoint, then `add -A` refreshes it to mirror the working
-    // tree (new files become adds, missing files become deletes). Seeding matters: files tracked by
-    // the store but ignored by a later .gitignore (a real proxmox case — .env.local, tmp/) stay
-    // tracked and refresh from disk; an empty index would drop them (`add -A` skips ignored
-    // untracked files) and report them as phantom deletions against every checkpoint.
-    await runGit(projectDir, ['read-tree', checkpointId], { extraEnv: env })
-    await runGit(projectDir, ['add', '-A'], { extraEnv: env })
-
+  return withWorkingTreeIndex(projectDir, checkpointId, async (env) => {
     // name-status for the A/M/D letter, numstat for the +/- counts — both checkpoint → scratch index.
     const base = ['diff', '--cached', '--no-renames', '-z', checkpointId]
     const [{ stdout: ns }, { stdout: num }] = await Promise.all([
@@ -96,9 +108,28 @@ export async function checkpointChanges(
       files.push({ path, status: statusOf(letter), additions: c.additions, deletions: c.deletions, binary: c.binary })
     }
     return { files, truncated: total > files.length }
-  } finally {
-    await rm(tmpIndex, { force: true })
-  }
+  })
+}
+
+/** Unified checkpoint → current-worktree diff for the phone. This is intentionally safety-git, not
+ * user Git: checkpoint ids name Koda's separate store and remain meaningful after an agent commits. */
+export async function checkpointFileDiffText(
+  projectDir: string,
+  checkpointId: string,
+  requested: string,
+): Promise<{ diff: string; truncated: boolean }> {
+  const abs = resolve(projectDir, requested)
+  if (abs === projectDir || !abs.startsWith(projectDir + sep)) throw new Error('path must stay inside the project')
+  const relPath = abs.slice(projectDir.length + 1).split(sep).join('/')
+  return withWorkingTreeIndex(projectDir, checkpointId, async (env) => {
+    const { stdout } = await runGit(
+      projectDir,
+      ['diff', '--cached', '--no-renames', checkpointId, '--', relPath],
+      { extraEnv: env },
+    )
+    const truncated = stdout.length > MAX_DIFF_TEXT
+    return { diff: truncated ? stdout.slice(0, MAX_DIFF_TEXT) : stdout, truncated }
+  })
 }
 
 export interface CheckpointFileDiff {

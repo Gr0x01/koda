@@ -7,6 +7,8 @@ import {
   CHANGES_SURFACE_ID,
   PREVIEW_SURFACE_ID,
   TERMINAL_SURFACE_ID,
+  TURN_CHANGES_SURFACE_ID,
+  type SessionState,
 } from './store'
 
 /**
@@ -38,6 +40,164 @@ beforeEach(() => {
   // Everything else here (openFile's recentFiles, openPreview, showEdit*) touches no bridge, so a bare
   // store reset is the rest of the fixture.
   useWorkspace.setState({ activeId: SESSION, editors: {}, recentFiles: [], stageExpanded: false })
+  useWorkspace.setState({
+    sessions: {
+      [SESSION]: { id: SESSION, cwd: '/p' } as SessionState,
+      'sess-background': { id: 'sess-background', cwd: '/other' } as SessionState,
+    },
+  })
+})
+
+describe('presentation receipts', () => {
+  it('puts an explicit file and source location on the requesting session Stage', () => {
+    useWorkspace.getState().applyStageReceipt({
+      kind: 'present-file',
+      id: 'receipt-file-1',
+      sessionId: SESSION,
+      path: 'src/app.ts',
+      view: 'file',
+      line: 17,
+      column: 4,
+    })
+
+    expect(tabs()).toEqual(['/p/src/app.ts'])
+    expect(selected()).toBe('/p/src/app.ts')
+    expect(activeEditor(useWorkspace.getState()).surfaces[0]).toMatchObject({
+      receiptId: 'receipt-file-1',
+      gotoLine: 17,
+      gotoColumn: 4,
+    })
+  })
+
+  it('collects catch-up and background receipts without moving the foreground Stage', () => {
+    const s = useWorkspace.getState()
+    s.openFile('/p/notes.md')
+    s.applyStageReceipt({
+      kind: 'present-file',
+      id: 'receipt-catchup',
+      sessionId: SESSION,
+      path: 'README.md',
+      view: 'document',
+    }, { catchup: true })
+    s.applyStageReceipt({
+      kind: 'present-file',
+      id: 'receipt-background',
+      sessionId: 'sess-background',
+      path: 'report.md',
+      view: 'document',
+    })
+
+    expect(tabs()).toEqual(['/p/notes.md', '/p/README.md'])
+    expect(selected()).toBe('/p/notes.md')
+    expect(useWorkspace.getState().editors['sess-background'].surfaces).toEqual([
+      expect.objectContaining({ path: '/other/report.md', view: 'doc' }),
+    ])
+  })
+
+  it('keeps this-turn evidence distinct from ambient working-tree Changes', () => {
+    const s = useWorkspace.getState()
+    s.openChanges()
+    s.applyStageReceipt({
+      kind: 'turn-changes',
+      id: 'receipt-turn-1',
+      sessionId: SESSION,
+      checkpointId: 'abcdef1',
+      files: [
+        { path: 'src/app.ts', status: 'modified', additions: 3, deletions: 1, binary: false },
+      ],
+      complete: true,
+      overlapObserved: false,
+    })
+
+    expect(tabs()).toEqual([CHANGES_SURFACE_ID, TURN_CHANGES_SURFACE_ID])
+    expect(selected()).toBe(CHANGES_SURFACE_ID)
+    expect(activeEditor(useWorkspace.getState()).surfaces.at(-1)).toMatchObject({
+      kind: 'turn-changes',
+      receiptCheckpointId: 'abcdef1',
+      receiptFiles: [{ path: 'src/app.ts', status: 'modified' }],
+      receiptComplete: true,
+    })
+  })
+
+  it('replaces a historical diff source when the same file returns to live session work', () => {
+    const s = useWorkspace.getState()
+    s.openFile('/p/src/app.ts', undefined, {
+      view: 'diff',
+      diffSource: {
+        kind: 'checkpoint',
+        sessionId: SESSION,
+        checkpointId: 'abcdef1',
+        path: 'src/app.ts',
+      },
+    })
+    expect(activeEditor(useWorkspace.getState()).surfaces[0].diffSource).toMatchObject({
+      kind: 'checkpoint',
+    })
+
+    s.showEditDiff('/p/src/app.ts', SESSION)
+    expect(activeEditor(useWorkspace.getState()).surfaces[0].diffSource).toEqual({
+      kind: 'session',
+      sessionId: SESSION,
+    })
+  })
+
+  it('gives an explicit diff receipt its portable safety baseline and relative path', () => {
+    useWorkspace.getState().applyStageReceipt({
+      kind: 'present-file',
+      id: 'receipt-diff-1',
+      sessionId: SESSION,
+      path: 'src/app.ts',
+      view: 'diff',
+      checkpointId: 'abcdef1',
+    })
+
+    expect(activeEditor(useWorkspace.getState()).surfaces[0].diffSource).toEqual({
+      kind: 'checkpoint',
+      sessionId: SESSION,
+      checkpointId: 'abcdef1',
+      path: 'src/app.ts',
+    })
+  })
+
+  it('replaces the singleton receipt and removes it when a later turn changed nothing', () => {
+    const s = useWorkspace.getState()
+    s.applyStageReceipt({
+      kind: 'turn-changes',
+      id: 'receipt-turn-1',
+      sessionId: SESSION,
+      files: [{ path: 'a.ts', status: 'added', additions: 1, deletions: 0, binary: false }],
+      complete: true,
+      overlapObserved: false,
+    })
+    s.applyStageReceipt({
+      kind: 'turn-changes',
+      id: 'receipt-turn-2',
+      sessionId: SESSION,
+      files: [{ path: 'b.ts', status: 'deleted', additions: 0, deletions: 2, binary: false }],
+      complete: false,
+      overlapObserved: true,
+    })
+
+    expect(tabs()).toEqual([TURN_CHANGES_SURFACE_ID])
+    expect(activeEditor(useWorkspace.getState()).surfaces[0]).toMatchObject({
+      receiptId: 'receipt-turn-2',
+      receiptFiles: [{ path: 'b.ts', status: 'deleted' }],
+      receiptComplete: false,
+      receiptOverlapObserved: true,
+    })
+
+    s.applyStageReceipt({
+      kind: 'turn-changes',
+      id: 'receipt-turn-3',
+      sessionId: SESSION,
+      files: [],
+      complete: true,
+      overlapObserved: false,
+    })
+
+    expect(tabs()).toEqual([])
+    expect(selected()).toBeNull()
+  })
 })
 
 describe('auto-follow adds and selects tabs', () => {

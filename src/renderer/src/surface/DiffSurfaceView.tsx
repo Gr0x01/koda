@@ -1,5 +1,6 @@
 import { Suspense, useEffect, useState } from 'react'
 import type { DiffFileResult } from '@shared/ipc'
+import type { FileDiffSource } from '../workspace/store'
 import { lazyWithRetry } from '../ui'
 
 // Lazy like FileSurfaceView so `monaco-editor` loads only when a diff is actually shown.
@@ -14,12 +15,12 @@ const MonacoDiffEditor = lazyWithRetry(() => import('./MonacoDiffEditor'))
 export function DiffSurfaceView({
   path,
   rev,
-  sessionId,
+  diffSource,
   className = '',
 }: {
   path: string
   rev: number
-  sessionId?: string
+  diffSource?: FileDiffSource
   className?: string
 }) {
   const [diff, setDiff] = useState<DiffFileResult | null>(null)
@@ -28,14 +29,25 @@ export function DiffSurfaceView({
   useEffect(() => {
     let alive = true
     setError(null)
-    window.koda
-      .diffFile({ path, sessionId })
+    const read = diffSource?.kind === 'checkpoint'
+      ? window.koda
+          .checkpointFileDiff({
+            checkpointId: diffSource.checkpointId,
+            path: diffSource.path,
+            sessionId: diffSource.sessionId,
+          })
+          .then((result) => ({ path, ...result }))
+      : window.koda.diffFile({
+          path,
+          ...(diffSource?.kind === 'session' ? { sessionId: diffSource.sessionId } : {}),
+        })
+    read
       .then((r) => alive && setDiff(r))
       .catch((e) => alive && setError(String(e)))
     return () => {
       alive = false
     }
-  }, [path, rev, sessionId])
+  }, [path, rev, diffSource])
 
   return (
     <div className={`flex flex-col overflow-hidden ${className}`}>

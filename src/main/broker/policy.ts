@@ -54,6 +54,9 @@ export const ENSURE_TOOL_TOOL = 'mcp__koda_broker__ensure_tool'
  *  nothing and touches no project file → no checkpoint, and frictionless in Auto like the preview tools. */
 export const OPEN_TERMINAL_TOOL = 'mcp__koda_broker__open_terminal'
 
+/** Showing an existing workspace file on Koda's Stage mutates no project data. */
+export const PRESENT_FILE_TOOL = 'mcp__koda_broker__present_file'
+
 /** Koda's "keep this as a document" capability — it WRITES a file into the user's project, so it stays
  *  off every list in this module and takes the fail-closed pre-checkpoint. Named here only so
  *  `checkpointLabel` can give that checkpoint a human sentence instead of the raw MCP tool name. */
@@ -108,6 +111,8 @@ const READ_ONLY_TOOLS = new Set([
   ENSURE_TOOL_TOOL,
   // Opening the terminal (and staging, never running, a command) mutates no project file.
   OPEN_TERMINAL_TOOL,
+  // Presenting an existing file is a read-only UI action.
+  PRESENT_FILE_TOOL,
 ])
 
 /** The optional Playwright browser-testing tools (`mcp__playwright__*`, server name 'playwright' in

@@ -14,6 +14,9 @@ import { createSaveCoalescer, docEditorGuards } from './CrepeDocEditor'
  * of one engine.
  */
 const SOURCE = readFileSync(join(__dirname, 'CrepeDocEditor.tsx'), 'utf8')
+const CALLOUT_SOURCE = readFileSync(join(__dirname, 'blocks/callout.ts'), 'utf8')
+const TOGGLE_SOURCE = readFileSync(join(__dirname, 'blocks/toggle.ts'), 'utf8')
+const MILKDOWN_RUNTIME_SOURCE = readFileSync(join(__dirname, 'milkdown-runtime.ts'), 'utf8')
 
 /** The body of a top-level function declaration, by brace matching from its signature. */
 function functionBody(src: string, signature: string): string {
@@ -150,6 +153,31 @@ describe('the direct-edit path', () => {
     // Revert also drains through autosave; a second writer could race a confirmed sidebar delete.
     expect(SOURCE.match(/window\.koda\.writeFile\(/g)).toHaveLength(1)
     expect(functionBody(SOURCE, 'async function revertReview()')).toContain('await autosave.flush()')
+  })
+})
+
+describe('the Milkdown runtime boundary', () => {
+  it('keeps Crepe and every custom desktop plugin on one module identity', () => {
+    for (const source of [SOURCE, CALLOUT_SOURCE, TOGGLE_SOURCE]) {
+      const runtimeImports = source
+        .split('\n')
+        .filter((line) => line.includes("from '@milkdown/") && !line.trimStart().startsWith('import type'))
+      expect(runtimeImports).toEqual([])
+    }
+
+    expect(SOURCE).toContain("from './milkdown-runtime'")
+    expect(CALLOUT_SOURCE).toContain("from '../milkdown-runtime'")
+    expect(TOGGLE_SOURCE).toContain("from '../milkdown-runtime'")
+    expect(MILKDOWN_RUNTIME_SOURCE).toContain("export { Crepe } from '@milkdown/crepe'")
+    expect(MILKDOWN_RUNTIME_SOURCE).toContain("from '@milkdown/kit/core'")
+    expect(MILKDOWN_RUNTIME_SOURCE).toContain("from '@milkdown/kit/utils'")
+  })
+
+  it('does not present an initialization failure as a save failure', () => {
+    expect(SOURCE).toContain("Couldn't open editor: {initError}")
+    expect(SOURCE).toContain("Couldn't save: {saveError}")
+    expect(SOURCE).toContain('await reloadForModuleGraphError(e)')
+    expect(SOURCE).not.toContain('.catch((e) => !disposed && setError(String(e)))')
   })
 })
 

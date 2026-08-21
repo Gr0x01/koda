@@ -18,13 +18,16 @@
 import type { Ctx } from '@milkdown/kit/ctx'
 import type { NodeViewConstructor } from '@milkdown/kit/prose/view'
 import type { Root } from 'mdast'
-import { commandsCtx, editorViewCtx } from '@milkdown/kit/core'
 import {
+  $nodeSchema,
+  $remark,
+  $view,
   addBlockTypeCommand,
   clearTextInCurrentBlockCommand,
+  commandsCtx,
+  editorViewCtx,
   selectTextNearPosCommand,
-} from '@milkdown/kit/preset/commonmark'
-import { $nodeSchema, $remark, $view } from '@milkdown/kit/utils'
+} from '../milkdown-runtime'
 
 /** A single opaque `html` flow node opening a toggle, optionally carrying the inline `<summary>`. */
 const OPEN = /^<details(?:\s[^>]*)?>\s*(?:<summary>([\s\S]*?)<\/summary>)?\s*$/i

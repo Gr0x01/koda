@@ -17,11 +17,13 @@ const MonacoFileEditor = lazyWithRetry(() => import('./MonacoFileEditor'))
 export function FileSurfaceView({
   path,
   gotoLine,
+  gotoColumn,
   gotoNonce,
   className = '',
 }: {
   path: string
   gotoLine?: number
+  gotoColumn?: number
   gotoNonce?: number
   className?: string
 }) {
@@ -86,6 +88,7 @@ export function FileSurfaceView({
               initialContent={file.content}
               readOnly={file.truncated}
               gotoLine={gotoLine}
+              gotoColumn={gotoColumn}
               gotoNonce={gotoNonce}
               className="h-full"
             />

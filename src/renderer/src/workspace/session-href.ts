@@ -34,35 +34,10 @@
  * The first catches a second copy of the ladder; the second catches an href assembled by hand.
  */
 
-/** The scheme + host Koda claims for "go to this conversation". Namespaced so it can never collide
- *  with a project-relative markdown href, and shaped as a URL so `koda://document/…` and friends stay
- *  available without re-litigating the format. Lowercase is canonical; parsing accepts any case. */
-export const SESSION_HREF_PREFIX = 'koda://session/'
-
-/** Build the href for a session id. The id is percent-encoded even though today's ids are UUIDs —
- *  the writer of a `source:` field is a file on disk that anyone can edit. */
-export function sessionHref(sessionId: string): string {
-  return `${SESSION_HREF_PREFIX}${encodeURIComponent(sessionId)}`
-}
-
-/**
- * Pull the session id back out of an href, or null when this isn't a session door. Strict about the
- * shape: exactly one path segment after the host, non-empty once decoded, no nested path. A malformed
- * `koda://session/…` is declined rather than guessed at, so it falls through to the caller's normal
- * handling instead of navigating somewhere arbitrary.
- */
-export function parseSessionHref(href: string): string | null {
-  if (!href.toLowerCase().startsWith(SESSION_HREF_PREFIX)) return null
-  const rest = href.slice(SESSION_HREF_PREFIX.length).split('#')[0].split('?')[0]
-  if (!rest || rest.includes('/')) return null
-  let id: string
-  try {
-    id = decodeURIComponent(rest)
-  } catch {
-    id = rest // a literal % that isn't a valid escape — take it as written
-  }
-  return id.trim() || null
-}
+/** The portable href vocabulary is shared with the phone. This module remains the owner of desktop
+ * door resolution and re-exports the shared builders so existing callers keep one route. */
+import { parseSessionHref, sessionHref, SESSION_HREF_PREFIX } from '@shared/stage-links'
+export { parseSessionHref, sessionHref, SESSION_HREF_PREFIX }
 
 /**
  * What a recorded session id points at NOW.

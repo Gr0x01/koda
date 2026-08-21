@@ -740,6 +740,102 @@ export const TaskCompletionStateSchema = z.object({
 export type TaskCompletionState = z.infer<typeof TaskCompletionStateSchema>
 export const TaskCompletionStatesSchema = z.array(TaskCompletionStateSchema)
 
+/** A safety checkpoint id is always a git SHA. Presentation receipts carry the same portable handle
+ * as Recovery, so define the boundary once before either contract uses it. */
+export const CheckpointIdSchema = z.string().regex(/^[0-9a-f]{7,40}$/)
+
+/** Portable file identity carried by Koda's presentation plane. Main derives the workspace root from
+ * `sessionId`; clients and agents may name only a normalized workspace-relative POSIX path. */
+export const StageWorkspacePathSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(4096)
+  .refine(
+    (path) =>
+      !path.startsWith('/') &&
+      !path.includes('\\') &&
+      path !== '.' &&
+      path.split('/').every((segment) => segment.length > 0 && segment !== '.' && segment !== '..'),
+    'expected a normalized workspace-relative path',
+  )
+
+const StageLocationSchema = z
+  .object({
+    line: z.number().int().positive().optional(),
+    column: z.number().int().positive().optional(),
+  })
+  .superRefine(({ line, column }, ctx) => {
+    if (column !== undefined && line === undefined)
+      ctx.addIssue({ code: 'custom', path: ['column'], message: 'column requires line' })
+  })
+
+export const PresentFileStageReceiptSchema = z
+  .object({
+    kind: z.literal('present-file'),
+    id: z.string().min(1).max(160),
+    sessionId: z.string().min(1),
+    path: StageWorkspacePathSchema,
+    view: z.enum(['document', 'file', 'diff']),
+    /** Required for diff view: the safety-git baseline is the portable meaning of this diff. */
+    checkpointId: CheckpointIdSchema.optional(),
+  })
+  .and(StageLocationSchema)
+  .superRefine(({ view, line, checkpointId }, ctx) => {
+    if (line !== undefined && view !== 'file')
+      ctx.addIssue({ code: 'custom', path: ['line'], message: 'locations require the file view' })
+    if (view === 'diff' && checkpointId === undefined)
+      ctx.addIssue({ code: 'custom', path: ['checkpointId'], message: 'diff view requires a checkpoint' })
+    if (view !== 'diff' && checkpointId !== undefined)
+      ctx.addIssue({ code: 'custom', path: ['checkpointId'], message: 'checkpoint requires the diff view' })
+  })
+
+/** Deliberately mirrors safety-git's changed-file evidence without importing a main-process module. */
+export const StageChangedFileSchema = z.object({
+  path: StageWorkspacePathSchema,
+  status: z.enum(['added', 'modified', 'deleted']),
+  additions: z.number(),
+  deletions: z.number(),
+  binary: z.boolean(),
+})
+
+export const TurnChangesStageReceiptSchema = z.object({
+  kind: z.literal('turn-changes'),
+  id: z.string().min(1).max(160),
+  sessionId: z.string().min(1),
+  /** The safety-git baseline for exact diffs, absent only when checkpoint evidence failed. */
+  checkpointId: z.string().regex(/^[0-9a-f]{7,40}$/).optional(),
+  files: z.array(StageChangedFileSchema).max(500),
+  complete: z.boolean(),
+  overlapObserved: z.boolean().default(false),
+})
+
+export const StageReceiptSchema = z.union([
+  PresentFileStageReceiptSchema,
+  TurnChangesStageReceiptSchema,
+])
+export type StageReceipt = z.infer<typeof StageReceiptSchema>
+export const StageReceiptsSchema = z.array(StageReceiptSchema).max(1000)
+
+export const ResolveStageLinkRequestSchema = z.object({
+  sessionId: z.string().min(1).optional(),
+  href: z.string().trim().min(1).max(8192),
+})
+export type ResolveStageLinkRequest = z.infer<typeof ResolveStageLinkRequestSchema>
+
+export const StageLinkTargetSchema = z.union([
+  z
+    .object({
+      kind: z.literal('file'),
+      path: StageWorkspacePathSchema,
+      /** Desktop-only projection. Remote doors intentionally omit absolute paths. */
+      absolutePath: z.string().min(1).optional(),
+    })
+    .and(StageLocationSchema),
+  z.object({ kind: z.enum(['declined', 'missing']), reason: z.string().optional() }),
+])
+export type StageLinkTarget = z.infer<typeof StageLinkTargetSchema>
+
 /** An inline image attached to a turn — base64 + its media type. `name` is present for a phone-side
  * document attachment that uses the same transport envelope. */
 export const ImageAttachmentSchema = z.object({
@@ -900,6 +996,8 @@ export const AdoptedHeadlessSessionSchema = z.object({
   /** Latest main-owned runtime capability evidence. Ephemeral: adoption carries it across renderer
    *  ownership changes, but it never enters transcript persistence or replay. */
   capabilities: SessionCapabilitySnapshotSchema.optional(),
+  /** Latest replaceable Stage intent, carried across a renderer reload/adoption but not transcript. */
+  stageReceipts: z.array(StageReceiptSchema).max(2).optional(),
   events: z.array(ReplayEntrySchema),
 })
 export type AdoptedHeadlessSession = z.infer<typeof AdoptedHeadlessSessionSchema>
@@ -1066,10 +1164,6 @@ export type Checkpoint = z.infer<typeof CheckpointSchema>
 /** safety:list response — the timeline, newest first. Project-scoped (root from the window). */
 export const CheckpointListSchema = z.array(CheckpointSchema)
 
-/** A checkpoint id is always a git SHA — pin the shape so it can't be smuggled in as a git flag
- *  (`--output=…`) when placed positionally in a diff/show/checkout (defense-in-depth at the boundary). */
-const CheckpointIdSchema = z.string().regex(/^[0-9a-f]{7,40}$/)
-
 export const SafetyRestoreRequestSchema = z.object({ checkpointId: CheckpointIdSchema })
 export type SafetyRestoreRequest = z.infer<typeof SafetyRestoreRequestSchema>
 
@@ -1096,6 +1190,9 @@ export type SafetyChangesResult = z.infer<typeof SafetyChangesResultSchema>
 export const SafetyFileDiffRequestSchema = z.object({
   checkpointId: CheckpointIdSchema,
   path: z.string(),
+  /** Present only for a session Stage diff. Main validates window ownership and derives that cwd;
+   * Recovery omits it and stays anchored to the sender window's project root. */
+  sessionId: z.string().min(1).optional(),
 })
 export type SafetyFileDiffRequest = z.infer<typeof SafetyFileDiffRequestSchema>
 
@@ -2235,6 +2332,23 @@ export type TerminalData = z.infer<typeof TerminalDataSchema>
 export const TerminalExitSchema = z.object({ code: z.number().nullable() })
 export type TerminalExit = z.infer<typeof TerminalExitSchema>
 
+/** Bounded phone replay of the same workspace pty. `reset` means the requested cursor fell outside the
+ * retained output window (or belonged to a shell that has since respawned), so xterm replaces its view. */
+export const RemoteTerminalStateSchema = z.object({
+  cwd: z.string(),
+  cursor: z.number().int().nonnegative(),
+  data: z.string(),
+  reset: z.boolean(),
+  exited: z.boolean(),
+  exitCode: z.number().int().nullable(),
+})
+export type RemoteTerminalState = z.infer<typeof RemoteTerminalStateSchema>
+
+/** An unguessable, process-local input capability makes retries idempotent without persisting terminal
+ * keystrokes. A new Stage open replaces the prior capability for that session. */
+export const RemoteTerminalStartResultSchema = RemoteTerminalStateSchema.extend({ inputToken: z.string() })
+export type RemoteTerminalStartResult = z.infer<typeof RemoteTerminalStartResultSchema>
+
 /** Pop the terminal shelf open (main → renderer; the agent's open_terminal tool). `command`, when set,
  *  is staged at the prompt for the user to review and run — Koda never runs it for them. */
 export const TerminalShowSchema = z.object({ sessionId: z.string(), command: z.string().optional() })
@@ -3275,6 +3389,12 @@ export interface KodaApi {
   onCompletionState: (listener: (state: TaskCompletionState) => void) => () => void
   /** Catch up after a renderer reload without persisting stale completion claims across app restarts. */
   listCompletionStates: () => Promise<TaskCompletionState[]>
+  /** Subscribe to engine-neutral Stage intent (separate from transcript/replay). */
+  onStageReceipt: (listener: (receipt: StageReceipt) => void) => () => void
+  /** Catch up the latest presentation + completed-turn receipt for this window's live sessions. */
+  listStageReceipts: () => Promise<StageReceipt[]>
+  /** Resolve a markdown-local href against main-owned session/window workspace identity. */
+  resolveStageLink: (args: ResolveStageLinkRequest) => Promise<StageLinkTarget>
   // Side questions ("btw" / aside) — answered from the live conversation without entering it.
   askAside: (args: AskAsideRequest) => Promise<void>
   cancelAside: (args: CancelAsideRequest) => Promise<void>

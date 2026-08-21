@@ -86,6 +86,12 @@ export interface RepoInfo {
   /** The trunk ("main line"): a local branch named main, else master; null when neither exists.
    *  Lets the renderer tell the user they're on a side branch. */
   defaultBranch: string | null
+  /** True when this checkout came from `git worktree add`, not the canonical clone. A linked worktree
+   *  is its own `--show-toplevel` root and reads as a clean repo root on every other field, so only
+   *  its per-worktree git-dir differing from the shared git-common-dir tells the two apart. `null`
+   *  means the probe failed or was unparseable — an unattended writer must treat that as a refusal,
+   *  never as "not a worktree". */
+  isLinkedWorktree: boolean | null
 }
 
 export interface StatusResult {
@@ -241,7 +247,15 @@ export async function detectRepo(projectDir: string): Promise<RepoInfo> {
   try {
     const { stdout } = await runUserGit(projectDir, ['rev-parse', '--show-toplevel'])
     const top = stdout.trim()
-    if (!top) return { isRepo: false, repoRoot: null, isSubdir: false, branch: null, defaultBranch: null }
+    if (!top)
+      return {
+        isRepo: false,
+        repoRoot: null,
+        isSubdir: false,
+        branch: null,
+        defaultBranch: null,
+        isLinkedWorktree: false,
+      }
     // realpath both sides — macOS resolves /var → /private/var, and the project dir is already
     // realpath'd upstream (project:open), so an un-resolved toplevel would falsely read as a subdir.
     const [realTop, realProject] = await Promise.all([
@@ -267,9 +281,45 @@ export async function detectRepo(projectDir: string): Promise<RepoInfo> {
     } catch {
       /* leave null */
     }
-    return { isRepo: true, repoRoot: realTop, isSubdir: realTop !== realProject, branch, defaultBranch }
+    // Git prints either dir relative to the process cwd (`.git` at a root, `../.git` from a subdir),
+    // so both resolve against projectDir — resolving against repoRoot instead would read an ordinary
+    // subdir as a worktree. realpath for the same /var → /private/var reason as above.
+    let isLinkedWorktree: boolean | null = null
+    try {
+      const probe = await runUserGit(projectDir, ['rev-parse', '--git-dir', '--git-common-dir'])
+      const dirs = probe.stdout
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+      if (dirs.length === 2) {
+        const [gitDir, commonDir] = await Promise.all(
+          dirs.map(async (dir) => {
+            const abs = resolve(projectDir, dir)
+            return realpath(abs).catch(() => abs)
+          }),
+        )
+        isLinkedWorktree = gitDir !== commonDir
+      }
+    } catch {
+      /* leave null — unknown must fail closed, not read as canonical */
+    }
+    return {
+      isRepo: true,
+      repoRoot: realTop,
+      isSubdir: realTop !== realProject,
+      branch,
+      defaultBranch,
+      isLinkedWorktree,
+    }
   } catch {
-    return { isRepo: false, repoRoot: null, isSubdir: false, branch: null, defaultBranch: null }
+    return {
+      isRepo: false,
+      repoRoot: null,
+      isSubdir: false,
+      branch: null,
+      defaultBranch: null,
+      isLinkedWorktree: false,
+    }
   }
 }
 
@@ -962,10 +1012,9 @@ export async function gitFileDiff(
 const MAX_DIFF_TEXT = 200_000
 
 /**
- * Unified diff TEXT for one working-tree file vs HEAD — the remote (phone) diff surface. Ships git's
- * own hunks instead of before/after blobs, so the payload stays small enough for a relay frame and the
- * client just colors lines. Untracked files diff against /dev/null (all-adds); binary changes come out
- * as git's one-line "Binary files … differ" notice, which renders fine as-is.
+ * Unified diff TEXT for one working-tree file vs HEAD — the remote (phone) ambient Changes surface.
+ * Completed-turn evidence belongs to safety-git/changes.ts instead; a safety SHA must never be handed
+ * to the user's repository. Ships git's own hunks so the payload stays small enough for a relay frame.
  */
 export async function diffTextOf(
   projectDir: string,
@@ -1086,12 +1135,14 @@ export async function commitAll(projectDir: string, message: string): Promise<{ 
  * (covers new/untracked, modified, and deletions) and commits them via an explicit pathspec, so any
  * other dirty files (another session's in-flight work) stay uncommitted. Same identity check and error
  * mapping as commitAll. Paths are project-relative, straight from `getStatus`; `--` guards any that
- * look like flags.
+ * look like flags. An `author` names an unattended writer (Dream) on the commit while the COMMITTER
+ * stays the user's own identity, so their hooks and signing still apply.
  */
 export async function commitPaths(
   projectDir: string,
   paths: string[],
   message: string,
+  opts?: { author?: string },
 ): Promise<{ sha: string }> {
   const info = await detectRepo(projectDir)
   if (!info.isRepo) throw new UserGitError('not a git repo', 'not_a_repo')
@@ -1109,7 +1160,14 @@ export async function commitPaths(
   try {
     // Pathspec-scoped commit: takes only these paths, ignoring whatever else is staged — the invariant
     // that keeps a sibling session's changes out of this version.
-    await runUserGit(projectDir, ['commit', '--message', message, '--', ...commitSpec])
+    await runUserGit(projectDir, [
+      'commit',
+      '--message',
+      message,
+      ...(opts?.author ? [`--author=${opts.author}`] : []),
+      '--',
+      ...commitSpec,
+    ])
   } catch (err) {
     throwCommitError(err)
   }

@@ -6,10 +6,12 @@ import { DocSurfaceView } from './DocSurfaceView'
 import { DiffSurfaceView } from './DiffSurfaceView'
 import { PreviewSurfaceView, type PreviewViewport } from './PreviewSurfaceView'
 import { ChangesSurface } from './ChangesSurface'
+import { TurnChangesSurface } from './TurnChangesSurface'
 import { AgentsSurface } from './AgentsSurface'
 import { BranchGlyph } from './ChangesReview'
 import { TerminalSurfaceView } from './TerminalSurfaceView'
 import { useWorkspace, activeEditor, type FileSurface } from '../workspace/store'
+import { StarGlyph } from '../workspace/KeptDocs'
 import { isFleetEntry } from '../transcript/fleet'
 
 const isMarkdown = (path: string): boolean => /\.(md|markdown)$/i.test(path)
@@ -40,14 +42,40 @@ function StageBar() {
   const setStagePinned = useWorkspace((s) => s.setStagePinned)
   const stageExpanded = useWorkspace((s) => s.stageExpanded)
   const setStageExpanded = useWorkspace((s) => s.setStageExpanded)
+  const projectPath = useWorkspace((s) => s.projectPath)
+  const starredDocs = useWorkspace((s) => s.starredDocs)
+  const starDoc = useWorkspace((s) => s.starDoc)
+  const unstarDoc = useWorkspace((s) => s.unstarDoc)
   const staged = stagedSurface(editor)
   const barBtn = 'grid h-[26px] w-[26px] place-items-center rounded-md transition-colors'
   const heldHint = staged ? `${staged.title} holds the view while the agent works. Click another tab to leave it.` : ''
+  // The shelf's stars are project-relative document paths, so the toggle exists only for a markdown
+  // file tab inside the project — the same population the Library's own star can reach.
+  const starRel =
+    staged && !staged.kind && isMarkdown(staged.path) && projectPath && staged.path.startsWith(`${projectPath}/`)
+      ? staged.path.slice(projectPath.length + 1)
+      : null
+  const starred = starRel != null && starredDocs.includes(starRel)
   return (
     <div className="flex h-9 shrink-0 items-center gap-1 border-b border-border pl-1 pr-1.5">
       <StageTabs surfaces={editor.surfaces} staged={staged} />
       <div className="ml-auto flex shrink-0 items-center gap-1 pl-1">
         {staged && !staged.kind && <ViewToggle surface={staged} />}
+        {starRel && (
+          <button
+            onClick={() => (starred ? unstarDoc(starRel) : starDoc(starRel))}
+            title={
+              starred
+                ? 'Unstar. Remove this document from the sidebar.'
+                : 'Star. Keep this document in the sidebar.'
+            }
+            aria-label="Star this document"
+            aria-pressed={starred}
+            className={`${barBtn} ${starred ? 'text-accent' : 'text-text-muted hover:text-text'}`}
+          >
+            <StarGlyph filled={starred} size={14} className="" />
+          </button>
+        )}
         {staged &&
           // The live surfaces hold the view by themselves (see stageHeld in the store): while one is
           // selected the agent's edits stop stealing the selection, so there's nothing to toggle — show
@@ -230,15 +258,16 @@ function AddSurfaceButton() {
 }
 
 /** A surface's singleton kind, or null for an ordinary file tab (`kind` is optional on those). */
-function singletonKind(s: FileSurface): 'preview' | 'terminal' | 'changes' | 'agents' | null {
+function singletonKind(s: FileSurface): 'preview' | 'terminal' | 'changes' | 'turn-changes' | 'agents' | null {
   return s.kind && s.kind !== 'file' ? s.kind : null
 }
 
 /** What each singleton tab is, in one hover line. */
-const SINGLETON_HINT: Record<'preview' | 'terminal' | 'changes' | 'agents', string> = {
+const SINGLETON_HINT: Record<'preview' | 'terminal' | 'changes' | 'turn-changes' | 'agents', string> = {
   preview: 'Your app, running',
   terminal: 'A shell in this project folder',
   changes: 'Everything changed since your last version',
+  'turn-changes': 'The exact files Koda observed this turn',
   agents: 'The agents this chat handed work to',
 }
 
@@ -250,6 +279,7 @@ function SurfaceGlyph({ surface }: { surface: FileSurface }) {
   if (surface.kind === 'preview') return <IconWindow className={surface.live ? 'text-emerald-500' : undefined} />
   if (surface.kind === 'terminal') return <IconTerminal />
   if (surface.kind === 'changes') return <BranchGlyph size={14} />
+  if (surface.kind === 'turn-changes') return <BranchGlyph size={14} />
   if (surface.kind === 'agents') return <IconAgents />
   return <ViewIcon view={surface.view} md={isMarkdown(surface.path)} />
 }
@@ -286,6 +316,8 @@ function Stage() {
               <StagePreview preview={staged} />
             ) : staged.kind === 'changes' ? (
               <ChangesSurface />
+            ) : staged.kind === 'turn-changes' ? (
+              <TurnChangesSurface surface={staged} />
             ) : staged.kind === 'agents' ? (
               <AgentsSurface />
             ) : (
@@ -610,11 +642,11 @@ function SurfacePane({ surface, className = '' }: { surface: FileSurface; classN
     <div className={`flex flex-col ${className}`}>
       <div className="min-h-0 flex-1">
         {surface.view === 'diff' ? (
-          <DiffSurfaceView path={surface.path} rev={surface.rev} sessionId={surface.sessionId} className="h-full" />
+          <DiffSurfaceView path={surface.path} rev={surface.rev} diffSource={surface.diffSource} className="h-full" />
         ) : surface.view === 'doc' ? (
           <DocSurfaceView path={surface.path} rev={surface.rev} sessionId={surface.sessionId} className="h-full" />
         ) : (
-          <FileSurfaceView path={surface.path} gotoLine={surface.gotoLine} gotoNonce={surface.gotoNonce} className="h-full" />
+          <FileSurfaceView path={surface.path} gotoLine={surface.gotoLine} gotoColumn={surface.gotoColumn} gotoNonce={surface.gotoNonce} className="h-full" />
         )}
       </div>
     </div>

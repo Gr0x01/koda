@@ -13,7 +13,7 @@ import type { ToolDecision } from '@shared/ipc'
  * ship an approval that vanishes after ~5 minutes on the next engine bump.
  */
 
-// The broker constructor takes eleven collaborators; only the one a test names is exercised.
+// The broker constructor takes collaborators for every capability; only the one a test names is exercised.
 const noop = (async () => {}) as never
 function makeBroker(keepDocument: KeepDocumentFn = noop): PermissionBroker {
   return new PermissionBroker(
@@ -28,6 +28,7 @@ function makeBroker(keepDocument: KeepDocumentFn = noop): PermissionBroker {
     noop, // openTerminal
     { install: noop, start: noop, stop: noop, status: noop }, // miniApps
     keepDocument,
+    noop, // presentFile
   )
 }
 
@@ -254,6 +255,7 @@ describe('capabilities directory', () => {
       expect(payload.capabilities.map((entry) => entry.id)).toEqual([
         'recovery',
         'preview',
+        'stage',
         'environment',
         'documents',
       ])

@@ -10,26 +10,7 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
 
 ## [Unreleased]
 
-### Added
-
-- Settings now uses the same provider-first model catalog as chat for the small writing Koda does
-  around your work. Apple Intelligence and Plain local text stay one level away; Claude and Codex
-  each open their own model list with a separate reasoning control. Both use their configured provider
-  account through one ephemeral, non-mutating background-generation boundary.
-### Changed
-
-- Model selection now opens inside the current AI provider, with a distinct Koda mark and a short
-  explanation for each curated model. Switching between Claude and Codex lives one level deeper, so
-  the everyday menu stays compact and can grow cleanly as Koda adds providers.
-
-### Fixed
-
-- A Preview or Agents roster pushed by an agent in a background chat now brings that chat and its
-  Stage forward, instead of leaving the result hidden behind the session picker.
-- New chats now remember the complete provider, model, and reasoning choice. Changing reasoning no
-  longer falls back to the engine default when the next chat starts.
-
-## [0.1.11] - 2026-08-17
+## [0.1.12] - 2026-08-21
 
 ### Added
 
@@ -39,13 +20,24 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
   that conversation.
 - Say “keep this as a document” and Koda writes the useful result into your Documents folder
   only when you ask. The document remembers which chat it came from. Star a document to keep
-  it in the sidebar, where it stays available across chats.
+  it in the sidebar, where it stays available across chats. The star also sits on an open
+  document's Stage bar, beside the hold-view pin, so you can keep or release the document you
+  are reading without a trip through the Library.
 - Documents now open ready to read and switch to Edit when you want to type. Changes save as
   you go, failed saves offer a retry, and selecting a passage shows how much text will travel
   with your message to Koda.
-- Settings now lets you choose how Koda writes session names and saved-version descriptions.
-  Apple Intelligence stays on your Mac, Plain local text uses no AI, and Claude uses your
-  configured Anthropic account with tools turned off.
+- Agents can now put a primary document, source location, or diff on the correct session's Stage.
+  The Mac respects a held or hidden Stage; the phone adds it quietly and keeps it through reconnects.
+- Each completed turn gets a separate **This turn** file set derived from its recovery point, so the
+  exact files and diffs remain available after the agent saves the work and ordinary Changes is clean.
+- Links in agent replies can open contained project documents and source locations on Mac or phone,
+  including paths with spaces, `file://`, `#L12C3`, and `path:line:column` forms.
+- Settings now lets you choose how Koda writes session names and saved-version descriptions,
+  using the same provider-first model catalog as chat. Apple Intelligence stays on your Mac,
+  Plain local text uses no AI, and Claude and Codex each open their own model list with a
+  separate reasoning control, using your configured provider account.
+- Goal is now a shared Claude and Codex playbook. Invoke it to keep pursuing one concrete outcome
+  through verification instead of stopping at a plan or progress update.
 - Koda now includes Deep Review for changes that need a closer look. It follows related code,
   tests, and history, checks suspected problems, and gives the change an evidence-backed score.
   It is available on Claude and Codex when you ask for it.
@@ -65,6 +57,14 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
   hover card. Archived chats and recent images open from compact lines at the bottom, and old
   chats stay in one list until you choose to archive them. Files now open through ⌘P and
   documents through the Library.
+- Model selection now opens inside the current AI provider, with a distinct Koda mark and a short
+  explanation for each curated model. Switching between Claude and Codex lives one level deeper, so
+  the everyday menu stays compact and can grow cleanly as Koda adds providers.
+- A successful overnight memory tidy now saves its own clean memory changes as one local version
+  before the Dream appears in the morning. That version lands on whatever line of work the project is
+  on that night and is credited to Koda Dream, so overnight saves stay easy to recognize in your
+  history. Pre-existing or overlapping edits stay unsaved, and Koda never creates a Git repository
+  for an unversioned folder just to make that version.
 - Koda now matches planning and review to the size of the work. Agents open job-specific
   playbooks when useful, check which Koda tools actually loaded, and show one Preview mock when
   a screen needs a real design choice. Koda also answers more briefly after the work is done.
@@ -82,6 +82,16 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
 
 - Normal Codex work is no longer steered or interrupted by Koda after a fixed number of inference
   steps or tokens. The separate per-tool output cap remains to prevent oversized tool results.
+- New chats no longer open with a false "Some Koda abilities didn't load: Browser testing" warning.
+  The current engine stopped listing Koda's internal browser playbook in its startup inventory, so
+  the check reported a healthy capability as broken in every session; browser testing now reads from
+  the browser tools the engine actually loaded.
+- Documents recover automatically when a live development update leaves the editor on a stale
+  module graph, including a rapid burst of updates that one recovery alone could not outlast. Each
+  recovery now has to prove itself with a clean editor open: when the problem persists, Koda stops
+  after a few attempts and shows its recovery screen, instead of silently reloading the window and
+  closing the document you just opened every time you retry. If opening the editor genuinely fails,
+  Koda now says that instead of calling it a save error and offering a Retry action that cannot help.
 - Chats now move between Needs you and Active based on what you can act on. Working in two chats
   no longer leaves a permanent Needs check badge; each chat claims the files it changed, and a
   shared file names both chats.
@@ -91,6 +101,12 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
   limit. Repeated archive rows for the same chat also fold back into one.
 - Session names stop being rewritten by tool-only turns or a missed naming request. Desktop chats
   also keep their true origin after a reload instead of returning with a phone label.
+- New chats now remember the complete provider, model, and reasoning choice. Changing reasoning no
+  longer falls back to the engine default when the next chat starts.
+- A Preview or Agents roster pushed by an agent in a background chat now brings that chat and its
+  Stage forward, instead of leaving the result hidden behind the session picker.
+- A brand-new chat no longer announces "continuing on" the model you just picked. That banner is
+  reserved for a session that genuinely restarts under an existing conversation.
 - Saved-image cleanup now runs when a project opens, when the setting changes, and as files age
   in a quiet project.
 - Restoring an earlier version now tells every open agent which files moved back. A chat whose
@@ -510,8 +526,8 @@ _First versioned build — the baseline the auto-updater ships from._
 - Settings now shows the Koda version, the bundled Claude engine version, and a
   "Check for updates" button.
 
-[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.11...HEAD
-[0.1.11]: https://github.com/Gr0x01/koda/releases/tag/v0.1.11
+[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.12...HEAD
+[0.1.12]: https://github.com/Gr0x01/koda/releases/tag/v0.1.12
 [0.1.10]: https://github.com/Gr0x01/koda/releases/tag/v0.1.10
 [0.1.9]: https://github.com/Gr0x01/koda/releases/tag/v0.1.9
 [0.1.8]: https://github.com/Gr0x01/koda/releases/tag/v0.1.8

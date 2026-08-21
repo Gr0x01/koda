@@ -17,7 +17,8 @@
  * that permits local reads and realpath-contained edits under `.koda/memory/` only. Shell, network,
  * unknown mutators, traversal, and symlink escapes are denied. There is deliberately no live-tree
  * rollback: an editor or raw terminal outside Koda's mutation doors can never be mistaken for Dream
- * work and deleted during cleanup.
+ * work and deleted during cleanup. Successful Git-backed runs finish with one user-Git commit of
+ * clean, Dream-owned `.koda/memory/` paths; ambiguous or mixed work stays visible and uncommitted.
  */
 import { existsSync } from 'node:fs'
 import { readFileSync } from 'node:fs'
@@ -107,8 +108,19 @@ Mark observed facts, inferences, and speculation plainly. Never claim the proble
 
 interface DreamState {
   lastDream: Record<string, number>
+  /** Last successful Dream-owned user-Git commit per project. The commit itself is durable history;
+   * this is the scheduler's audit pointer to the last finalized workstream. */
+  lastCommit: Record<string, string>
   /** nightKey() of the last window that actually dreamed — one dream per night, ever. */
   lastNight?: string
+}
+
+interface RemDigestResult {
+  reply: string | undefined
+  interrupted: boolean
+  containmentHeld: boolean
+  /** False means the optional REM work did not reach its own clean terminal boundary. */
+  successful: boolean
 }
 
 /** Local-time gate: only from 21:00, or the pre-noon tail of a night that ran long. */
@@ -307,10 +319,11 @@ export class DreamScheduler {
       const parsed = JSON.parse(readFileSync(this.statePath, 'utf8')) as DreamState
       return {
         lastDream: parsed.lastDream ?? {},
+        lastCommit: parsed.lastCommit ?? {},
         lastNight: typeof parsed.lastNight === 'string' ? parsed.lastNight : undefined,
       }
     } catch {
-      return { lastDream: {} }
+      return { lastDream: {}, lastCommit: {} }
     }
   }
 
@@ -348,10 +361,12 @@ export class DreamScheduler {
 
     this.running = true
     const blocker = powerSaveBlocker.start('prevent-app-suspension')
-    // Persisted with the first per-project write below; a forced run spends the night too (it just
-    // dreamed — an auto re-run the same evening would be a double).
+    // Persist the attempted night before running. This throttles a broken unattended pass to one try
+    // per night, while per-project `lastDream` advances only after clean finalization so failed work is
+    // eligible again next night. A forced run spends the night too.
     state.lastNight = nightKey(new Date())
     try {
+      writeFileAtomic(this.statePath, JSON.stringify(state, null, 2))
       await this.sessions.reapDreamSessions() // end last night's un-adopted sessions before starting new ones
       for (const cwd of targets) {
         // The user sat down mid-pass — stop here; the remaining projects keep their eligibility.
@@ -360,11 +375,16 @@ export class DreamScheduler {
           log.info('dream', 'user returned mid-pass; abandoning remaining projects')
           break
         }
-        state.lastDream[cwd] = Date.now()
-        writeFileAtomic(this.statePath, JSON.stringify(state, null, 2))
-        await this.dreamProject(cwd, force || loadRemEnabled(), force).catch((err) =>
-          log.warn('dream', `project pass failed: ${cwd}`, err instanceof Error ? err.message : err),
-        )
+        try {
+          const completed = await this.dreamProject(cwd, force || loadRemEnabled(), force)
+          state.lastDream[cwd] = Date.now()
+          if (completed.commitSha) {
+            state.lastCommit[cwd] = completed.commitSha
+          }
+          writeFileAtomic(this.statePath, JSON.stringify(state, null, 2))
+        } catch (err) {
+          log.warn('dream', `project pass failed: ${cwd}`, err instanceof Error ? err.message : err)
+        }
       }
     } finally {
       powerSaveBlocker.stop(blocker)
@@ -372,7 +392,11 @@ export class DreamScheduler {
     }
   }
 
-  private async dreamProject(cwd: string, includeRem = false, forceRem = false): Promise<void> {
+  private async dreamProject(
+    cwd: string,
+    includeRem = false,
+    forceRem = false,
+  ): Promise<{ commitSha?: string }> {
     log.info('dream', `starting overnight tidy: ${cwd}`)
     // One Date for the session name AND the digest stamp — a turn crossing midnight must not name
     // itself yesterday and stamp its digest tomorrow.
@@ -395,11 +419,13 @@ export class DreamScheduler {
       } finally {
         this.sessions.forgetSession(sessionId)
       }
-      return
+      throw new Error('Dream could not create its safety checkpoint.')
     }
     let outcome: 'completed' | 'interrupted' | 'failed' = 'failed'
     let tidyReply: string | undefined
     let tidyError: unknown
+    let remDigest: RemDigestResult | undefined
+    let remError: unknown
     try {
       try {
         // The exact in-memory scope is a one-use scheduler capability. No renderer/phone caller can
@@ -413,14 +439,71 @@ export class DreamScheduler {
         tidyError = err
         tidyReply = `Dream tidy failed before it could leave a summary: ${err instanceof Error ? err.message : String(err)}`
       }
-      await this.sessions.finishProjectMutationScope(scope, async () => {
-        // The scheduler, not the agent, writes the digest — so an interrupted or silent night still
-        // leaves its dated trace. It stays inside the same completion boundary as the tidy turn.
-        this.writeDigestFile(cwd, night, tidyReply, outcome === 'interrupted')
-      })
+      if (!tidyError && includeRem && outcome === 'completed') {
+        try {
+          remDigest = await this.runRem(cwd, night, sessionId, forceRem)
+        } catch (err) {
+          remError = err
+        }
+      }
+
+      const successful =
+        !tidyError &&
+        !remError &&
+        outcome === 'completed' &&
+        (remDigest?.successful ?? true)
+      const finalized = await this.sessions.finishProjectMutationScope(
+        scope,
+        async () => {
+          // The scheduler, not the agent, writes the digests. Both land in the same ownership boundary
+          // as the tidy and before its one user-Git commit, so Dream finalizes as one workstream.
+          if (!this.writeDigestFile(cwd, night, tidyReply, outcome === 'interrupted'))
+            throw new Error('Dream could not write its overnight digest.')
+          if (
+            remDigest &&
+            !this.writeRemDigestFile(
+              cwd,
+              night,
+              remDigest.reply,
+              remDigest.interrupted,
+              remDigest.containmentHeld,
+            )
+          )
+            throw new Error('Dream could not write its REM digest.')
+        },
+        successful
+          ? {
+              message: `Dream: tidy project memory (${localDate(night)})`,
+              pathPrefix: '.koda/memory',
+              author: 'Koda Dream <dream@koda.local>',
+            }
+          : undefined,
+      )
+
       if (tidyError) throw tidyError
-      if (includeRem && outcome === 'completed') await this.runRem(cwd, night, sessionId, forceRem)
-      log.info('dream', `finished overnight tidy: ${cwd}`)
+      if (remError) throw remError
+      if (outcome !== 'completed') throw new Error('Dream tidy was interrupted before completion.')
+      if (remDigest && !remDigest.successful)
+        throw new Error('Dream REM did not reach a clean completion boundary.')
+
+      const commit = finalized.commit
+      if (!commit) throw new Error('Dream finished without a user-Git finalization result.')
+      if (commit.kind === 'needs-attention') {
+        const detail = commit.message ? `: ${commit.message}` : ''
+        throw new Error(`Dream left its changes uncommitted (${commit.reason})${detail}`)
+      }
+      if (commit.kind === 'not-versioned') {
+        // Never initialize a user's folder or claim an enclosing repository merely to satisfy an
+        // unattended pass. Safety Git remains the recovery layer and completion shows the loose files.
+        log.info('dream', `finished overnight tidy without user-Git history: ${cwd}`)
+        return {}
+      }
+      if (commit.kind === 'no-changes') {
+        log.info('dream', `finished overnight tidy with no versionable changes: ${cwd}`)
+        return {}
+      }
+      log.info('dream', `finished overnight tidy and committed ${commit.sha}: ${cwd}`)
+      return { commitSha: commit.sha }
     } finally {
       // Publish only after every scheduler-owned write is done. Even on failure, the resulting chat is
       // normal and answerable when it first becomes visible; if its process disappeared, reveal is a no-op.
@@ -434,29 +517,30 @@ export class DreamScheduler {
 
   /** The read-only generative half. It gets a fresh post-tidy checkpoint and is skipped entirely if
    *  that checkpoint cannot be made: paralysis is a mechanism, not a sentence in the prompt. */
-  private async runRem(cwd: string, night: Date, sourceSessionId: string, force = false): Promise<void> {
+  private async runRem(
+    cwd: string,
+    night: Date,
+    sourceSessionId: string,
+    force = false,
+  ): Promise<RemDigestResult> {
     if (!force && !this.headroomOk(REM_HEADROOM_LIMIT_PCT)) {
       log.info('dream', `REM skipped for plan headroom: ${cwd}`)
-      await this.writeRemDigest(
-        cwd,
-        night,
-        'REM skipped — the current plan window was over 60% used.',
-        false,
-        true,
-      )
-      return
+      return {
+        reply: 'REM skipped — the current plan window was over 60% used.',
+        interrupted: false,
+        containmentHeld: true,
+        successful: true,
+      }
     }
     const pre = await this.sessions.checkpointProjectForSession(sourceSessionId, 'before overnight REM')
     if (!pre) {
       log.warn('dream', `REM skipped because its safety checkpoint failed: ${cwd}`)
-      await this.writeRemDigest(
-        cwd,
-        night,
-        'REM skipped — Koda could not make the safety checkpoint that keeps the pass read-only.',
-        false,
-        true,
-      )
-      return
+      return {
+        reply: 'REM skipped — Koda could not make the safety checkpoint that keeps the pass read-only.',
+        interrupted: false,
+        containmentHeld: true,
+        successful: true,
+      }
     }
 
     let sandbox: string
@@ -464,14 +548,12 @@ export class DreamScheduler {
       sandbox = await createCheckpointSandbox(cwd, pre.id)
     } catch (err) {
       log.warn('dream', `REM skipped because its sandbox failed: ${cwd}`, err instanceof Error ? err.message : err)
-      await this.writeRemDigest(
-        cwd,
-        night,
-        'REM skipped — Koda could not materialize the disposable safety snapshot.',
-        false,
-        true,
-      )
-      return
+      return {
+        reply: 'REM skipped — Koda could not materialize the disposable safety snapshot.',
+        interrupted: false,
+        containmentHeld: true,
+        successful: true,
+      }
     }
 
     let focus: string | undefined
@@ -493,17 +575,23 @@ export class DreamScheduler {
       const reply = `REM failed before its isolated session could start: ${err instanceof Error ? err.message : String(err)}`
       log.warn('dream', `REM session start failed: ${cwd}`, err instanceof Error ? err.message : err)
       const cleaned = await removeCheckpointSandbox(sandbox).then(() => true).catch(() => false)
-      await this.writeRemDigest(cwd, night, reply, false, cleaned)
-      return
+      return {
+        reply,
+        interrupted: false,
+        containmentHeld: cleaned,
+        successful: false,
+      }
     }
 
     let outcome: 'completed' | 'interrupted' = 'completed'
     let reply: string | undefined
+    let turnFailed = false
     try {
       await this.sessions.sendTurn(sessionId, remPrompt(focus), undefined, 'remote')
       outcome = await this.waitForTurnEnd(sessionId, REM_TURN_CAP_MS)
       reply = this.sessions.lastAssistantReply(sessionId)
     } catch (err) {
+      turnFailed = true
       reply = `REM failed before it could leave a brief: ${err instanceof Error ? err.message : String(err)}`
       log.warn('dream', `REM turn failed: ${cwd}`, err instanceof Error ? err.message : err)
     }
@@ -525,17 +613,17 @@ export class DreamScheduler {
           return false
         })
       : false
-    await this.writeRemDigest(
-      cwd,
-      night,
-      reply,
-      outcome === 'interrupted',
-      containmentHeld,
-    )
     log.info('dream', `finished read-only REM pass: ${cwd}`)
+    const interrupted = outcome === 'interrupted'
+    return {
+      reply,
+      interrupted,
+      containmentHeld,
+      successful: !turnFailed && !interrupted && containmentHeld,
+    }
   }
 
-  private writeDigestFile(cwd: string, night: Date, reply: string | undefined, interrupted: boolean): void {
+  private writeDigestFile(cwd: string, night: Date, reply: string | undefined, interrupted: boolean): boolean {
     const path = join(cwd, '.koda', 'memory', 'dream-digest.md')
     try {
       let existing = ''
@@ -545,32 +633,10 @@ export class DreamScheduler {
         /* first night — no digest yet */
       }
       writeFileAtomic(path, upsertDigest(existing, digestEntry(night, reply, interrupted)))
+      return true
     } catch (err) {
       log.warn('dream', `digest write failed: ${cwd}`, err instanceof Error ? err.message : err)
-    }
-  }
-
-  private async writeRemDigest(
-    cwd: string,
-    night: Date,
-    reply: string | undefined,
-    interrupted: boolean,
-    containmentHeld: boolean,
-  ): Promise<void> {
-    try {
-      await this.sessions.withExternalProjectMutation(
-        cwd,
-        { checkpointLabel: 'before overnight REM digest', refreshOwnership: false },
-        (checkpointed) => {
-          if (!checkpointed) {
-            log.warn('dream', `REM digest skipped because its safety checkpoint failed: ${cwd}`)
-            return
-          }
-          this.writeRemDigestFile(cwd, night, reply, interrupted, containmentHeld)
-        },
-      )
-    } catch (err) {
-      log.warn('dream', `REM digest ownership boundary failed: ${cwd}`, err instanceof Error ? err.message : err)
+      return false
     }
   }
 
@@ -580,7 +646,7 @@ export class DreamScheduler {
     reply: string | undefined,
     interrupted: boolean,
     containmentHeld: boolean,
-  ): void {
+  ): boolean {
     const path = join(cwd, '.koda', 'memory', 'rem-digest.md')
     try {
       let existing = ''
@@ -590,8 +656,10 @@ export class DreamScheduler {
         /* first REM night */
       }
       writeFileAtomic(path, upsertRemDigest(existing, remDigestEntry(night, reply, interrupted, containmentHeld)))
+      return true
     } catch (err) {
       log.warn('dream', `REM digest write failed: ${cwd}`, err instanceof Error ? err.message : err)
+      return false
     }
   }
 

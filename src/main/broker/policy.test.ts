@@ -286,7 +286,7 @@ describe('gate wiring: self-protection survives Auto-approve', () => {
 
 describe('mutation classification is fail-closed', () => {
   it('treats reads as non-mutating (no checkpoint needed)', () => {
-    for (const t of ['Read', 'Grep', 'Glob', 'WebFetch', 'mcp__koda_broker__capabilities'])
+    for (const t of ['Read', 'Grep', 'Glob', 'WebFetch', 'mcp__koda_broker__capabilities', 'mcp__koda_broker__present_file'])
       expect(isMutating(t)).toBe(false)
   })
 

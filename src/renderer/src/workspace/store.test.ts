@@ -807,6 +807,41 @@ describe('workflow observer lifecycle', () => {
   })
 })
 
+describe('session start notice', () => {
+  const started = (model: string) =>
+    useWorkspace.getState().applyEngineEvent({
+      type: 'SessionStarted',
+      sessionId: 'a',
+      model,
+      tools: [],
+      cwd: '/tmp/project',
+    })
+  const notices = () =>
+    useWorkspace.getState().sessions.a.items.filter((item) => item.kind === 'notice')
+
+  it('stays silent on the first start even though lazy init lands after the first user message', () => {
+    const a = session('a')
+    a.items = [{ id: 1, kind: 'user', text: 'hello' }]
+    useWorkspace.setState({ sessions: { a }, order: ['a'], activeId: 'a' })
+
+    started('claude-fable-5')
+
+    expect(notices()).toHaveLength(0)
+    expect(useWorkspace.getState().sessions.a.activeModel).toBe('claude-fable-5')
+  })
+
+  it('banners only a restart under a conversation the engine already started once', () => {
+    const a = session('a')
+    a.items = [{ id: 1, kind: 'user', text: 'hello' }]
+    useWorkspace.setState({ sessions: { a }, order: ['a'], activeId: 'a' })
+
+    started('claude-fable-5')
+    started('claude-fable-5')
+
+    expect(notices()).toEqual([expect.objectContaining({ text: 'continuing on Fable 5' })])
+  })
+})
+
 describe('session capability degradation', () => {
   const snapshot = (status: 'ready' | 'degraded') => ({
     engine: 'codex' as const,
