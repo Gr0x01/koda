@@ -13,14 +13,15 @@ import { ApprovalGate } from './gate'
  */
 function makeGate(checkpoint: (sessionId: string, label: string) => Promise<boolean> = async () => true) {
   const cancelled: string[] = []
+  const resolved: Array<{ sessionId: string; requestId: string }> = []
   const gate = new ApprovalGate(
     checkpoint,
     () => {}, // pushRequest
     (sessionId) => cancelled.push(sessionId), // pushCancelled
-    () => {}, // pushResolved
+    (sessionId, requestId) => resolved.push({ sessionId, requestId }), // pushResolved
     () => {}, // warn
   )
-  return { gate, cancelled }
+  return { gate, cancelled, resolved }
 }
 
 describe('cancelSession vs forgetSession: process-exit vs session-identity', () => {
@@ -197,6 +198,95 @@ describe('cancelSession vs forgetSession: process-exit vs session-identity', () 
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
+  })
+})
+
+/**
+ * The stranded-approval backstop. An "Ask me" prompt whose asking `approve` call outlived its turn
+ * (the engine aborted it on the ~1025s MCP idle timeout, sending no cancellation) leaks a pending slot
+ * that then gates the next turn's admission with a card no head can answer — the session bricks until
+ * restart. sweepStranded, fired at a genuine TurnComplete, and the askUser abort hook both clean it.
+ */
+describe('sweepStranded / abort: a leaked approval slot cannot brick the next turn', () => {
+  it('sweeps every pending slot of the session: card cleared per request, promise denied, others untouched', async () => {
+    const { gate, resolved } = makeGate()
+    gate.setSessionMode('s1', 'ask')
+    const a = gate.decide('s1', { toolUseId: 't1', toolName: 'Bash', input: { command: 'ls' } })
+    const b = gate.decide('s1', { toolUseId: 't2', toolName: 'Bash', input: { command: 'pwd' } })
+    // A second session's slot must survive s1's sweep.
+    gate.setSessionMode('s2', 'ask')
+    const other = gate.decide('s2', { toolUseId: 'u1', toolName: 'Bash', input: { command: 'id' } })
+    expect(gate.pendingRequests('s1')).toHaveLength(2)
+
+    gate.sweepStranded('s1')
+
+    expect(gate.pendingRequests('s1')).toEqual([])
+    expect(resolved).toEqual([
+      { sessionId: 's1', requestId: 't1' },
+      { sessionId: 's1', requestId: 't2' },
+    ])
+    for (const decision of [await a, await b]) {
+      expect(decision.kind).toBe('deny')
+      expect(decision.kind === 'deny' && decision.reason).toContain('ended along with its turn')
+    }
+    // s2 kept its slot — resolve it to prove it was never touched.
+    expect(gate.pendingRequests('s2')).toHaveLength(1)
+    gate.resolve('u1', { kind: 'allow' })
+    expect(await other).toEqual({ kind: 'allow' })
+  })
+
+  it('is a no-op for a session with no pending slots', () => {
+    const { gate, resolved } = makeGate()
+    gate.sweepStranded('empty')
+    expect(resolved).toEqual([])
+    expect(gate.pendingRequests('empty')).toEqual([])
+  })
+
+  it('an abort while the ask is pending denies and clears the card exactly once', async () => {
+    const { gate, resolved } = makeGate()
+    gate.setSessionMode('s1', 'ask')
+    const controller = new AbortController()
+    const pending = gate.decide('s1', { toolUseId: 't1', toolName: 'Bash', input: { command: 'ls' } }, controller.signal)
+    expect(gate.pendingRequests('s1')).toHaveLength(1)
+
+    controller.abort()
+    const decision = await pending
+    expect(decision.kind).toBe('deny')
+    expect(decision.kind === 'deny' && decision.reason).toContain('cancelled this request')
+    expect(gate.pendingRequests('s1')).toEqual([])
+    expect(resolved).toEqual([{ sessionId: 's1', requestId: 't1' }])
+
+    // A later turn-end sweep finds nothing to do — no second broadcast.
+    gate.sweepStranded('s1')
+    expect(resolved).toEqual([{ sessionId: 's1', requestId: 't1' }])
+  })
+
+  it('a sweep before the abort wins; the late abort is a no-op (no double clear)', async () => {
+    const { gate, resolved } = makeGate()
+    gate.setSessionMode('s1', 'ask')
+    const controller = new AbortController()
+    const pending = gate.decide('s1', { toolUseId: 't1', toolName: 'Bash', input: { command: 'ls' } }, controller.signal)
+
+    gate.sweepStranded('s1')
+    expect((await pending).kind).toBe('deny')
+    expect(resolved).toEqual([{ sessionId: 's1', requestId: 't1' }])
+
+    controller.abort() // the engine's cancellation lands after the sweep already cleaned the slot
+    expect(resolved).toEqual([{ sessionId: 's1', requestId: 't1' }]) // still once
+  })
+
+  it('an already-aborted signal denies immediately, pushing no card and no resolved event', async () => {
+    const { gate, resolved } = makeGate()
+    gate.setSessionMode('s1', 'ask')
+    const decision = await gate.decide(
+      's1',
+      { toolUseId: 't1', toolName: 'Bash', input: { command: 'ls' } },
+      AbortSignal.abort(),
+    )
+    expect(decision.kind).toBe('deny')
+    expect(decision.kind === 'deny' && decision.reason).toContain('cancelled this request')
+    expect(gate.pendingRequests('s1')).toEqual([]) // never registered
+    expect(resolved).toEqual([]) // nothing to broadcast — no card was ever pushed
   })
 })
 

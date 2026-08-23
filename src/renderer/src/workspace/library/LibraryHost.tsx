@@ -1,5 +1,4 @@
 import { useEffect, useState } from 'react'
-import { AnimatePresence } from '../../motion'
 import { Library } from './Library'
 import { windowHasOpenModal } from '../../window-modal'
 
@@ -43,7 +42,10 @@ export function LibraryHost() {
     }
   }, [])
 
-  // Mounted only while open, so every open is a fresh read and a clean autofocus; AnimatePresence
-  // defers the unmount so it animates out.
-  return <AnimatePresence>{open && <Library onClose={() => setOpen(false)} />}</AnimatePresence>
+  // Mounted only while open, so every open is a fresh read and a clean autofocus. The close is
+  // deliberately synchronous, with no exit animation: closing usually HANDS OFF to the Stage, and an
+  // animated exit keeps the scrim over the surface it just opened while that surface is busy
+  // mounting. Under a starved main thread the "brief" exit lingers whole seconds and eats the first
+  // click on the freshly opened file.
+  return <>{open && <Library onClose={() => setOpen(false)} />}</>
 }

@@ -95,6 +95,19 @@ export const IpcChannels = {
   fsWatchDocs: 'fs:watchDocs',
   fsUnwatchDocs: 'fs:unwatchDocs',
   fsDocsChanged: 'fs:docsChanged',
+  // The project's document shelf (.koda/doc-shelf.json), owned by main so the agent and the UI run
+  // ONE star command instead of the agent trying to patch renderer state. list/set/adoptLegacy are
+  // invoke; shelfChanged is the main→renderer push that carries the truth every surface projects —
+  // including a star the agent made and the rebase main performs on rename/delete. See doc-commands.ts.
+  docShelfList: 'docs:shelfList',
+  docShelfSet: 'docs:shelfSet',
+  docShelfAdoptLegacy: 'docs:shelfAdoptLegacy',
+  docShelfChanged: 'docs:shelfChanged',
+  // Turn a selected passage of a document into a self-contained interactive HTML view beside it. The
+  // same `createInteractiveDocument` command the agent's `create_interactive` broker verb runs, so the
+  // Stage action and the conversation produce one artifact by one rule. It writes ONLY the new file —
+  // the link back into the source document belongs to the caller. invoke. See doc-commands.ts.
+  docCreateInteractive: 'docs:createInteractive',
   // Create a new empty document at the project root (the "New document" entry point). invoke.
   fsCreateFile: 'fs:createFile',
   // File-management mutations (rename/move, delete, new folder). rename/delete checkpoint via
@@ -258,6 +271,10 @@ export const IpcChannels = {
   // Resolve a doc's relative image reference (e.g. `assets/pic.png`) to a loadable `koda-preview://`
   // URL so local images render in the WYSIWYG doc surface. See preview.ts / CrepeDocEditor.
   docAssetUrl: 'doc:assetUrl',
+  // Open an HTML document on its own sandboxed `koda-preview://doc-<token>` origin: main registers
+  // that exact project-relative path as servable and answers with the URL. Registration is the
+  // authorization, so the renderer cannot point the frame at anything main did not admit. See preview.ts.
+  docDocumentUrl: 'doc:documentUrl',
   // Export the open document as a PDF: the renderer sends the doc's rendered HTML, main lays it out
   // on a clean print page in a hidden window (printToPDF), saves where the user picks, then opens it.
   docExportPdf: 'doc:exportPdf',
@@ -354,6 +371,8 @@ export const IpcChannels = {
   billingGetState: 'billing:getState',
   // Daily usage history rollup (Settings → Usage) — read-only.
   usageGetHistory: 'usage:getHistory',
+  // Whole-subscription transcript scan + priced buckets (Settings → Usage) — read-only.
+  usageGetScanSummary: 'usage:getScanSummary',
   billingSaveApiKey: 'billing:saveApiKey',
   billingRemoveApiKey: 'billing:removeApiKey',
   // OpenAI/Codex BYO key (Settings → OpenAI): its own provider account + key slot, mirrors the pair above.

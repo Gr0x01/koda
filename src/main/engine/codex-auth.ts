@@ -17,7 +17,7 @@ import { IpcChannels } from '@shared/channels'
 import type { CodexAuthStatus, CodexLoginProgress, CodexModel } from '@shared/ipc'
 import { resolveEnginePath } from './binary'
 import { buildEngineEnv } from './env'
-import { ensureCodexAuthSeed } from './codex-home'
+import { ensureCodexAuthSeed, writeBackCodexAuth } from './codex-home'
 import { log } from '../logger'
 
 /** An OpenAI auth mode (codex `AuthMode`). 'chatgpt' = an active ChatGPT subscription. */
@@ -206,8 +206,10 @@ function cleanupCodexLogin(): void {
 }
 
 /** Spawn `codex login` and stream progress. Returns immediately; the renderer watches
- *  codexLoginProgress. Single-flighted — a second start while one is live is a no-op ack. */
-export function startCodexLogin(): { ok: boolean; reason?: string } {
+ *  codexLoginProgress. Single-flighted — a second start while one is live is a no-op ack. The
+ *  completion hook runs after Codex has written the new credential, so live sessions can reread
+ *  account usage before the user sends another turn. */
+export function startCodexLogin(onCompleted?: () => void): { ok: boolean; reason?: string } {
   if (codexLogin) return { ok: false, reason: 'already in progress' }
   codexAborting = false
   codexLastErr = ''
@@ -259,10 +261,14 @@ export function startCodexLogin(): { ok: boolean; reason?: string } {
     cleanupCodexLogin()
     if (wasAborting || signal) return // cancel/timeout already broadcast their own state
     if (code === 0) {
+      writeBackCodexAuth() // the user just minted this credential; keep their standalone ~/.codex on it
       broadcastLogin({ state: 'verifying' })
       try {
-        broadcastLogin({ state: 'completed', status: await getCodexAuthStatus() })
+        const status = await getCodexAuthStatus()
+        onCompleted?.()
+        broadcastLogin({ state: 'completed', status })
       } catch {
+        onCompleted?.()
         broadcastLogin({ state: 'completed' })
       }
     } else {

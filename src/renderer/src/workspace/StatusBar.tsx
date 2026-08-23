@@ -10,6 +10,7 @@ import {
   type RateLimitInfo,
 } from '@shared/ipc'
 import { Menu } from '../motion'
+import { shortResetCountdown } from '@shared/rate-limits'
 import { SegmentBar } from './ContextMeter'
 import { engineShort, engineOrder } from './models'
 import { useWorkspace } from './store'
@@ -534,7 +535,7 @@ function RateLimitStatus() {
   return (
     <div className="flex items-center gap-4">
       {engineIds.map((id) => (
-        <EngineWindows key={id} engineId={id} windows={liveRateLimitWindows(rateLimits[id], nowSec)} showLabel={labelEngines} />
+        <EngineWindows key={id} engineId={id} windows={liveRateLimitWindows(rateLimits[id], nowSec)} showLabel={labelEngines} nowSec={nowSec} />
       ))}
     </div>
   )
@@ -556,10 +557,12 @@ function EngineWindows({
   engineId,
   windows,
   showLabel,
+  nowSec,
 }: {
   engineId: EngineId
   windows: Record<string, RateLimitInfo>
   showLabel: boolean
+  nowSec: number
 }) {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
@@ -638,6 +641,10 @@ function EngineWindows({
   // Inline value: precise % when the engine reports one (Codex), else nothing (Claude's band is carried
   // by the bar's color), else an em dash before any turn has landed.
   const value = !primary ? '—' : pct
+  // The reset clock rides inline (usage-wave U4): the one question a filling gauge raises is "when
+  // does it free up", and the popout answering it was one click too far. liveRateLimitWindows already
+  // dropped elapsed windows, so a countdown here can never be stale.
+  const countdown = primary ? shortResetCountdown(primary.resetsAt, nowSec) : null
   // Present windows for the popout rows, five_hour first then the longer caps. Overage variants are
   // dropped — they're the same window with the overage flag, already surfaced by WindowRow's "using
   // overage" note, so listing them separately would just double a row.
@@ -668,6 +675,10 @@ function EngineWindows({
           segments={3}
         />
         {value && <span>{value}</span>}
+        {countdown && (
+          /* Reserved width + tabular digits: the tick must never shift the chip's neighbors. */
+          <span className="inline-block min-w-[6ch] text-left tabular-nums">· {countdown}</span>
+        )}
       </button>
       {/* Positioning lives on a plain wrapper: Menu animates `scale`, and motion's inline transform
           would override a class-based -translate-x-1/2 (the panel would hang off to the right). */}
@@ -721,6 +732,16 @@ function EngineWindows({
                 // No window yet (pre-first-turn): the anchored placeholder so the popout isn't empty.
                 <WindowRow type="five_hour" info={undefined} />
               )}
+              {/* The one route from limits to the ledger: same popup as ever, plus one last row. */}
+              <button
+                onClick={() => {
+                  setOpen(false)
+                  openSettingsTo('usage')
+                }}
+                className="mt-1.5 block w-full border-t border-border pt-1.5 text-left text-accent transition-colors hover:opacity-80"
+              >
+                Full usage →
+              </button>
             </Menu>
           </div>,
           document.body,

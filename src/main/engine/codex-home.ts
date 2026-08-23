@@ -10,7 +10,7 @@
  * never block a session from starting.
  */
 import { execFile, spawn } from 'node:child_process'
-import { cpSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -60,6 +60,41 @@ export function ensureCodexAuthSeed(): void {
     if (!existsSync(dest) && existsSync(src)) copyFileSync(src, dest)
   } catch (err) {
     log.warn('codex-home', 'auth seed failed', (err as Error)?.message)
+  }
+}
+
+/**
+ * Mirror a ChatGPT login the user just completed INSIDE Koda back to their standalone `~/.codex`.
+ * The seed above flows one way, once, so without this every in-Koda login or account switch strands
+ * the standalone CLI on its old token: shell `codex` fails auth refresh while Koda keeps working,
+ * and nothing on either surface says why. ChatGPT mode only, on both sides — an api-key credential
+ * is Koda-managed billing state that must never leak into the user's own CLI config, and a
+ * standalone api-key setup is the user's deliberate choice to keep. Same for a standalone config
+ * that stores credentials outside auth.json (cli_auth_credentials_store): a file we write there is
+ * at best ignored and at worst overrides that choice, so a non-file store skips the write-back.
+ * This stays within the multi-engine ToS line ("never extract/reuse the OAuth token outside the
+ * official CLI"): the file moves whole between two official CLI homes, like the seed above, and
+ * only the CLI ever uses the token. Fail-soft: a write-back failure must never mark the login that
+ * just succeeded as failed.
+ */
+export function writeBackCodexAuth(opts: { home?: string; standaloneDir?: string } = {}): void {
+  try {
+    const home = opts.home ?? codexHome()
+    const fresh = readCodexAuth(home)
+    if (fresh?.auth_mode !== 'chatgpt') return
+    const standaloneDir = opts.standaloneDir ?? join(homedir(), '.codex')
+    if (readCodexAuth(standaloneDir)?.auth_mode === 'apikey') return
+    const standaloneConfig = join(standaloneDir, 'config.toml')
+    if (existsSync(standaloneConfig)) {
+      const store = /^\s*cli_auth_credentials_store\s*=\s*"?([\w-]+)"?/m.exec(readFileSync(standaloneConfig, 'utf8'))
+      if (store && store[1] !== 'file') return
+    }
+    mkdirSync(standaloneDir, { recursive: true })
+    const dest = join(standaloneDir, 'auth.json')
+    copyFileSync(join(home, 'auth.json'), dest)
+    chmodSync(dest, 0o600)
+  } catch (err) {
+    log.warn('codex-home', 'auth write-back to ~/.codex failed (standalone codex may go stale)', (err as Error)?.message)
   }
 }
 

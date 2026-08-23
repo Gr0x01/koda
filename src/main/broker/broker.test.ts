@@ -1,8 +1,18 @@
 import { describe, it, expect } from 'vitest'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
-import { PermissionBroker, withApprovalHeartbeat, type KeepDocumentFn } from './server'
+import {
+  PermissionBroker,
+  withApprovalHeartbeat,
+  type CreateDocumentFn,
+  type CreateInteractiveFn,
+  type DecideFn,
+  type KeepDocumentFn,
+  type PresentFileFn,
+  type StarDocumentFn,
+} from './server'
 import type { ToolDecision } from '@shared/ipc'
+import { ApprovalGate } from './gate'
 
 /**
  * These guard the ONE invariant the broker exists to keep alive: a tool approval can block on a human
@@ -15,9 +25,21 @@ import type { ToolDecision } from '@shared/ipc'
 
 // The broker constructor takes collaborators for every capability; only the one a test names is exercised.
 const noop = (async () => {}) as never
-function makeBroker(keepDocument: KeepDocumentFn = noop): PermissionBroker {
+function makeBroker(
+  keepDocument: KeepDocumentFn = noop,
+  starDocument: StarDocumentFn = noop,
+  documents: {
+    create?: CreateDocumentFn
+    interactive?: CreateInteractiveFn
+    /** The Stage receipt a successful create opens the new file through — a spy in the present tests. */
+    present?: PresentFileFn
+  } = {},
+  /** The gate seam. Default auto-allows; the abort test wires a real ApprovalGate here so `approve`
+   *  blocks on a human and the request's cancellation can strand-then-clean a real pending slot. */
+  decide: DecideFn = async (): Promise<ToolDecision> => ({ kind: 'allow' }),
+): PermissionBroker {
   return new PermissionBroker(
-    async (): Promise<ToolDecision> => ({ kind: 'allow' }), // decide
+    decide,
     () => {}, // onError
     noop, // listCheckpoints
     noop, // restoreCheckpoint
@@ -28,7 +50,10 @@ function makeBroker(keepDocument: KeepDocumentFn = noop): PermissionBroker {
     noop, // openTerminal
     { install: noop, start: noop, stop: noop, status: noop }, // miniApps
     keepDocument,
-    noop, // presentFile
+    documents.present ?? noop, // presentFile
+    starDocument,
+    documents.create ?? noop,
+    documents.interactive ?? noop,
   )
 }
 
@@ -240,6 +265,474 @@ describe('keep_document', () => {
   })
 })
 
+/**
+ * The shelf is project state Koda owns, and the agent reaching it through this tool is what keeps
+ * "put that document on my shelf" answerable in conversation instead of only under a mouse. These pin
+ * the boundary: the routed call carries the exact path and state, and a refusal from the command comes
+ * back as something the agent can read rather than a silent success.
+ */
+describe('star_document', () => {
+  it('routes the path and the state to the one shelf command', async () => {
+    const seen: unknown[] = []
+    const broker = makeBroker(noop, (async (sessionId, args) => {
+      seen.push({ sessionId, args })
+      return { path: args.path, starred: args.starred }
+    }) as StarDocumentFn)
+    try {
+      await broker.ensureListening()
+      await broker.register('star-call', { includeApprove: false })
+      const result = await withClient(broker, 'star-call', (client) =>
+        client.callTool({
+          name: 'star_document',
+          arguments: { path: 'Documents/brief.md', starred: true },
+        }),
+      )
+
+      expect(result.isError).not.toBe(true)
+      expect(seen).toEqual([
+        { sessionId: 'star-call', args: { path: 'Documents/brief.md', starred: true } },
+      ])
+      expect(JSON.parse((result.content as Array<{ text: string }>)[0].text)).toEqual({
+        path: 'Documents/brief.md',
+        starred: true,
+      })
+    } finally {
+      await broker.dispose()
+    }
+  })
+
+  it('reports a bad path as a tool error the agent can act on', async () => {
+    const broker = makeBroker(noop, (async () => {
+      throw new Error('no document at "Documents/ghost.md"')
+    }) as StarDocumentFn)
+    try {
+      await broker.ensureListening()
+      await broker.register('star-refuse', { includeApprove: false })
+      const result = await withClient(broker, 'star-refuse', (client) =>
+        client.callTool({ name: 'star_document', arguments: { path: 'Documents/ghost.md', starred: true } }),
+      )
+
+      expect(result.isError).toBe(true)
+      expect((result.content as Array<{ text: string }>)[0].text).toContain('no document at')
+    } finally {
+      await broker.dispose()
+    }
+  })
+
+  it('refuses a call with no state instead of guessing which way the user meant it', async () => {
+    let called = false
+    const broker = makeBroker(noop, (async () => {
+      called = true
+      return { path: 'x', starred: true }
+    }) as StarDocumentFn)
+    try {
+      await broker.ensureListening()
+      await broker.register('star-missing', { includeApprove: false })
+      const result = await withClient(broker, 'star-missing', (client) =>
+        client.callTool({ name: 'star_document', arguments: { path: 'Documents/brief.md' } }),
+      )
+
+      expect(result.isError).toBe(true)
+      expect(called).toBe(false)
+    } finally {
+      await broker.dispose()
+    }
+  })
+
+  it('advertises the reversible, project-relative contract in the schema', async () => {
+    const broker = makeBroker()
+    try {
+      await broker.ensureListening()
+      await broker.register('star-schema', { includeApprove: false })
+      const tool = await withClient(broker, 'star-schema', async (client) =>
+        (await client.listTools()).tools.find((t) => t.name === 'star_document'),
+      )
+
+      expect(tool).toBeDefined()
+      expect(tool!.description).toContain('reversible')
+      const schema = tool!.inputSchema as { required?: string[]; properties?: Record<string, unknown> }
+      expect(schema.required).toEqual(['path', 'starred'])
+      expect(Object.keys(schema.properties ?? {})).toEqual(['path', 'starred'])
+    } finally {
+      await broker.dispose()
+    }
+  })
+})
+
+/**
+ * The routing decision — Markdown, HTML, mini app, or "Koda cannot do that yet" — is made before the
+ * first word is written, and it is made by the model. So it belongs in the tool descriptions, which
+ * reach both engines on every turn, rather than in a playbook that has to be routed to be read (the
+ * same reasoning that put keep_document's polarity there). These pin the four branches of that
+ * contract: a later edit that trims the description down to "creates a document" has to fail here.
+ */
+describe('create_document', () => {
+  it('states the whole routing contract where both engines see it', async () => {
+    const broker = makeBroker()
+    try {
+      await broker.ensureListening()
+      await broker.register('create-schema', { includeApprove: false })
+      const tool = await withClient(broker, 'create-schema', async (client) =>
+        (await client.listTools()).tools.find((t) => t.name === 'create_document'),
+      )
+
+      expect(tool).toBeDefined()
+      const description = tool!.description ?? ''
+      // Routed by the feedback loop, never by the noun in the request.
+      expect(description).toContain('Writing, revising, citing, or maintaining')
+      expect(description).toContain('Comparing, inspecting, navigating, or interacting')
+      // The two things that are NOT a document, named so the agent does not force them into one.
+      expect(description).toContain('mini app, NOT a document')
+      expect(description).toContain('Koda cannot produce yet')
+      // HTML's security contract is part of the routing, not a footnote: the sandbox blocks external
+      // resources, so an artifact born with a linked font renders wrong in the only surface that opens it.
+      expect(description).toContain('self-contained')
+
+      const schema = tool!.inputSchema as { required?: string[]; properties?: Record<string, unknown> }
+      expect(schema.required).toEqual(['format', 'title'])
+      expect(Object.keys(schema.properties ?? {})).toEqual([
+        'format',
+        'title',
+        'kind',
+        'description',
+        'body',
+        'folder',
+      ])
+      expect((schema.properties?.format as { enum: string[] }).enum).toEqual(['markdown', 'html'])
+      expect((schema.properties?.kind as { enum: string[] }).enum).toEqual([
+        'plan',
+        'decision',
+        'research',
+        'guide',
+        'reference',
+        'note',
+      ])
+    } finally {
+      await broker.dispose()
+    }
+  })
+
+  it('routes every field to the one command and reports where the document landed', async () => {
+    const seen: unknown[] = []
+    const broker = makeBroker(noop, noop, {
+      create: (async (sessionId, args) => {
+        seen.push({ sessionId, args })
+        return {
+          created: true as const,
+          path: 'Documents/decisions/Route comparison.html',
+          title: 'Route comparison',
+          format: 'html' as const,
+          kind: 'decision' as const,
+        }
+      }) as CreateDocumentFn,
+    })
+    try {
+      await broker.ensureListening()
+      await broker.register('create-call', { includeApprove: false })
+      const result = await withClient(broker, 'create-call', (client) =>
+        client.callTool({
+          name: 'create_document',
+          arguments: {
+            format: 'html',
+            title: 'Route comparison',
+            kind: 'decision',
+            description: 'Which shipping route wins under a late order.',
+            body: '<p>Two sliders.</p>',
+            folder: 'Documents/decisions',
+          },
+        }),
+      )
+
+      expect(result.isError).not.toBe(true)
+      // The sessionId is why this is a broker verb rather than a Write: it becomes the document's
+      // provenance, and the agent has no way to know it.
+      expect(seen).toEqual([
+        {
+          sessionId: 'create-call',
+          args: {
+            format: 'html',
+            title: 'Route comparison',
+            kind: 'decision',
+            description: 'Which shipping route wins under a late order.',
+            body: '<p>Two sliders.</p>',
+            folder: 'Documents/decisions',
+          },
+        },
+      ])
+      expect(JSON.parse((result.content as Array<{ text: string }>)[0].text)).toEqual({
+        created: true,
+        path: 'Documents/decisions/Route comparison.html',
+        title: 'Route comparison',
+        format: 'html',
+        kind: 'decision',
+      })
+    } finally {
+      await broker.dispose()
+    }
+  })
+
+  it('passes only the optional fields the agent actually sent', async () => {
+    const seen: unknown[] = []
+    const broker = makeBroker(noop, noop, {
+      create: (async (_sessionId, args) => {
+        seen.push(args)
+        return {
+          created: true as const,
+          path: 'Documents/T.md',
+          title: 'T',
+          format: 'markdown' as const,
+          kind: 'note' as const,
+        }
+      }) as CreateDocumentFn,
+    })
+    try {
+      await broker.ensureListening()
+      await broker.register('create-sparse', { includeApprove: false })
+      await withClient(broker, 'create-sparse', (client) =>
+        client.callTool({ name: 'create_document', arguments: { format: 'markdown', title: 'T' } }),
+      )
+
+      // An omitted `kind` has to arrive omitted, not as an empty string: the command's folder fallback
+      // is what fills it, and an empty string would fail validation instead of taking that default.
+      expect(seen).toEqual([{ format: 'markdown', title: 'T' }])
+    } finally {
+      await broker.dispose()
+    }
+  })
+
+  it('reports a refusal as a tool error rather than dropping the turn', async () => {
+    const broker = makeBroker(noop, noop, {
+      create: (async () => {
+        throw new Error('format is required, and must be "markdown" or "html"')
+      }) as CreateDocumentFn,
+    })
+    try {
+      await broker.ensureListening()
+      await broker.register('create-refuse', { includeApprove: false })
+      const result = await withClient(broker, 'create-refuse', (client) =>
+        client.callTool({ name: 'create_document', arguments: { format: 'docx', title: 'X' } }),
+      )
+
+      expect(result.isError).toBe(true)
+      expect((result.content as Array<{ text: string }>)[0].text).toContain('format is required')
+    } finally {
+      await broker.dispose()
+    }
+  })
+
+  it('opens the created document on the Stage through the present_file receipt', async () => {
+    const presented: Array<{ sessionId: string; args: unknown }> = []
+    const broker = makeBroker(noop, noop, {
+      create: (async () => ({
+        created: true as const,
+        path: 'Documents/decisions/Route comparison.html',
+        title: 'Route comparison',
+        format: 'html' as const,
+        kind: 'decision' as const,
+      })) as CreateDocumentFn,
+      present: (async (sessionId, args) => {
+        presented.push({ sessionId, args })
+        return { kind: 'present-file' }
+      }) as PresentFileFn,
+    })
+    try {
+      await broker.ensureListening()
+      await broker.register('create-present', { includeApprove: false })
+      const result = await withClient(broker, 'create-present', (client) =>
+        client.callTool({ name: 'create_document', arguments: { format: 'html', title: 'Route comparison' } }),
+      )
+
+      expect(result.isError).not.toBe(true)
+      // Path only, no body attachment and no view override — the same read-only receipt present_file
+      // itself emits, on the session that made the document.
+      expect(presented).toEqual([
+        { sessionId: 'create-present', args: { path: 'Documents/decisions/Route comparison.html' } },
+      ])
+    } finally {
+      await broker.dispose()
+    }
+  })
+
+  it('still reports the created document when presenting it hiccups', async () => {
+    const broker = makeBroker(noop, noop, {
+      create: (async () => ({
+        created: true as const,
+        path: 'Documents/T.md',
+        title: 'T',
+        format: 'markdown' as const,
+        kind: 'note' as const,
+      })) as CreateDocumentFn,
+      // The written file is the durable outcome; a Stage that has gone away must not fail the create.
+      present: (async () => {
+        throw new Error('stage is gone')
+      }) as PresentFileFn,
+    })
+    try {
+      await broker.ensureListening()
+      await broker.register('create-present-fail', { includeApprove: false })
+      const result = await withClient(broker, 'create-present-fail', (client) =>
+        client.callTool({ name: 'create_document', arguments: { format: 'markdown', title: 'T' } }),
+      )
+
+      expect(result.isError).not.toBe(true)
+      expect(JSON.parse((result.content as Array<{ text: string }>)[0].text)).toMatchObject({
+        created: true,
+        path: 'Documents/T.md',
+      })
+    } finally {
+      await broker.dispose()
+    }
+  })
+})
+
+describe('create_interactive', () => {
+  it('carries the same routing rule and says plainly that it will not touch the source', async () => {
+    const broker = makeBroker()
+    try {
+      await broker.ensureListening()
+      await broker.register('interactive-schema', { includeApprove: false })
+      const tool = await withClient(broker, 'interactive-schema', async (client) =>
+        (await client.listTools()).tools.find((t) => t.name === 'create_interactive'),
+      )
+
+      expect(tool).toBeDefined()
+      const description = tool!.description ?? ''
+      expect(description).toContain('mini app, not a document')
+      expect(description).toContain('not available yet')
+      // The boundary the renderer lane depends on: this verb writes ONE file, and the link back into
+      // the narrative is the caller's. An agent that assumes otherwise leaves the source unlinked.
+      expect(description).toContain('does not touch the source document')
+
+      const schema = tool!.inputSchema as { required?: string[]; properties?: Record<string, unknown> }
+      expect(schema.required).toEqual(['source_path', 'selection', 'title'])
+      expect(Object.keys(schema.properties ?? {})).toEqual(['source_path', 'selection', 'title'])
+    } finally {
+      await broker.dispose()
+    }
+  })
+
+  it('marshals the snake_case arguments onto the command’s request shape', async () => {
+    const seen: unknown[] = []
+    const broker = makeBroker(noop, noop, {
+      interactive: (async (sessionId, args) => {
+        seen.push({ sessionId, args })
+        return { ok: true as const, htmlPath: 'Documents/plans/Route comparison.html' }
+      }) as CreateInteractiveFn,
+    })
+    try {
+      await broker.ensureListening()
+      await broker.register('interactive-call', { includeApprove: false })
+      const result = await withClient(broker, 'interactive-call', (client) =>
+        client.callTool({
+          name: 'create_interactive',
+          arguments: {
+            source_path: 'Documents/plans/launch.md',
+            selection: 'Air freight beats sea by 12 days.',
+            title: 'Route comparison',
+          },
+        }),
+      )
+
+      expect(result.isError).not.toBe(true)
+      expect(seen).toEqual([
+        {
+          sessionId: 'interactive-call',
+          args: {
+            sourcePath: 'Documents/plans/launch.md',
+            selection: 'Air freight beats sea by 12 days.',
+            title: 'Route comparison',
+          },
+        },
+      ])
+      expect(JSON.parse((result.content as Array<{ text: string }>)[0].text)).toEqual({
+        ok: true,
+        htmlPath: 'Documents/plans/Route comparison.html',
+      })
+    } finally {
+      await broker.dispose()
+    }
+  })
+
+  it('turns the command’s refusal RESULT into a tool error', async () => {
+    const broker = makeBroker(noop, noop, {
+      interactive: (async () => ({ ok: false as const, reason: 'no document at "Documents/ghost.md"' })) as CreateInteractiveFn,
+    })
+    try {
+      await broker.ensureListening()
+      await broker.register('interactive-refuse', { includeApprove: false })
+      const result = await withClient(broker, 'interactive-refuse', (client) =>
+        client.callTool({
+          name: 'create_interactive',
+          arguments: { source_path: 'Documents/ghost.md', selection: 'x', title: 'T' },
+        }),
+      )
+
+      // The command answers a refusal as `{ ok: false }` because the Stage renders it as a sentence.
+      // For the agent it has to be an ERROR: a success-shaped result reads as "done", and the next turn
+      // tells the user about a file that was never written.
+      expect(result.isError).toBe(true)
+      expect((result.content as Array<{ text: string }>)[0].text).toContain('no document at')
+    } finally {
+      await broker.dispose()
+    }
+  })
+
+  it('opens the created HTML view on the Stage beside its source', async () => {
+    const presented: Array<{ sessionId: string; args: unknown }> = []
+    const broker = makeBroker(noop, noop, {
+      interactive: (async () => ({ ok: true as const, htmlPath: 'Documents/plans/Route comparison.html' })) as CreateInteractiveFn,
+      present: (async (sessionId, args) => {
+        presented.push({ sessionId, args })
+        return { kind: 'present-file' }
+      }) as PresentFileFn,
+    })
+    try {
+      await broker.ensureListening()
+      await broker.register('interactive-present', { includeApprove: false })
+      await withClient(broker, 'interactive-present', (client) =>
+        client.callTool({
+          name: 'create_interactive',
+          arguments: { source_path: 'Documents/plans/launch.md', selection: 'x', title: 'Route comparison' },
+        }),
+      )
+
+      expect(presented).toEqual([
+        { sessionId: 'interactive-present', args: { path: 'Documents/plans/Route comparison.html' } },
+      ])
+    } finally {
+      await broker.dispose()
+    }
+  })
+
+  it('does not present anything when the create is refused', async () => {
+    const presented: unknown[] = []
+    const broker = makeBroker(noop, noop, {
+      interactive: (async () => ({ ok: false as const, reason: 'selection is required' })) as CreateInteractiveFn,
+      present: (async (...call) => {
+        presented.push(call)
+        return { kind: 'present-file' }
+      }) as PresentFileFn,
+    })
+    try {
+      await broker.ensureListening()
+      await broker.register('interactive-refuse-present', { includeApprove: false })
+      const result = await withClient(broker, 'interactive-refuse-present', (client) =>
+        client.callTool({
+          name: 'create_interactive',
+          arguments: { source_path: 'Documents/plans/launch.md', selection: '', title: 'T' },
+        }),
+      )
+
+      // No file was written, so there is nothing to open — a receipt here would point the Stage at a
+      // path that does not exist.
+      expect(result.isError).toBe(true)
+      expect(presented).toEqual([])
+    } finally {
+      await broker.dispose()
+    }
+  })
+})
+
 describe('capabilities directory', () => {
   it('returns exact invocations for only the surfaces registered in this session', async () => {
     const broker = makeBroker()
@@ -250,7 +743,7 @@ describe('capabilities directory', () => {
         client.callTool({ name: 'capabilities', arguments: {} }),
       )
       const payload = JSON.parse((result.content as Array<{ text: string }>)[0].text) as {
-        capabilities: Array<{ id: string; invoke: string[] }>
+        capabilities: Array<{ id: string; outcome: string; invoke: string[] }>
       }
       expect(payload.capabilities.map((entry) => entry.id)).toEqual([
         'recovery',
@@ -259,6 +752,18 @@ describe('capabilities directory', () => {
         'environment',
         'documents',
       ])
+      // The documents outcome advertises all four verbs, so the agent learns that Koda can make a
+      // document in the right format — and shelve it — at the same moment it learns the surface exists.
+      expect(payload.capabilities.find((entry) => entry.id === 'documents')?.invoke).toEqual([
+        'mcp__koda_broker__create_document',
+        'mcp__koda_broker__create_interactive',
+        'mcp__koda_broker__keep_document',
+        'mcp__koda_broker__star_document',
+      ])
+      // The routing rule reaches an agent that asks the directory rather than reading a tool schema.
+      expect(payload.capabilities.find((entry) => entry.id === 'documents')?.outcome).toContain(
+        'self-contained HTML',
+      )
       expect(payload.capabilities.find((entry) => entry.id === 'preview')?.invoke).toEqual([
         'mcp__koda_broker__preview_file',
         'mcp__koda_broker__preview',
@@ -326,5 +831,75 @@ describe('approval heartbeat', () => {
     const sink = collector()
     await withApprovalHeartbeat(sink, 'tok-2', async () => 'done', 10)
     expect(sink.calls).toHaveLength(0)
+  })
+})
+
+describe('per-server idle timeout (mcpConfig)', () => {
+  it('sizes the koda_broker timeout for a human answering overnight, so a forced ask is not idle-aborted', async () => {
+    const broker = makeBroker()
+    try {
+      await broker.ensureListening()
+      const config = JSON.parse(broker.mcpConfig('cfg-1')) as {
+        mcpServers: Record<string, { timeout?: number }>
+      }
+      // The engine aborts an idle MCP tool after ~1025s by default; this per-server override is the real
+      // hold for a pending approval a user hasn't gotten back to (24h in ms).
+      expect(config.mcpServers.koda_broker.timeout).toBe(86_400_000)
+    } finally {
+      await broker.dispose()
+    }
+  })
+})
+
+describe('approve request abort cleans the gate slot (engine-side cancellation)', () => {
+  it('a cancelled approve unblocks the handler AND drops the pending gate slot exactly once', async () => {
+    const resolved: Array<{ sessionId: string; requestId: string }> = []
+    const gate = new ApprovalGate(
+      async () => true, // checkpoint
+      () => {}, // pushRequest
+      () => {}, // pushCancelled
+      (sessionId, requestId) => resolved.push({ sessionId, requestId }), // pushResolved
+      () => {}, // warn
+    )
+    const sessionId = 's-abort'
+    gate.setSessionMode(sessionId, 'ask') // force every tool to a human ask, so approve blocks
+    const broker = makeBroker(noop, noop, {}, (sid, req, signal) => gate.decide(sid, req, signal))
+    try {
+      await broker.ensureListening()
+      await broker.register(sessionId, { includeApprove: true })
+      const client = new Client({ name: 'abort-test', version: '1.0.0' })
+      await client.connect(
+        new StreamableHTTPClientTransport(new URL(broker.mcpHttpUrl(sessionId)), {
+          requestInit: { headers: { Authorization: `Bearer ${broker.tokenFor(sessionId)}` } },
+        }),
+      )
+      const controller = new AbortController()
+      // The aborted request rejects on the client; capture that so it never becomes an unhandled reject.
+      const call = client
+        .callTool(
+          { name: 'approve', arguments: { tool_name: 'Bash', input: { command: 'ls' }, tool_use_id: 'call-1' } },
+          undefined,
+          { signal: controller.signal },
+        )
+        .catch((err) => err)
+      // Wait until the gate has actually registered the pending ask before cancelling.
+      for (let i = 0; i < 400 && gate.pendingRequests(sessionId).length === 0; i += 1) {
+        await new Promise((r) => setTimeout(r, 5))
+      }
+      expect(gate.pendingRequests(sessionId)).toHaveLength(1)
+
+      controller.abort() // sends notifications/cancelled → the handler's extra.signal fires
+      await call
+
+      // The cancellation crosses the wire; give the server a moment to fire extra.signal and clean up.
+      for (let i = 0; i < 400 && gate.pendingRequests(sessionId).length > 0; i += 1) {
+        await new Promise((r) => setTimeout(r, 5))
+      }
+      expect(gate.pendingRequests(sessionId)).toEqual([])
+      expect(resolved).toEqual([{ sessionId, requestId: 'call-1' }])
+      await client.close()
+    } finally {
+      await broker.dispose()
+    }
   })
 })

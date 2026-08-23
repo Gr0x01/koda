@@ -1,10 +1,8 @@
 import {
-  forwardRef,
   useEffect,
   useMemo,
   useRef,
   useState,
-  type ButtonHTMLAttributes,
   type ReactNode,
 } from 'react'
 import { SIDEBAR_MIN_WIDTH } from '@shared/ipc'
@@ -13,24 +11,23 @@ import { HoverCard } from '../ui'
 import { computeSessionChanges, statusOf, useWorkspace, type SessionState } from './store'
 import { ageLabel, groupSessions } from './session-map'
 import { SessionRow } from './SessionRow'
-import { DocumentsShelf } from './KeptDocs'
-import { openLibrary } from './library/LibraryHost'
-import { PanelHeader } from './PanelHeader'
+import { StarredDocumentsShelf } from './KeptDocs'
+import { PanelHeader, PanelHeaderIconButton } from './PanelHeader'
 import { ArchivedFoot } from './RailFoot'
 import { RecentImages } from './RecentImages'
 import { ResizeHandle } from './ResizeHandle'
 
 /**
- * The left rail. Sessions remain its primary map of *who is working*. A deliberately small Documents
+ * The left rail. Sessions remain its primary map of *who is working*. A deliberately small Starred documents
  * section follows that map for project objects the person chose to keep close; the full set of what
  * exists is still summoned, used, and left.
  *
  * That rule is what removed the Files tree from here. An unfiltered directory listing (`build`, `out`,
  * `release`, `.DS_Store`) is an IDE explorer in a product whose users will not read code —
  * files are reached through Find (⌘P) and documents through the Library (⌘K), both overlays. What
- * follows the map is the project's document shelf. Two quiet foot lines stay pinned below the
- * scrolling navigation and disclose their contents on hover: **Archived**, the way back from a
- * one-click archive, and **Recent images**.
+ * follows the map is the project's starred-document shelf. History stays pinned below the scrolling
+ * navigation as its own named section; Archived chats and Recent images disclose their contents in
+ * the existing anchored cards without being pressed against the global footer.
  */
 export function Sidebar() {
   const width = useWorkspace((s) => s.sidebarWidth)
@@ -44,14 +41,13 @@ export function Sidebar() {
       style={{ width, minWidth: SIDEBAR_MIN_WIDTH }}
       className="relative flex shrink-0 flex-col border-r border-border bg-bg"
     >
-      <RailHeader />
-      {/* One scrolling navigation flow: Needs you → Active → Documents. The shelf belongs immediately
-          after the sessions it helps, while the two utility rows remain pinned at the foot. */}
-      <SessionMap />
-      <div className="mt-auto">
-        <ArchivedFoot />
-        <RecentImages />
+      <div className="flex min-h-0 flex-1 flex-col">
+        <SessionsHeader />
+        {/* One scrolling navigation flow: sessions → starred documents. History stays outside this
+            scroll owner so the way back remains reachable without colliding with global controls. */}
+        <SessionMap />
       </div>
+      <HistorySection />
       {/* Drag the sidebar ⇆ main split (over the right border). */}
       <ResizeHandle
         orientation="vertical"
@@ -66,46 +62,29 @@ export function Sidebar() {
 }
 
 /**
- * The rail's head: this window's project, and the one action that starts work in it.
- *
- * Deliberately **no chevron and no picker** — Koda is one project per window, so a caret would promise
- * switching that does not exist. The Library button is the only visible door to the document surface
- * (⌘K is otherwise a keystroke you have to already know), which is why it sits beside the `+` rather
- * than leaving with the Files section it used to head.
+ * Sessions owns the rail head. The project name already lives in the window title and cannot change
+ * within this window, so repeating it here spends the strongest navigation position on inert context.
  */
-function RailHeader() {
-  const projectPath = useWorkspace((s) => s.projectPath)
+function SessionsHeader() {
   const startSession = useWorkspace((s) => s.startSession)
-  const name = projectPath ? basename(projectPath) : 'No project'
 
   return (
     <PanelHeader
       title={
-        <div className="flex min-w-0 items-center gap-2 text-text">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className="shrink-0 text-text-muted" aria-hidden>
-            <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
-          </svg>
-          <h2 className="min-w-0 truncate text-[12px] font-medium">{name}</h2>
-        </div>
+        <h2
+          id="sessions-heading"
+          className="font-display text-[11px] font-semibold uppercase tracking-wider text-text-muted"
+        >
+          Sessions
+        </h2>
       }
     >
-      <div className="-mr-1 flex items-center gap-0.5">
+      <div className="-mr-1">
         <HoverCard
           trigger={
-            <HeaderIconButton onClick={openLibrary} aria-label="Browse documents">
-              <path d="M4 5.5A1.5 1.5 0 0 1 5.5 4H9v16H5.5A1.5 1.5 0 0 1 4 18.5Z" />
-              <path d="M9 4h4.5A1.5 1.5 0 0 1 15 5.5v13a1.5 1.5 0 0 1-1.5 1.5H9" />
-              <path d="m17.4 6.6 2.2 12.1" />
-            </HeaderIconButton>
-          }
-        >
-          Your documents, by title (⌘K).
-        </HoverCard>
-        <HoverCard
-          trigger={
-            <HeaderIconButton onClick={() => startSession()} aria-label="New chat">
+            <PanelHeaderIconButton onClick={() => startSession()} aria-label="New chat">
               <path d="M12 5v14M5 12h14" />
-            </HeaderIconButton>
+            </PanelHeaderIconButton>
           }
         >
           Start another chat in this project (⌘T).
@@ -115,25 +94,20 @@ function RailHeader() {
   )
 }
 
-/** An icon-only header action. `forwardRef` + `...rest` because `HoverCard` clones its trigger in
- *  place and needs the underlying element (see HoverCard's header for the contract). Not `IconButton`:
- *  that primitive carries a native `title=`, which is exactly what `HoverCard` replaces. */
-const HeaderIconButton = forwardRef<HTMLButtonElement, ButtonHTMLAttributes<HTMLButtonElement>>(
-  function HeaderIconButton({ children, ...rest }, ref) {
-    return (
-      <button
-        ref={ref}
-        type="button"
-        className="flex h-6 w-6 items-center justify-center rounded-md text-text-muted outline-none transition-colors hover:bg-surface hover:text-text focus-visible:bg-surface focus-visible:text-text"
-        {...rest}
+function HistorySection() {
+  return (
+    <section aria-labelledby="history-heading" className="mt-auto shrink-0 px-1.5 pb-3 pt-2">
+      <h2
+        id="history-heading"
+        className="px-2 pb-1 pt-2 font-display text-[11px] font-semibold uppercase tracking-wider text-text-muted"
       >
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-          {children}
-        </svg>
-      </button>
-    )
-  },
-)
+        History
+      </h2>
+      <ArchivedFoot />
+      <RecentImages />
+    </section>
+  )
+}
 
 function SessionMap() {
   const order = useWorkspace((s) => s.order)
@@ -168,7 +142,7 @@ function SessionMap() {
 
   // Flatten both parts into ONE ordered item list — headings included — so the whole map renders as a
   // single presence tree. Grouping is a derived, moment-to-moment fact (selecting a Needs-you row
-  // clears its attention, so it belongs under Active a frame later), and the map has to be able to move
+  // clears its attention, so it rejoins the ordinary session rows a frame later), and the map has to move
   // a row between parts without the row leaving the DOM. See the render for why that matters.
   const items = useMemo(() => {
     const out: MapItem[] = []
@@ -178,7 +152,7 @@ function SessionMap() {
       for (const session of group) out.push({ kind: 'row', key: session.id, session })
     }
     part('Needs you', grouped.waiting)
-    part('Active', grouped.active)
+    for (const session of grouped.active) out.push({ kind: 'row', key: session.id, session })
     return out
   }, [grouped])
 
@@ -186,7 +160,7 @@ function SessionMap() {
     // `layoutScroll` so a row's slide is measured against the scrolled list, not the viewport —
     // without it a reorder while the map is scrolled animates from the wrong place.
     <motion.div layoutScroll className="min-h-0 flex-1 overflow-y-auto pb-2">
-      <div className="px-1.5">
+      <section aria-labelledby="sessions-heading" className="px-1.5">
         {list.length === 0 ? (
           <p className="px-2 py-1.5 text-xs leading-relaxed text-text-muted">
             No chats yet. Start one to begin.
@@ -195,13 +169,13 @@ function SessionMap() {
         /*
          * Needs-you first: an approval or a stopped turn is the only thing here the user has to act
          * on, and burying it under this morning's threads is what made the flat list read as an
-         * archive. Every nonempty part keeps its heading, so Active remains as legible as Needs you
-         * and Documents even when no chat needs attention. Everything else is one recency list, and
+         * archive. Needs you keeps one subordinate caption only when it exists; Sessions names the
+         * ordinary list once at the top. Everything else is one recency list, and
          * a dormant thread is marked by nothing but its own age text — it sinks to the bottom and
          * stays reachable, rather than being filed away for the user.
          *
          * ONE list and ONE AnimatePresence for both parts, not a list per part. Clicking a row under
-         * Needs you clears its attention, which is exactly what moves it to Active — so the map
+         * Needs you clears its attention, which is exactly what moves it into the ordinary rows — so the map
          * re-groups on the click that selects. Rendered as sibling presence trees, that move was an
          * unmount here and a mount there: the row collapsed to zero height in one part while a copy
          * of itself grew back in another, and every other row's layout animation ran against the
@@ -229,7 +203,7 @@ function SessionMap() {
                   />
                 ) : (
                   <MapHeading key={item.key}>
-                    <h3 className="px-2 pb-1 pt-2 font-display text-[11px] font-semibold uppercase tracking-wider text-text-muted">
+                    <h3 className="px-2 pb-1 pt-2 font-display text-[10px] font-semibold uppercase tracking-wider text-text-muted/70">
                       {item.label}
                     </h3>
                   </MapHeading>
@@ -238,10 +212,10 @@ function SessionMap() {
             </AnimatePresence>
           </ul>
         )}
-      </div>
-      {/* Project-wide document shortcuts are a sibling section immediately after Active, never a
-          bottom utility. Renders nothing until something is starred. */}
-      <DocumentsShelf />
+      </section>
+      {/* Project-wide document shortcuts are a sibling section immediately after the sessions, never
+          a bottom utility. Its heading remains so the Library action is reachable with no stars. */}
+      <StarredDocumentsShelf />
     </motion.div>
   )
 }
@@ -274,9 +248,4 @@ function MapHeading({ children }: { children: ReactNode }) {
       {children}
     </motion.li>
   )
-}
-
-function basename(path: string): string {
-  const parts = path.replace(/\/+$/, '').split('/')
-  return parts[parts.length - 1] || path
 }

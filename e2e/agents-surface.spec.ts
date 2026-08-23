@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { mkdtempSync, realpathSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { launchKoda, makeUserDataDir } from './support/koda'
+import { launchKoda, makeUserDataDir, openFileViaLibrary } from './support/koda'
 
 const SESSION_LABEL = `AgentRoster${'x'.repeat(120)}`
 
@@ -125,12 +125,7 @@ test('Agents is a launch-order roster with one inline detail and fluid narrow la
 
     // Start with one ordinary file on stage. The first live delegate must add AND select Agents by
     // itself — no transcript click or + picker round-trip — while keeping that file co-open.
-    await win.keyboard.press('Meta+p')
-    const find = win.getByPlaceholder('Find in this project')
-    await find.waitFor({ timeout: 20_000 })
-    await find.fill('README.md')
-    await win.getByRole('button', { name: 'README.md', exact: true }).first().waitFor({ timeout: 20_000 })
-    await win.keyboard.press('Enter')
+    await openFileViaLibrary(win, 'README.md')
     await emitLiveFleet(app)
     const roster = win.getByTestId('agents-roster')
     await expect(roster).toBeVisible({ timeout: 20_000 })

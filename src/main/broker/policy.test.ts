@@ -312,6 +312,16 @@ describe('mutation classification is fail-closed', () => {
     // Not an always-confirm either: the user asked for the document, so Auto should not re-ask.
     expect(isAlwaysConfirm('mcp__koda_broker__keep_document')).toBe(false)
   })
+
+  /**
+   * `star_document` sits on the other side of that line, and the distinction is what it writes: the
+   * shelf record, never the user's document. There is nothing for a checkpoint to bring back, and one
+   * more call reverses it — so it rides the session posture like a read instead of stopping Auto.
+   */
+  it('treats star_document as a read: no checkpoint, no forced confirm', () => {
+    expect(isMutating('mcp__koda_broker__star_document')).toBe(false)
+    expect(isAlwaysConfirm('mcp__koda_broker__star_document')).toBe(false)
+  })
 })
 
 /**

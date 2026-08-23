@@ -8,7 +8,7 @@
  * (`model-pricing.ts`). There is deliberately NO projection, pace, forecast, or personal-ceiling
  * estimate — that was built once, rejected, and reverted; do not reintroduce it.
  */
-import type { ModelSpend, UsageHistoryDay } from './ipc'
+import type { ModelSpend, PricedScanBucket, ScanCostSource, UsageHistoryDay } from './ipc'
 import { cacheSavingsUsd, publishedRate } from './model-pricing'
 
 /** A two-brand heuristic for attributing a model id to an engine, NOT a model-version assertion —
@@ -259,4 +259,182 @@ export function buildUsageValue(days: UsageHistoryDay[]): UsageValue {
   }
 
   return { byEngine, daily, activeDays }
+}
+
+// ── Whole-subscription scan view-model (the Usage page, usage-wave U3) ─────────────
+// Same posture as buildUsageValue above: pure arithmetic over measured buckets so every rendered
+// figure reconciles in a plain Node test. The scan's dollars differ from the tracker's in one way —
+// they are ALL citable by construction (usage-pricing.ts sets costUsd null otherwise), so here
+// `costUsd == pricedCostUsd` on every point and the unpriced share is carried as tokens.
+
+export type ScanModelRow = {
+  model: string
+  engine: string
+  totalTokens: number
+  /** Null ⇒ this row renders tokens, never a dollar. */
+  costUsd: number | null
+  /** Share of the PRICED total, 0 for an unpriced row — shares close at 100% against the headline. */
+  costShare: number
+  costSource: ScanCostSource
+}
+
+export type ScanEngineRow = {
+  engineId: string
+  pricedCostUsd: number
+  totalTokens: number
+  costShare: number
+  tokenShare: number
+}
+
+export type ScanUsageValue = {
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheCreationTokens: number
+  reasoningTokens: number
+  totalTokens: number
+  records: number
+  /** The headline: every dollar in it carries a citation. */
+  pricedCostUsd: number
+  cacheSavingsUsd: number | null
+  unpricedTokens: number
+  /** Descending by priced cost, then tokens. */
+  byEngine: ScanEngineRow[]
+  models: ScanModelRow[]
+  /** Day columns for the chart, oldest→newest. `turns` carries record counts. */
+  daily: DailyPoint[]
+  /** Hour columns for the rolling-24h view; `date` is the bucket's ISO hour start. */
+  hourly: DailyPoint[]
+  activeDays: number
+  tokensPerActiveDay: number
+  pricedPerActiveDayUsd: number
+  /** Token split for the "through Koda / outside" line. */
+  originTokens: { koda: number; outside: number }
+}
+
+function bucketTokens(b: PricedScanBucket): number {
+  return b.uncachedInput + b.cachedInput + b.cacheCreation + b.output
+}
+
+export function buildScanUsageValue(buckets: PricedScanBucket[]): ScanUsageValue {
+  const value: ScanUsageValue = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    reasoningTokens: 0,
+    totalTokens: 0,
+    records: 0,
+    pricedCostUsd: 0,
+    cacheSavingsUsd: null,
+    unpricedTokens: 0,
+    byEngine: [],
+    models: [],
+    daily: [],
+    hourly: [],
+    activeDays: 0,
+    tokensPerActiveDay: 0,
+    pricedPerActiveDayUsd: 0,
+    originTokens: { koda: 0, outside: 0 },
+  }
+
+  const engines = new Map<string, { cost: number; tokens: number }>()
+  const models = new Map<string, ScanModelRow>()
+  const byDay = new Map<string, DailyPoint>()
+  const byHour = new Map<number, DailyPoint>()
+
+  const pointEngine = (point: DailyPoint, engineId: string): DailyPoint['byEngine'][number] => {
+    let row = point.byEngine.find((e) => e.engineId === engineId)
+    if (!row) {
+      row = { engineId, costUsd: 0, pricedCostUsd: 0, totalTokens: 0 }
+      point.byEngine.push(row)
+    }
+    return row
+  }
+
+  for (const b of buckets) {
+    const tokens = bucketTokens(b)
+    value.inputTokens += b.uncachedInput
+    value.outputTokens += b.output
+    value.cacheReadTokens += b.cachedInput
+    value.cacheCreationTokens += b.cacheCreation
+    value.reasoningTokens += b.reasoning
+    value.totalTokens += tokens
+    value.records += b.records
+    value.originTokens[b.origin] += tokens
+    if (b.costUsd == null) value.unpricedTokens += tokens
+    else value.pricedCostUsd += b.costUsd
+    if (b.cacheSavingsUsd != null) value.cacheSavingsUsd = (value.cacheSavingsUsd ?? 0) + b.cacheSavingsUsd
+
+    const engine = engines.get(b.engine) ?? { cost: 0, tokens: 0 }
+    engine.cost += b.costUsd ?? 0
+    engine.tokens += tokens
+    engines.set(b.engine, engine)
+
+    const modelKey = `${b.engine}:${b.model}`
+    const model =
+      models.get(modelKey) ??
+      ({ model: b.model, engine: b.engine, totalTokens: 0, costUsd: null, costShare: 0, costSource: b.costSource } as ScanModelRow)
+    model.totalTokens += tokens
+    if (b.costUsd != null) model.costUsd = (model.costUsd ?? 0) + b.costUsd
+    models.set(modelKey, model)
+
+    const day =
+      byDay.get(b.day) ??
+      ({ date: b.day, costUsd: 0, pricedCostUsd: 0, totalTokens: 0, turns: 0, byEngine: [] } as DailyPoint)
+    day.costUsd += b.costUsd ?? 0
+    day.pricedCostUsd += b.costUsd ?? 0
+    day.totalTokens += tokens
+    day.turns += b.records
+    const dayEngine = pointEngine(day, b.engine)
+    dayEngine.costUsd += b.costUsd ?? 0
+    dayEngine.pricedCostUsd += b.costUsd ?? 0
+    dayEngine.totalTokens += tokens
+    byDay.set(b.day, day)
+
+    const hour =
+      byHour.get(b.hourStartMs) ??
+      ({
+        date: new Date(b.hourStartMs).toISOString(),
+        costUsd: 0,
+        pricedCostUsd: 0,
+        totalTokens: 0,
+        turns: 0,
+        byEngine: [],
+      } as DailyPoint)
+    hour.costUsd += b.costUsd ?? 0
+    hour.pricedCostUsd += b.costUsd ?? 0
+    hour.totalTokens += tokens
+    hour.turns += b.records
+    const hourEngine = pointEngine(hour, b.engine)
+    hourEngine.costUsd += b.costUsd ?? 0
+    hourEngine.pricedCostUsd += b.costUsd ?? 0
+    hourEngine.totalTokens += tokens
+    byHour.set(b.hourStartMs, hour)
+  }
+
+  value.daily = [...byDay.values()].sort((a, b) => a.date.localeCompare(b.date))
+  value.hourly = [...byHour.entries()].sort((a, b) => a[0] - b[0]).map(([, p]) => p)
+  value.activeDays = value.daily.filter((d) => d.totalTokens > 0).length
+  value.tokensPerActiveDay = value.activeDays > 0 ? value.totalTokens / value.activeDays : 0
+  value.pricedPerActiveDayUsd = value.activeDays > 0 ? value.pricedCostUsd / value.activeDays : 0
+
+  value.byEngine = [...engines.entries()]
+    .map(([engineId, e]) => ({
+      engineId,
+      pricedCostUsd: e.cost,
+      totalTokens: e.tokens,
+      costShare: value.pricedCostUsd > 0 ? e.cost / value.pricedCostUsd : 0,
+      tokenShare: value.totalTokens > 0 ? e.tokens / value.totalTokens : 0,
+    }))
+    .sort((a, b) => b.pricedCostUsd - a.pricedCostUsd || b.totalTokens - a.totalTokens)
+
+  value.models = [...models.values()]
+    .map((m) => ({
+      ...m,
+      costShare: m.costUsd != null && value.pricedCostUsd > 0 ? m.costUsd / value.pricedCostUsd : 0,
+    }))
+    .sort((a, b) => (b.costUsd ?? 0) - (a.costUsd ?? 0) || b.totalTokens - a.totalTokens)
+
+  return value
 }

@@ -69,6 +69,11 @@ import {
   ScratchSaveResultSchema,
   DocMetaGetRequestSchema,
   DocMetaSetRequestSchema,
+  DocShelfSchema,
+  DocStarRequestSchema,
+  LegacyDocStarsRequestSchema,
+  CreateInteractiveRequestSchema,
+  CreateInteractiveResultSchema,
   DocMetaSchema,
   ScratchListRequestSchema,
   ScratchListResultSchema,
@@ -171,6 +176,8 @@ import { probeEngine } from './engine/probe'
 import { EngineSessionManager } from './engine/sessions'
 import { DreamScheduler } from './engine/dream'
 import { loadUsageHistory } from './engine/usage-history'
+import { scanUsageTranscripts } from './engine/usage-scan'
+import { loadRateTable, priceScanBuckets } from './engine/usage-pricing'
 import { currentProviderStatus, refreshProviderStatus, setStatusWatchHooks } from './engine/status-watch'
 import {
   browseDir,
@@ -264,7 +271,13 @@ import {
   remoteStatusWatchHooks,
   disposeRemoteControl,
 } from './remote-control'
-import { staticPreviewUrl, previewAssetUrl, startDevServer, showStaticPreview } from './preview'
+import {
+  staticPreviewUrl,
+  previewAssetUrl,
+  documentPreviewUrl,
+  startDevServer,
+  showStaticPreview,
+} from './preview'
 import { listScratchImages } from './scratch'
 import {
   applyScratchRetentionSetting,
@@ -273,6 +286,13 @@ import {
 } from './scratch-retention'
 import { healGuidelinesPair } from './guidelines'
 import { readDocMeta, writeDocMeta } from './docmeta'
+import {
+  adoptLegacyDocStars,
+  createInteractiveDocument,
+  readDocShelf,
+  rebaseDocStars,
+  setDocStar,
+} from './doc-commands'
 import {
   listGuardrails,
   principleMemberKeys,
@@ -765,7 +785,7 @@ export function registerIpcHandlers(): void {
     AuthLoginStartResultSchema.parse(
       isHermeticE2EProfile()
         ? { ok: false, reason: HERMETIC_E2E_BLOCK_REASON }
-        : startCodexLogin(),
+        : startCodexLogin(() => getEngineSessions().refreshCodexUsage()),
     ),
   )
   ipcMain.handle(IpcChannels.codexLoginCancel, () => {
@@ -874,6 +894,27 @@ export function registerIpcHandlers(): void {
     return previewAssetUrl(win.id, rel) ?? null
   })
 
+  // Admit an HTML document to this window's sandboxed document origin (preview.ts, document mode) and
+  // hand back the URL its frame loads. Everything the surface is allowed to show is decided here: the
+  // path is realpath-contained and must exist, and only an HTML format is registered. A renderer that
+  // asks for anything else gets null and shows its own "couldn't open this" state.
+  ipcMain.handle(IpcChannels.docDocumentUrl, (event, rawArgs: unknown) => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    if (!win) return null
+    if (typeof rawArgs !== 'object' || rawArgs === null || typeof (rawArgs as { path?: unknown }).path !== 'string')
+      return null
+    const root = rootForSender(event.sender)
+    let file: string
+    try {
+      file = containedReal(root, (rawArgs as { path: string }).path) // realpath: escape OR missing
+    } catch {
+      return null
+    }
+    const rel = relative(root, file).split(sep).join('/')
+    if (!rel || rel.startsWith('..') || isAbsolute(rel)) return null
+    return documentPreviewUrl(win.id, rel) ?? null
+  })
+
   // Re-run a session's last preview (the "Restart preview" button). Window-direct like previewStaticUrl,
   // NOT the agent's gated capability: the user is replaying a command the agent already ran in front of
   // them, on their own window's project. Resolves with the served URL (main also pushes preview:show so
@@ -978,6 +1019,34 @@ export function registerIpcHandlers(): void {
     const key = docMetaKey(event.sender, path)
     if (key) await writeDocMeta(key.root, key.rel, meta)
   })
+
+  // The document shelf. These three are thin adapters: validation, containment, persistence and the
+  // change event all belong to doc-commands.ts, which the agent's `star_document` tool calls too — one
+  // command with two doors, rather than a UI mutation the agent has to imitate.
+  ipcMain.handle(IpcChannels.docShelfList, async (event) =>
+    DocShelfSchema.parse(await readDocShelf(rootForSender(event.sender))),
+  )
+
+  ipcMain.handle(IpcChannels.docShelfSet, async (event, rawArgs: unknown) =>
+    DocShelfSchema.parse(await setDocStar(rootForSender(event.sender), DocStarRequestSchema.parse(rawArgs))),
+  )
+
+  ipcMain.handle(IpcChannels.docShelfAdoptLegacy, async (event, rawArgs: unknown) =>
+    DocShelfSchema.parse(
+      await adoptLegacyDocStars(rootForSender(event.sender), LegacyDocStarsRequestSchema.parse(rawArgs)),
+    ),
+  )
+
+  // The same thin-adapter shape: the command owns containment, naming, the no-clobber write and the
+  // refusal wording, so the Stage action and the agent's `create_interactive` verb produce one artifact.
+  ipcMain.handle(IpcChannels.docCreateInteractive, async (event, rawArgs: unknown) =>
+    CreateInteractiveResultSchema.parse(
+      await createInteractiveDocument(
+        rootForSender(event.sender),
+        CreateInteractiveRequestSchema.parse(rawArgs),
+      ),
+    ),
+  )
 
   // How heavy this project's memory navigation pair is (status-bar tidy pill + Settings →
   // Memory). A no-project window has no memory to weigh.
@@ -1248,6 +1317,19 @@ export function registerIpcHandlers(): void {
 
   ipcMain.handle(IpcChannels.usageGetHistory, () => loadUsageHistory())
 
+  // The Usage page's single source: scan the CLIs' own transcripts, price with citable provenance.
+  // One call returns everything so the page can hold its skeleton until one answer lands whole.
+  ipcMain.handle(IpcChannels.usageGetScanSummary, async () => {
+    const [scan, table] = await Promise.all([scanUsageTranscripts(), loadRateTable()])
+    return {
+      buckets: priceScanBuckets(scan.buckets, table),
+      sources: scan.sources,
+      provenance: table.provenance,
+      scannedAt: scan.scannedAt,
+      scanMs: scan.scanMs,
+    }
+  })
+
   // 'auto' mode: the renderer confirmed continuing on the API key after a plan-limit rejection. Mark the
   // key effective until the window resets; the renderer drops live sessions so they reattach on API.
   ipcMain.handle(IpcChannels.billingActivateFallback, async (_event, rawArgs: unknown) => {
@@ -1473,9 +1555,14 @@ export function registerIpcHandlers(): void {
       root,
       { checkpointLabel: `rename ${basename(from)}` },
       async () =>
-        withProjectDocsRefresh(root, async () =>
-          RenamePathResultSchema.parse({ path: await renameProjectPath(root, from, to) }),
-        ),
+        withProjectDocsRefresh(root, async () => {
+          const path = await renameProjectPath(root, from, to)
+          // The shelf follows the document here rather than in the renderer, so a shortcut is repaired
+          // even when no window is watching — and so the same repair covers a rename Koda performs for
+          // the agent, which used to leave the star pointing at a path that no longer exists.
+          await rebaseDocStars(root, from, path)
+          return RenamePathResultSchema.parse({ path })
+        }),
     )
   })
 
@@ -1494,11 +1581,15 @@ export function registerIpcHandlers(): void {
         () => withProjectDocsRefresh(root, () => deleteProjectDocument(root, prepared)),
         prepared,
       )
+      // Only after the delete actually landed: a refused checkpoint throws above, and a shortcut must
+      // not be dropped for a document that is still there.
+      await rebaseDocStars(root, prepared.path, null)
       return
     }
     await withRequiredCheckpoint(root, `delete ${basename(path)}`, 'nothing was deleted.', () =>
       withProjectDocsRefresh(root, () => deleteProjectPath(root, path)),
     )
+    await rebaseDocStars(root, path, null)
   })
 
   // Duplicate a file/folder as "<name> copy". Checkpoint first so the copy is undoable. Returns the

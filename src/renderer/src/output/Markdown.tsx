@@ -29,6 +29,36 @@ export function markdownUrlTransform(url: string, key: string): string {
   return defaultUrlTransform(url)
 }
 
+export function isPathShapedInlineCode(value: string): boolean {
+  if (!value || value !== value.trim()) return false
+  if (/[\s\\*$|><;&`'"!?()[\]{}]/.test(value) || /[@=#]/.test(value)) return false
+
+  // Remove only a valid source location before checking for schemes. Otherwise `name.ts:12`
+  // looks like a custom protocol, while `https://example.com/a.ts:12` still retains its scheme.
+  const path = value.replace(/:[1-9]\d*(?::[1-9]\d*)?$/, '')
+  if (!path || /^[a-z][a-z0-9+.-]*:/i.test(path) || path.includes(':')) return false
+  // A domain is rejected only when it wears `www.` or carries a path. A bare `stem.ext` is exactly
+  // what a filename looks like (`archive.7z`), so shape alone cannot separate it from `example.com`;
+  // a wrong click there lands on the resolver's ordinary refusal.
+  if (/^www\./i.test(path)) return false
+  if (/^[a-z0-9-]+(?:\.[a-z0-9-]+)+\//i.test(path)) return false
+  if (/^v?\d+(?:\.[a-z0-9]+)+[+-]?[a-z0-9.-]*$/i.test(path)) return false
+
+  let body = path
+  if (body.startsWith('~/')) body = body.slice(2)
+  else if (body.startsWith('/')) body = body.slice(1)
+  else {
+    while (body.startsWith('./') || body.startsWith('../')) body = body.slice(body.indexOf('/') + 1)
+  }
+
+  if (!body || body.endsWith('/') || body.includes('//')) return false
+  const segments = body.split('/')
+  if (segments.some((segment) => !/^(?=.*[a-z0-9])[a-z0-9._+-]+$/i.test(segment))) return false
+  if (path.includes('/')) return true
+
+  return /^(?:\.[a-z0-9_-]+|[a-z0-9_+-][a-z0-9._+-]*)\.(?:[a-z][a-z0-9]{0,9}|7z)$/i.test(path)
+}
+
 /**
  * The single render path for assistant markdown — used both live (streaming
  * buffer) and finalized (AssistantBlock). Holds nothing; the source string is
@@ -60,6 +90,10 @@ export const Markdown = memo(function Markdown({ children }: { children: string 
   )
 })
 
+/** True while rendering a link's children: a path chip inside an anchor must stay plain text, because
+ *  a button inside a link is invalid interactive nesting and the link already owns the open. */
+const InsideLinkContext = createContext(false)
+
 function MarkdownLink({ href, children }: { href?: string; children: ReactNode }) {
   const openLocal = useContext(LocalLinkContext)
   return (
@@ -77,7 +111,7 @@ function MarkdownLink({ href, children }: { href?: string; children: ReactNode }
       }}
       className="text-accent underline underline-offset-2 hover:opacity-80"
     >
-      {children}
+      <InsideLinkContext.Provider value={true}>{children}</InsideLinkContext.Provider>
     </a>
   )
 }
@@ -116,6 +150,29 @@ function CodeBlock({ code, children }: { code: string; children: ReactNode }) {
   )
 }
 
+function InlineCode({ children, text }: { children: ReactNode; text: string }) {
+  const openLocal = useContext(LocalLinkContext)
+  const insideLink = useContext(InsideLinkContext)
+  if (!openLocal || insideLink || !isPathShapedInlineCode(text)) {
+    return (
+      <code className="rounded border border-border bg-surface px-1.5 py-0.5 font-mono text-[0.85em] text-text [overflow-wrap:anywhere]">
+        {children}
+      </code>
+    )
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={() => openLocal(text)}
+      aria-label={`Open ${text}`}
+      className="inline rounded border border-border bg-surface px-1.5 py-0.5 text-left font-mono text-[0.85em] text-text [overflow-wrap:anywhere] hover:cursor-pointer hover:text-accent hover:underline hover:underline-offset-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+    >
+      {children}
+    </button>
+  )
+}
+
 const COMPONENTS: Components = {
   h1: ({ children }) => <h1 className="mt-5 mb-2 font-display text-[1.5em] font-semibold tracking-tight text-text">{children}</h1>,
   h2: ({ children }) => <h2 className="mt-5 mb-2 font-display text-[1.34em] font-semibold tracking-tight text-text">{children}</h2>,
@@ -146,11 +203,7 @@ const COMPONENTS: Components = {
     const text = hastText(node)
     const isBlock = match || text.includes('\n')
     if (isBlock) return <code className={className}>{children}</code>
-    return (
-      <code className="rounded border border-border bg-surface px-1.5 py-0.5 font-mono text-[0.85em] text-text [overflow-wrap:anywhere]">
-        {children}
-      </code>
-    )
+    return <InlineCode text={text}>{children}</InlineCode>
   },
   pre: ({ children, node }) => <CodeBlock code={hastText(node)}>{children}</CodeBlock>,
 }

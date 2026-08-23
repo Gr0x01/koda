@@ -163,6 +163,18 @@ const TOOL_DENY_REASONS: Record<string, string> = {
     "The user declined the install. Don't install it another way (no brew/curl/npm end-runs) — continue with the tools already on the machine.",
 }
 
+/** A pending ask found still open at a genuine TurnComplete: its asking tool call already ended with
+ *  the turn (the engine aborted the `approve` on its ~1025s idle timeout and moved on, leaving the
+ *  requestId with no cancel event), so no one is awaiting it. NOT the user-decline register — nobody
+ *  declined; the request simply outlived its turn. */
+const STRANDED_TURN_ENDED_REASON =
+  'The tool call that asked for this ended along with its turn, so this approval no longer applies. Do not act on it; if the work still matters, start it again.'
+
+/** The engine cancelled its own in-flight `approve` request (its MCP idle-abort, or a dead request
+ *  stream) while the user was still deciding. The slot is answerable by no one now. */
+const STRANDED_ABANDONED_REASON =
+  'The engine cancelled this request before it was answered, so the approval no longer applies.'
+
 export class ApprovalGate {
   /** The posture new sessions start at (seeded from the persisted setting). */
   private defaultMode: ApprovalMode = 'auto'
@@ -266,7 +278,7 @@ export class ApprovalGate {
    * the self-protection tier): the deny couldn't stop the operation, only relocate it to the user's
    * terminal, and it stranded anyone mid-rebase who didn't already know Git.
    */
-  async decide(sessionId: string, req: ApproveRequest): Promise<ToolDecision> {
+  async decide(sessionId: string, req: ApproveRequest, signal?: AbortSignal): Promise<ToolDecision> {
     if (this.readOnly.has(sessionId) && !REM_EVIDENCE_TOOLS.has(req.toolName)) {
       return {
         kind: 'deny',
@@ -314,7 +326,7 @@ export class ApprovalGate {
     // askuserquestion-answer-via-updatedinput for the engine-side mechanism.)
     if (isUserQuestion(req.toolName)) {
       if (this.unattended.has(sessionId)) return { kind: 'deny', reason: UNATTENDED_REASON }
-      return this.askUser(sessionId, req)
+      return this.askUser(sessionId, req, undefined, signal)
     }
 
     // Plan posture on an engine with no native plan mode: deny the mutation outright. Asking the user
@@ -369,7 +381,7 @@ export class ApprovalGate {
     const decision: ToolDecision = ask
       ? this.unattended.has(sessionId)
         ? { kind: 'deny', reason: UNATTENDED_REASON }
-        : await this.askUser(sessionId, req, reason)
+        : await this.askUser(sessionId, req, reason, signal)
       : { kind: 'allow' }
 
     // Skip the pre-checkpoint for self-snapshotting tools (restore_checkpoint snapshots internally) —
@@ -399,9 +411,19 @@ export class ApprovalGate {
     return isMutating(toolName) && !isEditTool(toolName) // acceptEdits / plan
   }
 
-  /** "Ask me" mode — push to the renderer and wait indefinitely (no timeout; the engine waits too). */
-  private askUser(sessionId: string, req: ApproveRequest, reason?: string): Promise<ToolDecision> {
+  /** "Ask me" mode — push to the renderer and wait indefinitely (no timeout; the engine waits too).
+   *  The optional `signal` is the asking transport's cancellation (Claude's MCP `approve` request):
+   *  if the engine abandons that request while the user is still deciding — its idle-abort, or a dead
+   *  request stream — the slot must not linger, or it gates the next turn's admission with a card no
+   *  head can answer. So hook the abort to clean the slot exactly like one slot of the turn-end sweep. */
+  private askUser(sessionId: string, req: ApproveRequest, reason?: string, signal?: AbortSignal): Promise<ToolDecision> {
     return new Promise<ToolDecision>((resolve) => {
+      // Already abandoned before we could even register (the engine can cancel during the synchronous
+      // decision path). Deny straight away and never push a card no one is waiting behind.
+      if (signal?.aborted) {
+        resolve({ kind: 'deny', reason: STRANDED_ABANDONED_REASON })
+        return
+      }
       this.pending.set(req.toolUseId, {
         resolve,
         sessionId,
@@ -411,6 +433,11 @@ export class ApprovalGate {
         reason,
       })
       this.pushRequest({ sessionId, requestId: req.toolUseId, toolName: req.toolName, input: req.input, reason })
+      // Idempotent with a user answer (resolve/cancel already dropped the slot) and with the turn-end
+      // sweep — whichever lands first wins; discardPending no-ops once the slot is gone.
+      signal?.addEventListener('abort', () => this.discardPending(req.toolUseId, STRANDED_ABANDONED_REASON), {
+        once: true,
+      })
     })
   }
 
@@ -483,6 +510,35 @@ export class ApprovalGate {
     // pinned, a stale mode would judge the FIRST turn of the respawned process.
     this.turnMode.delete(sessionId)
     this.pushCancelled(sessionId)
+  }
+
+  /** Drop one pending slot, clear its card on every head, and unblock the awaiting broker handler with
+   *  a deny carrying `reason`. NOT resolve(): its bare-deny branch substitutes the standing user-decline
+   *  register, which is the wrong voice for a slot no one is answering. No-op if already gone, so the
+   *  turn-end sweep, an engine-side abort, and a user answer can race without double-clearing a card. */
+  private discardPending(requestId: string, reason: string): void {
+    const slot = this.pending.get(requestId)
+    if (!slot) return
+    this.pending.delete(requestId)
+    this.pushResolved(slot.sessionId, requestId)
+    slot.resolve({ kind: 'deny', reason })
+  }
+
+  /**
+   * A genuine TurnComplete arrived — sweep any pending ask this session still holds. The engine blocks
+   * its turn synchronously on a pending `approve`, so a real turn end proves no live caller is awaiting
+   * any of these slots; whatever is left was stranded (the engine aborted its `approve` on the ~1025s
+   * MCP idle timeout and moved on, sending no cancellation), and left in place it would gate the next
+   * turn's admission — "This session is waiting for your answer" — with a card the renderer already
+   * cleared at turn-complete, so nothing on screen to answer and the session bricked until restart.
+   *
+   * This is the backstop for part 1: if the engine ever DOES send a cancellation for its idle abort,
+   * askUser's signal hook cleans the slot first and this finds nothing left to do.
+   */
+  sweepStranded(sessionId: string): void {
+    for (const [requestId, slot] of this.pending) {
+      if (slot.sessionId === sessionId) this.discardPending(requestId, STRANDED_TURN_ENDED_REASON)
+    }
   }
 
   /**

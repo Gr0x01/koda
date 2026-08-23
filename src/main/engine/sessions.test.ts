@@ -18,6 +18,7 @@ import {
 import { IpcChannels } from '@shared/channels'
 import { latestReplayTurnFailure, transcriptFromReplay, turnFailureOf } from '@shared/delegation'
 import { EngineSessionManager } from './sessions'
+import type { ApprovalGate } from '../broker/gate'
 import { updateSettings } from '../settings'
 
 describe('live safety-handle maintenance', () => {
@@ -4111,6 +4112,29 @@ describe('changing posture mid-thread', () => {
   })
 })
 
+describe('refreshing Codex usage after account login', () => {
+  type UsageManager = {
+    sessions: Map<string, { refreshAccountUsage?: () => void }>
+    sessionEngines: Map<string, string>
+    refreshCodexUsage: () => void
+  }
+
+  it('refreshes live Codex sessions without touching Claude sessions', () => {
+    const mgr = new EngineSessionManager() as unknown as UsageManager
+    const refreshCodex = vi.fn()
+    const refreshClaude = vi.fn()
+    mgr.sessions.set('codex-chat', { refreshAccountUsage: refreshCodex })
+    mgr.sessions.set('claude-chat', { refreshAccountUsage: refreshClaude })
+    mgr.sessionEngines.set('codex-chat', 'codex')
+    mgr.sessionEngines.set('claude-chat', 'claude')
+
+    mgr.refreshCodexUsage()
+
+    expect(refreshCodex).toHaveBeenCalledOnce()
+    expect(refreshClaude).not.toHaveBeenCalled()
+  })
+})
+
 describe('an ask runs on the engine of the chat it was launched from', () => {
   // The Library's ask names a chat and main reads the engine off it. Resolving app-wide instead refused
   // an ask launched from a Claude chat because a DIFFERENT session had been switched to Codex, and ran
@@ -4304,5 +4328,28 @@ describe('proposeVersionMessage evidence ordering', () => {
     expect(readEvidence).toHaveBeenCalledOnce()
     // Empty diff floors inside generateVersionMessage without spawning — no engine child in tests.
     expect(res.source).toBe('fallback')
+  })
+})
+
+describe('TurnComplete sweeps a stranded approval so the next turn is admissible', () => {
+  it('a genuine TurnComplete clears a pending approval slot the engine left behind', async () => {
+    const mgr = new EngineSessionManager() as unknown as {
+      gate: ApprovalGate
+      forward: (event: EngineEvent) => unknown
+    }
+    const sessionId = 'stranded-approval'
+    mgr.gate.setSessionMode(sessionId, 'ask') // force every tool to a human ask, so the slot stays pending
+    const pending = mgr.gate.decide(sessionId, { toolUseId: 'call-1', toolName: 'Bash', input: { command: 'ls' } })
+    expect(mgr.gate.pendingRequests(sessionId)).toHaveLength(1)
+
+    // The asking approve was long since aborted by the engine's MCP idle timeout; its turn now ends.
+    mgr.forward({ type: 'TurnComplete', sessionId, stopReason: 'success' })
+
+    // pendingRequests is exactly what sendTurn's admission guard reads (sessions.ts): empty now, so the
+    // next message can be admitted instead of being refused with "waiting for your answer".
+    expect(mgr.gate.pendingRequests(sessionId)).toEqual([])
+    const decision = (await pending) as { kind: string; reason?: string }
+    expect(decision.kind).toBe('deny')
+    expect(decision.reason).toContain('ended along with its turn')
   })
 })

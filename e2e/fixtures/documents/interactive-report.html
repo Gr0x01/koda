@@ -1,0 +1,174 @@
+<!doctype html>
+<!--
+  Koda test fixture: a well-behaved self-contained interactive document.
+  Everything it needs is inline. No network requests, no external stylesheets, fonts, or scripts.
+  Used to prove the HTML document surface renders and stays interactive inside the sandbox.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Frost date explorer</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --ink: #131a24;
+        --muted: #5d6b7f;
+        --line: #dfe4ec;
+        --accent: #2f5fd0;
+        --panel: #f6f8fc;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --ink: #e7ecf5;
+          --muted: #93a1b6;
+          --line: #2a3444;
+          --accent: #7ba1ff;
+          --panel: #161d29;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 32px 24px 48px;
+        font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+        color: var(--ink);
+        max-width: 720px;
+      }
+      h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+      p.lede { margin: 0 0 24px; color: var(--muted); }
+      fieldset {
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 16px 18px;
+        margin: 0 0 24px;
+        background: var(--panel);
+      }
+      legend { padding: 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+      label { display: block; font-size: 13px; margin-bottom: 6px; color: var(--muted); }
+      input[type="range"] { width: 100%; accent-color: var(--accent); }
+      .row { display: flex; gap: 20px; flex-wrap: wrap; }
+      .row > div { flex: 1 1 220px; }
+      .readout { font-variant-numeric: tabular-nums; font-weight: 600; color: var(--ink); }
+      table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+      th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+      th { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }
+      td.date { font-variant-numeric: tabular-nums; }
+      tr.late td { color: var(--accent); }
+      .bar { height: 8px; border-radius: 4px; background: var(--accent); opacity: 0.75; }
+      button {
+        font: inherit;
+        border: 1px solid var(--line);
+        background: transparent;
+        color: var(--ink);
+        border-radius: 8px;
+        padding: 6px 12px;
+        cursor: pointer;
+      }
+      button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+      footer { margin-top: 28px; font-size: 12px; color: var(--muted); }
+    </style>
+  </head>
+  <body>
+    <h1>Frost date explorer</h1>
+    <p class="lede">Drag the last-frost date and the tray count to see when each crop has to go under the lights.</p>
+
+    <fieldset>
+      <legend>Settings</legend>
+      <div class="row">
+        <div>
+          <label for="frost">Last frost: <span class="readout" id="frost-out"></span></label>
+          <input id="frost" type="range" min="0" max="45" value="14" step="1" />
+        </div>
+        <div>
+          <label for="trays">Trays available: <span class="readout" id="trays-out"></span></label>
+          <input id="trays" type="range" min="1" max="8" value="4" step="1" />
+        </div>
+      </div>
+      <p style="margin: 14px 0 0">
+        <button id="units" type="button" aria-pressed="false">Show weeks instead of dates</button>
+      </p>
+    </fieldset>
+
+    <table>
+      <thead>
+        <tr><th>Crop</th><th>Start</th><th>Lead</th><th>Fits</th></tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+
+    <footer id="note"></footer>
+
+    <script>
+      // Self-contained: the data lives here, nothing is fetched.
+      const CROPS = [
+        { name: 'Pepper', weeks: 8, trays: 2 },
+        { name: 'Tomato', weeks: 6, trays: 2 },
+        { name: 'Basil', weeks: 4, trays: 1 },
+        { name: 'Squash', weeks: 2, trays: 1 },
+      ]
+      const MONTH = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+      const BASE = new Date(2027, 2, 20) // March 20 — day 0 of the frost slider
+
+      const frost = document.getElementById('frost')
+      const trays = document.getElementById('trays')
+      const units = document.getElementById('units')
+      const rows = document.getElementById('rows')
+
+      const addDays = (date, days) => new Date(date.getFullYear(), date.getMonth(), date.getDate() + days)
+      const fmt = (date) => MONTH[date.getMonth()] + ' ' + date.getDate()
+
+      function render() {
+        const frostDate = addDays(BASE, Number(frost.value))
+        const trayBudget = Number(trays.value)
+        const asWeeks = units.getAttribute('aria-pressed') === 'true'
+
+        document.getElementById('frost-out').textContent = fmt(frostDate)
+        document.getElementById('trays-out').textContent = String(trayBudget)
+        units.textContent = asWeeks ? 'Show dates instead of weeks' : 'Show weeks instead of dates'
+
+        let used = 0
+        rows.replaceChildren()
+        for (const crop of CROPS) {
+          const fits = used + crop.trays <= trayBudget
+          if (fits) used += crop.trays
+          const start = addDays(frostDate, -crop.weeks * 7)
+
+          const tr = document.createElement('tr')
+          if (crop.weeks >= 6) tr.className = 'late'
+
+          const name = document.createElement('td')
+          name.textContent = crop.name
+
+          const when = document.createElement('td')
+          when.className = 'date'
+          when.textContent = asWeeks ? crop.weeks + ' weeks out' : fmt(start)
+
+          const lead = document.createElement('td')
+          const bar = document.createElement('div')
+          bar.className = 'bar'
+          bar.style.width = Math.round((crop.weeks / 8) * 100) + '%'
+          lead.appendChild(bar)
+
+          const room = document.createElement('td')
+          room.textContent = fits ? 'yes' : 'needs ' + crop.trays + ' more'
+
+          tr.append(name, when, lead, room)
+          rows.appendChild(tr)
+        }
+
+        document.getElementById('note').textContent =
+          used + ' of ' + trayBudget + ' trays committed. Peppers set the earliest start at ' +
+          fmt(addDays(frostDate, -56)) + '.'
+      }
+
+      frost.addEventListener('input', render)
+      trays.addEventListener('input', render)
+      units.addEventListener('click', () => {
+        units.setAttribute('aria-pressed', units.getAttribute('aria-pressed') === 'true' ? 'false' : 'true')
+        render()
+      })
+      render()
+    </script>
+  </body>
+</html>

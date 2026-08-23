@@ -43,6 +43,14 @@ export async function invokeIpc(channel: string, sender: unknown, ...args: unkno
 export const BrowserWindow = {
   fromWebContents: (sender: { __win?: unknown }): unknown => sender?.__win,
   getAllWindows: (): unknown[] => [],
+  fromId: (): unknown => null,
+}
+
+/** preview.ts registers the `koda-preview://` scheme at import time in production. Tests call its
+ *  exported request handler directly, so registration only has to resolve, not do anything. */
+export const protocol = {
+  registerSchemesAsPrivileged: (): void => {},
+  handle: (): void => {},
 }
 
 export const dialog = {
@@ -86,4 +94,14 @@ export const safeStorage = {
   },
 }
 
-export default { app, BrowserWindow, dialog, ipcMain, Notification, safeStorage, powerMonitor, shell }
+export default {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  Notification,
+  protocol,
+  safeStorage,
+  powerMonitor,
+  shell,
+}

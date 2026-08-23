@@ -127,8 +127,8 @@ export function Library({ onClose }: { onClose: () => void }) {
         className="flex min-h-0 flex-1 flex-col"
       >
         <LibraryPanel
-          onOpenPath={(path, line) => {
-            openFile(path, line)
+          onOpenPath={(path, line, asCode) => {
+            openFile(path, line, asCode ? { view: 'file' } : undefined)
             onClose()
           }}
           onNewDocument={async () => {

@@ -16,6 +16,7 @@ import { createSaveCoalescer, docEditorGuards } from './CrepeDocEditor'
 const SOURCE = readFileSync(join(__dirname, 'CrepeDocEditor.tsx'), 'utf8')
 const CALLOUT_SOURCE = readFileSync(join(__dirname, 'blocks/callout.ts'), 'utf8')
 const TOGGLE_SOURCE = readFileSync(join(__dirname, 'blocks/toggle.ts'), 'utf8')
+const ARTIFACT_CARD_SOURCE = readFileSync(join(__dirname, 'artifact-card.ts'), 'utf8')
 const MILKDOWN_RUNTIME_SOURCE = readFileSync(join(__dirname, 'milkdown-runtime.ts'), 'utf8')
 
 /** The body of a top-level function declaration, by brace matching from its signature. */
@@ -158,7 +159,7 @@ describe('the direct-edit path', () => {
 
 describe('the Milkdown runtime boundary', () => {
   it('keeps Crepe and every custom desktop plugin on one module identity', () => {
-    for (const source of [SOURCE, CALLOUT_SOURCE, TOGGLE_SOURCE]) {
+    for (const source of [SOURCE, CALLOUT_SOURCE, TOGGLE_SOURCE, ARTIFACT_CARD_SOURCE]) {
       const runtimeImports = source
         .split('\n')
         .filter((line) => line.includes("from '@milkdown/") && !line.trimStart().startsWith('import type'))
@@ -204,5 +205,38 @@ describe('agent-edit review', () => {
   it('still treats the user typing over a pending agent edit as acceptance', () => {
     // Revert must never be able to discard writing the user did on top of the agent's change.
     expect(SOURCE).toMatch(/if \(dirty && review !== null\) setReview\(null\)/)
+  })
+})
+
+describe('smart artifact references', () => {
+  it('renders recognized links as cards without touching the document model', () => {
+    // The card is a decoration plugin, registered like the other custom plugins — so the markdown on
+    // disk stays the portable link and never gains a card node.
+    expect(SOURCE).toContain('createArtifactCardPlugin({')
+  })
+
+  it('creates the view through the shared command and never as an engine turn', () => {
+    const create = functionBody(SOURCE, 'async function createInteractiveView()')
+    // One command owns the artifact — the same IPC the agent's create_interactive verb runs.
+    expect(create).toContain('window.koda.createInteractiveDocument({')
+    // It inserts the portable link back and opens the artifact beside the source (a co-open tab).
+    expect(create).toContain('insertArtifactLink(')
+    expect(create).toContain('openFile(joinProjectPath(')
+    // Making a view is not an agent edit: no engine turn is sent from this path.
+    expect(create).not.toContain('sendCanvasEdit')
+  })
+
+  it('inserts an ordinary markdown link node, not raw HTML, into the source', () => {
+    const insert = functionBody(SOURCE, 'function insertArtifactLink(')
+    expect(insert).toContain('schema.marks.link')
+    expect(insert).not.toContain('innerHTML')
+    expect(insert).not.toContain('<a')
+  })
+
+  it('opens a card through the session rename-repair resolver', () => {
+    // A card's link text is the portable original; opening resolves through the repair map so a
+    // Koda-driven rename still lands on the artifact's current home.
+    expect(SOURCE).toContain('repairArtifactTarget(resolved, repairsRef.current)')
+    expect(SOURCE).toContain('const docRefRepairs = useWorkspace((s) => s.docRefRepairs)')
   })
 })

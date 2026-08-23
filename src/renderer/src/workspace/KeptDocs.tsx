@@ -13,7 +13,8 @@ import {
   type DocumentMenuTarget,
 } from './DocumentShelfMenu'
 import { docTitle } from './library/library-format'
-import { PanelHeader } from './PanelHeader'
+import { openLibrary } from './library/LibraryHost'
+import { PanelHeader, PanelHeaderIconButton } from './PanelHeader'
 import { activeEditor, useWorkspace } from './store'
 
 /** Resolved metadata for the starred paths, from the exact `library:resolve` read. */
@@ -22,7 +23,7 @@ type StarredMeta = Record<string, { title: string; path: string }>
 type DeleteTarget = Pick<DocumentMenuTarget, 'path' | 'title' | 'trigger'>
 
 /**
- * The sidebar's compact **Documents** shelf — durable project shortcuts chosen in the Library.
+ * The sidebar's compact **Starred documents** shelf — durable project shortcuts chosen in the Library.
  *
  * Membership already says that a row was starred, so the resting UI does not repeat that state in
  * both a heading and a large glyph on every item. The star remains where it is an actual toggle: in
@@ -34,29 +35,21 @@ type DeleteTarget = Pick<DocumentMenuTarget, 'path' | 'title' | 'trigger'>
  * still renders from its filename, but only Unstar remains available — a stale shortcut is never
  * promoted into a filesystem target by reconstructing an absolute path.
  */
-export function DocumentsShelf() {
+export function StarredDocumentsShelf() {
   const starred = useWorkspace((s) => s.starredDocs)
   const activeSurfaceId = useWorkspace((s) => activeEditor(s).activeSurfaceId)
   const projectPath = useWorkspace((s) => s.projectPath)
-  const hydrated = useWorkspace((s) => s.hydrated)
   const filesRev = useWorkspace((s) => s.filesRev)
   const openFile = useWorkspace((s) => s.openFile)
   const unstarDoc = useWorkspace((s) => s.unstarDoc)
   const deleteEntry = useWorkspace((s) => s.deleteEntry)
   const clearTreeError = useWorkspace((s) => s.clearTreeError)
-  const migrateDocPins = useWorkspace((s) => s.migrateDocPins)
   const [meta, setMeta] = useState<StarredMeta>({})
   const [menu, setMenu] = useState<DocumentMenuTarget | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null)
   // Retain the last target through Menu's close animation.
   const lastMenu = useRef<DocumentMenuTarget | null>(null)
   if (menu) lastMenu.current = menu
-
-  // Adopt the retired Documents pane's project-level pins after hydrate, so the restore cannot
-  // overwrite the migration. No chat is required: project stars exist before and after conversations.
-  useEffect(() => {
-    if (hydrated && projectPath) migrateDocPins()
-  }, [hydrated, projectPath, migrateDocPins])
 
   // Resolve the exact starred paths instead of consulting the Library's capped browse result. The same
   // response owns the small set of file watches, so external edits/deletes anywhere in the project
@@ -103,109 +96,121 @@ export function DocumentsShelf() {
     }
   }, [starred, filesRev, projectPath])
 
-  if (!starred.length) return null
-
   return (
-    <section aria-labelledby="documents-shelf-heading" className="flex shrink-0 flex-col">
+    <section aria-labelledby="documents-shelf-heading" className="mt-3 flex shrink-0 flex-col">
       <PanelHeader
         title={
           <h2
             id="documents-shelf-heading"
             className="font-display text-[11px] font-semibold uppercase tracking-wider text-text-muted"
           >
-            Documents
+            Starred documents
           </h2>
         }
-      />
+      >
+        <HoverCard
+          trigger={
+            <PanelHeaderIconButton onClick={openLibrary} aria-label="Browse documents">
+              <path d="M4 5.5A1.5 1.5 0 0 1 5.5 4H9v16H5.5A1.5 1.5 0 0 1 4 18.5Z" />
+              <path d="M9 4h4.5A1.5 1.5 0 0 1 15 5.5v13a1.5 1.5 0 0 1-1.5 1.5H9" />
+              <path d="m17.4 6.6 2.2 12.1" />
+            </PanelHeaderIconButton>
+          }
+        >
+          Your documents, by title (⌘K).
+        </HoverCard>
+      </PanelHeader>
       {/* Sessions and documents share the rail's one scroll owner, so this list never nests another
           scrollbar or pushes the pinned utilities off the bottom. */}
-      <ul className="flex flex-col px-1.5 pb-2">
-        {starred.map((rel) => {
-          const hit = meta[rel]
-          const filenameTitle = docTitle({ name: basename(rel) })
-          // A path with no Library entry still gets a row: the filename, cleaned up the same way an
-          // un-frontmattered document's is, so a starred thing never disappears on a failed lookup.
-          const title = hit?.title ?? filenameTitle
-          const path = hit?.path ?? (projectPath ? `${projectPath}/${rel}` : rel)
-          const available = !!hit
-          const active = available && activeSurfaceId === path
-          const trigger = (
-            <DocumentButton
-              path={path}
-              label={title}
-              active={active}
-              available={available}
-              onOpen={openFile}
-            />
-          )
-          const expanded = menu?.rel === rel
-          return (
-            <li
-              key={rel}
-              onContextMenu={(e) => {
-                e.preventDefault()
-                const row = e.currentTarget
-                setMenu({
-                  rel,
-                  path,
-                  title,
-                  available,
-                  trigger: row.querySelector<HTMLButtonElement>('[data-document-open]'),
-                  x: e.clientX,
-                  y: e.clientY,
-                })
-              }}
-              className={`group flex items-center gap-1 rounded-md pr-1 transition-colors hover:bg-surface focus-within:bg-surface ${
-                active || expanded ? 'bg-surface' : ''
-              }`}
-            >
-              {/* A path is useful only when it disambiguates the title. Showing `CHANGELOG.md` when
-                  the row already says CHANGELOG is repetition, not disclosure. */}
-              {pathAddsContext(rel, title, filenameTitle) ? (
-                <HoverCard trigger={trigger} disabled={!!menu || !!deleteTarget}>
-                  <span className="break-all font-mono text-[11px]">{rel}</span>
-                </HoverCard>
-              ) : (
-                trigger
-              )}
-              <button
-                type="button"
-                aria-label={`Actions for ${title}`}
-                aria-haspopup="menu"
-                aria-expanded={expanded}
-                onClick={(e) => {
-                  e.stopPropagation()
-                  const rect = e.currentTarget.getBoundingClientRect()
+      {starred.length > 0 && (
+        <ul className="flex flex-col px-1.5 pb-2">
+          {starred.map((rel) => {
+            const hit = meta[rel]
+            const filenameTitle = docTitle({ name: basename(rel) })
+            // A path with no Library entry still gets a row: the filename, cleaned up the same way an
+            // un-frontmattered document's is, so a starred thing never disappears on a failed lookup.
+            const title = hit?.title ?? filenameTitle
+            const path = hit?.path ?? (projectPath ? `${projectPath}/${rel}` : rel)
+            const available = !!hit
+            const active = available && activeSurfaceId === path
+            const trigger = (
+              <DocumentButton
+                path={path}
+                label={title}
+                active={active}
+                available={available}
+                onOpen={openFile}
+              />
+            )
+            const expanded = menu?.rel === rel
+            return (
+              <li
+                key={rel}
+                onContextMenu={(e) => {
+                  e.preventDefault()
+                  const row = e.currentTarget
                   setMenu({
                     rel,
                     path,
                     title,
                     available,
-                    trigger: e.currentTarget,
-                    x: rect.right - 176,
-                    y: rect.bottom + 4,
+                    trigger: row.querySelector<HTMLButtonElement>('[data-document-open]'),
+                    x: e.clientX,
+                    y: e.clientY,
                   })
                 }}
-                className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-text-muted opacity-0 outline-none transition group-hover:opacity-100 group-focus-within:opacity-100 hover:bg-text/[0.08] hover:text-text focus-visible:bg-text/[0.08] focus-visible:text-text ${
-                  expanded ? 'bg-text/[0.08] text-text opacity-100' : ''
+                className={`group flex items-center gap-1 rounded-md pr-1 transition-colors hover:bg-surface focus-within:bg-surface ${
+                  active || expanded ? 'bg-surface' : ''
                 }`}
               >
-                <svg
-                  width="14"
-                  height="14"
-                  viewBox="0 0 24 24"
-                  fill="currentColor"
-                  aria-hidden
+                {/* A path is useful only when it disambiguates the title. Showing `CHANGELOG.md` when
+                    the row already says CHANGELOG is repetition, not disclosure. */}
+                {pathAddsContext(rel, title, filenameTitle) ? (
+                  <HoverCard trigger={trigger} disabled={!!menu || !!deleteTarget}>
+                    <span className="break-all font-mono text-[11px]">{rel}</span>
+                  </HoverCard>
+                ) : (
+                  trigger
+                )}
+                <button
+                  type="button"
+                  aria-label={`Actions for ${title}`}
+                  aria-haspopup="menu"
+                  aria-expanded={expanded}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    const rect = e.currentTarget.getBoundingClientRect()
+                    setMenu({
+                      rel,
+                      path,
+                      title,
+                      available,
+                      trigger: e.currentTarget,
+                      x: rect.right - 176,
+                      y: rect.bottom + 4,
+                    })
+                  }}
+                  className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-text-muted opacity-0 outline-none transition group-hover:opacity-100 group-focus-within:opacity-100 hover:bg-text/[0.08] hover:text-text focus-visible:bg-text/[0.08] focus-visible:text-text ${
+                    expanded ? 'bg-text/[0.08] text-text opacity-100' : ''
+                  }`}
                 >
-                  <circle cx="5" cy="12" r="1.5" />
-                  <circle cx="12" cy="12" r="1.5" />
-                  <circle cx="19" cy="12" r="1.5" />
-                </svg>
-              </button>
-            </li>
-          )
-        })}
-      </ul>
+                  <svg
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="currentColor"
+                    aria-hidden
+                  >
+                    <circle cx="5" cy="12" r="1.5" />
+                    <circle cx="12" cy="12" r="1.5" />
+                    <circle cx="19" cy="12" r="1.5" />
+                  </svg>
+                </button>
+              </li>
+            )
+          })}
+        </ul>
+      )}
 
       {lastMenu.current && (
         <DocumentContextMenu

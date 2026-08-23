@@ -644,6 +644,30 @@ describe('Codex turn-scoped steering', () => {
 })
 
 describe('Codex live plan mapping', () => {
+  it('rereads account windows on demand after a login', async () => {
+    const child = new FakeCodexProcess()
+    spawnMock.mockReturnValue(child)
+    const events: EngineEvent[] = []
+    const session = startCodexSession((event) => events.push(event), {
+      sessionId: 'koda-usage-refresh',
+      cwd: '/tmp/project',
+      binaryPath: '/fake/codex',
+      decide: async () => ({ kind: 'allow' }),
+    })
+    try {
+      await vi.waitFor(() => expect(events.some((event) => event.type === 'SessionStarted')).toBe(true))
+      await vi.waitFor(() =>
+        expect(child.requests.filter((request) => request.method === 'account/rateLimits/read')).toHaveLength(1),
+      )
+      session.refreshAccountUsage?.()
+      await vi.waitFor(() =>
+        expect(child.requests.filter((request) => request.method === 'account/rateLimits/read')).toHaveLength(2),
+      )
+    } finally {
+      await session.dispose()
+    }
+  })
+
   it('normalizes app-server plan rows for Koda\'s existing task list', () => {
     expect(
       codexPlanSteps([

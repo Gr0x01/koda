@@ -163,6 +163,16 @@ export function IconChip() {
   )
 }
 // lucide triangle-alert — the shared warning glyph (memory grown heavy, …).
+/** Settings → Usage: a bar meter — the ledger, not a gauge. */
+export function IconMeter() {
+  return (
+    <Svg>
+      <path d="M4 20V10M9.5 20V4M15 20v-8M20.5 20v-5" />
+      <path d="M3 20h18" />
+    </Svg>
+  )
+}
+
 export function IconWarning() {
   return (
     <Svg>

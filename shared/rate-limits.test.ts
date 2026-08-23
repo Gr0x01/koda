@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { RateLimitInfo } from './ipc'
-import { liveRateLimitWindows, rateLimitBand, reconcileRateLimitWindows } from './rate-limits'
+import { liveRateLimitWindows, rateLimitBand, reconcileRateLimitWindows, shortResetCountdown } from './rate-limits'
 
 function window(overrides: Partial<RateLimitInfo> = {}): RateLimitInfo {
   return {
@@ -77,5 +77,18 @@ describe('rate-limit reconciler', () => {
       ),
     ).toHaveProperty('live')
     expect(liveRateLimitWindows({ expired: window({ resetsAt: 100 }) }, 100)).toEqual({})
+  })
+})
+
+describe('shortResetCountdown', () => {
+  const now = Math.floor(Date.parse('2026-08-20T12:00:00.000Z') / 1000)
+  it('renders minutes under an hour, hours+minutes under a day, weekday past that', () => {
+    expect(shortResetCountdown(now + 38 * 60, now)).toBe('38m')
+    expect(shortResetCountdown(now + (3 * 60 + 12) * 60, now)).toBe('3h 12m')
+    expect(shortResetCountdown(now + 5 * 24 * 3600, now)).toMatch(/^[A-Z][a-z]{2}/)
+  })
+  it('never renders a countdown for an elapsed reset', () => {
+    expect(shortResetCountdown(now, now)).toBeNull()
+    expect(shortResetCountdown(now - 5, now)).toBeNull()
   })
 })

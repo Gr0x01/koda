@@ -1,4 +1,4 @@
-import { _electron as electron, type ElectronApplication } from '@playwright/test'
+import { _electron as electron, type ElectronApplication, type Page } from '@playwright/test'
 import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -123,4 +123,20 @@ export async function launchKoda(opts: LaunchKodaOptions = {}): Promise<Electron
     chromiumSandbox: process.platform === 'linux',
     env: launchEnv(userDataDir, opts.realAccounts === true),
   })
+}
+
+/**
+ * Open a project file by name through the Library, the one search door (⌘K/⌘P). Matching the row by
+ * the filename reliably lands on its Project files row (document rows are titled, not filenamed),
+ * and double-click opens through the same `openFile` seam every overlay caller uses.
+ */
+export async function openFileViaLibrary(win: Page, filename: string): Promise<void> {
+  await win.keyboard.press('ControlOrMeta+p')
+  const find = win.getByLabel('Find a document or a file')
+  await find.waitFor({ timeout: 20_000 })
+  await find.fill(filename)
+  const escaped = filename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const row = win.getByRole('option', { name: new RegExp(escaped) }).first()
+  await row.waitFor({ timeout: 20_000 })
+  await row.dblclick()
 }

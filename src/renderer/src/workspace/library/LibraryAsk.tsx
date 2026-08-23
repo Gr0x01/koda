@@ -58,10 +58,7 @@ export const askWithFreshHotStore: AskFn = async (req, isCurrent = () => true) =
     const snapshotStartedAt = Date.now()
     const blob = workspace.persistBlob()
     try {
-      if (await window.koda.saveSessions(blob)) {
-        useWorkspace.getState().completeDocPinMigration(blob)
-        hotStoreSavedAt = snapshotStartedAt
-      }
+      if (await window.koda.saveSessions(blob)) hotStoreSavedAt = snapshotStartedAt
     } catch {
       // The ask may still use readable documents/chats, but main will mark the session corpus partial.
     }

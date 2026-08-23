@@ -156,6 +156,38 @@ export function countLabel(n: number, searching: boolean, truncated: boolean): s
 }
 
 /**
+ * The header subtitle for the merged search. Browsing promises the files are in here too, so the user
+ * who assumed a filename would work never has to guess a second box. A search states the split with the
+ * documents count first, because documents ranking above files is a guarantee of this surface, not a
+ * scoring accident — the count reads that promise back. `fileCount` is null while the file scan is
+ * still running or does not apply (a kind filter, or a query too short to walk the tree), so the
+ * subtitle names only what it can currently stand behind.
+ */
+export function librarySubtitle(
+  searching: boolean,
+  docCount: number,
+  docTruncated: boolean,
+  fileCount: number | null,
+  fileTruncated: boolean,
+): string {
+  const docs = `${docCount}${docTruncated ? '+' : ''} ${docCount === 1 ? 'document' : 'documents'}`
+  if (!searching) return `${docs}, and every file in this project`
+  if (fileCount === null) return docs
+  const files = `${fileCount}${fileTruncated ? '+' : ''} ${fileCount === 1 ? 'file' : 'files'}`
+  return `${docs} · ${files}`
+}
+
+/**
+ * Where a project file sits, as a phrase rather than a path fragment — the parent folders when it is
+ * nested, or a plain sentence when it sits at the root. A file row and its preview say the file's
+ * location this way so the files section never reads as `ls` output beside the documents above it.
+ */
+export function fileContext(rel: string): string {
+  const cut = rel.lastIndexOf('/')
+  return cut > 0 ? rel.slice(0, cut) : 'at the top of this project'
+}
+
+/**
  * What the ask says when the engine this chat runs on REFUSES it (`ASK_ENGINE_REFUSAL`, thrown by
  * `engineAskRunner` before anything spawns). Main names the engine and this owns the sentence, the
  * same split `followRefusalCopy` uses.

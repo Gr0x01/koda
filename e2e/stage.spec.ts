@@ -2,7 +2,7 @@ import { test, expect } from '@playwright/test'
 import { mkdtempSync, realpathSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { launchKoda } from './support/koda'
+import { launchKoda, openFileViaLibrary } from './support/koda'
 
 /**
  * Runtime confirmation for the STAGE dock: boots the BUILT app into a throwaway project and walks the
@@ -36,27 +36,17 @@ test('stage: away until a file lands on it → two co-open tabs → switch → c
     await win.getByRole('button', { name: 'New chat' }).waitFor({ timeout: 20_000 })
     await expect(win.getByRole('button', { name: addControl })).toHaveCount(0)
 
-    // Files moved out of the rail, so the Find overlay (⌘P) is the file-opening path now. Typing the
-    // name and taking the first hit is what a user does; it exercises the same `openFile` seam the
-    // tree used to call.
-    await win.keyboard.press('Meta+p')
-    const find = win.getByPlaceholder('Find in this project')
-    await find.waitFor({ timeout: 20_000 })
-    await find.fill('app.ts')
-    await win.getByRole('button', { name: 'app.ts', exact: true }).first().waitFor({ timeout: 20_000 })
-    await win.keyboard.press('Enter')
+    // Files moved out of the rail, so the Library (⌘P/⌘K) is the file-opening path now. Typing the
+    // name and taking its Project files row is what a user does; it exercises the same `openFile`
+    // seam the tree used to call.
+    await openFileViaLibrary(win, 'app.ts')
     const tab = (name: string) => win.locator(`[data-staged][title="${join(project, name)}"]`)
     await expect(tab('app.ts')).toHaveAttribute('data-staged', 'true', { timeout: 20_000 })
     // Monaco actually rendered the file body on the stage.
     await expect(win.locator('.monaco-editor').first()).toBeVisible({ timeout: 20_000 })
 
     // A second file joins as its OWN tab: the first stays open beside it (the co-open contract).
-    await win.keyboard.press('Meta+p')
-    const find2 = win.getByPlaceholder('Find in this project')
-    await find2.waitFor({ timeout: 20_000 })
-    await find2.fill('style.css')
-    await win.getByRole('button', { name: 'style.css', exact: true }).first().waitFor({ timeout: 20_000 })
-    await win.keyboard.press('Enter')
+    await openFileViaLibrary(win, 'style.css')
     await expect(tab('style.css')).toHaveAttribute('data-staged', 'true')
     await expect(tab('app.ts')).toHaveAttribute('data-staged', 'false')
 
@@ -88,12 +78,7 @@ test('the picker stages the terminal and the changes as tabs, like any file', as
     // is the readiness gate: the old tree click waited for the workspace implicitly, a global shortcut
     // does not, and firing it at a half-mounted window silently does nothing.
     await win.getByRole('button', { name: 'New chat' }).waitFor({ timeout: 20_000 })
-    await win.keyboard.press('Meta+p')
-    const pick = win.getByPlaceholder('Find in this project')
-    await pick.waitFor({ timeout: 20_000 })
-    await pick.fill('app.ts')
-    await win.getByRole('button', { name: 'app.ts', exact: true }).first().waitFor({ timeout: 20_000 })
-    await win.keyboard.press('Enter')
+    await openFileViaLibrary(win, 'app.ts')
     await win.getByRole('button', { name: addControl }).waitFor({ timeout: 20_000 })
 
     // Terminal: a tab on the stage, not a shelf under it.

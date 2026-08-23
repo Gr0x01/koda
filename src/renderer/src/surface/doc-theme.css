@@ -395,3 +395,80 @@
 .milkdown .ProseMirror .koda-toggle-body > .koda-toggle-summary + * {
   margin-top: 0.25rem;
 }
+
+/* Smart artifact card — a portable relative link to a project-local artifact (e.g. an interactive
+ * .html view), presented as a card. This styles a paragraph the decoration plugin recognized; the
+ * markdown on disk is still a plain `[title](sibling.html)` link, so the file stays portable and the
+ * card never enters the document model. See artifact-card.ts, [[crepe-doc-extensibility]]. */
+.milkdown .ProseMirror p.koda-artifact-card {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin: 0.75rem 0;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--koda-border);
+  border-radius: 10px;
+  background: var(--koda-surface);
+  transition:
+    border-color 0.12s ease,
+    background-color 0.12s ease;
+}
+.milkdown .ProseMirror p.koda-artifact-card:hover {
+  border-color: color-mix(in srgb, var(--koda-accent) 40%, var(--koda-border));
+  background: color-mix(in srgb, var(--koda-accent) 5%, var(--koda-surface));
+}
+/* A small document glyph so the card reads as an artifact at a glance. */
+.milkdown .ProseMirror p.koda-artifact-card::before {
+  content: '';
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  background-color: var(--koda-accent);
+  -webkit-mask: var(--koda-artifact-glyph) center / contain no-repeat;
+  mask: var(--koda-artifact-glyph) center / contain no-repeat;
+}
+/* The link becomes the card title: heavier, quiet until hover, and it grows to fill the row. */
+.milkdown .ProseMirror p.koda-artifact-card > a {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+  color: var(--koda-text);
+  text-decoration: none;
+}
+.milkdown .ProseMirror p.koda-artifact-card:hover > a {
+  color: var(--koda-accent);
+}
+/* Actions live in a decoration widget, not the model — inert to the editor, revealed on hover/focus. */
+.milkdown .ProseMirror .koda-artifact-card-actions {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.15rem;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.milkdown .ProseMirror p.koda-artifact-card:hover .koda-artifact-card-actions,
+.milkdown .ProseMirror .koda-artifact-card-actions:focus-within {
+  opacity: 1;
+}
+.milkdown .ProseMirror .koda-artifact-card-action {
+  display: grid;
+  place-items: center;
+  width: 1.6rem;
+  height: 1.6rem;
+  border-radius: 7px;
+  color: var(--koda-text-muted);
+  transition:
+    color 0.12s ease,
+    background-color 0.12s ease;
+}
+.milkdown .ProseMirror .koda-artifact-card-action:hover {
+  color: var(--koda-text);
+  background: color-mix(in srgb, var(--koda-text) 7%, transparent);
+}
+.milkdown {
+  --koda-artifact-glyph: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z'/%3E%3Cpath d='M14 2v6h6'/%3E%3C/svg%3E");
+}

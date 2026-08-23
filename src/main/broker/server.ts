@@ -16,11 +16,17 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { CallToolRequestSchema, isInitializeRequest, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http'
 import { randomUUID, timingSafeEqual } from 'node:crypto'
-import { DocKindSchema, type ToolDecision } from '@shared/ipc'
+import {
+  DocKindSchema,
+  type CreateInteractiveRequest,
+  type CreateInteractiveResult,
+  type ToolDecision,
+} from '@shared/ipc'
 import type { Checkpoint } from '../safety-git/checkpoint'
 import { REREAD_AFTER_RESTORE } from '../safety-git/restore-notice'
 import { CLIS, RUNTIMES, RUNTIME_IDS, CLI_IDS } from '../runtime/registry'
 import type { EnsureToolResult } from '../runtime/provision'
+import type { CreateDocumentArgs, CreatedDocument, StarredDocument } from '../doc-commands'
 import type { KeepDocumentArgs, KeptDocument } from '../keep-document'
 import { log } from '../logger'
 
@@ -70,6 +76,27 @@ export type PresentFileFn = (
  *  which is where the frontmatter and the session's own id as provenance come from. */
 export type KeepDocumentFn = (sessionId: string, args: KeepDocumentArgs) => Promise<KeptDocument>
 
+/** Star or unstar a project document (typed-documents plan, Slice 0 decision 3). The same command the
+ *  Library and the Stage bar run: the shelf is main-owned project state, so the agent changes it by
+ *  asking for the command rather than by imitating a UI mutation it cannot reach. */
+export type StarDocumentFn = (
+  sessionId: string,
+  args: { path: string; starred: boolean },
+) => Promise<StarredDocument>
+
+/** Create a document in the format the ask needs (typed-documents plan, Slice 1). The broker drives;
+ *  `doc-commands.createDocument` owns containment, naming, the no-clobber write and the metadata block
+ *  both formats are born with. The session id becomes the document's provenance. */
+export type CreateDocumentFn = (sessionId: string, args: CreateDocumentArgs) => Promise<CreatedDocument>
+
+/** Turn a passage of an existing document into a self-contained interactive HTML view beside it. The
+ *  same command the Stage action runs. It writes only the new artifact — the link back into the source
+ *  belongs to whoever asked, so a half-done write can never leave a link to a file that never existed. */
+export type CreateInteractiveFn = (
+  sessionId: string,
+  args: CreateInteractiveRequest,
+) => Promise<CreateInteractiveResult>
+
 /** Mini-app lifecycle capability (mini-apps-plan.md): install/start/stop/status for the project's mini
  *  apps. The broker drives; the manager resolves session → project → app dir (containment) and the
  *  supervisor (mini-apps.ts) owns the processes. The verbs are advertised only when register() is told
@@ -100,10 +127,34 @@ const TOOL_APP_START = 'app_start'
 const TOOL_APP_STOP = 'app_stop'
 const TOOL_APP_STATUS = 'app_status'
 const TOOL_KEEP_DOCUMENT = 'keep_document'
+const TOOL_STAR_DOCUMENT = 'star_document'
+const TOOL_CREATE_DOCUMENT = 'create_document'
+const TOOL_CREATE_INTERACTIVE = 'create_interactive'
 /** The mini-app lifecycle verbs — advertised only when the mini-apps flag is on (register() opts). */
 const MINI_APP_TOOLS = new Set([TOOL_APP_INSTALL, TOOL_APP_START, TOOL_APP_STOP, TOOL_APP_STATUS])
 /** The env var the engine expands for the bearer token (kept out of argv). */
 export const BROKER_TOKEN_ENV = 'KODA_BROKER_TOKEN'
+
+/**
+ * The routing contract, in front of BOTH engines on every turn as create_document's tool description,
+ * for the same reason keep_document's polarity is: a playbook has to be routed to be read, and the one
+ * decision this tool exists to get right is made before the first word is written. It routes by the
+ * reader's FEEDBACK LOOP, never by the noun in the request — "report", "plan" and "comparison" are all
+ * sometimes Markdown and sometimes HTML. It also names the two asks that are NOT a document (a mini
+ * app, an office handoff Koda cannot produce yet), so the agent does not force them into one.
+ *
+ * Exported so the routing assay can pin the four branches as a unit, without standing up the broker
+ * (routing-contract.test.ts). The description text is the contract — a change here is a change to what
+ * both engines route on.
+ */
+export const CREATE_DOCUMENT_GUIDANCE =
+  'Create a new document in the user\'s Documents/ folder, in the format the ask actually needs. Choose by what the reader will DO with it, never by the word they used. Writing, revising, citing, or maintaining something that has to stay editable and quotable → format "markdown". Comparing, inspecting, navigating, or interacting — a page with controls, a filterable table, a chart, a walkthrough — → format "html", one self-contained file whose own styles and scripts run inside Koda\'s sandbox (no external fonts, stylesheets, scripts, or network requests: inline everything). A recurring workflow with data that has to persist between uses is a mini app, NOT a document — do not force it into one here. Sending a file into a Word workflow, or freezing it for print or signature, is an office handoff Koda cannot produce yet: say so plainly instead of approximating it in another format. Koda writes the title, date, kind and provenance (frontmatter for Markdown, koda: meta tags for HTML) — you write the content. The name is deduped, never clobbered, and the result tells you the path it actually got.'
+
+/** create_interactive carries the SAME four-branch routing rule as create_document, restated for the
+ *  selection→view move, plus the boundary that it writes only the artifact and never the source.
+ *  Exported for the same routing assay. */
+export const CREATE_INTERACTIVE_GUIDANCE =
+  'Turn a passage of an existing document into a self-contained interactive HTML view filed beside it — the move for when part of a written document wants comparing, inspecting, navigating, or tuning rather than reading. Same routing rule as create_document: prose that is being written, revised, or cited stays Markdown; a recurring workflow with persistent data is a mini app, not a document; a Word or print handoff is not available yet, so say so. Pass the source document, the exact passage, and a name for the view. Koda writes ONE new file and returns its project-relative path — it does not touch the source document, so if the user wants the narrative to point at the view, add an ordinary relative Markdown link yourself.'
 
 interface CapabilityDirectoryEntry {
   id: string
@@ -150,9 +201,10 @@ const CAPABILITY_DIRECTORY: CapabilityDirectoryDefinition[] = [
   {
     id: 'documents',
     label: 'Documents',
-    outcome: 'Keep a conversation as a durable Koda document when the user explicitly asks.',
-    tools: [TOOL_KEEP_DOCUMENT],
-    note: 'Never create a kept document on the agent\'s own initiative.',
+    outcome:
+      'Create a document in the format the ask needs — Markdown to write and revise, self-contained HTML to compare, inspect, navigate, or interact — turn a passage of one into an interactive view beside it, keep a conversation as a durable document when the user explicitly asks, and put a document on (or take it off) this project\'s shelf.',
+    tools: [TOOL_CREATE_DOCUMENT, TOOL_CREATE_INTERACTIVE, TOOL_KEEP_DOCUMENT, TOOL_STAR_DOCUMENT],
+    note: 'A recurring workflow with data that persists is a mini app, not a document. Never create a kept document on the agent\'s own initiative.',
   },
   {
     id: 'mini-apps',
@@ -190,6 +242,17 @@ interface SessionEntry {
  *  engine's MCP client (Node fetch/undici) ~5-min idle body timeout, which any received byte resets. */
 const STANDALONE_KEEPALIVE_MS = 25_000
 
+/**
+ * Per-server MCP idle timeout for koda_broker (ms), set on the config entry (mcpConfig). The engine
+ * now aborts an idle MCP tool call after ~1025s by default — verbatim from its own error: `MCP server
+ * "koda_broker" tool "approve" sent no response or progress for 1025s; aborting. … set a per-server
+ * "timeout" (ms) to allow longer silent runs for just this server; otherwise set
+ * CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT (ms) globally (0 disables).` A forced ask (destructive-git,
+ * self-protection) legitimately waits on a human who may be away overnight or a weekend, and the
+ * progress heartbeat no longer reliably resets that clock, so hold this server a full day.
+ */
+const BROKER_APPROVE_IDLE_TIMEOUT_MS = 86_400_000
+
 /** After a dev server is confirmed serving, give the just-pointed preview iframe this long to navigate
  *  and paint its first frame before we auto-screenshot it for the agent. Long enough for a typical SPA
  *  to render something; a slow first-hit compile may still capture a spinner (honest — the agent can
@@ -225,6 +288,13 @@ export class PermissionBroker {
     private readonly keepDocument: KeepDocumentFn,
     /** Explicit presentation: show an existing workspace file on every Koda control head. */
     private readonly presentFile: PresentFileFn,
+    /** Star/unstar a project document — the shelf command the UI runs, reached from the conversation. */
+    private readonly starDocument: StarDocumentFn,
+    /** Create a document in the format the ask needs, born with the same metadata block Koda's own
+     *  creation route writes. Closes the ledger gap where an agent-made document arrived untitled. */
+    private readonly createDocument: CreateDocumentFn,
+    /** Turn a passage of a document into an interactive HTML view beside it (writes only the artifact). */
+    private readonly createInteractive: CreateInteractiveFn,
   ) {}
 
   /**
@@ -483,6 +553,94 @@ export class PermissionBroker {
             additionalProperties: false,
           },
         },
+        {
+          name: TOOL_STAR_DOCUMENT,
+          description:
+            "Put a document on this project's shelf — the starred shortcuts in Koda's sidebar — or take it off again. The shelf is what the user keeps coming back to, so star the document they say matters (including one you just created for them, when they ask for it to be kept handy), and unstar when they say they are done with it. Pass a project-relative path. Starring changes no file and is reversible in one call.",
+          inputSchema: {
+            type: 'object',
+            properties: {
+              path: {
+                type: 'string',
+                description: 'Project-relative path to the document, e.g. "Documents/decisions/Branches.md".',
+              },
+              starred: {
+                type: 'boolean',
+                description: 'true puts it on the shelf, false takes it off.',
+              },
+            },
+            required: ['path', 'starred'],
+            additionalProperties: false,
+          },
+        },
+        {
+          name: TOOL_CREATE_DOCUMENT,
+          // The routing contract lives in CREATE_DOCUMENT_GUIDANCE (above), in front of both engines on
+          // every turn. It is exported so the routing assay can pin its four branches as a unit.
+          description: CREATE_DOCUMENT_GUIDANCE,
+          inputSchema: {
+            type: 'object',
+            properties: {
+              format: {
+                type: 'string',
+                enum: ['markdown', 'html'],
+                description:
+                  'markdown for writing/revising/citing; html for comparing/inspecting/navigating/interacting.',
+              },
+              title: {
+                type: 'string',
+                description: "The document's name — it becomes both the filename and the title on the page.",
+              },
+              kind: {
+                type: 'string',
+                enum: [...DocKindSchema.options],
+                description:
+                  'What the document is FOR, not where it lives — "note" is the honest catch-all. Omit to take the destination folder\'s default.',
+              },
+              description: {
+                type: 'string',
+                description:
+                  'One honest sentence saying what this document is for — the line shown under the title when the user is looking for something.',
+              },
+              body: {
+                type: 'string',
+                description:
+                  'The content: markdown source for format "markdown", or the body markup for format "html". Omit either block Koda writes — no frontmatter, no <html>/<head> wrapper.',
+              },
+              folder: {
+                type: 'string',
+                description:
+                  'Optional project-relative topic folder under Documents/, e.g. "Documents/decisions". Created if it does not exist. Omit to file at the top of Documents/.',
+              },
+            },
+            required: ['format', 'title'],
+            additionalProperties: false,
+          },
+        },
+        {
+          name: TOOL_CREATE_INTERACTIVE,
+          description: CREATE_INTERACTIVE_GUIDANCE,
+          inputSchema: {
+            type: 'object',
+            properties: {
+              source_path: {
+                type: 'string',
+                description:
+                  'Project-relative path of the document the passage came from, e.g. "Documents/plans/Launch.md".',
+              },
+              selection: {
+                type: 'string',
+                description: 'The passage itself — it becomes the new view\'s seed content.',
+              },
+              title: {
+                type: 'string',
+                description: "The view's name — it becomes both the filename and the title on the page.",
+              },
+            },
+            required: ['source_path', 'selection', 'title'],
+            additionalProperties: false,
+          },
+        },
       ].filter(
         (t) => (includeApprove || t.name !== TOOL_APPROVE) && (includeMiniApps || !MINI_APP_TOOLS.has(t.name)),
       )
@@ -639,6 +797,63 @@ export class PermissionBroker {
           return toolError(err)
         }
       }
+      if (req.params.name === TOOL_STAR_DOCUMENT) {
+        // Containment and existence are checked in doc-commands.ts, next to the shelf it writes, so a
+        // bad path comes back as a sentence the agent can act on rather than a silent no-op.
+        if (typeof args.starred !== 'boolean') {
+          return toolError(new Error('starred is required — true puts the document on the shelf, false takes it off'))
+        }
+        try {
+          const result = await this.starDocument(sessionId, {
+            path: String(args.path ?? ''),
+            starred: args.starred,
+          })
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] }
+        } catch (err) {
+          return toolError(err)
+        }
+      }
+      if (req.params.name === TOOL_CREATE_DOCUMENT) {
+        // Format, title, kind and containment are all validated in doc-commands.ts, beside the write
+        // they guard, so a refusal is one sentence naming the rule rather than a schema rejection the
+        // agent has to guess at.
+        try {
+          const created = await this.createDocument(sessionId, {
+            format: String(args.format ?? ''),
+            title: String(args.title ?? ''),
+            ...(typeof args.kind === 'string' ? { kind: args.kind } : {}),
+            ...(typeof args.description === 'string' ? { description: args.description } : {}),
+            ...(typeof args.body === 'string' ? { body: args.body } : {}),
+            ...(typeof args.folder === 'string' ? { folder: args.folder } : {}),
+          })
+          // The completion message names what was created AND opens it on the Stage (typed-documents
+          // plan, "Create the right artifact"). It rides the same read-only present_file receipt — path
+          // only, no body, no model turn — so a created doc lands on stage without a second mechanism.
+          await this.presentOnStage(sessionId, created.path)
+          return { content: [{ type: 'text', text: JSON.stringify(created) }] }
+        } catch (err) {
+          return toolError(err)
+        }
+      }
+      if (req.params.name === TOOL_CREATE_INTERACTIVE) {
+        try {
+          const result = await this.createInteractive(sessionId, {
+            sourcePath: String(args.source_path ?? ''),
+            selection: String(args.selection ?? ''),
+            title: String(args.title ?? ''),
+          })
+          // The command answers refusals as a RESULT because two adapters render them differently. For
+          // the agent, a refusal has to be an error it can act on — a success-shaped `ok:false` reads
+          // as "done" and the next turn tells the user about a file that does not exist.
+          if (!result.ok) return toolError(new Error(result.reason))
+          // Open the new HTML view on the Stage beside its source, through the same read-only receipt
+          // present_file uses (typed-documents plan, "Turn part of a document into a richer view").
+          await this.presentOnStage(sessionId, result.htmlPath)
+          return { content: [{ type: 'text', text: JSON.stringify(result) }] }
+        } catch (err) {
+          return toolError(err)
+        }
+      }
       if (MINI_APP_TOOLS.has(req.params.name)) {
         // Defense in depth: an unadvertised verb must also be uncallable (a session registered with the
         // flag off never reaches the supervisor, even if the agent guesses the tool name).
@@ -675,12 +890,21 @@ export class PermissionBroker {
       }
 
       // Default: the permission-prompt-tool `approve` (the engine consults it before every tool call).
+      // No progressToken means withApprovalHeartbeat above is a no-op (nothing to address a ping to), so
+      // it cannot hold the engine's MCP idle-abort off — the failure that stranded two overnight forced
+      // asks after ~1025s. The per-server `timeout` in mcpConfig is the real hold now; log the missing
+      // token at warn so the next engine bump that drops it shows up in the dogfood log rather than as a
+      // silently bricked session.
+      if (req.params._meta?.progressToken === undefined)
+        log.warn('broker', 'approve call carried no progressToken — heartbeat is a no-op; relying on the per-server MCP timeout', { sessionId })
       const approve: ApproveRequest = {
         toolName: String(args.tool_name ?? ''),
         input: args.input,
         toolUseId: String(args.tool_use_id ?? ''),
       }
-      const decision = await this.decide(sessionId, approve)
+      // Thread the request's AbortSignal so the gate cleans the slot the instant the engine cancels its
+      // own `approve` (an idle-abort that DOES notify, or a dead request stream) while the user decides.
+      const decision = await this.decide(sessionId, approve, extra.signal)
       return { content: [{ type: 'text', text: JSON.stringify(toWire(decision, approve.input)) }] }
       }),
     )
@@ -704,6 +928,20 @@ export class PermissionBroker {
       initializeChain: Promise.resolve(),
       keepalive,
     })
+  }
+
+  /**
+   * Open a just-created document on its session's Stage, through the SAME read-only present_file
+   * receipt path — path only, no body attachment, no model turn. The written file is the durable
+   * outcome; a presentation hiccup is logged and swallowed rather than allowed to fail a create that
+   * already put the document on disk.
+   */
+  private async presentOnStage(sessionId: string, path: string): Promise<void> {
+    try {
+      await this.presentFile(sessionId, { path })
+    } catch (err) {
+      log.warn('broker', 'present-on-create failed', err instanceof Error ? err.message : err)
+    }
   }
 
   /** Tear down a session's MCP server (engine ended). Safe if never registered. */
@@ -736,6 +974,9 @@ export class PermissionBroker {
           type: 'http',
           url: `http://127.0.0.1:${this.port}/mcp/${sessionId}`,
           headers: { Authorization: `Bearer \${${BROKER_TOKEN_ENV}}` },
+          // Hold the engine's idle-abort off for a pending approval however long the user is away (see
+          // BROKER_APPROVE_IDLE_TIMEOUT_MS — the field name is the engine's own idle-abort remedy).
+          timeout: BROKER_APPROVE_IDLE_TIMEOUT_MS,
         },
       },
     })

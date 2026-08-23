@@ -61,3 +61,17 @@ export function liveRateLimitWindows(
   if (!windows) return {}
   return Object.fromEntries(Object.entries(windows).filter(([, info]) => info.resetsAt > nowSec))
 }
+
+/**
+ * The chip-sized countdown to a window's reset: "38m" under an hour, "3h 12m" under a day, the
+ * weekday past that ("Mon"). Null once the reset has passed — the gauge treats an elapsed window
+ * as absent, so a stale countdown must never render beside it.
+ */
+export function shortResetCountdown(resetsAtSec: number, nowSec: number): string | null {
+  const diff = resetsAtSec - nowSec
+  if (diff <= 0) return null
+  const minutes = Math.ceil(diff / 60)
+  if (minutes < 60) return `${minutes}m`
+  if (minutes < 24 * 60) return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, '0')}m`
+  return new Date(resetsAtSec * 1000).toLocaleDateString(undefined, { weekday: 'short' })
+}

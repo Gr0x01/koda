@@ -19,6 +19,7 @@ import type {
   AuthProgress,
   CodexLoginProgress,
   ConnectState,
+  DocShelf,
   ProviderStatusEvent,
   UpdateStatus,
   RemoteActivity,
@@ -262,6 +263,7 @@ const api: KodaApi = {
     ipcRenderer.invoke(IpcChannels.previewStaticUrl, filePath),
   docAssetUrl: (docPath: string, ref: string) =>
     ipcRenderer.invoke(IpcChannels.docAssetUrl, { docPath, ref }),
+  docDocumentUrl: (path: string) => ipcRenderer.invoke(IpcChannels.docDocumentUrl, { path }),
   exportPdf: (args) => ipcRenderer.invoke(IpcChannels.docExportPdf, args),
   previewRestart: (sessionId, restart) =>
     ipcRenderer.invoke(IpcChannels.previewRestart, { sessionId, restart }),
@@ -292,6 +294,15 @@ const api: KodaApi = {
   listScratchImages: (args) => ipcRenderer.invoke(IpcChannels.scratchList, args),
   getDocMeta: (args) => ipcRenderer.invoke(IpcChannels.docmetaGet, args),
   setDocMeta: (args) => ipcRenderer.invoke(IpcChannels.docmetaSet, args),
+  listDocStars: () => ipcRenderer.invoke(IpcChannels.docShelfList),
+  setDocStar: (args) => ipcRenderer.invoke(IpcChannels.docShelfSet, args),
+  adoptLegacyDocStars: (args) => ipcRenderer.invoke(IpcChannels.docShelfAdoptLegacy, args),
+  onDocShelfChanged: (listener) => {
+    const handler = (_e: IpcRendererEvent, shelf: DocShelf): void => listener(shelf)
+    ipcRenderer.on(IpcChannels.docShelfChanged, handler)
+    return () => ipcRenderer.removeListener(IpcChannels.docShelfChanged, handler)
+  },
+  createInteractiveDocument: (args) => ipcRenderer.invoke(IpcChannels.docCreateInteractive, args),
   getMemoryWeight: () => ipcRenderer.invoke(IpcChannels.memoryWeight),
   getBackupStatus: () => ipcRenderer.invoke(IpcChannels.backupStatus),
   backupNow: () => ipcRenderer.invoke(IpcChannels.backupNow),
@@ -338,6 +349,7 @@ const api: KodaApi = {
   },
   getBillingState: () => ipcRenderer.invoke(IpcChannels.billingGetState),
   getUsageHistory: () => ipcRenderer.invoke(IpcChannels.usageGetHistory),
+  getUsageScanSummary: () => ipcRenderer.invoke(IpcChannels.usageGetScanSummary),
   saveApiKey: (key) => ipcRenderer.invoke(IpcChannels.billingSaveApiKey, key),
   removeApiKey: () => ipcRenderer.invoke(IpcChannels.billingRemoveApiKey),
   saveCodexApiKey: (key) => ipcRenderer.invoke(IpcChannels.billingSaveCodexApiKey, key),

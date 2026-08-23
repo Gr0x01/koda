@@ -37,9 +37,9 @@ beforeEach(() => {
   ;(globalThis as unknown as { window: unknown }).window = {
     koda: { gitDetect: async () => ({ isRepo: false }) },
   }
-  // Everything else here (openFile's recentFiles, openPreview, showEdit*) touches no bridge, so a bare
-  // store reset is the rest of the fixture.
-  useWorkspace.setState({ activeId: SESSION, editors: {}, recentFiles: [], stageExpanded: false })
+  // Everything else here (openFile, openPreview, showEdit*) touches no bridge, so a bare store reset is
+  // the rest of the fixture.
+  useWorkspace.setState({ activeId: SESSION, editors: {}, stageExpanded: false })
   useWorkspace.setState({
     sessions: {
       [SESSION]: { id: SESSION, cwd: '/p' } as SessionState,

@@ -373,6 +373,72 @@ export const UsageHistoryDaySchema = z.object({
 })
 export type UsageHistoryDay = z.infer<typeof UsageHistoryDaySchema>
 
+// ── Whole-subscription usage scan (usage-wave U1–U3) ─────────────────────────────
+// The scan reads the engine CLIs' own on-disk transcripts, so these buckets cover activity inside
+// AND outside Koda. They are the Usage page's single source; the tracker history above keeps
+// feeding rate windows and the status bar.
+
+/** `koda` = a session Koda itself drove; `outside` = the same subscription used anywhere else. */
+export const ScanOriginSchema = z.enum(['koda', 'outside'])
+export type ScanOrigin = z.infer<typeof ScanOriginSchema>
+
+/** Why a bucket's dollars exist (or don't). `tableRated` = the dated LiteLLM row, `published` = a
+ *  named rate in model-pricing.ts, `unpriced` = tokens count and dollars never render. */
+export const ScanCostSourceSchema = z.enum(['tableRated', 'published', 'unpriced'])
+export type ScanCostSource = z.infer<typeof ScanCostSourceSchema>
+
+/** One hour × engine × model × origin cell. `hourStartMs` is the epoch start of the hour the tokens
+ *  landed in; `day` is that instant's LOCAL calendar day (the scanner buckets in wall-clock terms).
+ *  `reasoning` is a subset of `output` — never add it on top. */
+export const PricedScanBucketSchema = z.object({
+  hourStartMs: z.number(),
+  day: z.string(),
+  engine: z.string(),
+  model: z.string(),
+  origin: ScanOriginSchema,
+  uncachedInput: z.number(),
+  cachedInput: z.number(),
+  cacheCreation: z.number(),
+  output: z.number(),
+  reasoning: z.number(),
+  records: z.number(),
+  /** Raw API-equivalent cost, or null when no rate is citable — null, not zero, so an unpriced
+   *  bucket can never sum into a total by accident. */
+  costUsd: z.number().nullable(),
+  cacheSavingsUsd: z.number().nullable(),
+  costSource: ScanCostSourceSchema,
+})
+export type PricedScanBucket = z.infer<typeof PricedScanBucketSchema>
+
+/** Per-root scan coverage, rendered as plain sentences when anything is short of ok. */
+export const ScanSourceSchema = z.object({
+  engine: z.string(),
+  root: z.string(),
+  status: z.enum(['ok', 'missing', 'partial']),
+  files: z.number(),
+  skippedFiles: z.number(),
+  malformedRecords: z.number(),
+})
+export type ScanSource = z.infer<typeof ScanSourceSchema>
+
+/** Where the rate table came from and how old it is — rendered beside any tableRated dollar. */
+export const RatesProvenanceSchema = z.object({
+  status: z.enum(['fresh', 'cached', 'unavailable']),
+  source: z.string(),
+  fetchedAt: z.number().nullable(),
+  knownModels: z.number(),
+})
+export type RatesProvenance = z.infer<typeof RatesProvenanceSchema>
+
+export const UsageScanSummarySchema = z.object({
+  buckets: z.array(PricedScanBucketSchema),
+  sources: z.array(ScanSourceSchema),
+  provenance: RatesProvenanceSchema,
+  scannedAt: z.number(),
+  scanMs: z.number(),
+})
+export type UsageScanSummary = z.infer<typeof UsageScanSummarySchema>
+
 /** Terminal reason paired with a pre-start rejection. New clients use EngineError.category to offer
  * retry; the companion TurnComplete keeps pre-category clients from leaving busy latched and explicitly
  * says no turn succeeded. There is no client-version negotiation yet, so those builds may still treat
@@ -1855,9 +1921,9 @@ export const PersistedSessionsSchema = z.object({
   /** The tab that was active at save time (restored on next launch). */
   activeId: z.string().nullable(),
   sessions: z.array(PersistedSessionSchema),
-  /** Project-wide document stars — normalized project-relative POSIX paths, in the user's order.
-   *  Paths only: titles and other metadata are re-read from `library:query`. Optional for back-compat
-   *  with stores written while stars still lived on individual sessions. */
+  /** LEGACY project-wide document stars. The shelf moved into the project itself
+   *  (`.koda/doc-shelf.json`, doc-commands.ts) so it survives the folder being moved; this field is
+   *  read once to migrate those paths and is emptied as soon as main acknowledges them. */
   starredDocs: z.array(z.string()).optional(),
   /** Paths already imported from legacy per-session `keptDocs` fields. Keeping this small migration
    *  ledger prevents a delayed archived-session read from resurrecting a document the user has since
@@ -2018,6 +2084,44 @@ export type ListDocsRequest = z.infer<typeof ListDocsRequestSchema>
  */
 export const DocKindSchema = z.enum(['plan', 'decision', 'research', 'guide', 'reference', 'note'])
 export type DocKind = z.infer<typeof DocKindSchema>
+
+/**
+ * What a document IS — its representation on disk. Orthogonal to `DocKind`, which stays exactly as it
+ * is: a plan can be Markdown, HTML, DOCX, or PDF, so "plan" describes purpose and "html" describes
+ * bytes. Closed on purpose; `text` is the honest fallback surface for everything Koda opens without a
+ * format-aware adapter, so an unrecognized extension degrades to the plain file surface instead of
+ * inventing a sixth format. Resolution lives in `shared/document-contract.ts`.
+ */
+export const DocFormatSchema = z.enum(['markdown', 'html', 'docx', 'pdf', 'text'])
+export type DocFormat = z.infer<typeof DocFormatSchema>
+
+/**
+ * What a format can honestly support, stated once so main, the desktop renderer, and the phone stop
+ * re-deriving it from extension regexes (three of which already disagree in this repository). This is
+ * STATIC format support, the same shape of truth as `shared/engine-capabilities.ts`: whether a given
+ * file, in a given session, actually reaches a surface that can do these things is separate runtime
+ * evidence and must never be inferred from this table.
+ *
+ * A capability claimed here is a promise the product keeps. Claiming an edit path a format cannot
+ * survive is how a user's file gets silently normalized on save.
+ */
+export const DocFormatCapabilitiesSchema = z.object({
+  /** Koda can extract this format's text for Library excerpts, search, and a context receipt. */
+  canRead: z.boolean(),
+  /** The Stage surface hands the user's visible selection to the agent. */
+  canSelect: z.boolean(),
+  /** A Koda editing surface may write this file in place without normalizing what it cannot model. */
+  canDirectEdit: z.boolean(),
+  /** A format-aware apply/revert handler exists, so an agent edit lands as a reviewable change on the
+   *  canonical file. False does NOT mean the agent may never touch the bytes — it means Koda has no
+   *  handler that can apply an edit to THIS format and honestly offer to revert it. */
+  canAgentApply: z.boolean(),
+  /** This format can act as the source of a derived export (Word, PDF). */
+  canExport: z.boolean(),
+  /** The surface executes the document's own scripts, and therefore needs the sandbox. */
+  canRunScripts: z.boolean(),
+})
+export type DocFormatCapabilities = z.infer<typeof DocFormatCapabilitiesSchema>
 
 export const ProjectDocSchema = z.object({
   /** Absolute, realpath-resolved path (the open/tab identity). */
@@ -2387,6 +2491,75 @@ export type DocMetaGetRequest = z.infer<typeof DocMetaGetRequestSchema>
 
 export const DocMetaSetRequestSchema = z.object({ path: z.string(), meta: DocMetaSchema })
 export type DocMetaSetRequest = z.infer<typeof DocMetaSetRequestSchema>
+
+// ── Project document shelf (.koda/doc-shelf.json) ─────────────────────────────
+//
+// Which documents this project keeps on its shelf. Main owns it and stores it INSIDE the project, so
+// the shelf travels with the folder — the userData session blob is keyed by a hash of the absolute
+// project path, so a project the user moved used to arrive with every star gone. Paths only; titles
+// and availability are always re-read from disk. See main/doc-commands.ts.
+
+/** The shelf file's whole content. Versioned so an older build refuses a newer shape rather than
+ *  silently rewriting it away. */
+export const DocShelfSchema = z.object({
+  version: z.literal(1),
+  /** Starred documents as project-relative POSIX paths, in the order the user starred them. */
+  starred: z.array(z.string()),
+  /** Paths that already had an explicit decision — starred, unstarred, adopted from a legacy source,
+   *  or carried through a Koda rename/delete. It is the migration tombstone: a legacy source that
+   *  becomes readable later (an archived chat, a stale localStorage key) must not get a second vote
+   *  and put back a document the user has since unstarred. */
+  settled: z.array(z.string()),
+})
+export type DocShelf = z.infer<typeof DocShelfSchema>
+
+/** docs:shelfSet — star or unstar exactly one document. `path` is project-relative (an absolute path
+ *  inside the project is accepted too); main validates containment and existence. */
+export const DocStarRequestSchema = z.object({ path: z.string(), starred: z.boolean() })
+export type DocStarRequest = z.infer<typeof DocStarRequestSchema>
+
+/** docs:shelfAdoptLegacy — hand main the star sources that predate the project shelf (the sessions
+ *  blob's `starredDocs`, the retired Documents pane's localStorage pins) together with the ledger of
+ *  paths already decided. Main merges what the ledger still allows and answers with the durable shelf;
+ *  only that answer permits the caller to delete its legacy copy. */
+export const LegacyDocStarsRequestSchema = z.object({
+  starred: z.array(z.string()),
+  settled: z.array(z.string()),
+})
+export type LegacyDocStarsRequest = z.infer<typeof LegacyDocStarsRequestSchema>
+
+/**
+ * docs:createInteractive — turn a passage of a document into a self-contained interactive HTML view.
+ *
+ * `sourcePath` is the document the passage came from, project-relative (an absolute path inside the
+ * project is accepted too); main validates containment and that a real file is behind it. `selection`
+ * is the passage itself, carried into the new artifact as its seed content. `title` names the artifact
+ * and becomes both its filename and its `<title>`.
+ *
+ * This request writes exactly ONE file. It inserts nothing into `sourcePath`: the ordinary relative
+ * link back into the narrative belongs to whoever asked, because an artifact command that also edits
+ * the user's prose can half-succeed into a link pointing at a file that was never created.
+ */
+export const CreateInteractiveRequestSchema = z.object({
+  sourcePath: z.string().min(1).max(4096),
+  selection: z.string().min(1).max(200_000),
+  title: z.string().min(1).max(200),
+})
+export type CreateInteractiveRequest = z.infer<typeof CreateInteractiveRequestSchema>
+
+/**
+ * The answer. A refusal is a RESULT, not an exception: a path that moved, a folder where a document
+ * was, or an empty selection are all ordinary and every surface has to render them as a sentence.
+ *
+ * `htmlPath` is PROJECT-RELATIVE and POSIX-separated — the form every other Koda document surface
+ * names a document by (`KeptDocument.path`, `ProjectDoc.rel`, the shelf), and the form a caller needs
+ * to compute an ordinary relative markdown link from the source document to the artifact.
+ */
+export const CreateInteractiveResultSchema = z.discriminatedUnion('ok', [
+  z.object({ ok: z.literal(true), htmlPath: z.string() }),
+  z.object({ ok: z.literal(false), reason: z.string() }),
+])
+export type CreateInteractiveResult = z.infer<typeof CreateInteractiveResultSchema>
 
 // ── Voice input: on-device push-to-talk dictation ─────────────────────────────
 //
@@ -3608,6 +3781,9 @@ export interface KodaApi {
   /** Resolve a doc-relative image `ref` (against the doc at `docPath`) to a `koda-preview://` URL the
    *  renderer can load; null if it escapes the project or doesn't exist. */
   docAssetUrl: (docPath: string, ref: string) => Promise<string | null>
+  /** Admit the HTML document at absolute `path` to this window's sandboxed document origin and return
+   *  the URL its frame loads; null when the file is not HTML, not inside the project, or gone. */
+  docDocumentUrl: (path: string) => Promise<string | null>
   /** Export the open doc as a PDF (save dialog + auto-open). Null path = user cancelled. */
   exportPdf: (args: ExportPdfRequest) => Promise<ExportPdfResult>
   /** Re-run a session's last preview (dev command or static file) when it's been torn down — the
@@ -3642,6 +3818,22 @@ export interface KodaApi {
   getDocMeta: (args: DocMetaGetRequest) => Promise<DocMeta>
   /** Persist a doc's presentation sidecar. Best-effort (a lost column width never breaks anything). */
   setDocMeta: (args: DocMetaSetRequest) => Promise<void>
+  /** This project's document shelf as main holds it — the renderer's starred list is a projection. */
+  listDocStars: () => Promise<DocShelf>
+  /** Star or unstar one document. The same command the agent's `star_document` tool runs, so a star
+   *  made from the Library, the Stage bar or the conversation is one behavior with one owner. */
+  setDocStar: (args: DocStarRequest) => Promise<DocShelf>
+  /** Migrate pre-shelf star sources into the project shelf; the resolved shelf IS the acknowledgement
+   *  that lets the caller delete its legacy copy. */
+  adoptLegacyDocStars: (args: LegacyDocStarsRequest) => Promise<DocShelf>
+  /** Subscribe to shelf changes — a star from any window, an agent star, or the rebase main performs
+   *  when a starred document is renamed or deleted. Returns an unsubscribe fn. */
+  onDocShelfChanged: (listener: (shelf: DocShelf) => void) => () => void
+  /** Turn a selected passage into a self-contained interactive HTML view beside its source document.
+   *  The same command the agent's `create_interactive` tool runs. Writes only the new file; inserting
+   *  the ordinary relative link back into the source is the caller's job. Refusals come back as
+   *  `{ ok: false, reason }` rather than as a thrown error. */
+  createInteractiveDocument: (args: CreateInteractiveRequest) => Promise<CreateInteractiveResult>
   /** How heavy this project's memory navigation pair is (status-bar pill + Settings → Memory). */
   getMemoryWeight: () => Promise<MemoryWeight>
   /** Cloud-backup status for THIS project (Settings → Backup). Cheap; safe to poll on section open. */
@@ -3710,6 +3902,8 @@ export interface KodaApi {
   getBillingState: () => Promise<BillingState>
   /** Recent daily usage rollups (newest first) for the Usage view's History section. */
   getUsageHistory: () => Promise<UsageHistoryDay[]>
+  /** Whole-subscription scan: priced hour×model×origin buckets + coverage + rate provenance. */
+  getUsageScanSummary: () => Promise<UsageScanSummary>
   /** Validate + store an API key (encrypted) and switch to API billing. `ok:false` carries why. */
   saveApiKey: (key: string) => Promise<BillingSaveResult>
   /** Remove the stored key and switch back to subscription billing. Returns the fresh state. */

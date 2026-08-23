@@ -1,10 +1,12 @@
 ---
 name: documents
-description: Create, place, or edit a markdown document for the user to read or share in Koda, or keep a conversation as one when they ask you to ("keep this", "save this as a document", "write that up"). Use before choosing the target for a memo, plan, report, draft, notes, or other user-facing `.md` file. Covers live `Documents/` lookup, extending the right existing document, what is worth keeping, and rich Koda formatting. Do not use for code documentation or hidden project memory.
+description: Create, place, or edit a markdown document for the user to read or share in Koda, or keep a conversation as one when they ask you to ("keep this", "save this as a document", "write that up"). Use before choosing the target for a memo, plan, report, draft, notes, or other user-facing `.md` file. Covers live `Documents/` lookup, extending the right existing document, what is worth keeping, and rich Koda formatting. Do not use for code documentation, hidden project memory, or a markdown file that is part of the code, such as a test fixture, a template, sample input, or a README.
 user-invocable: false
 ---
 
 Put user-facing writing in the project's `Documents/` folder, separate from code and from agent-facing `.koda/memory/` notes.
+
+**Not every markdown file is a document.** A `.md` file the code owns is ordinary code work: a test fixture, a template, sample input, a README beside the module it explains, a note inside `.claude/` or `.koda/`. Write it where the code needs it, under the same judgment as any other source file. Nothing below applies to it, and the extension alone never makes a file the user's to read.
 
 Before choosing a target:
 

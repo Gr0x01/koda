@@ -17,6 +17,7 @@ import {
   PREVIEW_SURFACE_ID,
 } from './store'
 import { connectApprovals } from './approval-catchup'
+import { openLibrary } from './library/LibraryHost'
 import { windowHasOpenModal } from '../window-modal'
 
 /**
@@ -251,6 +252,16 @@ export function useEngineBridge(): void {
         return { ok: false, backupKept: null }
       }
     }
+    /** Show whatever the project's own shelf holds, independently of the chat store's fate. */
+    const loadDocShelf = async (): Promise<void> => {
+      try {
+        const shelf = await window.koda.listDocStars?.()
+        if (shelf) useWorkspace.getState().applyDocShelf(shelf)
+      } catch (err) {
+        // The shelf stays as hydrate left it; a later star or the migration below will reconcile it.
+        console.error('doc shelf load failed', err)
+      }
+    }
     // Hot first, cold second. `loadSessions` can perform the one-shot migration of old inline archives
     // into the cold index; reading both concurrently could snapshot the index before that move, then
     // acknowledge an incomplete archive-star migration and let retention delete the missed row.
@@ -269,6 +280,10 @@ export function useEngineBridge(): void {
           archiveBackupKept: archivedResult.ok ? null : archivedResult.backupKept,
           droppedArchives: archivedResult.ok ? archivedResult.droppedArchives : 0,
         })
+        // The shelf is its own file in the project, so it loads on its own terms — before the branch
+        // below, which returns early when the chat store is unreadable. A project whose sessions file
+        // is broken still has its documents and its shelf, and hiding the shelf would say otherwise.
+        void loadDocShelf()
         // The sessions read FAILED (as opposed to reading an empty store, which succeeds with no data).
         // Deliberately do NOT hydrate: hydrating un-gates the debounced save, and the very first save
         // would then overwrite the real on-disk store with this empty state — that's how a boot crash
@@ -312,6 +327,10 @@ export function useEngineBridge(): void {
           protectedArchived,
           rateLimits: data?.rateLimits, // restore the 5-hour/weekly footer (refreshed next turn)
         })
+        // Hand main whatever star sources this project still carries from before the project shelf
+        // existed. It runs here rather than in the shelf component because it is a boot migration, not
+        // a panel's business: a project whose only stars are legacy has nothing on screen to mount.
+        useWorkspace.getState().adoptLegacyDocStars()
         // A project opened with no sessions + no guidelines yet → offer the one-time intake (common
         // case: an existing folder, not just New project). No-op otherwise (has sessions / skipped /
         // already has CLAUDE.md|AGENTS.md). New project pre-sets the flag, so this early-returns there.
@@ -380,6 +399,14 @@ export function useEngineBridge(): void {
   // Optional-chained: dev HMR reloads the renderer against a preload that predates this API.
   useEffect(() => window.koda.onScratchChanged?.(() => useWorkspace.getState().bumpScratch()), [])
 
+  // The project's document shelf changed in main — a star from the agent, from another window, or the
+  // repair main makes when a starred document is renamed or deleted. The store keeps a projection, so
+  // this push is the truth. Optional-chained: dev HMR can pair new renderer code with an old preload.
+  useEffect(
+    () => window.koda.onDocShelfChanged?.((shelf) => useWorkspace.getState().applyDocShelf(shelf)),
+    [],
+  )
+
   // Anything (usually the agent) writing under `Documents/` → one debounced `filesRev` bump, which is
   // already the signal every document surface re-reads on: the Library, the kept-documents shelf and
   // the Files tree. The watch lives here, for the window's lifetime, rather than in whichever panel
@@ -417,8 +444,7 @@ export function useEngineBridge(): void {
       window.koda
         .saveSessions(blob)
         .then((saved) => {
-          if (saved) useWorkspace.getState().completeDocPinMigration(blob)
-          else if (lastQueued.current === serialized) {
+          if (!saved && lastQueued.current === serialized) {
             lastQueued.current = ''
           }
         })
@@ -473,7 +499,7 @@ export function useEngineBridge(): void {
     }
   }, [])
 
-  // Window-level shortcuts: ⌘P / ⌘⇧F → Find overlay, ⌘/Ctrl + 1–9 → fast-switch sessions.
+  // Window-level shortcuts: ⌘P / ⌘⇧F → the Library, ⌘/Ctrl + 1–9 → fast-switch sessions.
   useEffect(() => {
     function onKey(e: KeyboardEvent): void {
       // A modal owns the window while it is open. Inert blocks pointer/focus traversal, but global
@@ -481,14 +507,15 @@ export function useEngineBridge(): void {
       // the Library and ⌘1–9 silently changed the engine its ask would use.
       if (windowHasOpenModal()) return
       if (!(e.metaKey || e.ctrlKey)) return
-      // ⌘P (quick open) or ⌘⇧F (find in files) — summon the Find overlay. ⌘F stays Monaco's in-file
-      // find; ⌘⇧F never collides with it (the shift distinguishes them).
+      // ⌘P (quick open) or ⌘⇧F (find in files) — summon the Library, now the one search door: it
+      // reaches every file in the project once you type, so both shortcuts land where a filename works.
+      // ⌘F stays Monaco's in-file find; ⌘⇧F never collides with it (the shift distinguishes them).
       const isFindKey =
         (!e.shiftKey && (e.code === 'KeyP' || e.key.toLowerCase() === 'p')) ||
         (e.shiftKey && (e.code === 'KeyF' || e.key.toLowerCase() === 'f'))
       if (isFindKey) {
         e.preventDefault()
-        useWorkspace.getState().setSearchOpen(true)
+        openLibrary()
         return
       }
       // Browser-tab convention: ⌘T new session, ⌘W close the current one. (⌘W is free because the

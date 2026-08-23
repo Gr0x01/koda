@@ -48,6 +48,8 @@ const ALLOWED: Record<string, string> = {
     'the brand mark a session row draws — identity, like accountLabel and the two pickers above: it reports WHOSE engine ran and decides nothing from the answer. It is its own file precisely so this exception cannot spread to cover SessionRow.tsx, where a real behavior branch could hide unnoticed',
   'src/main/api-key.ts':
     "the stored key's filename is a compatibility fact: Claude's `billing-key.enc` predates the per-engine suffix and renaming it would orphan every existing user's key",
+  'src/main/engine/usage-scan.ts':
+    "the transcript scanner selects a PARSER for each engine's own on-disk file format (Claude project JSONL vs Codex rollout JSONL) — the format is engine-owned, so the name is the subject, like a driver reading its own wire protocol; no session behavior branches on it",
 }
 
 /**

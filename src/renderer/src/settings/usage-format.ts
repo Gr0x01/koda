@@ -56,3 +56,9 @@ export function fmtDayShort(date: string): string {
   if (!y || !m || !d) return date
   return new Date(y, m - 1, d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
+
+/** An hourly column's label — the local clock hour of an ISO hour-start instant. */
+export function fmtHour(iso: string): string {
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleTimeString(undefined, { hour: 'numeric' })
+}

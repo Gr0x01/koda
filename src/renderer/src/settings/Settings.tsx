@@ -12,6 +12,7 @@ import { ArchivedSection } from './ArchivedSection'
 import { BackupSection } from './BackupSection'
 import { AboutSection, DeveloperSection } from './AboutSection'
 import { ProvidersSection } from './ProvidersSection'
+import { UsageSection } from './UsageSection'
 import { GuardrailsSection, SkillsSection } from './GuardrailsSection'
 import { MemorySection } from './MemorySection'
 import { KodaAccountSection, RemoteSection } from './RemoteSection'
@@ -22,6 +23,7 @@ import {
   IconAppearance,
   IconUser,
   IconChip,
+  IconMeter,
   IconShield,
   IconBook,
   IconMemory,
@@ -50,6 +52,7 @@ type CategoryId =
   | 'general'
   | 'koda-account'
   | 'providers'
+  | 'usage'
   | 'appearance'
   | 'approvals'
   | 'guardrails'
@@ -84,6 +87,7 @@ const NAV_GROUPS: { title: string; items: NavItemDef[] }[] = [
     items: [
       { id: 'koda-account', label: 'Koda account', icon: <IconUser /> },
       { id: 'providers', label: 'AI providers', icon: <IconChip /> },
+      { id: 'usage', label: 'Usage', icon: <IconMeter /> },
     ],
   },
   {
@@ -253,6 +257,7 @@ export function Settings() {
             {active === 'general' && <GeneralSection />}
             {active === 'koda-account' && <KodaAccountSection />}
             {active === 'providers' && <ProvidersSection />}
+            {active === 'usage' && <UsageSection />}
             {active === 'appearance' && <AppearanceSection />}
             {active === 'approvals' && <ApprovalsSection />}
             {active === 'guardrails' && <GuardrailsSection />}

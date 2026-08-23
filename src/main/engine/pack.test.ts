@@ -202,7 +202,7 @@ describe('ambient context assembly', () => {
     const rules = loadPackRules(pack.dir)!
     const presentation = loadPresentation(pack.dir)!
     const ids = new Set(rules.groups.flatMap((group) => group.rules.map((rule) => rule.id)))
-    expect(rules.groups.find((group) => group.id === 'constitution')?.rules).toHaveLength(11)
+    expect(rules.groups.find((group) => group.id === 'constitution')?.rules).toHaveLength(12)
     expect(rules.groups.find((group) => group.id === 'routes')?.rules).toHaveLength(5)
     expect(presentation.map((principle) => principle.id)).toEqual([
       'work-like-this',

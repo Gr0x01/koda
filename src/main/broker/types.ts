@@ -16,5 +16,8 @@ export interface ApproveRequest {
   toolUseId: string
 }
 
-/** Resolve a tool call to a decision. Provided by the gate; same fn for every session and engine. */
-export type DecideFn = (sessionId: string, req: ApproveRequest) => Promise<ToolDecision>
+/** Resolve a tool call to a decision. Provided by the gate; same fn for every session and engine.
+ *  `signal` is the asking transport's cancellation (Claude's MCP `approve` request): if it fires while
+ *  a human is still deciding, the gate cleans the pending slot instead of leaking it. Optional — Codex
+ *  reaches the gate from its native approval callback and passes none. */
+export type DecideFn = (sessionId: string, req: ApproveRequest, signal?: AbortSignal) => Promise<ToolDecision>

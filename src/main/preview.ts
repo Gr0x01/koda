@@ -17,13 +17,14 @@ import { extname } from 'node:path'
 import http from 'node:http'
 import https from 'node:https'
 import { IpcChannels } from '@shared/channels'
+import { resolveDocFormat } from '@shared/document-contract'
 import { track } from './telemetry'
 import { PreviewRectSchema, type PreviewRect } from '@shared/ipc'
 import { BROKER_TOKEN_ENV } from './broker/server'
 import { containedReal } from './fs-browse'
 import { readWholeContainedRegularFile } from './contained-read'
 import { userPath } from './engine/user-path'
-import { contextForPreviewToken, previewTokenForWindow } from './window-registry'
+import { contextForPreviewToken, contextForWindow, previewTokenForWindow } from './window-registry'
 import { log } from './logger'
 
 export const PREVIEW_SCHEME = 'koda-preview'
@@ -59,6 +60,120 @@ export function staticPreviewUrl(winId: number, relPath?: string): string | unde
       ? relPath.split('/').map(encodeURIComponent).join('/') // path-safe for spaces etc.
       : 'index.html'
   return `${PREVIEW_SCHEME}://${token}/${entry}`
+}
+
+// ── Document mode (typed-documents plan §4) ───────────────────────────────────────────────────────
+// An HTML *document* is not an app preview. It reuses this file's containment and nothing else: its
+// own origin, only the one file it names, no network at all, and no dev-server semantics. The mode is
+// carried by the URL HOST rather than a query string, because a query is dropped the moment the page
+// resolves a relative reference — a document that asked for `logo.png` would come back through the
+// permissive app-preview branch and read another project file. Host `doc-<docToken>` is a distinct web
+// origin, and `docToken` is minted INDEPENDENTLY of the window's app-preview `previewToken` — so a
+// document that reads its own hostname learns nothing that lets it reconstruct the permissive
+// app-preview URL, and the two modes cannot reach each other's storage or responses.
+
+const DOCUMENT_HOST_PREFIX = 'doc-'
+
+/**
+ * A window's open HTML documents under an origin token unrelated to its app-preview `previewToken`.
+ *
+ * - `token` is minted fresh (`randomUUID`) the first time the window opens a document and shares
+ *   nothing with the app-preview host. Severing that derivation is what closes the containment escape
+ *   where a document stripped the `doc-` prefix off its own host to address the no-CSP app-preview
+ *   branch and regain network egress.
+ * - `paths` is the allowlist, not a filter: a document that navigates itself to any other path —
+ *   including one it guessed — gets the same 404 as an escape. That is what makes "no reads of any file
+ *   other than the document itself" a property of the server instead of a promise about the CSP.
+ */
+interface DocumentOrigin {
+  token: string
+  paths: Set<string>
+}
+const documentPreviews = new Map<number, DocumentOrigin>()
+
+/** Reverse index docToken → winId. Document requests resolve through THIS map only, never through the
+ *  app-preview `contextForPreviewToken` registry, so the two token spaces never meet. */
+const documentTokenToWindow = new Map<string, number>()
+
+/** Mint (once per window) or return this window's document origin. Undefined for an unknown/closed
+ *  window, so nothing serves before the window and its project exist. */
+function ensureDocumentOrigin(winId: number): DocumentOrigin | undefined {
+  if (!contextForWindow(winId)) return undefined
+  let origin = documentPreviews.get(winId)
+  if (!origin) {
+    origin = { token: randomUUID(), paths: new Set() }
+    documentPreviews.set(winId, origin)
+    documentTokenToWindow.set(origin.token, winId)
+  }
+  return origin
+}
+
+/**
+ * The containment the document mode actually rests on, stated once as a response header so the
+ * document cannot restate it: bytes on disk are never trusted to carry their own policy.
+ *
+ * - `default-src 'none'` withdraws every fetch destination it backstops, which is what makes the
+ *   document offline: `fetch`, `XMLHttpRequest`, WebSocket, `sendBeacon`, external scripts, styles,
+ *   fonts, media, frames and workers all have nowhere to go.
+ * - `script-src` re-grants inline scripts only. Interaction is the point of this format, and the
+ *   scripts are already confined to an opaque origin with no network and no privileged globals.
+ *   `'unsafe-eval'` rides with it because a chart or template helper compiling a function is not a
+ *   new capability once nothing can be reached.
+ * - `img-src`/`font-src`/`media-src` allow `data:`/`blob:` so a genuinely self-contained document
+ *   keeps its inlined art. A remote pixel — the cheapest exfiltration channel there is — is not a
+ *   destination either of those schemes can name.
+ * - `form-action` and `base-uri` are listed explicitly because neither falls back to `default-src`.
+ * - `sandbox allow-scripts` repeats the iframe attribute from the side the renderer cannot edit, so
+ *   the opaque origin (no storage, no cookies, no same-origin reads) survives a mistake in the DOM.
+ *   `allow-modals` is deliberately absent: a document is not permitted to hold Koda's UI thread on an
+ *   `alert()`. `frame-ancestors` is deliberately absent too — it does NOT fall back, and naming a
+ *   value would refuse the `file://` renderer that has to frame this.
+ */
+export const DOCUMENT_PREVIEW_CSP = [
+  "default-src 'none'",
+  "script-src 'unsafe-inline' 'unsafe-eval'",
+  "style-src 'unsafe-inline'",
+  'img-src data: blob:',
+  'font-src data:',
+  'media-src data: blob:',
+  "form-action 'none'",
+  "base-uri 'none'",
+  'sandbox allow-scripts',
+].join('; ')
+
+/**
+ * Register `relPath` as this window's open HTML document and return the URL its sandboxed frame
+ * loads. Registration is the authorization: nothing under the document origin serves until a surface
+ * has asked for that exact path. Returns undefined for an unknown/project-less window or a path that
+ * is not HTML — the format contract decides that, not a local regex.
+ */
+export function documentPreviewUrl(winId: number, relPath: string): string | undefined {
+  const rel = relPath.replace(/^\/+/, '').trim()
+  if (!rel || resolveDocFormat(rel) !== 'html') return undefined
+  const origin = ensureDocumentOrigin(winId)
+  if (!origin) return undefined
+  origin.paths.add(rel)
+  const entry = rel.split('/').map(encodeURIComponent).join('/')
+  return `${PREVIEW_SCHEME}://${DOCUMENT_HOST_PREFIX}${origin.token}/${entry}`
+}
+
+/** Drop a closed window's document origin — both the winId→origin entry and the docToken→winId reverse
+ *  index, so a stale host can never resolve back to a gone window's project. */
+export function forgetWindowDocuments(winId: number): void {
+  const origin = documentPreviews.get(winId)
+  if (origin) documentTokenToWindow.delete(origin.token)
+  documentPreviews.delete(winId)
+}
+
+/** Narrow state probe for the containment tests; production callers never need this. */
+export function documentPreviewPathsForTest(winId: number): string[] {
+  return [...(documentPreviews.get(winId)?.paths ?? [])]
+}
+
+/** The window's document-origin host token (independent of its app-preview token), or undefined before
+ *  any document is opened. For the containment tests only. */
+export function documentTokenForTest(winId: number): string | undefined {
+  return documentPreviews.get(winId)?.token
 }
 
 /** Build a `koda-preview://` URL for any project-relative asset (not just `.html`) — used to make a
@@ -130,32 +245,115 @@ export function registerPreviewScheme(): void {
 
 /** Wire the request handler. Call once, after app `ready`. */
 export function registerPreviewProtocol(): void {
-  protocol.handle(PREVIEW_SCHEME, async (req) => {
-    let url: URL
-    try {
-      url = new URL(req.url)
-    } catch {
-      return blankPreviewResponse(400)
-    }
-    const ctx = contextForPreviewToken(url.hostname)
-    if (!ctx || !ctx.projectPath) return blankPreviewResponse(404)
+  protocol.handle(PREVIEW_SCHEME, (req) => servePreviewRequest(req.url))
+}
 
-    let rel = decodeURIComponent(url.pathname)
-    if (rel === '/' || rel === '') rel = '/index.html'
+/**
+ * Answer one `koda-preview://` request. Exported so the containment tests exercise the shipped
+ * handler rather than a re-implementation of its rules.
+ */
+export async function servePreviewRequest(rawUrl: string): Promise<Response> {
+  let url: URL
+  try {
+    url = new URL(rawUrl)
+  } catch {
+    return blankPreviewResponse(400)
+  }
 
-    try {
-      // Validation and bytes come from one opened descriptor. A path-only realpath check followed by
-      // `readFile(path)` left a swap window where a project asset could become an outside symlink.
-      const { bytes, path } = await readWholeContainedRegularFile(
-        ctx.projectPath,
-        rel.replace(/^\/+/, ''), // strip leading '/' → project-relative
-      )
-      return new Response(bytes, { headers: { 'Content-Type': contentType(path) } })
-    } catch (err) {
-      // Escapes, missing files and read failures are deliberately indistinguishable to the preview.
-      log.warn('preview', 'read failed', err instanceof Error ? err.message : err)
-      return blankPreviewResponse(404)
-    }
+  let rel = decodeURIComponent(url.pathname)
+  if (rel === '/' || rel === '') rel = '/index.html'
+  rel = rel.replace(/^\/+/, '') // strip leading '/' → project-relative
+
+  // The document origin is a SEPARATE token space: its host resolves through documentTokenToWindow,
+  // never contextForPreviewToken, so a document host reveals nothing about — and cannot be turned into
+  // — the permissive app-preview host.
+  if (url.hostname.startsWith(DOCUMENT_HOST_PREFIX)) {
+    return serveDocumentRequest(url.hostname.slice(DOCUMENT_HOST_PREFIX.length), rel)
+  }
+
+  const ctx = contextForPreviewToken(url.hostname)
+  if (!ctx || !ctx.projectPath) return blankPreviewResponse(404)
+  try {
+    // Validation and bytes come from one opened descriptor. A path-only realpath check followed by
+    // `readFile(path)` left a swap window where a project asset could become an outside symlink.
+    const { bytes, path } = await readWholeContainedRegularFile(ctx.projectPath, rel)
+    return new Response(bytes, { headers: { 'Content-Type': contentType(path) } })
+  } catch (err) {
+    // Escapes, missing files and read failures are deliberately indistinguishable to the preview.
+    log.warn('preview', 'read failed', err instanceof Error ? err.message : err)
+    return blankPreviewResponse(404)
+  }
+}
+
+/**
+ * Answer a document-origin request. `docToken` is the host with the `doc-` prefix already stripped; it
+ * resolves through the document token registry ONLY — the app-preview token space is unreachable from
+ * here. The allowlist is authorization, the realpath read is containment: a subresource, a guessed
+ * sibling, and a self-navigation to another path all land here and are refused before a descriptor is
+ * opened.
+ */
+async function serveDocumentRequest(docToken: string, rel: string): Promise<Response> {
+  const winId = documentTokenToWindow.get(docToken)
+  const origin = winId !== undefined ? documentPreviews.get(winId) : undefined
+  const ctx = winId !== undefined ? contextForWindow(winId) : undefined
+  if (!ctx || !ctx.projectPath || !origin || !origin.paths.has(rel)) return refusedDocumentResponse()
+  try {
+    const { bytes } = await readWholeContainedRegularFile(ctx.projectPath, rel)
+    return new Response(bytes, {
+      headers: {
+        // Forced, never sniffed: the allowlist already decided this is the open HTML document.
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Security-Policy': DOCUMENT_PREVIEW_CSP,
+        'X-Content-Type-Options': 'nosniff',
+        // The surface refreshes by reloading this exact URL when the file changes on disk, so a cached
+        // copy would quietly show the agent's previous draft.
+        'Cache-Control': 'no-store',
+      },
+    })
+  } catch (err) {
+    log.warn('preview', 'read failed', err instanceof Error ? err.message : err)
+    return refusedDocumentResponse()
+  }
+}
+
+/**
+ * Defense in depth for the document origin (typed-documents plan §4). A frame currently showing a
+ * sandboxed HTML document may reload itself (live refresh) and follow same-origin paths, but it must
+ * never navigate to a different host or scheme — that hop is how the document's no-network CSP would be
+ * shed by moving to the app-preview origin (or any origin added to this scheme later). Returns true
+ * when the navigation to `targetUrl` must be denied. Only frames CURRENTLY on the document origin are
+ * policed; the app-preview origin and the file:// renderer keep their existing, separate guards.
+ */
+export function isDocumentFrameEscape(currentUrl: string, targetUrl: string): boolean {
+  let current: URL
+  try {
+    current = new URL(currentUrl)
+  } catch {
+    return false
+  }
+  const onDocumentOrigin =
+    current.protocol === `${PREVIEW_SCHEME}:` && current.hostname.startsWith(DOCUMENT_HOST_PREFIX)
+  if (!onDocumentOrigin) return false
+  let target: URL
+  try {
+    target = new URL(targetUrl)
+  } catch {
+    return true // an unparseable destination is not somewhere a document frame may go
+  }
+  return target.protocol !== current.protocol || target.hostname !== current.hostname
+}
+
+/** A document-origin refusal. Plain text, and still policed: a refusal that carried no policy would be
+ *  the one response in this origin a hostile document could use as a scriptable page. */
+function refusedDocumentResponse(): Response {
+  return new Response('Not available.', {
+    status: 404,
+    headers: {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Content-Security-Policy': DOCUMENT_PREVIEW_CSP,
+      'X-Content-Type-Options': 'nosniff',
+      'Cache-Control': 'no-store',
+    },
   })
 }
 

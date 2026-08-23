@@ -5,6 +5,16 @@ import { Collapse } from '../motion'
 import { IconButton, reloadForModuleGraphError, noteModuleGraphRecovered } from '../ui'
 import { useTableColumnResize } from './useTableColumnResize'
 import { buildDocBlockMenu, docBlockPlugins } from './blocks'
+import {
+  artifactLinkRef,
+  createArtifactCardPlugin,
+  decodeArtifactRef,
+  deriveInteractiveViewTitle,
+  isRecognizedArtifactRef,
+  repairArtifactTarget,
+  resolveDocRelativePath,
+  type ArtifactCardActions,
+} from './artifact-card'
 import { DocOutline, docHeadingEls, headingSlug } from './DocOutline'
 import { DocPageChrome } from './DocPageChrome'
 import { TranscriptFind } from './TranscriptFind'
@@ -26,20 +36,18 @@ const KODA_AI_ICON =
  * metadata survives byte-for-byte. The match captures its own trailing newline so `frontmatter + body`
  * reconstructs the original exactly.
  */
-/** Resolve a doc-relative link target against the doc's own folder — a pure string walk (no node:path
- *  in the renderer). An absolute path passes through (the contained-fs gate downstream judges it); a
- *  `..` escape above root returns null and the click is simply ignored. */
-function resolveDocLink(docPath: string, ref: string): string | null {
-  if (ref.startsWith('/')) return ref
-  const base = docPath.split('/').slice(0, -1)
-  for (const seg of ref.split('/')) {
-    if (!seg || seg === '.') continue
-    if (seg === '..') {
-      if (base.length <= 1) return null
-      base.pop()
-    } else base.push(seg)
-  }
-  return base.join('/') || null
+/** Project-relative POSIX path of an absolute path that lives under `root`, or null when it does not.
+ *  Used to name the source document for the create-interactive command in the project's own terms. */
+function relativeUnderProject(root: string, abs: string): string | null {
+  const base = root.endsWith('/') ? root.slice(0, -1) : root
+  if (abs === base || !abs.startsWith(base + '/')) return null
+  return abs.slice(base.length + 1)
+}
+
+/** Join a project-relative POSIX path back onto its absolute root — the surface key form the Stage
+ *  opens an artifact by. */
+function joinProjectPath(root: string, rel: string): string {
+  return `${root.endsWith('/') ? root.slice(0, -1) : root}/${rel}`
 }
 
 /**
@@ -171,11 +179,24 @@ function CrepeDocEditor({
   const crepeRootRef = useRef<HTMLDivElement>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
   const crepeRef = useRef<Crepe | null>(null)
+  // The card plugin is registered once per mount but must act on the latest resolver, so it calls
+  // through this ref rather than closing over a stale render's functions.
+  const artifactActionsRef = useRef<ArtifactCardActions>({ onOpen: () => {}, onReveal: () => {} })
   const sendCanvasEdit = useWorkspace((s) => s.sendCanvasEdit)
   const openFile = useWorkspace((s) => s.openFile)
+  const projectPath = useWorkspace((s) => s.projectPath)
+  // Koda-driven artifact renames/deletes this session — read at click time so a smart card opens the
+  // artifact's current home even though the source link text still spells the old one. A ref keeps the
+  // card plugin (created once per mount) reading the latest map without re-registering.
+  const docRefRepairs = useWorkspace((s) => s.docRefRepairs)
+  const repairsRef = useRef(docRefRepairs)
+  repairsRef.current = docRefRepairs
   // The live "point at a passage → ask the agent" affordance: a frozen selection + a floating toolbar.
   const [sel, setSel] = useState<CanvasSelection | null>(null)
   const [aiOpen, setAiOpen] = useState(false)
+  // A refusal from Create interactive view (an empty selection, a source that moved) is a sentence in
+  // the status line, never a thrown exception the surface has to survive.
+  const [actionError, setActionError] = useState<string | null>(null)
   // Pending agent edit awaiting the user's Keep/Revert. Holds the doc body from BEFORE the edit (the
   // revert target); null = nothing to review. Stays stable across a multi-write turn until the user acts.
   const [review, setReview] = useState<string | null>(null)
@@ -214,6 +235,89 @@ function CrepeDocEditor({
   const autosaveRef = useRef<SaveCoalescer | null>(null)
   if (!autosaveRef.current) autosaveRef.current = createSaveCoalescer(() => saveRef.current())
   const autosave = autosaveRef.current
+
+  // ── Smart artifact references ──────────────────────────────────────────────
+  // A recognized relative link to a project-local artifact resolves against the doc's folder, then
+  // through this session's Koda-driven renames/deletes, so the card opens the artifact's CURRENT home.
+  function resolveArtifact(href: string): { path: string; deleted: boolean } | null {
+    const resolved = resolveDocRelativePath(path, decodeArtifactRef(href))
+    if (!resolved) return null
+    return repairArtifactTarget(resolved, repairsRef.current)
+  }
+  function openArtifact(href: string): void {
+    const target = resolveArtifact(href)
+    if (!target || target.deleted) return
+    openFile(target.path)
+  }
+  function revealArtifact(href: string): void {
+    const target = resolveArtifact(href)
+    if (!target || target.deleted) return
+    window.koda.revealPath?.({ path: target.path })
+  }
+  artifactActionsRef.current = { onOpen: openArtifact, onReveal: revealArtifact }
+
+  /** Insert an ordinary relative markdown link as its own paragraph after the current selection. The
+   *  ProseMirror model gains a plain link node, so `getMarkdown()` still emits portable `[t](ref)` — no
+   *  new syntax reaches the file. */
+  function insertArtifactLink(title: string, ref: string): boolean {
+    const crepe = crepeRef.current
+    if (!crepe) return false
+    try {
+      const view = crepe.editor.ctx.get(editorViewCtx)
+      const { state } = view
+      const linkType = state.schema.marks.link
+      const paragraphType = state.schema.nodes.paragraph
+      if (!linkType || !paragraphType) return false
+      const text = state.schema.text(title, [linkType.create({ href: ref })])
+      const paragraph = paragraphType.createAndFill(null, text)
+      if (!paragraph) return false
+      const $to = state.selection.$to
+      const insertAt = $to.depth >= 1 ? $to.after(1) : state.doc.content.size
+      view.dispatch(state.tr.insert(insertAt, paragraph))
+      return true
+    } catch (e) {
+      window.koda.logFromRenderer({ level: 'error', args: [`Insert artifact link failed: ${String(e)}`] })
+      return false
+    }
+  }
+
+  /** Create interactive view: carve the selected passage into a sibling HTML artifact, drop a portable
+   *  relative link back into the source, and open the artifact beside it on the Stage. The create
+   *  command writes exactly one file and touches nothing in the source — inserting the link is this
+   *  side's job, so a half-done write can never leave a link pointing at a file that was not created. */
+  async function createInteractiveView(): Promise<void> {
+    const selection = sel?.text
+    setSel(null)
+    setAiOpen(false)
+    setActionError(null)
+    if (!selection) return
+    if (!projectPath) {
+      setActionError("Couldn't locate this document inside the project.")
+      return
+    }
+    const sourceRel = relativeUnderProject(projectPath, surfacePath)
+    if (!sourceRel) {
+      setActionError("Couldn't locate this document inside the project.")
+      return
+    }
+    // The source has to match disk: the passage is the seed, and the link lands in the file the command
+    // reads. A checkpoint from the flush also covers the edit that inserts the link.
+    await autosave.flush()
+    const title = deriveInteractiveViewTitle(selection)
+    let result: Awaited<ReturnType<typeof window.koda.createInteractiveDocument>>
+    try {
+      result = await window.koda.createInteractiveDocument({ sourcePath: sourceRel, selection, title })
+    } catch (e) {
+      setActionError(String(e))
+      return
+    }
+    if (!result.ok) {
+      setActionError(result.reason)
+      return
+    }
+    if (insertArtifactLink(title, artifactLinkRef(sourceRel, result.htmlPath))) await autosave.flush()
+    openFile(joinProjectPath(projectPath, result.htmlPath))
+  }
   // The last save landed but main couldn't take a recovery point for it. Silence would leave the user
   // believing this edit is undoable when it isn't. Cleared by the next save that does get one.
   const [noUndo, setNoUndo] = useState(false)
@@ -294,7 +398,13 @@ function CrepeDocEditor({
         el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
         return
       }
-      const resolved = resolveDocLink(path, decodeURIComponent(target))
+      // A recognized artifact link (the card's own title) opens through the rename-repair resolver, so a
+      // click lands on the artifact's current home rather than the stale path the source still spells.
+      if (isRecognizedArtifactRef(href)) {
+        artifactActionsRef.current.onOpen(href)
+        return
+      }
+      const resolved = resolveDocRelativePath(path, decodeURIComponent(target))
       if (resolved) openFile(resolved)
     }
     host.addEventListener('click', onClick)
@@ -349,6 +459,14 @@ function CrepeDocEditor({
     })
     // Register Koda's block schemas + remark transformers before the editor is created.
     crepe.editor.use(docBlockPlugins)
+    // Render recognized relative artifact links as smart cards. A decoration, not a node, so the
+    // markdown on disk stays the portable link — the card never enters the document model.
+    crepe.editor.use(
+      createArtifactCardPlugin({
+        onOpen: (href) => artifactActionsRef.current.onOpen(href),
+        onReveal: (href) => artifactActionsRef.current.onReveal(href),
+      }),
+    )
     crepe.on((api) => {
       api.markdownUpdated((_ctx, markdown) => {
         if (disposed) return
@@ -738,6 +856,7 @@ function CrepeDocEditor({
             top={sel.top}
             left={sel.left}
             onAsk={(instruction) => void askCanvas(instruction)}
+            onCreateView={() => void createInteractiveView()}
             onBack={backToFormatting}
             onClose={() => {
               setSel(null)
@@ -780,6 +899,10 @@ function CrepeDocEditor({
           ) : saveError ? (
             <span role="status" className="truncate text-[11px] text-red-400">
               Couldn't save: {saveError}
+            </span>
+          ) : actionError ? (
+            <span role="status" className="truncate text-[11px] text-red-400">
+              {actionError}
             </span>
           ) : noUndo ? (
             <span role="status" className="truncate text-[11px] text-amber-600 dark:text-amber-400">
@@ -834,12 +957,14 @@ function CanvasToolbar({
   top,
   left,
   onAsk,
+  onCreateView,
   onBack,
   onClose,
 }: {
   top: number
   left: number
   onAsk: (instruction: string) => void
+  onCreateView: () => void
   onBack: () => void
   onClose: () => void
 }) {
@@ -873,6 +998,21 @@ function CanvasToolbar({
             {q}
           </button>
         ))}
+        {/* Not an AI edit: this carves the passage into its own interactive artifact and links back. */}
+        <span className="mx-1 h-6 w-px bg-border" />
+        <button
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={onCreateView}
+          title="Create an interactive view from this passage"
+          className="flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-medium text-text transition-colors hover:bg-bg"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            <rect x="3" y="3" width="18" height="18" rx="2" />
+            <path d="M3 9h18" />
+            <path d="M9 21V9" />
+          </svg>
+          Interactive view
+        </button>
         <input
           value={text}
           onChange={(e) => setText(e.target.value)}

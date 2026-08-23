@@ -3,7 +3,11 @@ import type { DailyPoint } from '@shared/usage-value'
 import { motion, spring, useReducedMotion } from '../motion'
 import { engineAccent, engineOrder, engineShort } from '../workspace/models'
 import { SegmentedControl } from './controls'
-import { fmtDay, fmtDayShort, fmtTokens, fmtUsd } from './usage-format'
+import { fmtDay, fmtDayShort, fmtHour, fmtTokens, fmtUsd } from './usage-format'
+
+function countLabel(n: number, noun: 'turns' | 'responses'): string {
+  return n === 1 ? `1 ${noun.slice(0, -1)}` : `${n} ${noun}`
+}
 
 /**
  * Daily usage as columns, cross-engine, with one toggle: dollars or tokens. Both are the same measured
@@ -23,10 +27,25 @@ const CHART_HEIGHT = 96
 /** Enough of a stub that an active-but-tiny day is visibly not zero. */
 const MIN_VISIBLE_PX = 2
 
-export function UsageChart({ daily, engines }: { daily: DailyPoint[]; engines: string[] }) {
+export function UsageChart({
+  daily,
+  engines,
+  resolution = 'day',
+  countNoun = 'turns',
+}: {
+  daily: DailyPoint[]
+  engines: string[]
+  /** 'hour' renders the same columns over ISO hour-start dates (the rolling-24h Usage view). */
+  resolution?: 'day' | 'hour'
+  /** What a point's `turns` count actually counts — the scan view plots responses, not turns. */
+  countNoun?: 'turns' | 'responses'
+}) {
   const [mode, setMode] = useState<UsageChartMode>('cost')
   const [hover, setHover] = useState<string | null>(null)
   const reduce = useReducedMotion()
+  const labelLong = (date: string): string => (resolution === 'hour' ? fmtHour(date) : fmtDay(date))
+  const labelShort = (date: string): string =>
+    resolution === 'hour' ? fmtHour(date) : fmtDayShort(date)
 
   // Cost mode plots PRICED cost. An engine that reports a cost estimate for models with no published
   // rate contributes tokens here and nothing to the dollar view — the same tokens-only contract the
@@ -43,11 +62,11 @@ export function UsageChart({ daily, engines }: { daily: DailyPoint[]; engines: s
       <div className="mb-3 flex items-end justify-between gap-4">
         <div className="min-w-0">
           <div className="text-[13.5px] font-medium text-text">
-            {mode === 'cost' ? 'Cost per day' : 'Tokens per day'}
+            {mode === 'cost' ? 'Cost' : 'Tokens'} per {resolution}
           </div>
           {peakDay && (
             <div className="mt-0.5 text-[12.5px] text-text-muted">
-              Busiest day {fmtDay(peakDay.date)}, {fmt(peak)}
+              Busiest {resolution} {labelLong(peakDay.date)}, {fmt(peak)}
             </div>
           )}
         </div>
@@ -86,7 +105,7 @@ export function UsageChart({ daily, engines }: { daily: DailyPoint[]; engines: s
                 onFocus={() => setHover(d.date)}
                 onBlur={() => setHover((cur) => (cur === d.date ? null : cur))}
                 role="img"
-                aria-label={`${fmtDay(d.date)}: ${fmt(total)}, ${d.turns === 1 ? '1 turn' : `${d.turns} turns`}`}
+                aria-label={`${labelLong(d.date)}: ${fmt(total)}, ${countLabel(d.turns, countNoun)}`}
               >
                 <motion.div
                   className="flex w-full flex-col-reverse gap-[2px] overflow-hidden rounded-t-[4px]"
@@ -112,11 +131,18 @@ export function UsageChart({ daily, engines }: { daily: DailyPoint[]; engines: s
         </div>
         <div className="mt-1 h-px w-full bg-border" />
         <div className="mt-1.5 flex justify-between text-[11px] text-text-muted">
-          <span>{daily[0] && fmtDayShort(daily[0].date)}</span>
-          <span>{daily.length > 1 && fmtDay(daily[daily.length - 1].date)}</span>
+          <span>{daily[0] && labelShort(daily[0].date)}</span>
+          <span>{daily.length > 1 && labelLong(daily[daily.length - 1].date)}</span>
         </div>
 
-        {hover && <ChartTooltip point={daily.find((d) => d.date === hover)} mode={mode} />}
+        {hover && (
+          <ChartTooltip
+            point={daily.find((d) => d.date === hover)}
+            mode={mode}
+            label={labelLong}
+            countNoun={countNoun}
+          />
+        )}
       </div>
 
       {multi && (
@@ -135,7 +161,17 @@ export function UsageChart({ daily, engines }: { daily: DailyPoint[]; engines: s
 
 /** The hovered day's exact numbers. Anchored above the column strip rather than the column so it can
  *  never push the card wider or get clipped at either end of the window. */
-function ChartTooltip({ point, mode }: { point?: DailyPoint; mode: UsageChartMode }) {
+function ChartTooltip({
+  point,
+  mode,
+  label,
+  countNoun,
+}: {
+  point?: DailyPoint
+  mode: UsageChartMode
+  label: (date: string) => string
+  countNoun: 'turns' | 'responses'
+}) {
   if (!point) return null
   const value = mode === 'cost' ? point.pricedCostUsd : point.totalTokens
   const fmt = (n: number): string => (mode === 'cost' ? fmtUsd(n) : fmtTokens(n))
@@ -144,7 +180,7 @@ function ChartTooltip({ point, mode }: { point?: DailyPoint; mode: UsageChartMod
     .sort((a, b) => engineOrder(a.engineId) - engineOrder(b.engineId))
   return (
     <div className="pointer-events-none absolute bottom-full left-0 z-10 mb-2 rounded-lg border border-border bg-surface px-2.5 py-1.5 shadow-pop">
-      <div className="text-[12px] font-medium text-text">{fmtDay(point.date)}</div>
+      <div className="text-[12px] font-medium text-text">{label(point.date)}</div>
       <div className="mt-0.5 font-mono text-[12px] text-text">{fmt(value)}</div>
       {split.length > 1 &&
         split.map((e) => (
@@ -153,9 +189,7 @@ function ChartTooltip({ point, mode }: { point?: DailyPoint; mode: UsageChartMod
             {engineShort(e.engineId)} {fmt(mode === 'cost' ? e.pricedCostUsd : e.totalTokens)}
           </div>
         ))}
-      <div className="mt-0.5 text-[11px] text-text-muted">
-        {point.turns === 1 ? '1 turn' : `${point.turns} turns`}
-      </div>
+      <div className="mt-0.5 text-[11px] text-text-muted">{countLabel(point.turns, countNoun)}</div>
     </div>
   )
 }

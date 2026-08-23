@@ -6,8 +6,10 @@ import {
   docTitle,
   docTopic,
   excerptLine,
+  fileContext,
   kindFilterLabel,
   kindLabel,
+  librarySubtitle,
   libraryResultActionable,
   timeBucket,
   whenLabel,
@@ -121,6 +123,35 @@ describe('countLabel', () => {
     expect(countLabel(54, false, false)).toBe('54 documents')
     expect(countLabel(1, true, false)).toBe('1 match')
     expect(countLabel(300, false, true)).toBe('300+ documents')
+  })
+})
+
+describe('librarySubtitle', () => {
+  it('promises files are in here too while browsing', () => {
+    expect(librarySubtitle(false, 34, false, null, false)).toBe('34 documents, and every file in this project')
+    expect(librarySubtitle(false, 1, false, null, false)).toBe('1 document, and every file in this project')
+    expect(librarySubtitle(false, 300, true, null, false)).toBe('300+ documents, and every file in this project')
+  })
+
+  it('states the split with documents first once searching', () => {
+    expect(librarySubtitle(true, 2, false, 3, false)).toBe('2 documents · 3 files')
+    expect(librarySubtitle(true, 1, false, 1, false)).toBe('1 document · 1 file')
+    expect(librarySubtitle(true, 2, true, 3, true)).toBe('2+ documents · 3+ files')
+  })
+
+  it('names only the documents while the file scan has no count to stand behind', () => {
+    // Files still loading, a one-letter query, or a kind filter: the file half is withheld, not zeroed.
+    expect(librarySubtitle(true, 2, false, null, false)).toBe('2 documents')
+  })
+})
+
+describe('fileContext', () => {
+  it('names the parent folders when a file is nested', () => {
+    expect(fileContext('src/main/ipc.ts')).toBe('src/main')
+  })
+
+  it('reads as a sentence at the project root', () => {
+    expect(fileContext('.env.local')).toBe('at the top of this project')
   })
 })
 

@@ -29,7 +29,11 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { isLibraryDocumentPath, splitDocumentFrontmatter } from '@shared/document-contract'
+import {
+  isLibraryAdmittedDocumentPath,
+  resolveDocFormat,
+  splitDocumentFrontmatter,
+} from '@shared/document-contract'
 import type {
   DiffFileResult,
   DocKind,
@@ -51,7 +55,9 @@ import {
   inferDocKind,
   readDocMetadata,
   writeDocFrontmatter,
+  type DocFrontmatter,
 } from './doc-frontmatter'
+import { readHtmlDocumentMetadata } from './html-document'
 import { readContainedRegularFile } from './contained-read'
 import {
   sameRequiredFileFingerprint,
@@ -207,9 +213,18 @@ const DOC_EXTS = new Set(['.md', '.markdown', '.mdx', '.txt', '.rst', '.org'])
  * documents" is withdrawn. That is the right side to err on, because noise is unbounded (one build can
  * emit hundreds of rows) while the omission is one file the user can still reach two other ways.
  */
-/** Is this a file the Documents list / Library may treat as one of the user's documents? */
-function isLibraryDocName(name: string): boolean {
-  return isLibraryDocumentPath(name)
+/**
+ * Is this file — named by its PROJECT-RELATIVE path — one the Documents list and Library may treat as
+ * one of the user's documents?
+ *
+ * The path rather than the bare filename, because admission stopped being a pure question about the
+ * extension when HTML joined the corpus (typed-documents plan, Slice 1). Prose is admitted wherever it
+ * sits, exactly as before; `.html` is admitted only under `Documents/`. The rule itself lives in
+ * `shared/document-contract.ts` beside `resolveDocFormat`, so the renderer and the phone read the same
+ * one sentence rather than a copy of it.
+ */
+function isLibraryDocRel(rel: string): boolean {
+  return isLibraryAdmittedDocumentPath(rel)
 }
 
 /** Does this filename fall in the chosen scope? (Docs = a doc extension; Code = anything else.) */
@@ -224,7 +239,7 @@ function inScope(name: string, scope: SearchScope): boolean {
 /**
  * Fuzzy SUBSEQUENCE match of `needle` (already lowercased) against `hay` — returns a score (higher =
  * better) or null when the chars don't appear in order. Rewards contiguous runs, a match at the start,
- * and matches right after a word boundary (/ _ - .), so "srchovl" ranks SearchOverlay.tsx highly and a
+ * and matches right after a word boundary (/ _ - .), so "libpnl" ranks LibraryPanel.tsx highly and a
  * plain substring like "pricing" scores very high. Tiny + allocation-free — fine to run per filename.
  */
 function fuzzyScore(needle: string, hay: string): number | null {
@@ -427,41 +442,126 @@ export async function createProjectFile(
   source?: string,
   initial?: { description: string; kind: DocKind; body: string },
 ): Promise<string> {
+  return createProjectDocument(root, name, parent, '.md', /\.(md|markdown)$/i, ({ title, rel }) => {
+    const frontmatter = writeDocFrontmatter({
+      title,
+      date: docDateStamp(),
+      kind: initial?.kind ?? inferDocKind(rel),
+      source,
+    })
+    return initial
+      ? `${amendDocFrontmatter(frontmatter, {
+          description: initial.description,
+          kind: initial.kind,
+        }).trimEnd()}\n\n${initial.body}`
+      : frontmatter
+  })
+}
+
+/**
+ * Create a new self-contained HTML document and return its path. The HTML twin of `createProjectFile`
+ * and, deliberately, only that: identical home resolution, identical name sanitising, identical
+ * dedupe, identical exclusive no-clobber write. `render` receives the DEDUPED title so the `<title>`
+ * on the page matches the filename it actually got, exactly as the markdown frontmatter does.
+ *
+ * The bytes themselves belong to `html-document.ts`; this function owns only where the file may land.
+ */
+export async function createProjectHtmlFile(
+  root: string,
+  name: string | undefined,
+  parent: string | undefined,
+  render: (ctx: { title: string; rel: string }) => string,
+): Promise<string> {
+  return createProjectDocument(root, name, parent, '.html', /\.html?$/i, render)
+}
+
+/**
+ * The containment, dedupe and no-clobber core every Koda-created document shares.
+ *
+ * It exists as one function because the three defenses in it are the ones that must never diverge by
+ * format: the home is realpathed AFTER creation and range-checked (a pre-existing `Documents` symlink
+ * out of the project would otherwise pass a lexical check and have `writeFile` follow it out of
+ * bounds), the name is a sanitised basename with no traversal, and the write is exclusive so a race
+ * fails rather than clobbers. A second creation path with its own copy of those is how one of them
+ * quietly gets left out.
+ *
+ * No safety checkpoint here — a brand-new file is trivially discardable, and the first real save
+ * checkpoints. The single exclusive write owns the whole creation transaction, so a failure cannot
+ * strand a metadata-only skeleton that pushes the retry onto a deduped second filename.
+ */
+async function createProjectDocument(
+  root: string,
+  name: string | undefined,
+  parent: string | undefined,
+  extension: string,
+  stripExtension: RegExp,
+  render: (ctx: { title: string; rel: string }) => string,
+): Promise<string> {
   const realRoot = realpathSync(root)
   await mkdir(join(realRoot, DOCS_HOME), { recursive: true })
-  // realpath the home AFTER creating it and range-check against root: a pre-existing `Documents`
-  // symlink pointing outside the project would otherwise pass a lexical check yet have writeFile follow
-  // it out of bounds. (Same defense containedNewPath uses for the rest of the module.)
   const home = parent ? containedReal(root, parent) : realpathSync(join(realRoot, DOCS_HOME))
   if ((await stat(home)).isDirectory() === false) throw new Error('not a folder')
   if (home !== realRoot && !home.startsWith(realRoot + sep)) throw new Error('path escapes the project root')
-  const base = (name ?? 'Untitled').replace(/[/\\]/g, '').replace(/\.(md|markdown)$/i, '').trim() || 'Untitled'
-  let file = join(home, `${base}.md`)
+  const base = (name ?? 'Untitled').replace(/[/\\]/g, '').replace(stripExtension, '').trim() || 'Untitled'
+  let file = join(home, `${base}${extension}`)
   // The title follows the DEDUPED name — a second "Untitled" is titled "Untitled 2", so the Library
   // never shows two rows reading the same thing.
   let title = base
   for (let n = 2; existsSync(file); n++) {
     title = `${base} ${n}`
-    file = join(home, `${title}.md`)
+    file = join(home, `${title}${extension}`)
   }
   const rel = relative(realRoot, file).split(sep).join('/')
-  const frontmatter = writeDocFrontmatter({
-    title,
-    date: docDateStamp(),
-    kind: initial?.kind ?? inferDocKind(rel),
-    source,
-  })
-  const content = initial
-    ? `${amendDocFrontmatter(frontmatter, {
-        description: initial.description,
-        kind: initial.kind,
-      }).trimEnd()}\n\n${initial.body}`
-    : frontmatter
-  // One exclusive write owns the whole creation transaction. A failed keep cannot leave a metadata-
-  // only skeleton that forces the retry onto a deduped second filename.
-  await writeFile(file, content, { encoding: 'utf8', flag: 'wx' })
+  await writeFile(file, render({ title, rel }), { encoding: 'utf8', flag: 'wx' })
   invalidateDocsCache(root)
   return realpathSync(file)
+}
+
+/**
+ * Resolve a project-relative topic folder under `Documents/`, creating it when the topic is genuinely
+ * new. Returns the realpathed directory, or undefined for the `Documents/` root itself.
+ *
+ * Two containment layers, because every caller's argument crosses an agent boundary: a lexical pass
+ * that refuses traversal and forces the destination under `Documents/`, then `containedReal`, which
+ * realpaths the created directory and refuses anything that landed outside the project — the defense a
+ * lexical check alone cannot make when `Documents` is itself a symlink.
+ *
+ * Scoping to `Documents/` is load-bearing rather than tidy. Without it a creation tool writes
+ * agent-supplied text to any path in the project while classifying as neither Write nor Edit to the
+ * approval gate.
+ */
+export async function resolveDocumentsFolder(
+  root: string,
+  requested: string | undefined,
+): Promise<string | undefined> {
+  const realRoot = realpathSync(root)
+  const raw = (requested ?? '').trim().replace(/\\/g, '/').replace(/^\/+/, '')
+  if (!raw) return undefined
+  const segments = raw.split('/').filter((segment) => segment && segment !== '.')
+  if (segments.some((segment) => segment === '..')) {
+    throw new Error('folder must be a project-relative path inside Documents/, e.g. "Documents/decisions"')
+  }
+  // The home segment is recognized case-insensitively but REWRITTEN to Koda's spelling. Passing the
+  // agent's `documents/decisions` through verbatim resolved to the same folder on macOS and to a second,
+  // sibling home on any case-sensitive volume — where the Documents pane would then show one of them.
+  const nested = segments[0]?.toLowerCase() === DOCS_HOME.toLowerCase() ? segments.slice(1) : segments
+  const scoped = [DOCS_HOME, ...nested]
+  const rel = scoped.join('/')
+  const dir = join(realRoot, ...scoped)
+  if (!dir.startsWith(realRoot + sep)) {
+    throw new Error('folder must be a project-relative path inside Documents/, e.g. "Documents/decisions"')
+  }
+  // Range-check the deepest ancestor that already exists BEFORE creating anything. `Documents` (or a
+  // topic folder inside it) may itself be a symlink out of the project, and `mkdir -p` follows one
+  // happily — so without this, a refusal further down would still have left directories on the far side.
+  let ancestor = dir
+  while (ancestor !== realRoot && !existsSync(ancestor)) ancestor = dirname(ancestor)
+  const realAncestor = realpathSync(ancestor)
+  if (realAncestor !== realRoot && !realAncestor.startsWith(realRoot + sep)) {
+    throw new Error('folder escapes the project root')
+  }
+  await mkdir(dir, { recursive: true })
+  return containedReal(realRoot, rel)
 }
 
 /**
@@ -532,7 +632,10 @@ async function listProjectDocsDetailed(root: string): Promise<ProjectDocsDetail>
   let truncated = false
   let stop = false
 
-  async function walk(dir: string): Promise<void> {
+  // `relDir` is carried down rather than recomputed with `relative()` per file: admission now depends
+  // on WHERE a file sits (`.html` only under `Documents/`), and asking that question once per entry in
+  // a tree this walk already caps at 8,000 files should not cost a path resolution each time.
+  async function walk(dir: string, relDir: string): Promise<void> {
     if (stop) return // a cap was hit in a sibling frame — stop the whole walk, not just this dir
     let dirents: import('node:fs').Dirent[]
     try {
@@ -550,12 +653,13 @@ async function listProjectDocsDetailed(root: string): Promise<ProjectDocsDetail>
       if (stop) return
       if (d.isSymbolicLink()) continue // never follow symlinks (escape / cycle risk)
       const full = join(dir, d.name)
+      const rel = relDir ? `${relDir}/${d.name}` : d.name
       if (d.isDirectory()) {
         if (isExcludedDocsDir(d.name)) continue
-        await walk(full)
+        await walk(full, rel)
         continue
       }
-      if (!d.isFile() || !isLibraryDocName(d.name) || isNonUserDoc(d.name)) continue
+      if (!d.isFile() || !isLibraryDocRel(rel) || isNonUserDoc(d.name)) continue
       if (++scanned > DOCS.maxFilesScanned) {
         truncated = true
         stop = true
@@ -573,19 +677,18 @@ async function listProjectDocsDetailed(root: string): Promise<ProjectDocsDetail>
         truncated = true
         continue // vanished between readdir and stat — skip it, but do not call the walk complete
       }
-      const rel = relative(realRoot, full).split(sep).join('/')
       docs.push({ path: full, rel, name: d.name, mtimeMs })
     }
   }
 
-  await walk(realRoot)
+  await walk(realRoot, '')
   docs.sort((a, b) => b.mtimeMs - a.mtimeMs)
   const kept = docs.slice(0, DOCS.maxDocs)
   // Metadata is read AFTER the sort and the cap, so the added cost is bounded by what's returned
   // (≤ maxDocs head reads) rather than by how many docs the tree holds. The walk itself is untouched.
   const excerpts = new Map<string, string>()
   await mapConcurrent(kept, DOC_META_CONCURRENCY, async (doc) => {
-    const { fm, excerpt } = await readDocMetadata(doc.path, 600, realRoot)
+    const { fm, excerpt } = await readAdmittedDocMetadata(doc.path, doc.rel, realRoot)
     if (fm.title) doc.title = fm.title
     if (fm.description) doc.description = fm.description
     if (fm.kind) doc.kind = fm.kind
@@ -598,6 +701,25 @@ async function listProjectDocsDetailed(root: string): Promise<ProjectDocsDetail>
   if ((docsCacheGeneration.get(realRoot) ?? 0) === generation)
     docsListCache.set(realRoot, { at: Date.now(), detail })
   return detail
+}
+
+/**
+ * One admitted document's authored metadata and excerpt, read by the reader its FORMAT owns.
+ *
+ * The format decides, not the caller: `resolveDocFormat` is the single answer to "what are these
+ * bytes", so a document reaches `doc-frontmatter` (YAML between `---` fences) or `html-document`
+ * (`<title>` plus `koda:` metas) by the same rule that decides which Stage surface will open it. Both
+ * readers are fail-soft and byte-bounded, so an unreadable artifact of either kind costs its own row
+ * and nothing else.
+ */
+async function readAdmittedDocMetadata(
+  file: string,
+  rel: string,
+  root: string,
+): Promise<{ fm: DocFrontmatter; excerpt?: string }> {
+  return resolveDocFormat(rel) === 'html'
+    ? readHtmlDocumentMetadata(file, 600, root)
+    : readDocMetadata(file, 600, root)
 }
 
 /** Run `fn` over `items` with at most `limit` in flight. `fn` must swallow its own failures — a
@@ -769,7 +891,7 @@ async function assertLibraryDocumentTarget(
 ): Promise<void> {
   const parts = target.rel.split('/')
   const name = parts.pop() ?? ''
-  if (!isLibraryDocName(name) || isNonUserDoc(name) || parts.some(isExcludedDocsDir))
+  if (!isLibraryDocRel(target.rel) || isNonUserDoc(name) || parts.some(isExcludedDocsDir))
     throw new Error('not a Library document')
 
   // Match the Library walk's bundle pruning too: a Markdown sibling inside a skill/plugin bundle is
@@ -799,7 +921,7 @@ export async function resolveProjectDocs(root: string, rels: string[]): Promise<
     try {
       const target = await resolveLexicalRegularProjectFile(realRoot, requested)
       await assertLibraryDocumentTarget(realRoot, target)
-      const { fm } = await readDocMetadata(target.path, 600, realRoot)
+      const { fm } = await readAdmittedDocMetadata(target.path, target.rel, realRoot)
       // Metadata reads are fail-soft by design, but an exact resolver must not return a path that was
       // swapped while its row was being enriched. A later refresh may pick up the replacement if it is
       // independently eligible.

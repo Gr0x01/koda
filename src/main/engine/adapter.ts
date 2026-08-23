@@ -23,6 +23,7 @@ import type {
 import { rateLimitBand } from '@shared/rate-limits'
 import { buildSessionCapabilitySnapshot, capabilitySnapshotFingerprint } from '@shared/session-capabilities'
 import { logUnmappedEvent } from './unmapped-log'
+import { recordKodaClaudeSession } from './usage-scan'
 import { resolveEnginePath } from './binary'
 import { buildEngineEnv, type EngineEnvOptions } from './env'
 import { looksLikeProviderDown } from './status-watch'
@@ -227,6 +228,9 @@ export interface EngineSession {
    *  `planMode: 'turnText'` — they carry the mode in each turn's text, so no respawn is needed. A
    *  driver with a native mode (Claude) has no such setter and the caller respawns instead. */
   setApprovalMode?(mode: ApprovalMode): void
+  /** Ask the live engine for a fresh account-usage snapshot. Present only on drivers that can
+   *  reread subscription windows without spending a turn. */
+  refreshAccountUsage?(): void
   dispose(): Promise<void>
 }
 
@@ -308,6 +312,9 @@ class ClaudeSession implements EngineSession {
     this.onClose = opts.onClose
     this.id = opts.sessionId ?? randomUUID()
     this.cwd = opts.cwd ?? process.cwd()
+    // The CLI writes this conversation under ~/.claude with this same id (`--session-id`/`--resume`
+    // below), so registering it here is what lets the usage scan attribute the transcript to Koda.
+    recordKodaClaudeSession(this.id)
     // The driver reads its own cursor and decides reattach-vs-fresh here, once.
     const cursor = parseClaudeResumeCursor(opts.resumeCursor, this.id)
     this.turns = cursor?.turns ?? 0

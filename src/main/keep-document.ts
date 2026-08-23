@@ -21,12 +21,11 @@
  * mechanical half of that bar the design writes down — a `description` that merely restates the title is
  * worse than none, because it fills the slot the Library would otherwise use to say something.
  */
-import { mkdir } from 'node:fs/promises'
-import { basename, dirname, extname, join, relative, sep } from 'node:path'
-import { existsSync, realpathSync } from 'node:fs'
+import { basename, extname, relative, sep } from 'node:path'
+import { realpathSync } from 'node:fs'
 import { DocKindSchema, type DocKind } from '@shared/ipc'
 import { isDocFrontmatterBlock, splitFrontmatter } from './doc-frontmatter'
-import { containedReal, createProjectFile, DOCS_HOME } from './fs-browse'
+import { createProjectFile, resolveDocumentsFolder } from './fs-browse'
 
 /** What the agent supplies. Raw strings: this is an MCP boundary, so everything is validated here
  *  rather than trusted, and every failure comes back as a sentence that teaches the rule. */
@@ -75,7 +74,9 @@ export async function keepDocument(
   const body = readBody(args.body)
 
   const realRoot = realpathSync(root)
-  const parent = await resolveFolder(realRoot, args.folder)
+  // The one "lands in Documents/" resolver, shared with the create commands: a second copy of the
+  // traversal refusal and the symlink range-check is a second place for one of them to be forgotten.
+  const parent = await resolveDocumentsFolder(realRoot, args.folder)
   // Born through the one creation path: title/date/kind/source, dedupe, and the no-clobber write.
   // The authored kind wins over the destination folder's fallback, and all authored content rides the
   // same exclusive write as the metadata. There is no metadata-only intermediate file to strand.
@@ -141,44 +142,4 @@ function readBody(value: unknown): string {
     )
   }
   return `${text}\n`
-}
-
-/**
- * Resolve the topic subfolder, creating it when the topic is genuinely new (the routed playbook allows
- * exactly that). Two containment layers, because this argument crosses an MCP boundary: a lexical pass
- * that refuses traversal and forces the destination under `Documents/`, then `containedReal`, which
- * realpaths the created directory and refuses anything that landed outside the project — the defense a
- * lexical check alone cannot make when `Documents` is itself a symlink.
- *
- * Scoping to `Documents/` is load-bearing rather than tidy. Without it this tool writes agent-supplied
- * text to any path in the project while classifying as neither Write nor Edit to the approval gate.
- */
-async function resolveFolder(realRoot: string, requested: string | undefined): Promise<string | undefined> {
-  const raw = (requested ?? '').trim().replace(/\\/g, '/').replace(/^\/+/, '')
-  if (!raw) return undefined
-  const segments = raw.split('/').filter((segment) => segment && segment !== '.')
-  if (segments.some((segment) => segment === '..')) {
-    throw new Error('folder must be a project-relative path inside Documents/, e.g. "Documents/decisions"')
-  }
-  // The home segment is recognized case-insensitively but REWRITTEN to Koda's spelling. Passing the
-  // agent's `documents/decisions` through verbatim resolved to the same folder on macOS and to a second,
-  // sibling home on any case-sensitive volume — where the Documents pane would then show one of them.
-  const nested = segments[0]?.toLowerCase() === DOCS_HOME.toLowerCase() ? segments.slice(1) : segments
-  const scoped = [DOCS_HOME, ...nested]
-  const rel = scoped.join('/')
-  const dir = join(realRoot, ...scoped)
-  if (!dir.startsWith(realRoot + sep)) {
-    throw new Error('folder must be a project-relative path inside Documents/, e.g. "Documents/decisions"')
-  }
-  // Range-check the deepest ancestor that already exists BEFORE creating anything. `Documents` (or a
-  // topic folder inside it) may itself be a symlink out of the project, and `mkdir -p` follows one
-  // happily — so without this, a refusal further down would still have left directories on the far side.
-  let ancestor = dir
-  while (ancestor !== realRoot && !existsSync(ancestor)) ancestor = dirname(ancestor)
-  const realAncestor = realpathSync(ancestor)
-  if (realAncestor !== realRoot && !realAncestor.startsWith(realRoot + sep)) {
-    throw new Error('folder escapes the project root')
-  }
-  await mkdir(dir, { recursive: true })
-  return containedReal(realRoot, rel)
 }

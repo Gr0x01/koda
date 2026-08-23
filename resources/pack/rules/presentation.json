@@ -40,8 +40,8 @@
       "id": "working-in-koda",
       "title": "Works through Koda",
       "section": "core",
-      "summary": "Uses only real capabilities, asks Koda for its live options when useful, and routes personal apps through Koda's make-and-run recipe.",
-      "members": ["connectors-check-dont-invent", "discover-koda-capabilities", "app-ask-uses-recipe"]
+      "summary": "Uses only real capabilities, asks Koda for its live options when useful, opens the files it points at, and routes personal apps through Koda's make-and-run recipe.",
+      "members": ["connectors-check-dont-invent", "discover-koda-capabilities", "open-what-you-name", "app-ask-uses-recipe"]
     }
   ]
 }

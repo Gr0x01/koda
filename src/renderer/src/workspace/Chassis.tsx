@@ -6,7 +6,6 @@ import { Settings } from '../settings/Settings'
 import { AppFace } from './AppFace'
 import { Sidebar } from './Sidebar'
 import { SourceControl } from './SourceControl'
-import { SearchOverlay } from './SearchOverlay'
 import { LibraryHost } from './library/LibraryHost'
 import { TitleBar } from './TitleBar'
 import { StatusBar, BillingFallbackBanner, AccountSignInBanner, DataIntegrityBanner } from './StatusBar'
@@ -32,7 +31,6 @@ export function Chassis() {
   const settingsOpen = useWorkspace((s) => s.settingsOpen)
   const versionsOpen = useWorkspace((s) => s.versionsOpen)
   const setVersionsOpen = useWorkspace((s) => s.setVersionsOpen)
-  const searchOpen = useWorkspace((s) => s.searchOpen)
   // Stage expanded: the sidebar steps aside too, so the staged surface really is the whole window.
   const stageExpanded = useWorkspace((s) => s.stageExpanded && stageVisible(s))
   const projectPath = useWorkspace((s) => s.projectPath)
@@ -211,12 +209,8 @@ export function Chassis() {
 
       {!faceOn && <StatusBar />}
 
-      {/* Find overlay — summoned over everything (⌘P / ⌘⇧F); mounted only while open so each open is
-          a fresh autofocus + clean state. AnimatePresence defers the unmount so it animates out. */}
-      <AnimatePresence>{searchOpen && <SearchOverlay />}</AnimatePresence>
-
-      {/* The Library (⌘K) — the document surface, beside the code-shaped Find overlay rather than
-          inside it. It owns its own open flag and AnimatePresence. */}
+      {/* The Library — Koda's one search door. ⌘K, ⌘P and ⌘⇧F all summon it: documents by default, and
+          every file in the project once you type. It owns its own open flag and AnimatePresence. */}
       <LibraryHost />
 
       {/* The one image preview — opened by any thumbnail anywhere (composer, transcript, Recent images). */}

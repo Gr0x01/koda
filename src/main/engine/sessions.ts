@@ -86,6 +86,13 @@ import {
 } from '../completion-state'
 import { browseDir, containedReal, docExcerpt, listProjectDocs, readProjectFile, readProjectImage, writeProjectFile } from '../fs-browse'
 import { installApp, startApp, stopApp, appStatus, projectHasMiniApp } from '../mini-apps'
+import {
+  createDocument,
+  createInteractiveDocument,
+  readDocShelfForRecovery,
+  reconcileDocShelfAfterRestore,
+  starDocument,
+} from '../doc-commands'
 import { keepDocument } from '../keep-document'
 import { encodeWebp } from '../backup/webp'
 import { noteRateLimit } from './usage-reset-notifier'
@@ -592,7 +599,9 @@ export class EngineSessionManager {
       (sessionId, message) => this.forward({ type: 'EngineError', sessionId, message, fatal: false }),
     )
     this.broker = new PermissionBroker(
-      (sessionId, req) => this.gate.decide(sessionId, req),
+      // Forward ALL DecideFn args — a two-arg arrow here type-checks fine and silently drops the
+      // approve request's AbortSignal, leaving the gate unable to clean a slot the engine cancelled.
+      (sessionId, req, signal) => this.gate.decide(sessionId, req, signal),
       (sessionId, message) => this.forward({ type: 'EngineError', sessionId, message, fatal: false }),
       // Agent-driven recovery (dual-git.md §2): the broker exposes list/restore capability tools, the
       // manager executes them via safety-git (driver/implementer split). Restore runs through
@@ -640,6 +649,18 @@ export class EngineSessionManager {
       // Explicit presentation is Koda-owned and engine-neutral. The broker only validates/routes; the
       // manager resolves session → workspace and broadcasts the portable receipt to every head.
       (sessionId, args) => this.presentFile(sessionId, args),
+      // Star/unstar (typed-documents plan, Slice 0 decision 3): the shelf is project state owned by
+      // main, so the agent runs the SAME command the Library and Stage bar run. The manager's only job
+      // is session → project root, exactly like the mini-app verbs; no window is required, so a
+      // phone-driven session can shelve a document too.
+      (sessionId, args) => starDocument(this.projectPathFor(sessionId), args),
+      // Create a document (typed-documents plan, Slice 1). Session → project root, exactly like the
+      // verbs above; the session id also rides along as the document's `source` provenance, which is
+      // the one field an agent on the far side of the MCP boundary could never supply for itself.
+      (sessionId, args) => createDocument(this.projectPathFor(sessionId), args, sessionId),
+      // Turn a passage into an interactive view beside its source. No session id: the artifact's
+      // provenance is the DOCUMENT it came from, which the caller names, not the chat it happened in.
+      (sessionId, args) => createInteractiveDocument(this.projectPathFor(sessionId), args),
     )
     // Seed the DEFAULT posture new sessions start at (per-session overrides come from the renderer).
     this.gate.setDefaultMode(loadApprovalMode())
@@ -844,7 +865,7 @@ export class EngineSessionManager {
           {
             sessionId,
             cwd,
-            decide: (sid, req) => this.gate.decide(sid, req),
+            decide: (sid, req, signal) => this.gate.decide(sid, req, signal),
             // The SAME compact constitution, routes, and project card Claude gets, delivered as additive
             // developerInstructions. brokerWired: true — the Codex path always attaches the broker
             // (brokerUrl below), so any broker-gated routes apply.
@@ -2283,6 +2304,15 @@ export class EngineSessionManager {
       return Promise.resolve({ signedIn: false, authMethod: null, requiresOpenaiAuth: true, probeFailed: false })
     }
     return getCodexAuthStatus({ resourcesPath: this.resourcesPath })
+  }
+
+  /** A Codex login can replace the credential behind an already-running app-server. Ask those live
+   *  sessions to reread the account windows immediately, so the plan gauge changes with the account
+   *  switch instead of waiting for the next turn. */
+  refreshCodexUsage(): void {
+    for (const [sessionId, session] of this.sessions) {
+      if (this.sessionEngines.get(sessionId) === 'codex') session.refreshAccountUsage?.()
+    }
   }
 
   /** Provider-neutral picker payload shared by desktop and phone. Keep provider probes here, next to
@@ -4058,7 +4088,13 @@ export class EngineSessionManager {
     // Read the target's subject BEFORE the restore records its own "recovered to …" tip, so the notice
     // names the point the user actually picked rather than the marker the recovery just wrote.
     const target = await readCheckpoint(projectDir, checkpointId)
+    // The shelf is checkpointed with the documents it describes, so a rewind moves it too — which is
+    // wanted when the target HAS a shelf, and destructive when it does not. Restoring past the day the
+    // shelf was introduced deletes the file, and an absent shelf means "this point in history has no
+    // opinion about stars", never "the user had none". Carry it across in that case.
+    const before = await readDocShelfForRecovery(projectDir)
     const restored = await restore(projectDir, checkpointId)
+    await reconcileDocShelfAfterRestore(projectDir, before)
     const notice = restoreNotice(target ? applyHumanizedLabels([target])[0] : null)
     const root = realpathOrSelf(projectDir)
     for (const [sessionId, cwd] of this.projectDirs) {
@@ -4894,6 +4930,15 @@ export class EngineSessionManager {
     // The steered turn is over, so the live posture is the truth again. A posture the user changed
     // mid-turn takes effect from here — the same boundary the next turn's mode block announces.
     if (event.type === 'TurnComplete') this.gate.pinTurnMode(event.sessionId, null)
+
+    // Backstop for a stranded approval (approval-gate). The engine blocks its turn synchronously on a
+    // pending `approve`, so a genuine TurnComplete proves no live caller awaits any of this session's
+    // slots — anything still pending was orphaned when the engine aborted its `approve` on the ~1025s
+    // MCP idle timeout and moved on, sending no cancellation. Left in place it gates the NEXT turn's
+    // admission ("This session is waiting for your answer") with a card the renderer already cleared at
+    // turn-complete, so nothing on screen to answer and the session is bricked until restart. Sweep them:
+    // main clears every head's card and denies the awaiting handler, so admission is clean.
+    if (event.type === 'TurnComplete') this.gate.sweepStranded(event.sessionId)
 
     // A turn just moved the needle — refresh the plan gauge instead of leaving it up to a minute stale.
     // Debounced, so a run of short turns doesn't spawn a poll each time.

@@ -1,26 +1,24 @@
-import { forwardRef, useMemo, type ButtonHTMLAttributes, type ReactNode } from 'react'
+import { forwardRef, useMemo, type ButtonHTMLAttributes } from 'react'
 import { RotateCcw } from 'lucide-react'
 import { HoverCard, IconButton, cx } from '../ui'
 import { useWorkspace } from './store'
 
 /**
- * The rail's foot — the quiet lines under the session map, one per thing that answers *what exists*
- * rather than *who is working*. Each is a single icon + label + count that discloses its contents in
- * an interactive `HoverCard`: summoned, used, and left, instead of holding permanent rail height.
+ * The History section's quiet rows, one per thing that answers *what happened* rather than *who is
+ * working*. Each is a label + count that discloses its contents in an anchored interactive card.
  *
- * `RailFootLine` is the shared shape (this file's Archived line and `RecentImages` both wear it), and
+ * `HistoryRow` is the shared shape (this file's Archived chats row and `RecentImages` both wear it), and
  * it is a real `<button>` so it satisfies `HoverCard`'s trigger contract — cloned in place, host
  * element, focusable, so the card opens on keyboard focus as well as hover.
  */
 
-export interface RailFootLineProps extends ButtonHTMLAttributes<HTMLButtonElement> {
-  icon: ReactNode
+export interface HistoryRowProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   label: string
   count: number
 }
 
-export const RailFootLine = forwardRef<HTMLButtonElement, RailFootLineProps>(function RailFootLine(
-  { icon, label, count, className, ...rest },
+export const HistoryRow = forwardRef<HTMLButtonElement, HistoryRowProps>(function HistoryRow(
+  { label, count, className, ...rest },
   ref,
 ) {
   return (
@@ -28,16 +26,13 @@ export const RailFootLine = forwardRef<HTMLButtonElement, RailFootLineProps>(fun
       ref={ref}
       type="button"
       className={cx(
-        'flex w-full shrink-0 items-center gap-2 border-t border-border px-3 py-2 text-left text-[11.5px]',
-        'text-text-muted outline-none transition-colors hover:bg-surface hover:text-text',
+        'flex w-full shrink-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px]',
+        'text-text-muted outline-none transition-colors hover:bg-surface/60 hover:text-text',
         'focus-visible:bg-surface focus-visible:text-text',
         className,
       )}
       {...rest}
     >
-      <span aria-hidden className="shrink-0 opacity-80">
-        {icon}
-      </span>
       {label}
       <span className="ml-auto text-[10.5px] tabular-nums opacity-60">{count}</span>
     </button>
@@ -49,7 +44,7 @@ export const RailFootLine = forwardRef<HTMLButtonElement, RailFootLineProps>(fun
 const CARD_CAP = 6
 
 /**
- * **Archived** — the way back. Archiving is a one-click verb on a session row, so the return trip
+ * **Archived chats** — the way back. Archiving is a one-click verb on a session row, so the return trip
  * cannot stay four clicks deep in Settings; this line is that loop closed. Renders nothing at all
  * until something is archived, so an ordinary project never sees it.
  *
@@ -74,13 +69,12 @@ export function ArchivedFoot() {
   return (
     <HoverCard
       interactive
-      heading="Archived"
+      heading="Archived chats"
       ariaLabel="Archived chats"
       width={296}
       trigger={
-        <RailFootLine
-          icon={<IconArchive />}
-          label="Archived"
+        <HistoryRow
+          label="Archived chats"
           count={archived.length}
           aria-label={`Archived chats (${archived.length})`}
           onClick={() => openSettingsTo('archived')}
@@ -134,13 +128,4 @@ function shortAge(ms: number): string {
   if (weeks < 5) return `${weeks}w`
   const months = Math.round(days / 30)
   return months < 12 ? `${months}mo` : `${Math.round(days / 365)}y`
-}
-
-function IconArchive() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <rect x="2.5" y="4" width="19" height="4.5" rx="1" />
-      <path d="M4.5 8.5V19a1.5 1.5 0 0 0 1.5 1.5h12a1.5 1.5 0 0 0 1.5-1.5V8.5M10 12.5h4" />
-    </svg>
-  )
 }

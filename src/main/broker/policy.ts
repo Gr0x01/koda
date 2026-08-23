@@ -62,6 +62,11 @@ export const PRESENT_FILE_TOOL = 'mcp__koda_broker__present_file'
  *  `checkpointLabel` can give that checkpoint a human sentence instead of the raw MCP tool name. */
 export const KEEP_DOCUMENT_TOOL = 'mcp__koda_broker__keep_document'
 
+/** Koda's "put this document on the shelf" capability — it writes only Koda's own shelf record
+ *  (`.koda/doc-shelf.json`), never the user's content, and one call reverses it. So it takes no
+ *  pre-checkpoint and no forced confirm: it rides the session posture like a read. */
+export const STAR_DOCUMENT_TOOL = 'mcp__koda_broker__star_document'
+
 /** The engine's plan-mode exit tool. Touches no project file (it presents a plan + asks to
  *  proceed), so no checkpoint — but it ALWAYS confirms (see ALWAYS_CONFIRM_TOOLS) so the user
  *  actually sees the plan before building, even in Auto-approve. */
@@ -113,6 +118,8 @@ const READ_ONLY_TOOLS = new Set([
   OPEN_TERMINAL_TOOL,
   // Presenting an existing file is a read-only UI action.
   PRESENT_FILE_TOOL,
+  // Starring writes Koda's shelf record, not the user's document — nothing to recover, so no checkpoint.
+  STAR_DOCUMENT_TOOL,
 ])
 
 /** The optional Playwright browser-testing tools (`mcp__playwright__*`, server name 'playwright' in

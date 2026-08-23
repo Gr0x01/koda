@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
@@ -13,6 +13,7 @@ const {
   codexMarketplaceJson,
   codexPluginJson,
   codexSkillConfig,
+  writeBackCodexAuth,
 } = await import('./codex-home')
 
 function skill(dir: string, name = basename(dir)): void {
@@ -169,5 +170,94 @@ describe('Codex native skill configuration', () => {
       })),
     )
     expect(fullyWired).toEqual([])
+  })
+})
+
+describe('Codex auth write-back', () => {
+  const chatgpt = JSON.stringify({ auth_mode: 'chatgpt', tokens: { id_token: 'x' } })
+  const apikey = JSON.stringify({ auth_mode: 'apikey', OPENAI_API_KEY: 'sk-test' })
+
+  function homes(): { home: string; standaloneDir: string } {
+    const root = mkdtempSync(join(tmpdir(), 'koda-codex-writeback-'))
+    return { home: join(root, 'koda-home'), standaloneDir: join(root, '.codex') }
+  }
+
+  it('mirrors a fresh ChatGPT login into the standalone home, creating it if the CLI never ran', () => {
+    const { home, standaloneDir } = homes()
+    mkdirSync(home, { recursive: true })
+    writeFileSync(join(home, 'auth.json'), chatgpt)
+
+    writeBackCodexAuth({ home, standaloneDir })
+
+    const dest = join(standaloneDir, 'auth.json')
+    expect(readFileSync(dest, 'utf8')).toBe(chatgpt)
+    expect(statSync(dest).mode & 0o777).toBe(0o600)
+  })
+
+  it('replaces a stale standalone ChatGPT credential with the one just minted', () => {
+    const { home, standaloneDir } = homes()
+    mkdirSync(home, { recursive: true })
+    mkdirSync(standaloneDir, { recursive: true })
+    writeFileSync(join(home, 'auth.json'), chatgpt)
+    writeFileSync(join(standaloneDir, 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt', tokens: { id_token: 'stale' } }))
+
+    writeBackCodexAuth({ home, standaloneDir })
+
+    expect(readFileSync(join(standaloneDir, 'auth.json'), 'utf8')).toBe(chatgpt)
+  })
+
+  it('never copies Koda-managed api-key billing state out of the isolated home', () => {
+    const { home, standaloneDir } = homes()
+    mkdirSync(home, { recursive: true })
+    writeFileSync(join(home, 'auth.json'), apikey)
+
+    writeBackCodexAuth({ home, standaloneDir })
+
+    expect(existsSync(join(standaloneDir, 'auth.json'))).toBe(false)
+  })
+
+  it('never overwrites a deliberate standalone api-key setup', () => {
+    const { home, standaloneDir } = homes()
+    mkdirSync(home, { recursive: true })
+    mkdirSync(standaloneDir, { recursive: true })
+    writeFileSync(join(home, 'auth.json'), chatgpt)
+    writeFileSync(join(standaloneDir, 'auth.json'), apikey)
+
+    writeBackCodexAuth({ home, standaloneDir })
+
+    expect(readFileSync(join(standaloneDir, 'auth.json'), 'utf8')).toBe(apikey)
+  })
+
+  it('leaves a standalone CLI alone when its config stores credentials outside auth.json', () => {
+    const { home, standaloneDir } = homes()
+    mkdirSync(home, { recursive: true })
+    mkdirSync(standaloneDir, { recursive: true })
+    writeFileSync(join(home, 'auth.json'), chatgpt)
+    writeFileSync(join(standaloneDir, 'config.toml'), 'model = "gpt-5.5"\ncli_auth_credentials_store = "keyring"\n')
+
+    writeBackCodexAuth({ home, standaloneDir })
+
+    expect(existsSync(join(standaloneDir, 'auth.json'))).toBe(false)
+  })
+
+  it('still writes back when the standalone config explicitly selects file storage', () => {
+    const { home, standaloneDir } = homes()
+    mkdirSync(home, { recursive: true })
+    mkdirSync(standaloneDir, { recursive: true })
+    writeFileSync(join(home, 'auth.json'), chatgpt)
+    writeFileSync(join(standaloneDir, 'config.toml'), 'cli_auth_credentials_store = "file"\n')
+
+    writeBackCodexAuth({ home, standaloneDir })
+
+    expect(readFileSync(join(standaloneDir, 'auth.json'), 'utf8')).toBe(chatgpt)
+  })
+
+  it('does nothing when the isolated home holds no credential at all', () => {
+    const { home, standaloneDir } = homes()
+    mkdirSync(home, { recursive: true })
+
+    writeBackCodexAuth({ home, standaloneDir })
+
+    expect(existsSync(standaloneDir)).toBe(false)
   })
 })

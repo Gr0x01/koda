@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useId, useState, type ReactNode } from 'react'
 import type {
   BillingMode,
   BillingState,
@@ -7,22 +7,14 @@ import type {
   EngineId,
   MiniAppBridgeInfo,
   RateLimitInfo,
-  UsageHistoryDay,
 } from '@shared/ipc'
-import {
-  buildUsageValue,
-  type EngineValue,
-  type ModelValue,
-  type UsageValue,
-} from '@shared/usage-value'
 import { Collapse, motion, spring } from '../motion'
 import { Caret } from '../Caret'
 import { useWorkspace } from '../workspace/store'
 import { SegmentedControl, SettingsNote, SettingsRow, SettingsSection, Toggle } from './controls'
 import { BusyText, Button, PixelGlyph, cx } from '../ui'
 import { liveRateLimitWindows } from '@shared/rate-limits'
-import { UsageChart } from './UsageChart'
-import { fmtTokens, fmtUsd, prettyModel } from './usage-format'
+import { fmtUsd } from './usage-format'
 import { engineCapabilities } from '@shared/engine-capabilities'
 
 // ── AI providers (engine billing, one tab per provider) ─────────────────────────────
@@ -36,7 +28,6 @@ import { engineCapabilities } from '@shared/engine-capabilities'
 // history spans both providers, so it sits below the tabs.
 export function ProvidersSection() {
   const [billing, setBilling] = useState<BillingState | null>(null)
-  const [history, setHistory] = useState<UsageHistoryDay[]>([])
   const [codexAuth, setCodexAuth] = useState<CodexAuthStatus | null>(null)
   const [active, setActive] = useState<ProviderId>('anthropic')
   const rateLimits = useWorkspace((s) => s.rateLimits)
@@ -62,7 +53,6 @@ export function ProvidersSection() {
   useEffect(() => {
     refresh()
     refreshCodex()
-    window.koda.getUsageHistory().then(setHistory).catch(console.error)
   }, [refreshCodex])
 
   // Billing state is the ANTHROPIC account's (BYO Anthropic API key + 'auto' fallback). Codex is
@@ -70,19 +60,9 @@ export function ProvidersSection() {
   const apiAlways = billing?.mode === 'api'
   const apiActive = billing?.apiActive ?? false
 
-  // Every Usage number comes from the PERSISTED daily history, not just the sessions open right now —
-  // so it shows every model you've used lately (e.g. one from a session you've since closed), which the
-  // old open-sessions-only aggregate silently dropped. `buildUsageValue` owns the arithmetic (and the
-  // model → engine split) so the view and its reconciliation test read the history identically.
-  // Snapshotted at mount, which is fine for a settings pane.
-  const value = useMemo(() => buildUsageValue(history), [history])
-  const byEngine = value.byEngine
-
-  // OpenAI's usage card + the chart's engine split appear once there's any Codex usage on record.
-  const codexHasUsage =
-    (byEngine.codex?.totalTokens ?? 0) > 0 ||
-    (byEngine.codex?.costUsd ?? 0) > 0 ||
-    Object.keys(rateLimits.codex ?? {}).length > 0
+  // OpenAI's plan-limit card appears once Codex has reported any window. The accounting itself
+  // (spend, models, history) lives in Settings → Usage now — this pane is auth, billing, and limits.
+  const codexHasWindows = Object.keys(rateLimits.codex ?? {}).length > 0
 
   // Hide a provider's advanced (API key) + usage rows until it's actually signed in — a logged-out pane
   // should read as one clean "sign in" card, not a wall of empty usage. Claude is ready on a subscription
@@ -91,7 +71,6 @@ export function ProvidersSection() {
   const claudeReady = billing != null && (billing.verdict.mode !== 'logged-out' || billing.hasKey)
   // Codex is "ready" on a ChatGPT login OR a stored OpenAI API key (either credential can drive it).
   const codexReady = (codexAuth?.signedIn ?? false) || (billing?.hasCodexKey ?? false)
-  const anyReady = claudeReady || codexReady
 
   const claudeStatus = claudeStatusOf(billing)
   const codexStatus = codexStatusOf(codexAuth, billing)
@@ -121,16 +100,9 @@ export function ProvidersSection() {
               showKey={claudeReady}
               apiActive={apiActive}
             />
-            {claudeReady && (
-              <EngineUsage
-                title="Usage"
-                engineId="claude"
-                windows={rateLimits.claude ?? {}}
-                value={byEngine.claude}
-                // Plan windows are meaningless under always-API billing; hide just that block.
-                showPlanLimits={!apiAlways}
-                apiActive={apiActive}
-              />
+            {/* Plan windows are meaningless under always-API billing; the ledger lives in Usage. */}
+            {claudeReady && !apiAlways && (
+              <PlanLimits engineId="claude" windows={rateLimits.claude ?? {}} />
             )}
             <AppKeyAccess hasKey={billing?.hasKey ?? false} />
           </ProviderPanel>
@@ -152,24 +124,14 @@ export function ProvidersSection() {
                 refreshCodex() // auth.json flips between apikey/chatgpt after reconcile — re-read sign-in status
               }}
             />
-            {codexReady && codexHasUsage && (
-              <EngineUsage
-                title="Usage"
-                engineId="codex"
-                windows={rateLimits.codex ?? {}}
-                value={byEngine.codex}
-                // Plan windows are meaningless when Codex bills the API key; hide just that block.
-                showPlanLimits={!(billing?.codexApiActive ?? false)}
-                apiActive={billing?.codexApiActive ?? false}
-              />
+            {/* Plan windows are meaningless when Codex bills the API key; the ledger lives in Usage. */}
+            {codexReady && codexHasWindows && !(billing?.codexApiActive ?? false) && (
+              <PlanLimits engineId="codex" windows={rateLimits.codex ?? {}} />
             )}
           </ProviderPanel>
         </div>
       </div>
 
-      {anyReady && value.daily.length > 0 && (
-        <HistorySection value={value} apiActive={apiActive} />
-      )}
     </div>
   )
 }
@@ -884,57 +846,10 @@ function codexStatusOf(auth: CodexAuthStatus | null, billing: BillingState | nul
   return { dot: false, short: 'not set up', full: 'Not set up' }
 }
 
-// Attribute a recorded model id to its provider so the persisted history (a flat model→spend map) can be
-// split per tab. Claude reports `claude-*` ids or, rarely, a bare Claude alias; every other id is Codex.
-// ── Usage history (cross-engine daily chart) ──────────────────────────────────────────
-// The one usage card that spans both providers — the last two weeks of measured daily usage, read as
-// dollars or as tokens, segmented by engine when more than one ran. Per-provider plan windows + totals
-// live in each provider's own block above (EngineUsage). NO precise plan % anywhere — that needs the
-// OAuth usage endpoint, which the ToS bars; Anthropic's plan limits / usage credits do the actual
-// capping, this is a read-only mirror.
-function HistorySection({ value, apiActive }: { value: UsageValue; apiActive: boolean }) {
-  const recent = value.daily.slice(-14)
-  const engines = [...new Set(recent.flatMap((d) => d.byEngine.map((e) => e.engineId)))]
-  const anyUnpriced = Object.values(value.byEngine).some((e) => !e.priced && e.totalTokens > 0)
-  return (
-    <SettingsSection
-      title="History"
-      note={
-        <>
-          Every figure is measured: the tokens each turn actually used, and what the engine billed for
-          them.{' '}
-          {apiActive
-            ? 'Anthropic turns show real billed amounts.'
-            : 'Your plan covers this, so nothing here is charged to you.'}
-          {anyUnpriced &&
-            ' A provider Koda has no published price for appears in tokens and stays out of the money view.'}
-        </>
-      }
-    >
-      <UsageChart daily={recent} engines={engines} />
-    </SettingsSection>
-  )
-}
-
-/** One engine's usage within its provider block: plan windows + estimated spend + per-model split. The
- *  `title` is the card heading (e.g. "Usage") — the provider brand is the group header above, so this
- *  doesn't repeat it. Each engine is its own account, so these never combine across providers. */
-function EngineUsage({
-  title,
-  engineId,
-  windows,
-  value,
-  showPlanLimits,
-  apiActive,
-}: {
-  title: string
-  engineId: EngineId
-  windows: Record<string, RateLimitInfo>
-  /** Absent until this engine has recorded a turn — the card then shows plan windows only. */
-  value?: EngineValue
-  showPlanLimits: boolean
-  apiActive: boolean
-}) {
+/** One engine's subscription windows, as the engine itself reports them. The spend/model/history
+ *  accounting moved to Settings → Usage (the whole-subscription ledger); limits stay here because
+ *  they are properties of the provider ACCOUNT the pane manages. */
+function PlanLimits({ engineId, windows }: { engineId: EngineId; windows: Record<string, RateLimitInfo> }) {
   const [nowSec, setNowSec] = useState(() => Math.floor(Date.now() / 1000))
   useEffect(() => {
     const timer = setInterval(() => setNowSec(Math.floor(Date.now() / 1000)), 30_000)
@@ -947,147 +862,15 @@ function EngineUsage({
   // Anchor the 5-hour row for an engine whose plan always has one (always-present empty state); for
   // any other engine only show a window once it actually reports one (never fabricate a gauge).
   const anchorFiveHour = engineCapabilities(engineId).anchorsFiveHourWindow
+  if (!anchorFiveHour && !five && !weekly) return null
   return (
     <SettingsSection
-      title={title}
-      note={
-        showPlanLimits
-          ? 'These are your subscription usage windows as the engine reports them, so the provider’s own side enforces the exact limit.'
-          : 'Per-token spend as the engine reports it, while your real invoice lives in the provider’s console.'
-      }
+      title="Plan limits"
+      note="These are your subscription usage windows as the engine reports them, so the provider’s own side enforces the exact limit. The full accounting lives under Usage."
     >
-      {showPlanLimits && (anchorFiveHour || five) && <PlanWindowRow label="5-hour limit" info={five} />}
-      {showPlanLimits && weekly && <PlanWindowRow label="Weekly limit" info={weekly} />}
-      {value && <EngineUsageBody value={value} apiActive={apiActive} />}
+      {(anchorFiveHour || five) && <PlanWindowRow label="5-hour limit" info={five} />}
+      {weekly && <PlanWindowRow label="Weekly limit" info={weekly} />}
     </SettingsSection>
-  )
-}
-
-/** The exact rendered usage body, kept stateless so the published-price invariant can be asserted in
- *  the ordinary Node test lane without a second browser harness. */
-export function EngineUsageBody({ value, apiActive }: { value: EngineValue; apiActive: boolean }) {
-  return (
-    <>
-      <ValueHeadline value={value} apiActive={apiActive} />
-      {value.models.map((model) => (
-        <ModelUsageRow key={model.model} model={model} />
-      ))}
-    </>
-  )
-}
-
-/**
- * What this engine's usage is worth, as three measured facts side by side: the total at full API rate,
- * what the cache took off that total, and the same total divided by the days you actually ran turns.
- *
- * The headline is the engine's own per-turn cost summed — the number the provider would have billed at
- * published rates — so on a subscription it reads as the value the plan absorbed. The cache line is the
- * one derived figure: measured cache tokens priced at the published input rate against what those same
- * tokens would have cost uncached. Neither is a forecast, and per-active-day divides by days that
- * happened, never by a calendar span (which would quietly halve the number over a quiet week).
- */
-function ValueHeadline({ value, apiActive }: { value: EngineValue; apiActive: boolean }) {
-  const saved = value.priced ? value.cacheSavingsUsd : null
-  // `value.priced`, never a recorded cost: the Codex driver reports a cost estimate the tracker stores
-  // faithfully, so a cost-based branch would print dollars for a provider we have no published rate
-  // for. Unpriced ⇒ the whole card is tokens, headline and average alike.
-  const priced = value.priced
-  return (
-    <div className="py-4">
-      <div className="text-[11px] font-medium uppercase tracking-wider text-text-muted">
-        {priced ? (apiActive ? 'Billed to your API account' : 'At full API rate') : 'Tokens used'}
-      </div>
-      <div className="mt-1 flex flex-wrap items-baseline gap-x-6 gap-y-1">
-        {/* This value also appears in a model row, so the rendered-price guard needs to identify the
-            headline rather than pass because the same number appeared somewhere else. */}
-        <span
-          data-testid="usage-headline"
-          className="font-mono text-[30px] font-semibold leading-none text-text"
-        >
-          {/* pricedCostUsd, not costUsd: on an engine that mixed a citable model with an alias we
-              cannot price, the recorded total carries money this card must not put a dollar on. */}
-          {priced ? fmtUsd(value.pricedCostUsd) : `${fmtTokens(value.totalTokens)} tokens`}
-        </span>
-        {saved != null && saved !== 0 && (
-          <span className="text-[12.5px] text-text-muted">
-            {saved > 0 ? (
-              <>
-                Caching kept{' '}
-                <span className="font-mono text-text">{fmtUsd(saved)}</span> off that
-              </>
-            ) : (
-              <>
-                Cache writes added{' '}
-                <span className="font-mono text-text">{fmtUsd(-saved)}</span> to that
-              </>
-            )}
-          </span>
-        )}
-      </div>
-      <div className="mt-2 text-[12.5px] leading-snug text-text-muted">
-        {priced ? (
-          <>
-            <span className="font-mono text-text">{fmtUsd(value.pricedCostPerActiveDayUsd)}</span> and{' '}
-            <span className="font-mono text-text">{fmtTokens(value.tokensPerActiveDay)}</span> tokens
-            on a day you use it, across{' '}
-            {value.activeDays === 1 ? '1 such day' : `${value.activeDays} such days`}.
-          </>
-        ) : (
-          <>
-            <span className="font-mono text-text">{fmtTokens(value.tokensPerActiveDay)}</span> tokens
-            on a day you use it, across{' '}
-            {value.activeDays === 1 ? '1 such day' : `${value.activeDays} such days`}. This provider
-            reports no per-turn price, so Koda shows what it counted rather than a rate it made up.
-          </>
-        )}
-      </div>
-    </div>
-  )
-}
-
-/**
- * One model's measured cost, its share of this engine's spend, and its token split. The share bar is
- * the "which model is eating the plan" answer at a glance; the description calls out the cache share,
- * the single most useful token fact (cache reads dominate counts and cost a fraction of fresh input).
- * A model Koda has no published rate for shows its tokens and says so, rather than a made-up dollar.
- */
-function ModelUsageRow({ model }: { model: ModelValue }) {
-  const promptTokens = model.inputTokens + model.cacheReadTokens + model.cacheCreationTokens
-  const cachedPct = promptTokens > 0 ? Math.round((model.cacheReadTokens / promptTokens) * 100) : null
-  const parts = [`${fmtTokens(model.inputTokens)} in`, `${fmtTokens(model.outputTokens)} out`]
-  if (cachedPct !== null) parts.push(`${cachedPct}% cached`)
-  const sharePct = Math.round(model.costShare * 100)
-  return (
-    <SettingsRow
-      label={prettyModel(model.model)}
-      description={
-        <>
-          <span>{parts.join(' · ')}</span>
-          {/* Share is a share OF SPEND, so it only exists where spend does — `priced`, not a recorded
-              cost the engine estimated for a model we refuse to price. */}
-          {model.priced && (
-            <span className="mt-1.5 flex items-center gap-2">
-              <span className="h-1 w-24 overflow-hidden rounded-full bg-border/60">
-                <span
-                  className="block h-full rounded-full bg-accent/70"
-                  style={{ width: `${Math.max(2, sharePct)}%` }}
-                />
-              </span>
-              <span>{sharePct}% of spend</span>
-            </span>
-          )}
-        </>
-      }
-      control={
-        <span className="font-mono text-[13px] text-text">
-          {model.priced ? (
-            fmtUsd(model.costUsd)
-          ) : (
-            <span className="text-text-muted">{fmtTokens(model.totalTokens)} tokens</span>
-          )}
-        </span>
-      }
-    />
   )
 }
 

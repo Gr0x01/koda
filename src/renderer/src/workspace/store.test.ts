@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { TURN_REJECTED_STOP_REASON, type ArchivedSessionMeta } from '@shared/ipc'
+import { TURN_REJECTED_STOP_REASON, type ArchivedSessionMeta, type DocShelf } from '@shared/ipc'
 import { turnFailureOf } from '@shared/delegation'
 // Imported before `window` exists on purpose: the module's boot-time git refresh is behind a
 // `typeof window !== 'undefined'` guard, so the store loads clean in the node lane and the fake bridge
@@ -214,6 +214,7 @@ beforeEach(() => {
     starredDocs: [],
     legacyKeptDocsImported: [],
     legacyKeptDocPathChanges: [],
+    docRefRepairs: {},
     legacyKeptDocsMigrationComplete: false,
     archiveLoadFailed: false,
     archiveWriteFailed: false,
@@ -597,6 +598,54 @@ describe('pre-start rejection compatibility terminal', () => {
 
     expect(sendTurn).not.toHaveBeenCalled()
     expect(useWorkspace.getState().sessions.a.error?.message).toContain('attachments')
+  })
+})
+
+describe('a refused send surfaces as the composer banner', () => {
+  it('routes a sendTurn rejection into the session error banner and frees the composer', async () => {
+    // Main is the final admission boundary; a stranded approval that outlived its turn, or a race, can
+    // make it refuse a send. That rejection used to be an invisible unhandledrejection. It must instead
+    // show as the calm banner, carrying the actual refusal text (with the Electron IPC wrapper stripped).
+    const sendTurn = vi.fn(async () => {
+      throw new Error(
+        "Error invoking remote method 'send-turn': Error: This session is waiting for your answer. Resolve it before sending another message.",
+      )
+    })
+    installBridge({ sendTurn })
+    const a = { ...session('a'), live: true }
+    // activeId stays null so the setup EngineError's attention path short-circuits before it touches
+    // `document` (absent in the node lane) — matching the sibling turn-rejection tests above.
+    useWorkspace.setState({ sessions: { a }, order: ['a'], activeId: null })
+    // A failed text turn gives retryLastTurn a target to re-send through dispatchTurn — the path that
+    // ends in window.koda.sendTurn. append=true so a real user row is created for the failure to target.
+    useWorkspace.getState().applyRemoteUserTurn('a', 'send this again', 10, true, false, undefined)
+    useWorkspace.getState().applyEngineEvent({
+      type: 'EngineError',
+      sessionId: 'a',
+      message: 'first failure',
+      fatal: false,
+      category: 'turnRejected',
+      replaySeq: 11,
+    })
+
+    useWorkspace.getState().retryLastTurn('a')
+    await vi.waitFor(() =>
+      expect(useWorkspace.getState().sessions.a.error?.message).toBe(
+        'This session is waiting for your answer. Resolve it before sending another message.',
+      ),
+    )
+    expect(sendTurn).toHaveBeenCalled()
+    // Composer is usable again — the optimistic turn was ended, not left spinning.
+    expect(useWorkspace.getState().sessions.a.busy).toBe(false)
+    // The optimistic user item stays — the user's words are not lost.
+    expect(useWorkspace.getState().sessions.a.items.some((it) => it.kind === 'user' && it.text === 'send this again')).toBe(true)
+
+    // The refusal must leave a retry TARGET, not just a banner: the refused dispatch appended a fresh
+    // user row, which supersedes the older failure, so unless the refusal attaches its own TurnFailure
+    // envelope to that row, "Try again" finds nothing, clears the banner, and silently sends nothing.
+    const callsAfterRefusal = sendTurn.mock.calls.length
+    useWorkspace.getState().retryLastTurn('a')
+    await vi.waitFor(() => expect(sendTurn.mock.calls.length).toBe(callsAfterRefusal + 1))
   })
 })
 
@@ -2650,7 +2699,7 @@ describe('a new document records the conversation it came out of', () => {
         return { path: '/tmp/project/Documents/Untitled.md' }
       },
     })
-    useWorkspace.setState({ sessions: {}, order: [], activeId: null, editors: {}, recentFiles: [] })
+    useWorkspace.setState({ sessions: {}, order: [], activeId: null, editors: {} })
   })
 
   it('sends the active session as the new file’s provenance', async () => {
@@ -2679,6 +2728,46 @@ describe('a new document records the conversation it came out of', () => {
 })
 
 describe('starred documents — one durable project shelf', () => {
+  /**
+   * A stand-in for main's shelf command (doc-commands.ts): it applies the same rules — append on star,
+   * drop on unstar, every touched path settled — so these tests exercise the store as the PROJECTION
+   * it now is, against an owner that answers, instead of asserting a second copy of the truth.
+   */
+  function installShelfCommands(
+    initial: DocShelf = { version: 1, starred: [], settled: [] },
+    opts: { fail?: boolean } = {},
+  ): { calls: Array<{ path: string; starred: boolean }>; state: DocShelf } {
+    const calls: Array<{ path: string; starred: boolean }> = []
+    const state: DocShelf = { ...initial, starred: [...initial.starred], settled: [...initial.settled] }
+    const settle = (paths: string[]): void => {
+      for (const path of paths) if (!state.settled.includes(path)) state.settled.push(path)
+    }
+    installBridge({
+      setDocStar: async ({ path, starred }: { path: string; starred: boolean }) => {
+        calls.push({ path, starred })
+        await delay()
+        if (opts.fail) throw new Error('refused')
+        if (starred) {
+          if (!state.starred.includes(path)) state.starred.push(path)
+        } else {
+          state.starred = state.starred.filter((entry) => entry !== path)
+        }
+        settle([path])
+        return { ...state, starred: [...state.starred], settled: [...state.settled] }
+      },
+      adoptLegacyDocStars: async ({ starred, settled }: { starred: string[]; settled: string[] }) => {
+        await delay()
+        if (opts.fail) throw new Error('refused')
+        for (const path of starred) {
+          if (!state.settled.includes(path) && !state.starred.includes(path)) state.starred.push(path)
+        }
+        settle([...settled, ...starred])
+        return { ...state, starred: [...state.starred], settled: [...state.settled] }
+      },
+    })
+    return { calls, state }
+  }
+
   /** The store reaches for `localStorage` by bare global, like the rest of its per-project UI keys. */
   function installStorage(seed: Record<string, string> = {}): Record<string, string> {
     const store: Record<string, string> = { ...seed }
@@ -2704,6 +2793,7 @@ describe('starred documents — one durable project shelf', () => {
       legacyKeptDocsImported: [],
       legacyKeptDocPathChanges: [],
       legacyKeptDocsMigrationComplete: false,
+      docShelfAdopted: false,
     })
   })
 
@@ -2739,32 +2829,77 @@ describe('starred documents — one durable project shelf', () => {
     expect(useWorkspace.getState().starredDocs).toEqual(['Documents/brief.md'])
   })
 
-  it('carries a star through a folder rename and prunes it when the document is deleted', () => {
-    useWorkspace.getState().starDoc('Documents/plans/launch.md')
+  it('runs star and unstar as main-owned commands and takes the answer as truth', async () => {
+    const shelf = installShelfCommands()
 
-    useWorkspace.getState().notePathMoved('/tmp/project/Documents/plans', '/tmp/project/Documents/shipping')
-    expect(useWorkspace.getState().starredDocs).toEqual(['Documents/shipping/launch.md'])
+    useWorkspace.getState().starDoc('Documents/brief.md')
+    // Optimistic first: the star has to land under the click, before any round trip.
+    expect(useWorkspace.getState().starredDocs).toEqual(['Documents/brief.md'])
+    await delay()
+    expect(shelf.calls).toEqual([{ path: 'Documents/brief.md', starred: true }])
 
-    useWorkspace.getState().notePathDeleted('/tmp/project/Documents/shipping/launch.md')
+    useWorkspace.getState().unstarDoc('Documents/brief.md')
+    await delay()
+    expect(shelf.calls[1]).toEqual({ path: 'Documents/brief.md', starred: false })
+    expect(shelf.state.starred).toEqual([])
     expect(useWorkspace.getState().starredDocs).toEqual([])
+  })
+
+  it('projects the shelf main sends back rather than its own optimistic guess', async () => {
+    // Main answers with the durable order — here a star that was already on the shelf from another
+    // window. A renderer that kept its own list would show one document; the shelf holds two.
+    installShelfCommands({ version: 1, starred: ['Documents/older.md'], settled: [] })
+
+    useWorkspace.getState().starDoc('Documents/brief.md')
+    await delay()
+
+    expect(useWorkspace.getState().starredDocs).toEqual(['Documents/older.md', 'Documents/brief.md'])
+  })
+
+  it('puts the list back when the command refuses', async () => {
+    installShelfCommands(undefined, { fail: true })
+    useWorkspace.getState().starDoc('Documents/brief.md')
+
+    await delay()
+
+    // A star nothing durable agrees with is the failure worth avoiding: the row disappears again.
+    expect(useWorkspace.getState().starredDocs).toEqual([])
+  })
+
+  it('keeps working against a preload that predates the shelf command', async () => {
+    installBridge() // no shelf commands at all — dev HMR pairs new renderer code with an old preload
+    useWorkspace.getState().starDoc('Documents/brief.md')
+
+    await delay()
+
+    expect(useWorkspace.getState().starredDocs).toEqual(['Documents/brief.md'])
+    expect(useWorkspace.getState().persistBlob().starredDocs).toEqual(['Documents/brief.md'])
+  })
+
+  it('adopts a pushed shelf — an agent star, or main repairing a rename', () => {
+    useWorkspace.getState().applyDocShelf({
+      version: 1,
+      starred: ['Documents/shipping/launch.md'],
+      settled: ['Documents/plans/launch.md', 'Documents/shipping/launch.md'],
+    })
+
+    expect(useWorkspace.getState().starredDocs).toEqual(['Documents/shipping/launch.md'])
+    // The shelf's ledger joins this store's, so a legacy archive read later cannot re-add either path.
     expect(useWorkspace.getState().legacyKeptDocsImported).toEqual([
       'Documents/plans/launch.md',
       'Documents/shipping/launch.md',
     ])
-    expect(useWorkspace.getState().legacyKeptDocPathChanges).toEqual([
-      { from: 'Documents/plans', to: 'Documents/shipping' },
-      { from: 'Documents/shipping/launch.md', to: null },
-    ])
   })
 
-  it('repairs retired local pins when a path moves or is deleted before the first save acknowledgement', () => {
+  it('leaves the shelf to main on a rename or delete, and still repairs the not-yet-adopted sources', () => {
+    // Legacy pins are still the only durable copy until adoption is acknowledged, so a rename that
+    // happens first has to reach them. The shelf itself is repaired by main, inside the same rename.
     const storage = installStorage({
       'koda:doc-pins:/tmp/project': JSON.stringify([
         'Documents/plans/launch.md',
         'Documents/other.md',
       ]),
     })
-    useWorkspace.getState().migrateDocPins()
 
     useWorkspace.getState().notePathMoved('/tmp/project/Documents/plans', '/tmp/project/Documents/shipping')
     expect(JSON.parse(storage['koda:doc-pins:/tmp/project'])).toEqual([
@@ -2774,10 +2909,16 @@ describe('starred documents — one durable project shelf', () => {
 
     useWorkspace.getState().notePathDeleted('/tmp/project/Documents/shipping/launch.md')
     expect(JSON.parse(storage['koda:doc-pins:/tmp/project'])).toEqual(['Documents/other.md'])
-    expect(useWorkspace.getState().starredDocs).toEqual(['Documents/other.md'])
-
-    useWorkspace.getState().completeDocPinMigration(useWorkspace.getState().persistBlob())
-    expect(storage['koda:doc-pins:/tmp/project']).toBeUndefined()
+    expect(useWorkspace.getState().legacyKeptDocPathChanges).toEqual([
+      { from: 'Documents/plans', to: 'Documents/shipping' },
+      { from: 'Documents/shipping/launch.md', to: null },
+    ])
+    // A doc's smart artifact card keeps the portable link text, so the same rename/delete is recorded
+    // as absolute repairs the card resolves through when the user opens it.
+    expect(useWorkspace.getState().docRefRepairs).toEqual({
+      '/tmp/project/Documents/plans': '/tmp/project/Documents/shipping',
+      '/tmp/project/Documents/shipping/launch.md': null,
+    })
   })
 
   it('replays moves and deletion tombstones over a legacy archive that becomes readable later', () => {
@@ -2912,59 +3053,78 @@ describe('starred documents — one durable project shelf', () => {
     ])
   })
 
-  it('adopts retired local pins without a chat and clears them only after acknowledgement', () => {
+  it('hands every legacy source to main and drops them only once the shelf holds them', async () => {
     const storage = installStorage({
       'koda:doc-pins:/tmp/project': JSON.stringify(['Documents/brief.md', 'Documents/brief.md', 'Documents/old.md']),
       'koda:doc-folders-open:/tmp/project': JSON.stringify(['plans']),
     })
-    useWorkspace.setState({ sessions: {}, order: [], activeId: null })
+    const shelf = installShelfCommands()
+    useWorkspace.setState({
+      sessions: {},
+      order: [],
+      activeId: null,
+      starredDocs: ['Documents/from-blob.md'],
+    })
 
-    useWorkspace.getState().migrateDocPins()
+    useWorkspace.getState().adoptLegacyDocStars()
+    await delay()
 
-    expect(useWorkspace.getState().starredDocs).toEqual(['Documents/brief.md', 'Documents/old.md'])
-    expect(storage['koda:doc-pins:/tmp/project']).toBeDefined()
-    expect(storage['koda:doc-folders-open:/tmp/project']).toBeDefined()
-
-    useWorkspace.getState().completeDocPinMigration(useWorkspace.getState().persistBlob())
+    // Both legacy sources — the blob's own list and the retired pane's pins — reach the shelf once.
+    expect(shelf.state.starred).toEqual([
+      'Documents/from-blob.md',
+      'Documents/brief.md',
+      'Documents/old.md',
+    ])
+    expect(useWorkspace.getState().starredDocs).toEqual(shelf.state.starred)
     expect(storage['koda:doc-pins:/tmp/project']).toBeUndefined()
     expect(storage['koda:doc-folders-open:/tmp/project']).toBeUndefined()
+    // The blob stops carrying its copy: two lists that can disagree is what the shelf replaces.
+    expect(useWorkspace.getState().persistBlob().starredDocs).toEqual([])
 
-    // A second pass (another mount, another launch) has nothing to re-add.
-    useWorkspace.getState().migrateDocPins()
-    expect(useWorkspace.getState().starredDocs).toEqual(['Documents/brief.md', 'Documents/old.md'])
+    // A second launch has nothing to re-add, and the shelf's ledger refuses a repeat anyway.
+    useWorkspace.getState().adoptLegacyDocStars()
+    await delay()
+    expect(shelf.state.starred).toHaveLength(3)
   })
 
-  it('retains the legacy copy when the acknowledged blob does not contain every pin', () => {
+  it('keeps every legacy copy when the shelf command refuses', async () => {
     const storage = installStorage({
       'koda:doc-pins:/tmp/project': JSON.stringify(['Documents/brief.md', 'Documents/old.md']),
     })
-    useWorkspace.getState().migrateDocPins()
-    const stale = useWorkspace.getState().persistBlob()
-    stale.starredDocs = ['Documents/brief.md']
+    installShelfCommands(undefined, { fail: true })
+    useWorkspace.setState({ starredDocs: ['Documents/from-blob.md'] })
 
-    useWorkspace.getState().completeDocPinMigration(stale)
+    useWorkspace.getState().adoptLegacyDocStars()
+    await delay()
 
     expect(storage['koda:doc-pins:/tmp/project']).toBeDefined()
+    expect(useWorkspace.getState().persistBlob().starredDocs).toEqual(['Documents/from-blob.md'])
   })
 
-  it('does not resurrect a legacy pin the user removes before the first acknowledgement', () => {
-    const storage = installStorage({
+  it('does not resurrect a legacy pin the user removes before adoption is acknowledged', async () => {
+    installStorage({
       'koda:doc-pins:/tmp/project': JSON.stringify(['Documents/brief.md', 'Documents/old.md']),
     })
-    useWorkspace.getState().migrateDocPins()
+    const shelf = installShelfCommands()
 
+    useWorkspace.getState().adoptLegacyDocStars()
+    await delay()
+    // Both are on the shelf; the user then takes one back off before the next launch.
     useWorkspace.getState().unstarDoc('Documents/brief.md')
-    useWorkspace.getState().migrateDocPins() // the shelf remounted before persistence answered
+    await delay()
 
+    useWorkspace.getState().adoptLegacyDocStars()
+    await delay()
+
+    expect(shelf.state.starred).toEqual(['Documents/old.md'])
     expect(useWorkspace.getState().starredDocs).toEqual(['Documents/old.md'])
-    expect(JSON.parse(storage['koda:doc-pins:/tmp/project'])).toEqual(['Documents/old.md'])
   })
 
-  it('does not resurrect an unstarred legacy pin after a transient localStorage write failure', () => {
+  it('does not resurrect an unstarred legacy pin after a transient localStorage write failure', async () => {
     const storage = installStorage({
       'koda:doc-pins:/tmp/project': JSON.stringify(['Documents/brief.md']),
     })
-    useWorkspace.getState().migrateDocPins()
+    const shelf = installShelfCommands()
 
     let rejectWrites = true
     ;(globalThis as unknown as { localStorage: unknown }).localStorage = {
@@ -2979,13 +3139,19 @@ describe('starred documents — one durable project shelf', () => {
       },
     }
 
+    useWorkspace.getState().adoptLegacyDocStars()
+    await delay()
     useWorkspace.getState().unstarDoc('Documents/brief.md')
+    await delay()
+    // The pin could not be rewritten, so the stale key still names a document nobody wants starred.
     expect(storage['koda:doc-pins:/tmp/project']).toBeDefined()
 
     rejectWrites = false
-    useWorkspace.getState().migrateDocPins()
+    useWorkspace.getState().adoptLegacyDocStars()
+    await delay()
+
+    expect(shelf.state.starred).toEqual([])
     expect(useWorkspace.getState().starredDocs).toEqual([])
-    expect(storage['koda:doc-pins:/tmp/project']).toBeUndefined()
   })
 })
 

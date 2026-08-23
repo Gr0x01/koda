@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ScratchImage } from '@shared/ipc'
 import { HoverCard } from '../ui'
-import { RailFootLine } from './RailFoot'
+import { HistoryRow } from './RailFoot'
 import { useWorkspace } from './store'
 
 const PAGE = 30
@@ -97,8 +97,7 @@ export function RecentImages() {
       ariaLabel="Recent images"
       width={272}
       trigger={
-        <RailFootLine
-          icon={<IconImage />}
+        <HistoryRow
           label="Recent images"
           count={total}
           aria-label={`Recent images (${total})`}
@@ -151,15 +150,5 @@ export function RecentImages() {
         Click one to view it, or <span className="text-text">+</span> to add it to your message.
       </p>
     </HoverCard>
-  )
-}
-
-function IconImage() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <rect x="3" y="3" width="18" height="18" rx="2" />
-      <circle cx="8.5" cy="8.5" r="1.5" />
-      <path d="m21 15-5-5L5 21" />
-    </svg>
   )
 }

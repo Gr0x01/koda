@@ -1188,8 +1188,12 @@ class CodexSession implements EngineSession {
    *  snapshot at session start and after each turn to keep the windows honest. A `read` is AUTHORITATIVE
    *  (the complete current window set), so its emit prunes any stale slot the plan no longer reports.
    *  Fail-soft: a plan that doesn't support the read just leaves the last-known window in place. */
+  refreshAccountUsage(): void {
+    this.refreshRateLimits()
+  }
+
   private refreshRateLimits(): void {
-    if (this.disposed) return
+    if (this.disposed || !this.ready) return
     this.rpc('account/rateLimits/read', null).then(
       (res) => this.emitRateLimits((res as { rateLimits?: CodexRateLimitSnapshot } | null)?.rateLimits, true),
       (err) => log.warn('codex', 'rate-limit read failed', err instanceof Error ? err.message : err),

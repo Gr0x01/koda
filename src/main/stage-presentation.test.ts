@@ -12,6 +12,8 @@ function project(): string {
   mkdirSync(join(root, 'Documents'))
   mkdirSync(join(root, 'src'))
   writeFileSync(join(root, 'Documents', 'Build plan.md'), '# Plan')
+  writeFileSync(join(root, 'Documents', 'Rollout.html'), '<!doctype html><p>Rollout</p>')
+  writeFileSync(join(root, 'Documents', 'Notes.mdx'), '# Notes')
   writeFileSync(join(root, 'src', 'app.ts'), 'one\ntwo\nthree\n')
   return root
 }
@@ -33,6 +35,24 @@ describe('preparePresentFile', () => {
       line: 2,
       column: 3,
     })
+  })
+
+  it('follows the shared format contract for which files have a document view', () => {
+    const root = project()
+    // HTML has a real rendered surface now, so the agent may present one as a document.
+    expect(preparePresentFile(root, { path: 'Documents/Rollout.html' })).toMatchObject({
+      path: 'Documents/Rollout.html',
+      view: 'document',
+    })
+    expect(preparePresentFile(root, { path: 'Documents/Rollout.html', view: 'document' })).toMatchObject({
+      view: 'document',
+    })
+    // `.mdx` no longer does: the Dock opens it as source, and one file must not have two answers.
+    expect(preparePresentFile(root, { path: 'Documents/Notes.mdx' })).toMatchObject({
+      path: 'Documents/Notes.mdx',
+      view: 'file',
+    })
+    expect(() => preparePresentFile(root, { path: 'Documents/Notes.mdx', view: 'document' })).toThrow()
   })
 
   it('rejects absolute, traversing, missing, and incompatible presentation requests', () => {

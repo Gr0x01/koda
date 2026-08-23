@@ -1,8 +1,11 @@
-import { useEffect, useRef, useState } from 'react'
+import { forwardRef, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { AnimatePresence, Menu, motion, useReducedMotion, duration, ease, spring } from '../motion'
+import { Caret } from '../Caret'
+import { resolveDocFormat } from '@shared/document-contract'
 import { FileSurfaceView } from './FileSurfaceView'
 import { DocSurfaceView } from './DocSurfaceView'
+import { HtmlDocSurfaceView } from './HtmlDocSurfaceView'
 import { DiffSurfaceView } from './DiffSurfaceView'
 import { PreviewSurfaceView, type PreviewViewport } from './PreviewSurfaceView'
 import { ChangesSurface } from './ChangesSurface'
@@ -11,10 +14,12 @@ import { AgentsSurface } from './AgentsSurface'
 import { BranchGlyph } from './ChangesReview'
 import { TerminalSurfaceView } from './TerminalSurfaceView'
 import { useWorkspace, activeEditor, type FileSurface } from '../workspace/store'
+import { openLibrary } from '../workspace/library/LibraryHost'
 import { StarGlyph } from '../workspace/KeptDocs'
+import { DocumentDeleteConfirm } from '../workspace/DocumentShelfMenu'
 import { isFleetEntry } from '../transcript/fleet'
+import { hasDocView, stagedDocRel } from './stage-doc-actions'
 
-const isMarkdown = (path: string): boolean => /\.(md|markdown)$/i.test(path)
 // A displayable image has only one meaningful view (the picture) — no File/Diff/Doc toggle.
 const isImagePath = (path: string): boolean => /\.(png|jpe?g|gif|webp|svg|ico|bmp|avif)$/i.test(path)
 const PREVIEW_PRESET_DOCK_WIDTH: Record<PreviewViewport, number> = {
@@ -49,16 +54,17 @@ function StageBar() {
   const staged = stagedSurface(editor)
   const barBtn = 'grid h-[26px] w-[26px] place-items-center rounded-md transition-colors'
   const heldHint = staged ? `${staged.title} holds the view while the agent works. Click another tab to leave it.` : ''
-  // The shelf's stars are project-relative document paths, so the toggle exists only for a markdown
-  // file tab inside the project — the same population the Library's own star can reach.
-  const starRel =
-    staged && !staged.kind && isMarkdown(staged.path) && projectPath && staged.path.startsWith(`${projectPath}/`)
-      ? staged.path.slice(projectPath.length + 1)
-      : null
+  // One answer to "is a real, keepable document staged, and by what project-relative path?" — it owns
+  // both the project star and the quieter document-only view/overflow hierarchy.
+  const starRel = stagedDocRel(staged, projectPath)
   const starred = starRel != null && starredDocs.includes(starRel)
   return (
     <div className="flex h-9 shrink-0 items-center gap-1 border-b border-border pl-1 pr-1.5">
-      <StageTabs surfaces={editor.surfaces} staged={staged} />
+      <StageTabs
+        surfaces={editor.surfaces}
+        staged={staged}
+        heldSurfaceId={starRel && editor.pinned ? staged?.path ?? null : null}
+      />
       <div className="ml-auto flex shrink-0 items-center gap-1 pl-1">
         {staged && !staged.kind && <ViewToggle surface={staged} />}
         {starRel && (
@@ -76,6 +82,14 @@ function StageBar() {
             <StarGlyph filled={starred} size={14} className="" />
           </button>
         )}
+        {starRel && staged && (
+          <StageDocMenu
+            absPath={staged.path}
+            title={staged.title}
+            held={editor.pinned}
+            onToggleHeld={() => setStagePinned(!editor.pinned)}
+          />
+        )}
         {staged &&
           // The live surfaces hold the view by themselves (see stageHeld in the store): while one is
           // selected the agent's edits stop stealing the selection, so there's nothing to toggle — show
@@ -91,7 +105,7 @@ function StageBar() {
             >
               <IconPin filled />
             </div>
-          ) : (
+          ) : starRel == null ? (
             <button
               onClick={() => setStagePinned(!editor.pinned)}
               title={
@@ -105,7 +119,8 @@ function StageBar() {
             >
               <IconPin filled={editor.pinned} />
             </button>
-          ))}
+          ) : null)}
+        {starRel && <span aria-hidden className="mx-0.5 h-4 w-px shrink-0 bg-border" />}
         <button
           onClick={() => setStageExpanded(!stageExpanded)}
           title={stageExpanded ? 'Shrink back and show the session' : 'Expand to the full window'}
@@ -135,7 +150,15 @@ function stagedSurface(editor: { surfaces: FileSurface[]; activeSurfaceId: strin
  * tabs. The agent's auto-follow adds and selects tabs here, so the strip is the running record of what
  * it has touched this session.
  */
-function StageTabs({ surfaces, staged }: { surfaces: FileSurface[]; staged: FileSurface | null }) {
+function StageTabs({
+  surfaces,
+  staged,
+  heldSurfaceId,
+}: {
+  surfaces: FileSurface[]
+  staged: FileSurface | null
+  heldSurfaceId: string | null
+}) {
   const selectSurface = useWorkspace((s) => s.selectSurface)
   const closeSurface = useWorkspace((s) => s.closeSurface)
   const stripRef = useRef<HTMLDivElement>(null)
@@ -176,6 +199,15 @@ function StageTabs({ surfaces, staged }: { surfaces: FileSurface[]; staged: File
               >
                 {s.title}
               </span>
+              {s.path === heldSurfaceId && (
+                <span
+                  role="img"
+                  aria-label="View held"
+                  className="relative z-10 grid h-4 w-4 shrink-0 place-items-center text-accent"
+                >
+                  <IconPin filled />
+                </span>
+              )}
               <button
                 onClick={(e) => {
                   e.stopPropagation()
@@ -257,6 +289,184 @@ function AddSurfaceButton() {
   )
 }
 
+const DOC_MENU_WIDTH = 208
+
+/**
+ * The staged document's overflow menu — the project-owned actions that otherwise force a trip back
+ * through the Library: Hold view, Reveal in Finder, Copy path, and a recoverable Delete. Star
+ * deliberately is NOT here: the star button sits right beside this trigger and already owns that
+ * toggle, so repeating it in the menu would be redundant. Portaled with fixed coords for the same
+ * reason the add control is (the dock clips its overflow and the tab row scrolls), and it moves focus
+ * into the menu on open so the actions are reachable by keyboard, not only by pointer. Delete reuses
+ * the Library's own confirm dialog and the store's `deleteEntry`, which makes the undo point and closes
+ * the affected Stage tab itself — there is no parallel delete path.
+ */
+function StageDocMenu({
+  absPath,
+  title,
+  held,
+  onToggleHeld,
+}: {
+  absPath: string
+  title: string
+  held: boolean
+  onToggleHeld: () => void
+}) {
+  const deleteEntry = useWorkspace((s) => s.deleteEntry)
+  const [open, setOpen] = useState(false)
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<{
+    path: string
+    title: string
+    trigger: HTMLElement | null
+  } | null>(null)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+  const firstItemRef = useRef<HTMLButtonElement>(null)
+  const focusedThisOpen = useRef(false)
+  useEffect(() => {
+    if (!open) {
+      focusedThisOpen.current = false
+      return
+    }
+    const place = (): void => {
+      const r = triggerRef.current?.getBoundingClientRect()
+      if (!r) return
+      // Right-aligned to the button, then pulled back in when that would run past the window edge.
+      const left = Math.max(12, Math.min(r.right - DOC_MENU_WIDTH, window.innerWidth - DOC_MENU_WIDTH - 12))
+      setPos({ top: r.bottom + 6, left })
+    }
+    place()
+    window.addEventListener('resize', place)
+    const onDown = (e: PointerEvent): void => {
+      const t = e.target as Node
+      if (!triggerRef.current?.contains(t) && !menuRef.current?.contains(t)) setOpen(false)
+    }
+    document.addEventListener('pointerdown', onDown)
+    return () => {
+      window.removeEventListener('resize', place)
+      document.removeEventListener('pointerdown', onDown)
+    }
+  }, [open])
+  // Move focus into the menu once it has actually mounted (the portal is gated on `pos`), so the
+  // keyboard lands on the first action instead of nowhere — the whole point of an accessible route.
+  // Once per open, so a resize-driven reposition never yanks focus back off an item the user tabbed to.
+  useEffect(() => {
+    if (open && pos && !focusedThisOpen.current) {
+      focusedThisOpen.current = true
+      firstItemRef.current?.focus()
+    }
+  }, [open, pos])
+  const close = (): void => {
+    setOpen(false)
+    triggerRef.current?.focus()
+  }
+  return (
+    <>
+      <button
+        ref={triggerRef}
+        onClick={() => setOpen((v) => !v)}
+        title="More actions for this document"
+        aria-label="More document actions"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        className="grid h-[26px] w-[26px] shrink-0 place-items-center rounded-md text-text-muted transition-colors hover:bg-text/5 hover:text-text"
+      >
+        <IconEllipsis />
+      </button>
+      {pos &&
+        createPortal(
+          <Menu
+            open={open}
+            origin="origin-top-right"
+            onClose={close}
+            className="fixed z-50 rounded-xl border border-border bg-surface p-1.5 shadow-pop"
+            style={{ top: pos.top, left: pos.left, width: DOC_MENU_WIDTH }}
+          >
+            <div ref={menuRef} role="menu" aria-label="Document actions" className="flex flex-col">
+              <DocMenuItem
+                ref={firstItemRef}
+                label="Hold view"
+                checked={held}
+                icon={<IconPin filled={held} />}
+                onSelect={() => {
+                  onToggleHeld()
+                  close()
+                }}
+              />
+              <div role="separator" className="my-1 border-t border-border" />
+              <DocMenuItem
+                label="Reveal in Finder"
+                onSelect={() => {
+                  void window.koda.revealPath({ path: absPath })
+                  close()
+                }}
+              />
+              <DocMenuItem
+                label="Copy path"
+                onSelect={() => {
+                  void navigator.clipboard.writeText(absPath)
+                  close()
+                }}
+              />
+              <DocMenuItem
+                label="Delete…"
+                danger
+                onSelect={() => {
+                  // The confirm dialog owns focus from here, so close the menu WITHOUT returning focus
+                  // to the trigger; the dialog restores it on cancel or after a successful delete.
+                  setDeleteTarget({ path: absPath, title, trigger: triggerRef.current })
+                  setOpen(false)
+                }}
+              />
+            </div>
+          </Menu>,
+          document.body,
+        )}
+      <AnimatePresence>
+        {deleteTarget && (
+          <DocumentDeleteConfirm
+            target={deleteTarget}
+            onCancel={() => setDeleteTarget(null)}
+            onConfirm={async () => {
+              // On success the store closes the affected Stage tab itself (notePathDeleted) — do not
+              // also close it here; just clear the dialog and report no error.
+              const r = await deleteEntry(deleteTarget.path, { document: true })
+              if (r.ok) {
+                setDeleteTarget(null)
+                return null
+              }
+              return r.error ?? 'Could not delete.'
+            }}
+          />
+        )}
+      </AnimatePresence>
+    </>
+  )
+}
+
+/** One overflow-menu action: a real `menuitem` button so the menu is a menu to assistive tech and to
+ *  the keyboard, not a cluster of anonymous controls. */
+const DocMenuItem = forwardRef<
+  HTMLButtonElement,
+  { label: string; icon?: React.JSX.Element; checked?: boolean; danger?: boolean; onSelect: () => void }
+>(function DocMenuItem({ label, icon, checked, danger = false, onSelect }, ref) {
+  return (
+    <button
+      ref={ref}
+      role={checked == null ? 'menuitem' : 'menuitemcheckbox'}
+      aria-checked={checked == null ? undefined : checked}
+      onClick={onSelect}
+      className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs font-medium outline-none transition-colors hover:bg-bg focus-visible:bg-bg ${
+        danger ? 'text-red-400' : 'text-text'
+      }`}
+    >
+      {icon && <span className={checked ? 'text-accent' : 'text-text-muted'}>{icon}</span>}
+      <span>{label}</span>
+    </button>
+  )
+})
+
 /** A surface's singleton kind, or null for an ordinary file tab (`kind` is optional on those). */
 function singletonKind(s: FileSurface): 'preview' | 'terminal' | 'changes' | 'turn-changes' | 'agents' | null {
   return s.kind && s.kind !== 'file' ? s.kind : null
@@ -281,7 +491,7 @@ function SurfaceGlyph({ surface }: { surface: FileSurface }) {
   if (surface.kind === 'changes') return <BranchGlyph size={14} />
   if (surface.kind === 'turn-changes') return <BranchGlyph size={14} />
   if (surface.kind === 'agents') return <IconAgents />
-  return <ViewIcon view={surface.view} md={isMarkdown(surface.path)} />
+  return <ViewIcon view={surface.view} md={resolveDocFormat(surface.path) === 'markdown'} />
 }
 
 // ── The stage: the selected tab's surface ──────────────────────────────────────────────────────────
@@ -381,7 +591,6 @@ function StageEmpty() {
  */
 function SurfacePicker({ onPicked }: { onPicked?: () => void } = {}) {
   const openPreview = useWorkspace((s) => s.openPreview)
-  const setSearchOpen = useWorkspace((s) => s.setSearchOpen)
   const openChanges = useWorkspace((s) => s.openChanges)
   const openTerminal = useWorkspace((s) => s.openTerminal)
   const openAgents = useWorkspace((s) => s.openAgents)
@@ -455,7 +664,7 @@ function SurfacePicker({ onPicked }: { onPicked?: () => void } = {}) {
         icon={<ViewIcon view="file" md={false} />}
         title="A file"
         hint="Any file in the project, as a document, as code, or as a diff."
-        onClick={pick(() => setSearchOpen(true))}
+        onClick={pick(() => openLibrary())}
       />
       <PickerRow
         icon={<BranchGlyph size={14} />}
@@ -541,39 +750,33 @@ export function DockEmpty({
 }
 
 /**
- * The Doc/Markdown/Diff (or File/Diff) view selector for a surface. Lives in the Editor chrome — the
- * single-file header bar, the multi-tab row's right edge, or a split pane's own header.
+ * A document gets one labelled current-view control; its rendered page remains primary while source
+ * and diff wait in the menu as advanced escapes. Non-document files keep the compact two-cell toggle
+ * because neither of their views is the human-facing default.
  */
 function ViewToggle({ surface }: { surface: FileSurface }) {
   const setSurfaceView = useWorkspace((s) => s.setSurfaceView)
   // An image renders as a picture with no alternate view — hide the toggle entirely.
   if (isImagePath(surface.path)) return null
-  const md = isMarkdown(surface.path)
-  // Markdown gets the rich Doc default + a "Markdown" escape hatch to the raw editor (the advanced
-  // "show real markdown" path). Other files keep the plain File/Diff toggle.
-  const views = md ? (['doc', 'file', 'diff'] as const) : (['file', 'diff'] as const)
-  const label = (v: 'doc' | 'file' | 'diff'): string =>
-    v === 'doc' ? 'Doc' : v === 'diff' ? 'Diff' : md ? 'Markdown' : 'File'
-  // Icon-only segmented control. The optimal view is already shown on open, so this is the advanced
-  // escape hatch — glyphs + tooltips keep it compact (no "Markdown" word eating the row); it's
-  // non-destructive, so learning it by clicking is fine.
+  const format = resolveDocFormat(surface.path)
+  if (hasDocView(format)) return <DocumentViewMenu surface={surface} />
+  const views = ['file', 'diff'] as const
   return (
     <div className="flex shrink-0 items-center gap-px rounded-lg bg-text/5 p-0.5">
-      {views.map((v) => {
-        const active = surface.view === v
+      {views.map((view) => {
+        const active = surface.view === view
+        const label = docViewLabel(view, format)
         return (
           <button
-            key={v}
-            onClick={() => setSurfaceView(surface.path, v)}
-            title={label(v)}
-            aria-label={label(v)}
+            key={view}
+            onClick={() => setSurfaceView(surface.path, view)}
+            title={label}
+            aria-label={label}
             aria-pressed={active}
             className={`relative grid h-[22px] w-[26px] place-items-center rounded-md transition-colors ${
               active ? 'text-text' : 'text-text-muted hover:text-text'
             }`}
           >
-            {/* Shared layoutId (per surface, so split panes don't slide into each other) → the white
-                highlight SLIDES between cells like the Editor/Preview underline, instead of flashing. */}
             {active && (
               <motion.span
                 layoutId={`view-toggle-${surface.path}`}
@@ -582,12 +785,145 @@ function ViewToggle({ surface }: { surface: FileSurface }) {
               />
             )}
             <span className="relative z-10">
-              <ViewIcon view={v} md={md} />
+              <ViewIcon view={view} md={false} />
             </span>
           </button>
         )
       })}
     </div>
+  )
+}
+
+const DOCUMENT_VIEW_MENU_WIDTH = 184
+const DOCUMENT_VIEWS = ['doc', 'file', 'diff'] as const
+
+function docViewLabel(view: 'doc' | 'file' | 'diff', format: ReturnType<typeof resolveDocFormat>): string {
+  if (view === 'doc') return format === 'html' ? 'Page' : 'Doc'
+  if (view === 'diff') return 'Diff'
+  if (format === 'markdown') return 'Markdown'
+  if (format === 'html') return 'HTML'
+  return 'File'
+}
+
+function DocumentViewMenu({ surface }: { surface: FileSurface }) {
+  const setSurfaceView = useWorkspace((s) => s.setSurfaceView)
+  const format = resolveDocFormat(surface.path)
+  const [open, setOpen] = useState(false)
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+  const focusedThisOpen = useRef(false)
+  useEffect(() => {
+    if (!open) {
+      focusedThisOpen.current = false
+      return
+    }
+    const place = (): void => {
+      const r = triggerRef.current?.getBoundingClientRect()
+      if (!r) return
+      const left = Math.max(12, Math.min(r.right - DOCUMENT_VIEW_MENU_WIDTH, window.innerWidth - DOCUMENT_VIEW_MENU_WIDTH - 12))
+      setPos({ top: r.bottom + 6, left })
+    }
+    place()
+    window.addEventListener('resize', place)
+    const onDown = (event: PointerEvent): void => {
+      const target = event.target as Node
+      if (!triggerRef.current?.contains(target) && !menuRef.current?.contains(target)) setOpen(false)
+    }
+    document.addEventListener('pointerdown', onDown)
+    return () => {
+      window.removeEventListener('resize', place)
+      document.removeEventListener('pointerdown', onDown)
+    }
+  }, [open])
+  useEffect(() => {
+    if (open && pos && !focusedThisOpen.current) {
+      focusedThisOpen.current = true
+      menuRef.current?.querySelector<HTMLButtonElement>('[aria-checked="true"]')?.focus()
+    }
+  }, [open, pos])
+  const close = (): void => {
+    setOpen(false)
+    triggerRef.current?.focus()
+  }
+  const onMenuKeyDown = (event: React.KeyboardEvent<HTMLDivElement>): void => {
+    if (event.key === 'Tab') {
+      // Dismiss first, then let the browser continue from the trigger to the adjacent toolbar control.
+      setOpen(false)
+      triggerRef.current?.focus()
+      return
+    }
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return
+    const items = Array.from(menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]') ?? [])
+    if (items.length === 0) return
+    event.preventDefault()
+    const current = Math.max(0, items.indexOf(document.activeElement as HTMLButtonElement))
+    const next =
+      event.key === 'Home'
+        ? 0
+        : event.key === 'End'
+          ? items.length - 1
+          : event.key === 'ArrowDown'
+            ? (current + 1) % items.length
+            : (current - 1 + items.length) % items.length
+    items[next]?.focus()
+  }
+  const currentLabel = docViewLabel(surface.view, format)
+  return (
+    <>
+      <button
+        ref={triggerRef}
+        onClick={() => setOpen((value) => !value)}
+        aria-label={currentLabel}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        className="flex h-[26px] shrink-0 items-center gap-1.5 rounded-lg bg-text/5 px-2 text-xs font-medium text-text transition-colors hover:bg-text/10"
+      >
+        <ViewIcon view={surface.view} md={format === 'markdown'} />
+        <span>{currentLabel}</span>
+        <Caret dir={open ? 'up' : 'down'} size={10} className="text-text-muted" />
+      </button>
+      {pos &&
+        createPortal(
+          <Menu
+            open={open}
+            origin="origin-top-right"
+            onClose={close}
+            className="fixed z-50 rounded-xl border border-border bg-surface p-1.5 shadow-pop"
+            style={{ top: pos.top, left: pos.left, width: DOCUMENT_VIEW_MENU_WIDTH }}
+          >
+            <div
+              ref={menuRef}
+              role="menu"
+              aria-label="Document view"
+              onKeyDown={onMenuKeyDown}
+              className="flex flex-col"
+            >
+              {DOCUMENT_VIEWS.map((view) => {
+                const active = surface.view === view
+                return (
+                  <button
+                    key={view}
+                    role="menuitemradio"
+                    aria-checked={active}
+                    onClick={() => {
+                      setSurfaceView(surface.path, view)
+                      close()
+                    }}
+                    className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs font-medium outline-none transition-colors hover:bg-bg focus-visible:bg-bg ${
+                      active ? 'bg-bg text-text' : 'text-text-muted'
+                    }`}
+                  >
+                    <ViewIcon view={view} md={format === 'markdown'} />
+                    <span>{docViewLabel(view, format)}</span>
+                  </button>
+                )
+              })}
+            </div>
+          </Menu>,
+          document.body,
+        )}
+    </>
   )
 }
 
@@ -633,9 +969,13 @@ function ViewIcon({ view, md }: { view: 'doc' | 'file' | 'diff'; md: boolean }) 
 }
 
 /**
- * The staged file pane: the body (read-only live diff, rich Doc, or editable file per the surface's
- * `view`) — headerless; identity + the view toggle live in the stage bar. The diff re-fetches on
- * `rev` (bumped by each engine edit), so it tracks the agent's changes live.
+ * The staged file pane: the body (read-only live diff, the format's rendered document, or the editable
+ * file per the surface's `view`) — headerless; identity + the view toggle live in the stage bar. The
+ * diff re-fetches on `rev` (bumped by each engine edit), so it tracks the agent's changes live.
+ *
+ * `doc` is one view NAME with a per-format renderer behind it: Crepe for Markdown, the sandboxed frame
+ * for HTML. A format with no rendered view never reaches here as `doc` — the toggle does not offer the
+ * cell and `openFile` does not choose it — so the fallthrough is the raw file surface.
  */
 function SurfacePane({ surface, className = '' }: { surface: FileSurface; className?: string }) {
   return (
@@ -643,7 +983,9 @@ function SurfacePane({ surface, className = '' }: { surface: FileSurface; classN
       <div className="min-h-0 flex-1">
         {surface.view === 'diff' ? (
           <DiffSurfaceView path={surface.path} rev={surface.rev} diffSource={surface.diffSource} className="h-full" />
-        ) : surface.view === 'doc' ? (
+        ) : surface.view === 'doc' && resolveDocFormat(surface.path) === 'html' ? (
+          <HtmlDocSurfaceView path={surface.path} rev={surface.rev} className="h-full" />
+        ) : surface.view === 'doc' && resolveDocFormat(surface.path) === 'markdown' ? (
           <DocSurfaceView path={surface.path} rev={surface.rev} sessionId={surface.sessionId} className="h-full" />
         ) : (
           <FileSurfaceView path={surface.path} gotoLine={surface.gotoLine} gotoColumn={surface.gotoColumn} gotoNonce={surface.gotoNonce} className="h-full" />
@@ -681,6 +1023,16 @@ function IconAgents() {
       <circle cx="9" cy="8" r="3.2" />
       <path d="M3.5 19a5.5 5.5 0 0 1 11 0" />
       <path d="M16 6.2a3 3 0 0 1 0 5.6M18.5 19a5.6 5.6 0 0 0-2.2-4.4" />
+    </svg>
+  )
+}
+// Overflow glyph — the staged document's "more actions" control (Star/Unstar, Reveal in Finder).
+function IconEllipsis() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+      <circle cx="5" cy="12" r="1.6" />
+      <circle cx="12" cy="12" r="1.6" />
+      <circle cx="19" cy="12" r="1.6" />
     </svg>
   )
 }

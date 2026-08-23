@@ -5,6 +5,7 @@ import {
   StageWorkspacePathSchema,
   type StageLinkTarget,
 } from '@shared/ipc'
+import { resolveDocFormat } from '@shared/document-contract'
 import { containedReal } from './fs-browse'
 
 export type PresentFileView = 'auto' | 'document' | 'file' | 'diff'
@@ -24,7 +25,20 @@ export interface PreparedPresentation {
   column?: number
 }
 
-const isMarkdown = (path: string): boolean => /\.(md|markdown|mdx)$/i.test(path)
+/**
+ * Whether the agent's `document` view exists for this path. One predicate with the renderer's: the
+ * Stage resolves the same file to the same surface whether a person opened it or the agent presented
+ * it, so `present_file` can no longer promise a rich view the Dock would not give.
+ *
+ * This is a deliberate narrowing for `.mdx` (Slice 0 decision, 2026-08-20): it used to qualify here
+ * while the Dock opened it as raw source, so the agent could ask for a document view of a file the
+ * user's own double-click never rendered. It is a widening for `.html`, which now has a real
+ * (sandboxed) document surface.
+ */
+const hasDocumentView = (path: string): boolean => {
+  const format = resolveDocFormat(path)
+  return format === 'markdown' || format === 'html'
+}
 const posix = (path: string): string => path.split(sep).join('/')
 
 function relativeIdentity(root: string, absolutePath: string): string {
@@ -45,9 +59,16 @@ export function preparePresentFile(root: string, args: PresentFileArgs): Prepare
   if (!statSync(absolutePath).isFile()) throw new Error('path must name a file')
   const requested = args.view ?? 'auto'
   const view: PreparedPresentation['view'] =
-    requested === 'auto' ? (args.line !== undefined ? 'file' : isMarkdown(absolutePath) ? 'document' : 'file') : requested
+    requested === 'auto'
+      ? args.line !== undefined
+        ? 'file'
+        : hasDocumentView(absolutePath)
+          ? 'document'
+          : 'file'
+      : requested
   if (args.line !== undefined && view !== 'file') throw new Error('line and column require the file view')
-  if (view === 'document' && !isMarkdown(absolutePath)) throw new Error('document view requires Markdown')
+  if (view === 'document' && !hasDocumentView(absolutePath))
+    throw new Error('document view requires a Markdown or HTML document')
 
   return {
     path: relativeIdentity(root, absolutePath),

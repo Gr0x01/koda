@@ -406,6 +406,96 @@ describe('the Library scope is markdown, not every text file', () => {
 })
 
 /**
+ * HTML joins the corpus DELIBERATELY, which is a different admission rule from prose and has to stay
+ * one (typed-documents plan, Architecture §2). `.html` is the most common non-document extension there
+ * is — build output, coverage reports, email templates, vendored docs — so a project-wide rule would
+ * bury the user's writing the first time anyone ran a build. `Documents/` is the one folder whose
+ * contents the user put there on purpose, so that is where, and only where, an `.html` file counts.
+ */
+describe('deliberate HTML admission', () => {
+  it('admits an .html under Documents/ and refuses the identical file anywhere else', async () => {
+    file('Documents/report.html', '<html><head><title>Frost report</title></head><body><p>zneedle</p></body></html>')
+    file('dist/report.html', '<html><head><title>Built</title></head><body><p>zneedle</p></body></html>')
+    file('emails/welcome.html', '<html><head><title>Welcome</title></head><body><p>zneedle</p></body></html>')
+    file('coverage/index.html', '<html><head><title>Coverage</title></head><body><p>zneedle</p></body></html>')
+
+    const { docs } = await queryLibrary(root, { query: 'zneedle' })
+
+    expect(docs.map((d) => d.rel)).toEqual(['Documents/report.html'])
+  })
+
+  it('carries the same rule down into Documents/ subfolders, and holds for .htm', async () => {
+    file('Documents/reviews/q3.html', '<html><head><title>Q3</title></head><body><p>zneedle</p></body></html>')
+    file('Documents/legacy.htm', '<html><head><title>Legacy</title></head><body><p>zneedle</p></body></html>')
+
+    const { docs } = await queryLibrary(root, { query: 'zneedle' })
+
+    expect(docs.map((d) => d.rel).sort()).toEqual(['Documents/legacy.htm', 'Documents/reviews/q3.html'])
+  })
+
+  it('does not admit a Documents/ folder that is not the project’s home', async () => {
+    // The home is the top-level `Documents/`. A `docs/Documents/` inside a vendored tree is somebody
+    // else's folder that happens to share a name, and admitting it reopens the build-output door.
+    file('site/Documents/generated.html', '<html><head><title>Gen</title></head><body><p>zneedle</p></body></html>')
+
+    const { docs } = await queryLibrary(root, { query: 'zneedle' })
+
+    expect(docs).toEqual([])
+  })
+
+  it('gives an admitted artifact the same authored row a markdown document gets', async () => {
+    file(
+      'Documents/explorer.html',
+      [
+        '<!doctype html><html><head><title>Frost date explorer</title>',
+        '<meta name="koda:description" content="Which planting window survives a late freeze." />',
+        '<meta name="koda:kind" content="research" />',
+        '<meta name="koda:date" content="2026-08-20" />',
+        '<style>body { color: zneedle; }</style></head>',
+        '<body><h1>Frost date explorer</h1><p>Two sliders and a table.</p>',
+        '<script>const secret = "zneedle"</script></body></html>',
+      ].join('\n'),
+    )
+
+    const [doc] = await listProjectDocs(root)
+
+    expect(doc.title).toBe('Frost date explorer')
+    expect(doc.description).toBe('Which planting window survives a late freeze.')
+    expect(doc.kind).toBe('research')
+    // The excerpt is the page's prose. A Library row that previewed a stylesheet or a script would be
+    // the file tree this surface exists to replace.
+    const { docs } = await queryLibrary(root, {})
+    expect(docs[0].excerpt).toContain('Two sliders and a table.')
+    expect(docs[0].excerpt).not.toContain('color:')
+    expect(docs[0].excerpt).not.toContain('const secret')
+  })
+
+  it('keeps listing the rest of the Library when one artifact is unreadable', async () => {
+    file('Documents/good.md', '# Good\n')
+    file('Documents/broken.html', '<html><head><title>Never closed')
+
+    const rels = (await listProjectDocs(root)).map((d) => d.rel).sort()
+
+    // The broken artifact is still a row — it just has no authored metadata to show.
+    expect(rels).toEqual(['Documents/broken.html', 'Documents/good.md'])
+    const broken = (await listProjectDocs(root)).find((d) => d.rel === 'Documents/broken.html')
+    expect(broken?.title).toBeUndefined()
+  })
+
+  it('refreshes an admitted artifact through the exact-path resolver too', async () => {
+    file('Documents/report.html', '<html><head><title>Frost report</title></head><body><p>Text.</p></body></html>')
+    file('dist/report.html', '<html><head><title>Built</title></head><body><p>Text.</p></body></html>')
+
+    const docs = await resolveProjectDocs(root, ['Documents/report.html', 'dist/report.html'])
+
+    // The remembered-shortcut door has to answer admission identically to the walk, or a star could
+    // keep a row alive that discovery correctly refuses.
+    expect(docs.map((d) => d.rel)).toEqual(['Documents/report.html'])
+    expect(docs[0].title).toBe('Frost report')
+  })
+})
+
+/**
  * Both walks report a partial RESULT and stop on a hard CAP, and those are different facts. Sharing one
  * flag between them ended the walk at the first ordinary file — a long matching line, a directory the
  * process cannot read — and reported "no matches" for a project full of them. These pin the split.

@@ -25,6 +25,8 @@ import {
   registerPreviewProtocol,
   registerPreviewCaptureResponder,
   killDevServer,
+  forgetWindowDocuments,
+  isDocumentFrameEscape,
 } from './preview'
 import { stopAllLanForwards } from './lan-forward'
 import { bootStartMiniApps, disposeMiniApps } from './mini-apps'
@@ -190,6 +192,7 @@ function createWindow(projectPath: string, newProjectIntent = false): void {
   // restore-on-boot set (a user closing a window means "don't reopen it"; quitting preserves the set).
   win.on('closed', () => {
     killDevServer(win.id) // a managed preview dev server must not outlive its window
+    forgetWindowDocuments(win.id) // nor the paths its document origin was allowed to serve
     killTerminal(win.id) // nor the window's interactive shell
     voiceController.killForWindow(win.id) // nor a live dictation helper holding the mic
     const ctx = unregisterWindow(win.id)
@@ -262,6 +265,17 @@ function createWindow(projectPath: string, newProjectIntent = false): void {
   // location.href or <a href> the renderer should never be able to follow).
   win.webContents.on('will-navigate', (event, url) => {
     if (url !== win.webContents.getURL()) event.preventDefault()
+  })
+
+  // Defense in depth for the sandboxed document origin: `will-navigate` only fires for the MAIN frame,
+  // so a document iframe navigating ITSELF slips past it. A hostile document could read its own host
+  // and hop to the permissive app-preview origin to shed its no-network CSP. Deny any host/scheme
+  // change of a frame that is currently on the document origin; reloading itself for live refresh and
+  // same-origin paths are left untouched. (The independent document token already makes the app-preview
+  // URL unconstructable — this keeps the CSP unsheddable even if another served origin is added later.)
+  win.webContents.on('will-frame-navigate', (details) => {
+    const frameUrl = details.frame?.url
+    if (frameUrl && isDocumentFrameEscape(frameUrl, details.url)) details.preventDefault()
   })
 
   if (process.env.ELECTRON_RENDERER_URL) {

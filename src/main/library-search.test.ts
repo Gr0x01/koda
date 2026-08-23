@@ -331,3 +331,33 @@ describe('searchLibrary across both corpora', () => {
     expect(result.truncated).toBe(true)
   })
 })
+
+/**
+ * Admission and retrieval are one question, answered once. `searchLibrary` reaches the documents
+ * corpus only through `queryLibrary`, which walks the same list the Library shows — so a format the
+ * Library admits is a format an ask can cite, with no second walk to keep in agreement. These pin that
+ * the new format arrived through that seam rather than beside it.
+ */
+describe('an admitted HTML artifact is citable', () => {
+  it('returns a deliberate artifact as a document ref, labelled by its own <title>', async () => {
+    file(
+      'Documents/frost.html',
+      '<html><head><title>Frost date explorer</title></head><body><p>The last freeze usually lands in April.</p></body></html>',
+    )
+
+    const { refs } = await searchLibrary(root, 'freeze April', { scope: 'documents' })
+
+    expect(refs).toEqual([
+      expect.objectContaining({ kind: 'document', rel: 'Documents/frost.html', label: 'Frost date explorer' }),
+    ])
+  })
+
+  it('leaves an .html outside Documents/ out of the corpus entirely', async () => {
+    file(
+      'dist/frost.html',
+      '<html><head><title>Built</title></head><body><p>The last freeze lands in April.</p></body></html>',
+    )
+
+    expect((await searchLibrary(root, 'freeze April', { scope: 'documents' })).refs).toEqual([])
+  })
+})

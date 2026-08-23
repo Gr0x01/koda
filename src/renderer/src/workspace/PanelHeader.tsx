@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { forwardRef, type ButtonHTMLAttributes, type ReactNode } from 'react'
 
 /**
  * The shared header bar atop every left panel/nav (Sessions, Files, Source Control, Settings) — one
@@ -20,3 +20,34 @@ export function PanelHeader({ label, title, children }: { label?: string; title?
     </div>
   )
 }
+
+/** Icon-only action for a panel heading. Kept beside `PanelHeader` so headings can move their own
+ * actions without re-declaring this shape. It deliberately has no native `title=`: callers wrap it in
+ * `HoverCard`, which gives the action one consistent, keyboard-reachable disclosure. */
+export const PanelHeaderIconButton = forwardRef<
+  HTMLButtonElement,
+  ButtonHTMLAttributes<HTMLButtonElement>
+>(function PanelHeaderIconButton({ children, ...rest }, ref) {
+  return (
+    <button
+      ref={ref}
+      type="button"
+      className="flex h-6 w-6 items-center justify-center rounded-md text-text-muted outline-none transition-colors hover:bg-surface hover:text-text focus-visible:bg-surface focus-visible:text-text"
+      {...rest}
+    >
+      <svg
+        width="15"
+        height="15"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden
+      >
+        {children}
+      </svg>
+    </button>
+  )
+})

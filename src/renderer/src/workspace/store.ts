@@ -34,6 +34,7 @@ import type {
   BillingMode,
   MemoryWeight,
   ContextUsage,
+  DocShelf,
   EngineEvent,
   EngineId,
   GitStatusFile,
@@ -67,6 +68,7 @@ import type {
 } from '../transcript/Transcript'
 import type { TaskRow } from '../transcript/TaskList'
 import { engineCapabilities } from '@shared/engine-capabilities'
+import { resolveDocFormat } from '@shared/document-contract'
 import {
   isProvisionalSessionTitle,
   isSessionNamingPrompt,
@@ -666,6 +668,10 @@ interface WorkspaceStore {
   legacyKeptDocPathChanges: LegacyKeptDocPathChange[]
   /** Whether every readable archived legacy shelf has reached the same acknowledged hot-store blob. */
   legacyKeptDocsMigrationComplete: boolean
+  /** Whether main's project shelf has acknowledged this project's pre-shelf stars. Until it has, the
+   *  sessions blob keeps writing its own copy: it is the only durable one. After it has, that copy is
+   *  dropped, so a stale second list can never argue with the shelf. */
+  docShelfAdopted: boolean
   pending: ApprovalRequest[]
   /** Account-level subscription rate-limit windows, keyed by ENGINE then window type
    *  (`claude`/`codex` → `five_hour`/`weekly`). Each engine is a separate subscription with its own
@@ -721,15 +727,17 @@ interface WorkspaceStore {
   /** Open file/preview surfaces, keyed by session — the dock shows the active session's editor. See
    *  EditorState; read via the `activeEditor(state)` selector, never indexed directly at call sites. */
   editors: Record<string, EditorState>
-  /** Recently-opened files (absolute paths, most-recent first, capped). Powers the Find overlay's
-   *  empty-query quick-open. In-memory only (resets on restart) — cheap, like `openDirs`. */
-  recentFiles: string[]
   /** Expanded directories in the Files tree, by path. Lives here (not in DirNode local state) so the
    *  tree keeps its shape when the sidebar remounts. */
   openDirs: string[]
   /** Bumped when the Files tree's contents change (new doc/folder, rename, move, delete) so open
    *  directory rows re-read and reflect it. */
   filesRev: number
+  /** Koda-driven artifact renames/deletes this session, as absolute `old → new` (or `old → null` for a
+   *  delete). A doc's smart artifact card keeps the portable link text the file was written with, so it
+   *  consults this to open the artifact's CURRENT location after a rename it did not rewrite. In-memory
+   *  only, like `openDirs`; durable link-text rewrite is a separate follow-up. */
+  docRefRepairs: Record<string, string | null>
   /** A transient, human-readable error from a file-management action (rename clash, etc.), shown as a
    *  dismissable line in the Files browser; cleared on the next successful action or on dismiss. */
   treeError: string | null
@@ -797,9 +805,6 @@ interface WorkspaceStore {
   /** Put the Agents roster on stage — the surface a fan-out's fleet row opens. Session-scoped like
    *  every other tab: it shows the delegates of the session whose editor it lands in. */
   openAgents: (sessionId?: string) => void
-  /** The Find overlay (Spotlight-style centered search) — summoned over everything (⌘P / ⌘⇧F),
-   *  dismissed on Esc / click-out / opening a result. Independent of sidebarView + settings. */
-  searchOpen: boolean
   /** The one image lightbox — a full-screen preview opened by ANY image (composer staged thumbs, sent
    *  images in the transcript, the Recent images strip). Null = closed. Esc / click-out closes. */
   lightbox: ImageDraft | null
@@ -1035,8 +1040,6 @@ interface WorkspaceStore {
   persistLayout: () => void
   /** Restore every pane size to its default and persist (the Settings "Reset to default layout"). */
   resetLayout: () => void
-  /** Open/close the Find overlay (⌘P / ⌘⇧F to open; Esc / click-out / opening a result to close). */
-  setSearchOpen: (open: boolean) => void
   /** Expand the stage to the full window width (and back). Works for whichever tab is on stage. */
   setStageExpanded: (expanded: boolean) => void
 
@@ -1096,18 +1099,18 @@ interface WorkspaceStore {
 
   // starred documents (project-wide)
   /** Star a document for this project. `rel` is a project-relative POSIX path and the only document
-   *  data stored; everything else is re-read from the file. Works even when no chat is open. */
+   *  data stored; everything else is re-read from the file. Works even when no chat is open. The
+   *  durable write belongs to main's shelf command — this updates the projection and calls it. */
   starDoc: (rel: string) => void
   /** Remove a document from this project's starred list. */
   unstarDoc: (rel: string) => void
-  /** One-time move of this project's localStorage doc pins — the retired Documents pane's own idea of
-   *  "this one matters" — into the project-wide starred list. The legacy copy stays until
-   *  `completeDocPinMigration` sees an acknowledged persisted blob. */
-  migrateDocPins: () => void
-  /** Remove the retired pane's keys only after main acknowledged a project blob that contains every
-   *  adopted pin. The exact acknowledged blob is passed in so in-memory state cannot masquerade as
-   *  durable state while the IPC write is still in flight. */
-  completeDocPinMigration: (persisted: PersistedBlob) => void
+  /** Take main's shelf as truth. Pushed after every shelf change, including a star the agent made and
+   *  the rebase main performs when a starred document is renamed or deleted. */
+  applyDocShelf: (shelf: DocShelf) => void
+  /** One-time hand-off of the star sources that predate the project shelf — the sessions blob's own
+   *  list and the retired Documents pane's localStorage pins — to main. The legacy copies survive
+   *  until main answers with a shelf that holds them, so a failed migration simply runs again. */
+  adoptLegacyDocStars: () => void
   /** Close the preview surface. */
   closePreview: () => void
   /** Main says this preview URL stopped serving — drop the live mark wherever it's shown. */
@@ -1410,11 +1413,41 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         reattaching.delete(id)
       }
     }
-    await window.koda.sendTurn({
-      sessionId: id,
-      text: opts.sentText,
-      images: opts.images?.length ? opts.images : undefined,
-    })
+    try {
+      await window.koda.sendTurn({
+        sessionId: id,
+        text: opts.sentText,
+        images: opts.images?.length ? opts.images : undefined,
+      })
+    } catch (err) {
+      // Main is the final admission boundary and can refuse a send: a turn already running, a settings
+      // change in flight, or the session still holding a pending approval whose asking turn already
+      // ended. That rejection used to surface only as an invisible unhandledrejection, leaving the
+      // composer stuck "busy" with nothing on screen saying why.
+      const raw = err instanceof Error ? err.message : String(err)
+      // Electron wraps an IPC throw as "Error: Error invoking remote method '…': Error: <msg>" — unwrap
+      // to the refusal sentence itself.
+      const message = raw
+        .replace(/^Error:\s*/, '')
+        .replace(/^Error invoking remote method '[^']+':\s*/, '')
+        .replace(/^Error:\s*/, '')
+      // The refusal happened before anything reached the engine, so no TurnComplete will ever consume a
+      // handoff this dispatch carried — clear it, or the NEXT successful turn in this session would be
+      // mistaken for the handoff summary and open a phantom fresh chat.
+      handoffPending.delete(id)
+      if (opts.displayItem.kind === 'user') {
+        // Feed the refusal through the shared terminal-rejection path rather than hand-setting the
+        // banner: it ends the optimistic turn, raises the same calm retryable banner engine errors use,
+        // AND attaches the TurnFailure envelope to the just-appended user row — a bare banner would
+        // leave "Try again" with no target, stranding the user's words as an inert transcript row.
+        get().applyEngineEvent({ type: 'EngineError', sessionId: id, message, fatal: false, category: 'turnRejected' })
+      } else {
+        // A refused Canvas dispatch appended no user row, and with no replaySeq the envelope attach
+        // would pin the failure to an OLDER unrelated user turn — "Try again" would re-send that.
+        // Banner only; a canvas edit is re-driven from the canvas, not the composer.
+        patchSession(id, (s) => ({ ...endTurn(s), errored: true, error: { message, fatal: false } }))
+      }
+    }
     return true
   }
 
@@ -1667,6 +1700,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     legacyKeptDocsImported: [],
     legacyKeptDocPathChanges: [],
     legacyKeptDocsMigrationComplete: false,
+    docShelfAdopted: false,
     pending: [],
     rateLimits: {},
     providerDown: {},
@@ -1708,6 +1742,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     editors: {},
     openDirs: [],
     filesRev: 0,
+    docRefRepairs: {},
     treeError: null,
     settingsOpen: false,
     settingsSection: null,
@@ -1725,11 +1760,9 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     gitChangesTruncated: false,
     gitSideLinesWaiting: false,
     changesFocus: null,
-    searchOpen: false,
     lightbox: null,
     scratchTick: 0,
     recentImagesExpanded: false,
-    recentFiles: [],
     hydrated: false,
     sessionsLoadFailed: false,
     archiveLoadFailed: false,
@@ -1964,13 +1997,15 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
             )
             if (tool?.kind === 'tool' && EDIT_TOOLS.has(tool.name)) {
               const filePath = (tool.input as { file_path?: string } | null)?.file_path
-              // Markdown edits surface as a live rendered DOC (watch it build, Notion-style); code +
-              // everything else surface as the before→after DIFF (watch the change, catch mistakes).
+              // Document edits surface as the live rendered artifact (watch it build, Notion-style);
+              // code + everything else surface as the before→after DIFF (watch the change, catch
+              // mistakes). For HTML that means the sandboxed page, which is the result the reader was
+              // promised — the source is one toggle away in the same tab.
               // Only for edits inside THIS session's cwd — that's the safety-git root the diff resolves
               // against (see the fs:diffFile handler). An edit outside it (a global ~/.claude file) can't
               // be diffed, so surfacing it would just error and steal the Stage.
               if (filePath && withinDir(filePath, get().sessions[sid]?.cwd)) {
-                if (isMarkdown(filePath)) get().showEditDoc(filePath, sid)
+                if (opensAsDocument(filePath)) get().showEditDoc(filePath, sid)
                 else get().showEditDiff(filePath, sid)
               }
             }
@@ -2084,9 +2119,12 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
             byModel: foldModelSpend(s.byModel, e.models),
           }))
           // Invariant: the engine blocks a turn synchronously on a pending approval, so a completed turn
-          // means nothing is awaiting one. Any prompt still queued here is stale (e.g. the ~5min MCP
-          // approve timeout drops the `approve` call and the agent re-asks, stranding the old requestId
-          // with no cancel event) — clear it, else statusOf latches the session on "Needs your approval".
+          // means nothing is awaiting one. Any prompt still queued here is stale (e.g. the MCP approve
+          // idle-abort drops the `approve` call, stranding the old requestId with no cancel event) —
+          // clear it, else statusOf latches the session on "Needs your approval". This is now just the
+          // optimistic LOCAL mirror: main sweeps the gate at the same TurnComplete (ApprovalGate.
+          // sweepStranded) and broadcasts a resolved event to every head, which is what unbricks the
+          // session's next-turn admission and clears the card on a head that isn't this window.
           get().cancelPending(sid)
           settleDeferredBillingRespawn(sid)
           // A finished turn is activity: it re-dates the session in the map (and un-settles it if the
@@ -3015,7 +3053,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         const activeFile = ed.surfaces.find(
         (s) => s.path === ed.activeSurfaceId && (s.kind ?? 'file') === 'file',
       )
-        const noun = activeFile && isMarkdown(activeFile.path) ? 'document' : 'file'
+        const noun = activeFile && opensAsDocument(activeFile.path) ? 'document' : 'file'
       // Engine-facing text restores the full path behind any pretty `@`-mention; the transcript keeps
       // the clean name (displayItem uses `text` below).
         const engineText = await resolveDocMentions(text)
@@ -3690,7 +3728,6 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       set({ ...DEFAULT_LAYOUT })
       get().persistLayout()
     },
-    setSearchOpen: (open) => set({ searchOpen: open }),
     setStageExpanded: (expanded) =>
       set((state) => {
         const key = editorKey(state)
@@ -3709,10 +3746,10 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         const key = editorKey(state)
         const ed = state.editors[key] ?? EMPTY_EDITOR
         const existing = ed.surfaces.find((s) => s.path === path)
-        // Markdown opens as the WYSIWYG document (everyday-user default); everything else as the
-        // editable Monaco file. The per-pane toggle exposes the raw-markdown view for a doc. An
-        // explicit `view` overrides this (e.g. technical `.claude/**` files open as raw markdown).
-        const view: FileSurface['view'] = opts?.view ?? (isMarkdown(path) ? 'doc' : 'file')
+        // A document format opens as the rendered artifact (everyday-user default); everything else as
+        // the editable Monaco file. The per-pane toggle exposes the raw source for a doc. An explicit
+        // `view` overrides this (e.g. technical `.claude/**` files open as raw markdown).
+        const view: FileSurface['view'] = opts?.view ?? (opensAsDocument(path) ? 'doc' : 'file')
         const openedDiffSource: FileDiffSource | undefined =
           view === 'diff' ? (opts?.diffSource ?? { kind: 'working-tree' }) : undefined
         const surfaces = existing
@@ -3745,8 +3782,6 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           // stageShown deliberately dropped: an explicit open releases any hide the user had set, and
           // the default (follow the tabs) then keeps the stage up for as long as something is on it.
           ...withEditor(state.editors, key, { surfaces, activeSurfaceId: path, pinned: false }),
-          // MRU for the Find overlay's quick-open: this path to the front, deduped, capped.
-          recentFiles: [path, ...state.recentFiles.filter((p) => p !== path)].slice(0, 12),
         }
       }),
 
@@ -3880,7 +3915,12 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           editors,
           openDirs: state.openDirs.map(reb),
           filesRev: state.filesRev + 1,
-          ...remapStarredDocs(state, (abs) => rebasePath(abs, from, to) ?? abs),
+          // A smart artifact card keeps the portable link the file was written with, so record the move
+          // here and let the card resolve the artifact's current home at open time.
+          docRefRepairs: applyRefRepair(state.docRefRepairs, from, to),
+          // The starred shelf is NOT rebased here. Main repairs it inside the same rename it performed
+          // and pushes the result back, so the repair survives a closed window and covers a rename the
+          // agent asked for. This action keeps only surface state: tabs, the tree, and legacy sources.
           ...(legacyPathChange
             ? {
                 legacyKeptDocPathChanges: appendLegacyPathChange(
@@ -3912,7 +3952,10 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           editors,
           openDirs: state.openDirs.filter((p) => !under(p)),
           filesRev: state.filesRev + 1,
-          ...remapStarredDocs(state, (abs) => (under(abs) ? null : abs)),
+          // A card pointing at the deleted artifact is tombstoned, so opening it declines rather than
+          // reaching for a path that is gone.
+          docRefRepairs: applyRefRepair(state.docRefRepairs, path, null),
+          // Same division as notePathMoved: main drops the shelf entry as part of the delete it made.
           ...(legacyPathChange
             ? {
                 legacyKeptDocPathChanges: appendLegacyPathChange(
@@ -4224,6 +4267,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         // path becomes readable later, it must not get a second vote after the user unstars it.
         legacyKeptDocsImported: mergeUniquePaths(legacyKeptDocsImported, [rel]),
       })
+      void runDocStarCommand(rel, true, starredDocs)
     },
 
     unstarDoc: (rel) => {
@@ -4250,12 +4294,21 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         starredDocs: starredDocs.filter((path) => path !== rel),
         legacyKeptDocsImported: mergeUniquePaths(legacyKeptDocsImported, [rel]),
       })
+      void runDocStarCommand(rel, false, starredDocs)
     },
 
-    // Adoption and deletion are deliberately separate. The legacy key is the only durable copy until
-    // main acknowledges a project-store write containing the merged stars, so this action only adopts.
-    // `completeDocPinMigration` owns deletion after that acknowledgement.
-    migrateDocPins: () => {
+    applyDocShelf: (shelf) =>
+      set((state) => ({
+        starredDocs: shelf.starred,
+        // The shelf's settled ledger is the durable half of what this store used to hold alone. Merging
+        // it back keeps the in-memory tombstone whole while archived legacy shelves are still arriving.
+        legacyKeptDocsImported: mergeUniquePaths(state.legacyKeptDocsImported, shelf.settled),
+      })),
+
+    // Offer, then delete — the same two beats the retired pane's pins already followed, with main's
+    // shelf as the acknowledgement instead of a persisted blob. Nothing legacy is removed until the
+    // answer proves the project shelf holds it, so a refusal or an old preload just retries later.
+    adoptLegacyDocStars: () => {
       const {
         projectPath,
         starredDocs,
@@ -4263,50 +4316,37 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         legacyKeptDocPathChanges,
       } = get()
       if (!projectPath) return
-      const pinsKey = `koda:doc-pins:${projectPath}`
       const pins = repairLegacyDocPins(
         projectPath,
         legacyKeptDocPathChanges,
         (path) => starredDocs.includes(path) || !legacyKeptDocsImported.includes(path),
       )
-      if (!pins) return // storage unreadable: change nothing, and try again on the next mount
-      const merged = mergeUniquePaths(starredDocs, pins)
-      if (merged.length !== starredDocs.length) set({ starredDocs: merged })
-      // No choices to protect: clear the retired pane's empty residue immediately.
-      if (pins.length) return
-      try {
-        localStorage.removeItem(pinsKey)
-        localStorage.removeItem(`koda:doc-folders-open:${projectPath}`) // the retired pane's other key
-      } catch {
-        // Storage refused the delete: harmless. The merge above skips anything already starred, so the
-        // next mount re-runs it without duplicating a row.
-      }
-    },
-
-    completeDocPinMigration: (persisted) => {
-      const {
-        projectPath,
-        starredDocs,
-        legacyKeptDocsImported,
-        legacyKeptDocPathChanges,
-      } = get()
-      if (!projectPath) return
-      const pinsKey = `koda:doc-pins:${projectPath}`
-      const pins = repairLegacyDocPins(
-        projectPath,
-        legacyKeptDocPathChanges,
-        (path) => starredDocs.includes(path) || !legacyKeptDocsImported.includes(path),
-      )
-      if (!pins) return
-      // The acknowledgement is for THIS blob. Only it can prove every legacy choice has reached disk;
-      // current Zustand state may already have changed while the IPC round-trip was in flight.
-      if (pins.length && !pins.every((path) => persisted.starredDocs?.includes(path))) return
-      try {
-        localStorage.removeItem(pinsKey)
-        localStorage.removeItem(`koda:doc-folders-open:${projectPath}`)
-      } catch {
-        // Harmless and retryable: adoption de-duplicates the next time the old key is seen.
-      }
+      // A path already unstarred must not get a second vote, so the ledger filters what is offered
+      // here and travels with it — main keeps the tombstone once this store stops carrying one.
+      const offered = mergeUniquePaths(starredDocs, pins ?? [])
+      void (async () => {
+        let shelf: DocShelf | undefined
+        try {
+          shelf = await window.koda.adoptLegacyDocStars?.({
+            starred: offered,
+            settled: legacyKeptDocsImported,
+          })
+        } catch (err) {
+          console.error('doc shelf migration failed', err)
+        }
+        // No answer (an older preload, or a refusal): every legacy copy stays exactly as it was.
+        if (!shelf) return
+        get().applyDocShelf(shelf)
+        if (!offered.every((path) => shelf.settled.includes(path))) return
+        set({ docShelfAdopted: true })
+        if (!pins) return // storage was unreadable, so there is nothing here to delete safely
+        try {
+          localStorage.removeItem(`koda:doc-pins:${projectPath}`)
+          localStorage.removeItem(`koda:doc-folders-open:${projectPath}`) // the retired pane's other key
+        } catch {
+          // Storage refused the delete: harmless. The shelf's ledger refuses the same paths next time.
+        }
+      })()
     },
 
     closePreview: () => get().closeSurface(PREVIEW_SURFACE_ID),
@@ -4498,11 +4538,15 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         legacyKeptDocsImported,
         legacyKeptDocPathChanges,
         legacyKeptDocsMigrationComplete,
+        docShelfAdopted,
       } = get()
       return {
         version: 3,
         activeId,
-        starredDocs,
+        // The project shelf owns the stars once it has acknowledged them. Writing a second copy here
+        // after that would leave a stale list that argues with the shelf on the next launch — and the
+        // whole reason the shelf exists is that this file is addressed by where the project USED to be.
+        starredDocs: docShelfAdopted ? [] : starredDocs,
         legacyKeptDocsImported,
         legacyKeptDocPathChanges,
         legacyKeptDocsMigrationComplete,
@@ -4606,6 +4650,26 @@ function applyLegacyPathChanges(
   return current
 }
 
+/**
+ * Run a star/unstar through main's shelf command and take its answer as the truth.
+ *
+ * The optimistic local change already happened, because a star has to land under the click. What this
+ * adds is durability and reach: main writes the project's shelf file, so the choice survives the
+ * window, and it pushes the result to every surface — the same path an agent star arrives on. A
+ * refusal puts back exactly the list we had, rather than leaving a star nothing durable agrees with.
+ * An older preload without the command (dev HMR keeps a stale one) simply leaves the optimistic state,
+ * which the sessions blob still persists until the migration is acknowledged.
+ */
+async function runDocStarCommand(rel: string, starred: boolean, before: string[]): Promise<void> {
+  try {
+    const shelf = await window.koda.setDocStar?.({ path: rel, starred })
+    if (shelf) useWorkspace.getState().applyDocShelf(shelf)
+  } catch (err) {
+    console.error('doc star failed', err)
+    useWorkspace.setState({ starredDocs: before })
+  }
+}
+
 /** Keep the ordered change log compact under duplicate filesystem notifications. */
 function appendLegacyPathChange(
   changes: readonly LegacyKeptDocPathChange[],
@@ -4613,6 +4677,27 @@ function appendLegacyPathChange(
 ): LegacyKeptDocPathChange[] {
   const last = changes[changes.length - 1]
   return last?.from === next.from && last.to === next.to ? [...changes] : [...changes, next]
+}
+
+/**
+ * Fold one Koda-driven rename/delete (absolute `from → to`, `to = null` for a delete) into the smart
+ * artifact-card repair map. A card's stale link resolves to `from`, so `from → to` is recorded; any
+ * card already pointing at `from` (or under it, for a folder move) is chased forward to its new home
+ * or tombstoned, so a chain of renames still resolves in one lookup.
+ */
+function applyRefRepair(
+  repairs: Record<string, string | null>,
+  from: string,
+  to: string | null,
+): Record<string, string | null> {
+  const next: Record<string, string | null> = {}
+  for (const [key, value] of Object.entries(repairs)) {
+    if (value !== null && (value === from || value.startsWith(from + '/'))) {
+      next[key] = to === null ? null : to + value.slice(from.length)
+    } else next[key] = value
+  }
+  next[from] = to
+  return next
 }
 
 /** Apply path repair to the retired Documents pane's still-unacknowledged localStorage copy. Returns
@@ -4640,51 +4725,6 @@ function repairLegacyDocPins(
     return repaired
   } catch {
     return null
-  }
-}
-
-/**
- * Carry the project's starred-document shelf through a rename, move, or delete. Starred paths are
- * project-relative while file events are absolute, so this converts both ways around `projectPath`
- * (main resolves that to the same realpath it derives `rel` from).
- *
- * Every old and new path also joins the append-only legacy ledger. That is not bookkeeping noise: an
- * archived session may still carry the old path, and without the tombstone it could re-import the star
- * the next time its index becomes readable. `next` returns the new absolute path, or null to drop it.
- *
- * Returns `{}` when nothing changed, so the caller can spread it into a `set` payload without ever
- * replacing either array for a file event that touched no star.
- */
-function remapStarredDocs(
-  state: {
-    starredDocs: string[]
-    legacyKeptDocsImported: string[]
-    projectPath: string | null
-  },
-  next: (abs: string) => string | null,
-): { starredDocs?: string[]; legacyKeptDocsImported?: string[] } {
-  const root = state.projectPath
-  if (!root) return {}
-  const touched: string[] = []
-  const mapped: string[] = []
-  for (const rel of state.starredDocs) {
-    const absolute = next(`${root}/${rel}`)
-    if (!absolute || !absolute.startsWith(`${root}/`)) {
-      touched.push(rel)
-      continue
-    }
-    const nextRel = absolute.slice(root.length + 1)
-    mapped.push(nextRel)
-    if (nextRel !== rel) touched.push(rel, nextRel)
-  }
-  const starredDocs = mergeUniquePaths(mapped)
-  const unchanged =
-    starredDocs.length === state.starredDocs.length &&
-    starredDocs.every((rel, index) => rel === state.starredDocs[index])
-  if (unchanged) return {}
-  return {
-    starredDocs,
-    legacyKeptDocsImported: mergeUniquePaths(state.legacyKeptDocsImported, touched),
   }
 }
 
@@ -4740,9 +4780,15 @@ function humanFsError(e: unknown): string {
   return "Couldn't complete that — the file may have moved or be in use."
 }
 
-/** Markdown files default to the WYSIWYG document view. */
-function isMarkdown(path: string): boolean {
-  return /\.(md|markdown)$/i.test(path)
+/**
+ * Whether this path opens as a rendered DOCUMENT on the Stage rather than as raw source. Markdown gets
+ * the WYSIWYG editor; HTML gets the sandboxed document frame. Both are `view: 'doc'` — the Dock picks
+ * the renderer from the same format — so every caller here decides one thing: is this file's default
+ * the thing it is, or the text it is made of.
+ */
+function opensAsDocument(path: string): boolean {
+  const format = resolveDocFormat(path)
+  return format === 'markdown' || format === 'html'
 }
 
 /** The last few readable turns, baked into archive metadata at archive time so Settings can preview the

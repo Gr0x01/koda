@@ -10,6 +10,74 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-08-22
+
+### Added
+
+- Documents can now be interactive. Ask for a comparison, an explainer, or a small interactive
+  report and Koda can create it as a self-contained HTML document that opens on the Stage, appears
+  in the Library and search like any other document, and takes the same star, hold view, and live
+  refresh markdown documents have. Its scripts run inside a locked-down sandbox with no network
+  access and no reach into your files.
+- Select a passage in a document and turn it into an interactive view. Koda creates a sibling HTML
+  document from what you selected, drops an ordinary link to it back into your writing, and opens
+  it beside the source. A link to a local document now shows as a small card you can open or reveal
+  in place, and the file keeps a plain relative link, so the document is still just as portable in
+  any other editor.
+- A new Usage screen in Settings shows what your whole subscription did, counting Claude Code and
+  Codex activity on this Mac inside and outside Koda, terminal sessions included. Pick a window
+  from 24 hours up to 90 days and see what those tokens would have cost at full API rates, what
+  cache reuse saved you, the split across providers and models, and how much of it ran through
+  Koda. Every dollar cites its rate, and a model with no citable rate shows tokens instead of an
+  invented number.
+- The agent can now create documents properly from chat on both engines. New markdown is born with
+  its title, date, and kind, new HTML documents carry the same details inside the file, and the
+  document it makes opens on the Stage for you to see straight away.
+- Path-shaped code in an agent reply, such as `src/app.ts:12` or `.env.local`, can now be clicked
+  to open that file on the Stage.
+- You can now ask Koda to put a document on your Documents shelf, or take it off, in the middle of
+  a conversation. It is the same shelf the Library and the Stage bar use, so a document Koda just
+  wrote for you can be kept in one turn.
+
+### Changed
+
+- Search is now one door. ⌘K, ⌘P, and ⌘⇧F all open the Library, and there is no longer a separate
+  Find box to type into by mistake. Browsing is unchanged, and your documents still come first. The
+  moment you type, the same box also searches every file in the project and lists the matches in a
+  Project files section below your documents, by filename or by a phrase from inside. Selecting a
+  file shows it in the preview beside the list, with Open and Open as code, and find and replace
+  now lives right there on the file you are looking at.
+- Your Documents shelf is now kept with the project itself rather than beside it, so moving the
+  project folder no longer loses which documents you had starred, and restoring an earlier version
+  of your work brings the shelf back with the documents it describes. Existing stars move over on
+  the next launch, and a star follows its document through renames and moves.
+- An open document's Stage bar now keeps the current view in one labelled menu instead of three
+  permanent icon buttons. Starring stays visible, and the menu holds the Hold view, Reveal in
+  Finder, Copy path, and Delete actions.
+- AI providers in Settings now focuses on sign-in, billing, and your plan's live limit windows.
+  The spend, per-model, and history views moved to the new Usage screen.
+- The plan gauges in the bottom bar now carry their reset clock inline (64% · 3h 12m), so you can
+  see when a window frees up without clicking. The popup gains one new last row, Full usage, which
+  opens the new Usage screen.
+- The sidebar now has one clear hierarchy: Sessions, Starred documents, and History. The project
+  name is no longer repeated in the rail, and Archived chats and Recent images stay in anchored
+  popovers above the separate Versions and Settings footer.
+- Switching the Codex ChatGPT account now immediately refreshes the live 5-hour and weekly usage
+  windows, so the new subscription's reset time is visible before the next turn.
+
+### Fixed
+
+- A session could get permanently stuck refusing new messages after an approval you never answered
+  outlived its turn. Approvals now clean themselves up when their turn ends, and a message Koda
+  refuses to send shows a banner explaining why instead of vanishing with nothing on screen.
+- Signing in to Codex inside Koda now also signs in the `codex` terminal command, so the terminal
+  copy of your login no longer quietly expires and fails while Koda keeps working. A terminal
+  sign-in with an API key is left alone.
+- Koda no longer refuses to write a markdown file that belongs to the code, such as a test fixture,
+  a template, or a README. Only writing meant for you to read goes through the Documents rules.
+- Files that only look like markdown, such as `.mdx`, now open in the file editor instead of the
+  document editor, so their code-specific syntax cannot be quietly rewritten by the rich view.
+
 ## [0.1.12] - 2026-08-21
 
 ### Added
@@ -526,7 +594,8 @@ _First versioned build — the baseline the auto-updater ships from._
 - Settings now shows the Koda version, the bundled Claude engine version, and a
   "Check for updates" button.
 
-[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.12...HEAD
+[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.13...HEAD
+[0.1.13]: https://github.com/Gr0x01/koda/releases/tag/v0.1.13
 [0.1.12]: https://github.com/Gr0x01/koda/releases/tag/v0.1.12
 [0.1.10]: https://github.com/Gr0x01/koda/releases/tag/v0.1.10
 [0.1.9]: https://github.com/Gr0x01/koda/releases/tag/v0.1.9
