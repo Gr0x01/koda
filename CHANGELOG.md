@@ -10,6 +10,18 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
 
 ## [Unreleased]
 
+### Changed
+
+- Updated the bundled Codex engine to 0.149.1.
+
+- Updated the bundled Claude engine to 2.1.231.
+
+- Long-running agent work now keeps its place on disk. When the agent fans work out across several
+  waves, or carries a goal through many milestones, it writes a small progress ledger inside the
+  project and marks a step done only once its evidence checked out. If the session is interrupted,
+  restarted, or simply runs long, the agent picks up from what was actually verified instead of
+  guessing from memory, and the ledger is removed once the work is delivered.
+
 ## [0.1.13] - 2026-08-22
 
 ### Added

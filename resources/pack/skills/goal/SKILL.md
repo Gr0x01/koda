@@ -15,8 +15,13 @@ progress report is not completion.
    active goal. Set a token budget only when the user supplied one.
 3. Keep making useful progress. Maintain a short plan when the work benefits from one, revise it as
    evidence changes, and continue through intermediate milestones without handing the task back.
-4. Prove the requested outcome with the strongest practical verification available.
-5. Mark a native goal complete only after the outcome and its verification are satisfied. Mark it
+4. When the goal spans milestones or could outlive the current context, keep a ledger at
+   `.koda/progress/<goal-slug>.md`. Its first line states the objective; append one line per milestone
+   only once it is proven, never on intention. Start each goal turn by reading the ledger and trust it
+   over recollection; a ledger whose first line states a different objective is not yours to continue.
+   Delete the ledger when the goal completes.
+5. Prove the requested outcome with the strongest practical verification available.
+6. Mark a native goal complete only after the outcome and its verification are satisfied. Mark it
    blocked only when the same concrete blocker has prevented progress for three consecutive goal turns
    and no safe in-scope workaround remains.
 

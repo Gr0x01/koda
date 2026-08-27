@@ -135,6 +135,14 @@ jobs:
 
       # GITHUB_TOKEN-authored PRs do not recursively trigger ordinary pull_request workflows. Run the
       # repository's complete portable CI gate on the exact edited tree before this narrow bot PR merges.
+      # The unit suite resolves resources/engine/linux-x64/claude (adapter/pack tests; the lab's check
+      # lane installs it the same way). The bump above moved the pin to $TARGET, and /tmp/candidate
+      # already holds $TARGET's manifest-verified linux binary — install that, no second download.
+      - name: Install engine for the unit suite
+        if: success() && steps.v.outputs.go == 'true'
+        run: |
+          mkdir -p resources/engine/linux-x64
+          cp /tmp/candidate/claude resources/engine/linux-x64/claude
       - name: Portable repository gate
         if: success() && steps.v.outputs.go == 'true'
         env:
@@ -264,6 +272,16 @@ jobs:
           node scripts/apply-engine-bump.mjs apply --engine codex --version "$TARGET" --darwin-sha "$DARWIN_SHA"
           node scripts/apply-engine-bump.mjs verify --engine codex --version "$TARGET" --darwin-sha "$DARWIN_SHA"
 
+      # The unit suite resolves resources/engine/linux-x64/claude even in the Codex job (Claude
+      # adapter/pack tests run in `npm test`), and this job downloads only the codex candidate.
+      # Install the PINNED Claude engine the same verified way the candidate fetcher works.
+      - name: Install pinned Claude engine for the unit suite
+        if: success() && steps.v.outputs.go == 'true'
+        run: |
+          PINNED=$(node -p "require('fs').readFileSync('scripts/fetch-engine.mjs','utf8').match(/PINNED_VERSION\s*=\s*'([^']+)'/)[1]")
+          node scripts/fetch-candidate-engine.mjs --version "$PINNED" --platform linux-x64 --out /tmp/pinned-claude
+          mkdir -p resources/engine/linux-x64
+          cp /tmp/pinned-claude/claude resources/engine/linux-x64/claude
       - name: Portable repository gate
         if: success() && steps.v.outputs.go == 'true'
         env:

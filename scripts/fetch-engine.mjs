@@ -34,20 +34,20 @@ const execFileP = promisify(execFile)
 // was bug-fixes-only. Re-converge on `stable` at the next bump. The engine-contract workflow verifies,
 // writes, and merges only a strictly newer compatible stable pin. NOTE: check-engine-floor.mjs + the
 // workflow read `PINNED_VERSION` by regex — keep the name.
-const PINNED_VERSION = '2.1.221'
+const PINNED_VERSION = '2.1.231'
 const CLAUDE_BASE = 'https://downloads.claude.ai/claude-code-releases'
 
 // ── Codex ──────────────────────────────────────────────────────────────────────────────────────────
 // Latest GitHub-releases `stable` (non-prerelease) at pin time. The codex-contract job updates BOTH the
 // version and the per-platform tarball SHA only after its real app-server contract and repository gate.
-const PINNED_CODEX_VERSION = '0.147.0'
+const PINNED_CODEX_VERSION = '0.149.1'
 const CODEX_BASE = 'https://github.com/openai/codex/releases/download'
 // koda platform → codex release triple.
 const CODEX_TRIPLE = { 'darwin-arm64': 'aarch64-apple-darwin' }
 // SHA-256 of the plain `codex-<triple>.tar.gz` asset, per koda platform. Self-pinned (OpenAI publishes no
 // checksum for the plain binary). Recompute when bumping PINNED_CODEX_VERSION.
 const CODEX_TARBALL_SHA256 = {
-  'darwin-arm64': '75984b81f92a71b0c0f4b3b5cad80e5c57177e4d8c8b4b1e13db703b20dc4358',
+  'darwin-arm64': 'ed60f475c6dda6044c2c00fd7f33273cc3f3f98900ccd1204bfdf2fe935f3405',
 }
 
 const PLATFORMS = ['darwin-arm64']

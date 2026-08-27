@@ -172,11 +172,16 @@ describe.skipIf(!API_KEY)('codex engine contract', () => {
 
     expect(started).toHaveLength(2)
     expect(completed).toHaveLength(2)
-    const lastStartIndex = Math.max(
-      ...turn.map((event, index) => (event.type === 'SubagentStarted' ? index : -1)),
-    )
-    const firstCompletionIndex = turn.findIndex((event) => event.type === 'SubagentCompleted')
-    expect(lastStartIndex).toBeLessThan(firstCompletionIndex)
+    // Nesting is the wire contract; concurrency is the model's choice. Codex 0.148+ sometimes runs
+    // the two children back-to-back, so assert each child completes after ITS OWN start (and, via
+    // the runTurn slice, before the parent's TurnComplete) — not that both start before either ends.
+    for (const completion of completed) {
+      const startIndex = turn.findIndex(
+        (event) => event.type === 'SubagentStarted' && event.toolUseId === completion.toolUseId,
+      )
+      expect(startIndex, `SubagentStarted for ${completion.toolUseId}`).toBeGreaterThanOrEqual(0)
+      expect(turn.indexOf(completion)).toBeGreaterThan(startIndex)
+    }
     expect(completed.every((event) => event.taskId && event.resultText && !event.isError)).toBe(true)
     expect(nestedAnswers.length).toBeGreaterThanOrEqual(2)
     const childResults = completed.map((event) => event.resultText).join('\n').toUpperCase()

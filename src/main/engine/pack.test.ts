@@ -277,18 +277,16 @@ describe('routed playbooks', () => {
     ).not.toThrow()
   })
 
-  it.skipIf(process.platform !== 'darwin')('keeps legacy agents foreground without changing approved leaves', () => {
-    const script = join(resolvePack()!.dir, 'hooks', 'constrain-delegation.js')
-    const legacy = execFileSync('/usr/bin/osascript', ['-l', 'JavaScript', script], {
-      input: JSON.stringify({
-        tool_name: 'Agent',
-        tool_input: {
-          subagent_type: 'legacy-reader',
-          run_in_background: true,
-          future_field: { preserved: true },
-        },
-      }),
-      encoding: 'utf8',
+  // The hook is dual-runtime: osascript JXA on macOS (packaged app), node on Linux CI. Both
+  // entrypoints share decide(), so the same case table runs through whichever runtimes exist here.
+  const constrainDelegation = (runHook: (payload: unknown) => string): void => {
+    const legacy = runHook({
+      tool_name: 'Agent',
+      tool_input: {
+        subagent_type: 'legacy-reader',
+        run_in_background: true,
+        future_field: { preserved: true },
+      },
     })
     expect(JSON.parse(legacy)).toMatchObject({
       hookSpecificOutput: {
@@ -298,15 +296,29 @@ describe('routed playbooks', () => {
     })
 
     for (const subagentType of ['koda:scout', 'koda:worker', 'deep-review:detective', 'deep-review:finding-judge']) {
-      const leaf = execFileSync('/usr/bin/osascript', ['-l', 'JavaScript', script], {
-        input: JSON.stringify({
-          tool_name: 'Agent',
-          tool_input: { subagent_type: subagentType, run_in_background: true },
-        }),
-        encoding: 'utf8',
+      const leaf = runHook({
+        tool_name: 'Agent',
+        tool_input: { subagent_type: subagentType, run_in_background: true },
       })
       expect(leaf.trim()).toBe('')
     }
+  }
+
+  const hookScript = (): string => join(resolvePack()!.dir, 'hooks', 'constrain-delegation.js')
+
+  it('keeps legacy agents foreground without changing approved leaves (node runtime)', () => {
+    constrainDelegation((payload) =>
+      execFileSync(process.execPath, [hookScript()], { input: JSON.stringify(payload), encoding: 'utf8' }),
+    )
+  })
+
+  it.skipIf(process.platform !== 'darwin')('keeps legacy agents foreground without changing approved leaves (osascript runtime)', () => {
+    constrainDelegation((payload) =>
+      execFileSync('/usr/bin/osascript', ['-l', 'JavaScript', hookScript()], {
+        input: JSON.stringify(payload),
+        encoding: 'utf8',
+      }),
+    )
   })
 })
 

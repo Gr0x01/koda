@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/usr/bin/osascript -l JavaScript \"${CLAUDE_PLUGIN_ROOT}/hooks/constrain-delegation.js\"",
+            "command": "if [ -x /usr/bin/osascript ]; then /usr/bin/osascript -l JavaScript \"${CLAUDE_PLUGIN_ROOT}/hooks/constrain-delegation.js\"; else node \"${CLAUDE_PLUGIN_ROOT}/hooks/constrain-delegation.js\"; fi",
             "timeout": 5
           }
         ]
