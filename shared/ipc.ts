@@ -1562,13 +1562,6 @@ export const KodaSettingsSchema = z.object({
    *  for dogfooding — it opens a LAN port, the opposite of the shipped "no inbound port" design, which
    *  Phase 1 replaces with outbound polling. Persisted so an enabled server auto-starts on boot. */
   remoteEnabled: z.boolean(),
-  /** Anonymous usage events (telemetry.ts). Default-ON with presented consent: sends are also gated on
-   *  hasOnboarded, so nothing flows until the user has seen the toggle on the onboarding safety step;
-   *  off means zero pings. On sends fixed event names with typed props tied to a random install id,
-   *  never content (no file paths, prompts, code, or project names — enforced by the event map's
-   *  types, not by scrubbing). The site's /privacy Analytics section describes exactly this; change
-   *  them together. */
-  telemetryEnabled: z.boolean(),
   /** Whether a mini app's ask-or-fix line starts a FRESH conversation each calendar day (named for
    *  that day) instead of one ever-growing thread per app. Default-ON: a day thread is what makes an
    *  app's history browsable by date, and it keeps every turn from re-reading weeks of unrelated

@@ -4,7 +4,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const OFF_SETTINGS = {
-  telemetryEnabled: false,
   notificationsEnabled: false,
   usageResetNotify: false,
   providerStatusNotify: false,

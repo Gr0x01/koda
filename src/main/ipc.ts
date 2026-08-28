@@ -2,7 +2,6 @@ import { app, BrowserWindow, dialog, ipcMain, shell, type WebContents } from 'el
 import { existsSync, realpathSync } from 'node:fs'
 import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { track, trackFirstTurn } from './telemetry'
 import { checkForUpdatesNow, getUpdateStatus, getWhatsNew, quitAndInstallUpdate } from './updater'
 import { submitFeedback } from './feedback'
 import { z } from 'zod'
@@ -524,7 +523,6 @@ export function registerIpcHandlers(): void {
     const { sessionId, text, images } = SendTurnRequestSchema.parse(rawArgs)
     // Await: the turn-boundary safety checkpoint must land before the turn reaches the engine.
     await getEngineSessions().sendTurn(sessionId, text, images)
-    trackFirstTurn()
   })
 
   ipcMain.handle(IpcChannels.interruptSession, (_event, rawArgs: unknown) => {
@@ -798,16 +796,12 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(IpcChannels.settingsGet, () => KodaSettingsSchema.parse(loadSettings()))
   ipcMain.handle(IpcChannels.settingsSet, async (_event, rawArgs: unknown) => {
     const patch = KodaSettingsPatchSchema.parse(rawArgs)
-    // Activation-funnel signal: fire once when onboarding finishes. Order matters — updateSettings
-    // persists hasOnboarded:true first, so track()'s hasOnboarded send-gate is already open.
-    const justOnboarded = patch.hasOnboarded === true && !loadSettings().hasOnboarded
     // Every production prune shares the retention lane. Put persistence inside it so an older,
     // shorter policy cannot keep deleting after a longer/Forever preference has been saved.
     const next =
       patch.scratchRetentionDays !== undefined
         ? await applyScratchRetentionSetting(() => updateSettings(patch))
         : updateSettings(patch)
-    if (justOnboarded) track('onboarding_completed', {})
     if (patch.defaultApprovalMode !== undefined)
       getEngineSessions().setDefaultApprovalMode(next.defaultApprovalMode)
     if (patch.previewAutoStart !== undefined)
@@ -2085,7 +2079,6 @@ export function registerIpcHandlers(): void {
     noteProjectOpened(projectPath) // openProjects (restore-on-boot) + recents
     const { buildAppMenu } = await import('./index')
     buildAppMenu()
-    track('project_created', {})
     return ProjectOpenResultSchema.parse({ projectPath, alreadyOpen: false })
   })
 

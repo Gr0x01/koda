@@ -106,7 +106,6 @@ import {
   resizeRemoteTerminal,
   startRemoteTerminal,
 } from '../terminal'
-import { friendlyEngineError } from '@shared/engine-error'
 import { compactTranscriptToolOutput } from '@shared/tool-output'
 import {
   isTopLevelTurnActivity,
@@ -119,7 +118,6 @@ import {
   transcriptFromReplay,
 } from '@shared/delegation'
 import { reconcileRateLimitWindows } from '@shared/rate-limits'
-import { track } from '../telemetry'
 import { resolveGlobalSkillsPlugin } from './skills-catalog'
 import { projectSkillCollisionNames } from '../project-skills'
 import { noteMomentCheckpoint } from '../backup'
@@ -4724,11 +4722,6 @@ export class EngineSessionManager {
       void this.recoverResumeMiss(event.sessionId)
       return undefined
     }
-    // Telemetry (opt-in): the classifier TONE only — the message can carry file paths, so it never
-    // leaves. forward() is the one funnel both drivers' errors pass through.
-    if (event.type === 'EngineError')
-      track('engine_error', { tone: friendlyEngineError(event.message, event.fatal).tone, fatal: event.fatal })
-
     this.logEvent(event)
     this.trackSubagentLifecycle(event)
     // A broker-drop ToolResult starts recovery synchronously before the adapter can drain the next
@@ -4977,7 +4970,6 @@ export class EngineSessionManager {
     // surface (it never streams back into -p). The dir is main-internal — the renderer renders the
     // card from runId + name. Idempotent per runId.
     if (event.type === 'WorkflowStarted' && event.dir && !this.workflowWatchers.has(event.runId)) {
-      track('workflow_run', {})
       const watcher = new WorkflowWatcher(
         event.sessionId,
         event.runId,

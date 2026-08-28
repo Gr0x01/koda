@@ -16,9 +16,14 @@ concurrency:
 
 on:
   schedule:
-    # Daily 06:00 UTC. Checking is cheap (a version compare + one API call); the API-billing smoke test only
-    # runs on days `stable` actually advanced. Daily (not weekly) so a new release — e.g. a flagship model
-    # launch — is caught within ~1 day instead of up to 7.
+    # Daily 06:00 UTC. Checking is cheap (a version compare, no engine spawn). Daily (not weekly) so a new
+    # release — e.g. a flagship model launch — is caught within ~1 day instead of up to 7.
+    #
+    # The API-billing smoke test runs when `stable` is ahead of the pin — which is NOT the same as "on days
+    # stable advanced", because the pin only moves after a fully green run merges its bump PR. A red nightly
+    # leaves the pin behind forever, so every following night re-tested the same candidate and re-billed for
+    # it; that ran 17 nights straight in August 2026. The already-failed guard in the resolve step below is
+    # what bounds that, and it is the reason this cron can stay daily.
     - cron: '0 6 * * *'
   workflow_dispatch:
     inputs:
@@ -48,6 +53,9 @@ jobs:
 
       - name: Resolve versions + preconditions
         id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
         run: |
           if [ -z "$ANTHROPIC_API_KEY" ]; then
             echo "::notice::ANTHROPIC_API_KEY not set — skipping engine contract run."
@@ -67,6 +75,16 @@ jobs:
           ORDER=$(node --input-type=module -e "import { compareStableVersions } from './scripts/apply-engine-bump.mjs'; console.log(compareStableVersions(process.argv[1], process.argv[2]))" "$TARGET" "$PINNED")
           if [ "$ORDER" -le 0 ]; then
             echo "::notice::Claude pin $PINNED is already at or ahead of stable $TARGET — nothing to test."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          # A candidate that already failed must not be re-tested nightly. The smoke test bills the API in
+          # full, and a failing check bills MORE than a passing one (each check burns its whole timeout with
+          # the model still working), so a red nightly used to charge for the identical broken version every
+          # day until someone read the bill. The failure issue below is already the record of that attempt;
+          # this reads it back. Retry when the issue is closed, when a newer version ships, or on a manual
+          # dispatch — which is the escape hatch for a failure that was transient rather than real.
+          elif [ -z "$FORCE" ] && gh issue list --state open --limit 200 --json title --jq '.[].title' \
+            | grep -Fxq "Automated Claude engine update failed for $TARGET"; then
+            echo "::notice::Claude $TARGET already failed and its issue is still open — not re-testing (close it or dispatch manually to retry)."
             echo "go=false" >> "$GITHUB_OUTPUT"
           else
             echo "go=true" >> "$GITHUB_OUTPUT"
@@ -90,6 +108,9 @@ jobs:
         if: steps.v.outputs.go == 'true'
         env:
           KODA_ENGINE_CANDIDATE: /tmp/candidate/claude
+          # The checks assert stream-json plumbing, not model judgment, and this run bills the API — so pin
+          # a mid-tier model instead of inheriting the CLI's Opus default. See the note in smoke.test.ts.
+          KODA_ENGINE_CONTRACT_MODEL: sonnet
         run: npm run test:engine-contract
 
       # Watch the server-advertised min_version floor — the one thing that breaks a frozen bundle (see
@@ -179,8 +200,11 @@ jobs:
         run: |
           TARGET="${TARGET:-unknown}"
           TITLE="Automated Claude engine update failed for $TARGET"
-          BODY="Koda stopped the automated update for \`$TARGET\` before nightly publication. The failure may be version resolution, candidate verification, the real engine contract, the exact-diff guard, portable CI, or guarded PR integration. Logs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          EXISTING=$(gh issue list --state open --search "$TITLE in:title" --json number -q '.[0].number')
+          BODY="Koda stopped the automated update for \`$TARGET\` before nightly publication. The failure may be version resolution, candidate verification, the real engine contract, the exact-diff guard, portable CI, or guarded PR integration. Close this issue to let the nightly retry \`$TARGET\`. Logs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          # Exact title match, not `in:title` search: the resolve step reads these same titles back to decide
+          # whether a candidate already failed, and a fuzzy match across adjacent version numbers would make
+          # the two disagree — either skipping a version that never ran, or filing a fresh issue every night.
+          EXISTING=$(gh issue list --state open --limit 200 --json number,title -q ".[] | select(.title == \"$TITLE\") | .number" | head -n1)
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --body "$BODY"
           else
@@ -209,6 +233,7 @@ jobs:
         id: v
         env:
           GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
         run: |
           if [ -z "$OPENAI_API_KEY" ]; then
             echo "::notice::OPENAI_API_KEY not set — skipping codex contract run."
@@ -234,6 +259,11 @@ jobs:
           ORDER=$(node --input-type=module -e "import { compareStableVersions } from './scripts/apply-engine-bump.mjs'; console.log(compareStableVersions(process.argv[1], process.argv[2]))" "$TARGET" "$PINNED")
           if [ "$ORDER" -le 0 ]; then
             echo "::notice::Codex pin $PINNED is already at or ahead of stable $TARGET — nothing to test."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          # Same guard as the Claude job: an already-failed candidate must not re-bill the API every night.
+          elif [ -z "$FORCE" ] && gh issue list --state open --limit 200 --json title --jq '.[].title' \
+            | grep -Fxq "Automated Codex engine update failed for $TARGET"; then
+            echo "::notice::Codex $TARGET already failed and its issue is still open — not re-testing (close it or dispatch manually to retry)."
             echo "go=false" >> "$GITHUB_OUTPUT"
           else
             echo "go=true" >> "$GITHUB_OUTPUT"
@@ -319,8 +349,9 @@ jobs:
         run: |
           TARGET="${TARGET:-unknown}"
           TITLE="Automated Codex engine update failed for $TARGET"
-          BODY="Koda stopped the automated update for \`$TARGET\` before nightly publication. The failure may be version resolution, candidate verification, the real app-server contract, the exact-diff guard, portable CI, or guarded PR integration. Logs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          EXISTING=$(gh issue list --state open --search "$TITLE in:title" --json number -q '.[0].number')
+          BODY="Koda stopped the automated update for \`$TARGET\` before nightly publication. The failure may be version resolution, candidate verification, the real app-server contract, the exact-diff guard, portable CI, or guarded PR integration. Close this issue to let the nightly retry \`$TARGET\`. Logs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          # Exact title match — the resolve step reads these titles back; see the note in the Claude job.
+          EXISTING=$(gh issue list --state open --limit 200 --json number,title -q ".[] | select(.title == \"$TITLE\") | .number" | head -n1)
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --body "$BODY"
           else

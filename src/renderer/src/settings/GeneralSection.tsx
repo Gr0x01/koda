@@ -246,34 +246,7 @@ export function GeneralSection() {
       </SettingsSection>
 
       <AssistSection />
-      <PrivacySection />
     </>
-  )
-}
-
-function PrivacySection() {
-  const [enabled, setEnabled] = useState<boolean | null>(null)
-
-  useEffect(() => {
-    window.koda.getSettings().then((s) => setEnabled(s.telemetryEnabled)).catch(console.error)
-  }, [])
-
-  const toggle = (next: boolean): void => {
-    setEnabled(next)
-    window.koda.updateSettings({ telemetryEnabled: next }).catch(console.error) // main reads it live
-  }
-
-  return (
-    <SettingsSection
-      title="Privacy"
-      note="It never includes your files, chats, file names, or project names. Off sends nothing at all."
-    >
-      <SettingsRow
-        label="Help improve Koda"
-        description="Send counts of which features get used and which errors happen, tied to a random id."
-        control={<Toggle checked={enabled ?? true} onChange={toggle} label="Help improve Koda" />}
-      />
-    </SettingsSection>
   )
 }
 

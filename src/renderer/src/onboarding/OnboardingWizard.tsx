@@ -535,20 +535,6 @@ function Toggle({ on, onClick }: { on: boolean; onClick: () => void }) {
 }
 
 function TeachStep() {
-  // Presented consent: usage sharing defaults ON, and main gates every send on hasOnboarded — so this
-  // visible toggle is what the user walks past before anything can flow. Reads the real setting (a
-  // re-run of onboarding after opting out must not show it back on); writes apply immediately, so
-  // backing out of the wizard keeps whatever the user chose.
-  const [shareUsage, setShareUsage] = useState<boolean | null>(null)
-  useEffect(() => {
-    window.koda.getSettings().then((s) => setShareUsage(s.telemetryEnabled)).catch(console.error)
-  }, [])
-  const toggleShareUsage = (): void => {
-    const next = !(shareUsage ?? true)
-    setShareUsage(next)
-    window.koda.updateSettings({ telemetryEnabled: next }).catch(console.error)
-  }
-
   const rows = [
     {
       title: 'Go back anytime',
@@ -576,17 +562,6 @@ function TeachStep() {
             <div className="mt-0.5 text-xs leading-relaxed text-text-muted">{r.body}</div>
           </div>
         ))}
-        <div className="flex items-center gap-3 py-3">
-          <div className="min-w-0 flex-1">
-            <div className="font-display text-sm font-semibold">Help improve Koda</div>
-            <div className="mt-0.5 text-xs leading-relaxed text-text-muted">
-              Optional. Sends counts of which features get used and which errors happen, so we know
-              what to fix next. The counts carry a random id and nothing you make, so we could not
-              see your work even if we wanted to. Change it anytime in Settings.
-            </div>
-          </div>
-          <Toggle on={shareUsage ?? true} onClick={toggleShareUsage} />
-        </div>
       </div>
     </div>
   )

@@ -12,7 +12,7 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
 
 ### Changed
 
-- Updated the bundled Codex engine to 0.149.1.
+- Updated the bundled Codex engine to 0.150.1.
 
 - Updated the bundled Claude engine to 2.1.231.
 
@@ -21,6 +21,12 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
   project and marks a step done only once its evidence checked out. If the session is interrupted,
   restarted, or simply runs long, the agent picks up from what was actually verified instead of
   guessing from memory, and the ledger is removed once the work is delivered.
+
+### Removed
+
+- Koda no longer collects usage analytics. The app used to send anonymous feature and error counts
+  when the sharing toggle was on; that code is gone entirely, along with the toggle in setup and
+  Settings. Nothing about your usage leaves your Mac.
 
 ## [0.1.13] - 2026-08-22
 

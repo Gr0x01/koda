@@ -18,7 +18,6 @@ import http from 'node:http'
 import https from 'node:https'
 import { IpcChannels } from '@shared/channels'
 import { resolveDocFormat } from '@shared/document-contract'
-import { track } from './telemetry'
 import { PreviewRectSchema, type PreviewRect } from '@shared/ipc'
 import { BROKER_TOKEN_ENV } from './broker/server'
 import { containedReal } from './fs-browse'
@@ -216,7 +215,6 @@ export async function showStaticPreview(
   const url = staticPreviewUrl(winId, rel)
   if (!url) throw new Error('this window has no project to preview into')
   sessionPreviews.set(sessionId, { url, kind: 'static', winId })
-  track('preview_opened', { kind: 'static' })
   // Name the originating session: a window can host several sessions, and the push must land on the
   // one whose agent triggered it — NOT whichever session tab happens to be focused when it arrives.
   // `restart` lets the renderer re-show this file after the surface is closed (its token-bearing URL is
@@ -530,7 +528,6 @@ export function startDevServer(
           if (settled || !isCurrent()) return
           entry.url = url
           sessionPreviews.set(sessionId, { url, kind: 'dev', winId })
-          track('preview_opened', { kind: 'dev' })
           // `restart` carries the command (+ cwd) so the user can bring this dev server back with one
           // click after it's killed on window close — the process can't survive, but re-running it can.
           BrowserWindow.fromId(winId)?.webContents.send(IpcChannels.previewShow, {

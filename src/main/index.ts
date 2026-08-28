@@ -33,7 +33,6 @@ import { bootStartMiniApps, disposeMiniApps } from './mini-apps'
 import { voiceController } from './voice'
 import { resumePlaywrightIfEnabled } from './playwright'
 import { killTerminal, registerTerminalIpc } from './terminal'
-import { track } from './telemetry'
 import { startSuspensionWatchdog } from './suspension-watchdog'
 import { startProbeGovernor } from './probe-governor'
 import { startScratchRetentionSweep } from './scratch-retention'
@@ -518,7 +517,6 @@ app.whenReady().then(async () => {
   buildAppMenu()
   app.on('browser-window-focus', buildAppMenu)
   initUpdater() // app self-update: check-on-launch + interval, background download (packaged-only)
-  track('app_opened', {}) // no-op unless the user opted in (telemetry.ts)
 
   // Reopen the projects that were open at last quit, one window each (sequential — avoids any race on
   // shared init). Drop any whose folder has since been deleted/moved (a stale path would wedge the

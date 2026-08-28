@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { launchKoda, makeUserDataDir } from './support/koda'
 
@@ -10,7 +10,7 @@ test('E2E owns its app identity, state, logs, and credential home', async () => 
   process.env.OPENAI_TEST_SENTINEL = 'must-not-cross-the-e2e-boundary'
   process.env.GIT_ASKPASS = '/must/not/cross'
   try {
-    const app = await launchKoda({ userDataDir, settings: { telemetryEnabled: true } })
+    const app = await launchKoda({ userDataDir })
     try {
       const win = await app.firstWindow()
       await expect(win.getByRole('heading', { name: 'Open a project' })).toBeVisible({ timeout: 15_000 })
@@ -51,9 +51,6 @@ test('E2E owns its app identity, state, logs, and credential home', async () => 
       expect(accountGuards.sessionError).toContain('disabled in hermetic Koda E2E')
       expect(accountGuards.credentialError).toContain('disabled in hermetic Koda E2E')
 
-      // Even deliberately seeded ON, telemetry is hard-disabled by the profile and never mints an id.
-      const settings = JSON.parse(readFileSync(join(userDataDir, 'koda-settings.json'), 'utf8'))
-      expect(settings.telemetryInstallId).toBeUndefined()
       // StatusBar probes may create the isolated Codex directory, but must not copy the user's auth into it.
       expect(existsSync(join(userDataDir, 'codex', 'auth.json'))).toBe(false)
     } finally {

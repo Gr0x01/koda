@@ -14,7 +14,6 @@
  * data-integrity banner to show. A log line is not "user-visible"; the banner is.
  */
 import { app } from 'electron'
-import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { writeFileAtomic } from './atomic-write'
@@ -308,28 +307,6 @@ export function loadHasOnboarded(): boolean {
   return readSettings().hasOnboarded === true
 }
 
-/** Anonymous usage events — default-ON, but PRESENTED consent: telemetry.ts also gates every send on
- *  hasOnboarded, so nothing flows until the user has walked past the visible toggle on the onboarding
- *  safety step (decided 2026-07-09; supersedes the earlier opt-in default). Read live at every
- *  track() call, so flipping the toggle applies instantly; off = zero pings. */
-export function loadTelemetryEnabled(): boolean {
-  return readSettings().telemetryEnabled !== false
-}
-
-/** Random install id for telemetry events — internal state, not a preference (like RuntimeRecord).
- *  Minted on first use, tied to nothing about the user, and reset trivially by clearing settings. */
-export function loadTelemetryInstallId(): string {
-  const v = readSettings().telemetryInstallId
-  if (typeof v === 'string' && v.length > 0) return v
-  const id = randomUUID()
-  try {
-    writeFileAtomic(settingsPath(), JSON.stringify({ ...readSettings(), telemetryInstallId: id }, null, 2))
-  } catch (err) {
-    log.warn('settings', 'failed to persist install id', err instanceof Error ? err.message : err)
-  }
-  return id
-}
-
 /** The Koda version whose "What's New" the user has already seen — internal one-shot state (like the
  *  install id), not a preference. '' means never set (a fresh install). See updater.ts getWhatsNew. */
 export function loadWhatsNewSeenVersion(): string {
@@ -490,7 +467,6 @@ export function loadSettings(): KodaSettings {
     billingMode: loadBillingMode(),
     codexBillingMode: loadCodexBillingMode(),
     remoteEnabled: loadRemoteEnabled(),
-    telemetryEnabled: loadTelemetryEnabled(),
     appDaySessions: loadAppDaySessions(),
     critiquePass: loadCritiquePass(),
     suggestVersionMessage: loadSuggestVersionMessage(),
@@ -547,7 +523,6 @@ export function updateSettings(patch: Partial<KodaSettings>): KodaSettings {
   }
   if (patch.codexBillingMode !== undefined) next.codexBillingMode = patch.codexBillingMode
   if (patch.remoteEnabled !== undefined) next.remoteEnabled = patch.remoteEnabled
-  if (patch.telemetryEnabled !== undefined) next.telemetryEnabled = patch.telemetryEnabled
   if (patch.layout !== undefined) next.layout = clampLayout(patch.layout)
   try {
     writeFileAtomic(settingsPath(), JSON.stringify(next, null, 2))
