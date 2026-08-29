@@ -14,7 +14,7 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
 
 - Updated the bundled Codex engine to 0.150.1.
 
-- Updated the bundled Claude engine to 2.1.231.
+- Updated the bundled Claude engine to 2.1.236.
 
 - Long-running agent work now keeps its place on disk. When the agent fans work out across several
   waves, or carries a goal through many milestones, it writes a small progress ledger inside the

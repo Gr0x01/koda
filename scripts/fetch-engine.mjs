@@ -34,7 +34,7 @@ const execFileP = promisify(execFile)
 // was bug-fixes-only. Re-converge on `stable` at the next bump. The engine-contract workflow verifies,
 // writes, and merges only a strictly newer compatible stable pin. NOTE: check-engine-floor.mjs + the
 // workflow read `PINNED_VERSION` by regex — keep the name.
-const PINNED_VERSION = '2.1.231'
+const PINNED_VERSION = '2.1.236'
 const CLAUDE_BASE = 'https://downloads.claude.ai/claude-code-releases'
 
 // ── Codex ──────────────────────────────────────────────────────────────────────────────────────────

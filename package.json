@@ -1,6 +1,6 @@
 {
   "name": "koda",
-  "version": "0.1.14-nightly.1740.20260827172557.c8a24c6e",
+  "version": "0.1.14-nightly.1741.20260828181923.68ba6f18",
   "description": "A guardrailed Claude Code distribution as a Mac desktop app for non-engineers.",
   "private": true,
   "author": "RB",
