@@ -12,7 +12,7 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
 
 ### Changed
 
-- Updated the bundled Codex engine to 0.150.1.
+- Updated the bundled Codex engine to 0.151.0.
 
 - Updated the bundled Claude engine to 2.1.236.
 

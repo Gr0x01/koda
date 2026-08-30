@@ -40,14 +40,14 @@ const CLAUDE_BASE = 'https://downloads.claude.ai/claude-code-releases'
 // ── Codex ──────────────────────────────────────────────────────────────────────────────────────────
 // Latest GitHub-releases `stable` (non-prerelease) at pin time. The codex-contract job updates BOTH the
 // version and the per-platform tarball SHA only after its real app-server contract and repository gate.
-const PINNED_CODEX_VERSION = '0.150.1'
+const PINNED_CODEX_VERSION = '0.151.0'
 const CODEX_BASE = 'https://github.com/openai/codex/releases/download'
 // koda platform → codex release triple.
 const CODEX_TRIPLE = { 'darwin-arm64': 'aarch64-apple-darwin' }
 // SHA-256 of the plain `codex-<triple>.tar.gz` asset, per koda platform. Self-pinned (OpenAI publishes no
 // checksum for the plain binary). Recompute when bumping PINNED_CODEX_VERSION.
 const CODEX_TARBALL_SHA256 = {
-  'darwin-arm64': 'f66f1c45f1eda49d6a8aef86faee24121b0c8913cd9023f23ee44262606fc7b6',
+  'darwin-arm64': '6409e2c65994d294a92bc7330148ebc447ab23908bd7f5c71e718425a622c965',
 }
 
 const PLATFORMS = ['darwin-arm64']
