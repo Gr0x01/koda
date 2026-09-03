@@ -3220,3 +3220,167 @@ describe('regeneration crossings fire on the edge, not the level', () => {
     expect(useWorkspace.getState().persistBlob().sessions[0].namedAtTurns).toBe(10)
   })
 })
+
+// Queued-send: the chip is driven ONLY by main's QueuedTurn events (never assumed locally), and a
+// returned message must never overwrite or drop what the user has typed since queuing.
+describe('queued-send', () => {
+  it('sets the chip from main’s QueuedTurnUpdated event', () => {
+    const a = session('a')
+    useWorkspace.setState({ sessions: { a }, order: ['a'], activeId: 'a' })
+    useWorkspace.getState().applyEngineEvent({
+      type: 'QueuedTurnUpdated',
+      sessionId: 'a',
+      text: 'also add tests',
+      attachmentCount: 2,
+      revision: 1,
+    })
+    expect(useWorkspace.getState().sessions.a.queuedTurn).toEqual({ text: 'also add tests', attachmentCount: 2 })
+  })
+
+  it('clears the chip on a delivered clear and leaves the composer alone', () => {
+    const a = { ...session('a'), draft: 'a fresh thought', queuedTurn: { text: 'earlier', attachmentCount: 0 } }
+    useWorkspace.setState({ sessions: { a }, order: ['a'], activeId: 'a' })
+    useWorkspace.getState().applyEngineEvent({ type: 'QueuedTurnCleared', sessionId: 'a', reason: 'delivered', revision: 2 })
+    const s = useWorkspace.getState().sessions.a
+    expect(s.queuedTurn).toBeUndefined()
+    expect(s.draft).toBe('a fresh thought')
+  })
+
+  it('returns this head’s own segment text into an empty composer', () => {
+    const a = { ...session('a'), queuedTurn: { text: 'q', attachmentCount: 0 } }
+    useWorkspace.setState({ sessions: { a }, order: ['a'], activeId: 'a' })
+    useWorkspace.getState().applyEngineEvent({
+      type: 'QueuedTurnCleared',
+      sessionId: 'a',
+      reason: 'returned',
+      revision: 2,
+      segments: [{ text: 'run the linter', origin: 'desktop' }],
+    })
+    const s = useWorkspace.getState().sessions.a
+    expect(s.queuedTurn).toBeUndefined()
+    expect(s.draft).toBe('run the linter')
+    expect(s.error).toBeUndefined()
+  })
+
+  it('restores ONLY desktop-origin segments, never the phone’s (finding 8)', () => {
+    const a = { ...session('a'), draft: '' }
+    useWorkspace.setState({ sessions: { a }, order: ['a'], activeId: 'a' })
+    useWorkspace.getState().applyEngineEvent({
+      type: 'QueuedTurnCleared',
+      sessionId: 'a',
+      reason: 'returned',
+      revision: 2,
+      segments: [
+        { text: 'from the phone', origin: 'phone' },
+        { text: 'from the mac', origin: 'desktop' },
+      ],
+    })
+    // Only the desktop segment comes home to this composer; the phone's stays for the phone.
+    expect(useWorkspace.getState().sessions.a.draft).toBe('from the mac')
+  })
+
+  it('folds a returned message ahead of what the user has since typed, dropping nothing', () => {
+    const a = { ...session('a'), draft: 'newer text' }
+    useWorkspace.setState({ sessions: { a }, order: ['a'], activeId: 'a' })
+    useWorkspace.getState().applyEngineEvent({
+      type: 'QueuedTurnCleared',
+      sessionId: 'a',
+      reason: 'returned',
+      revision: 2,
+      segments: [{ text: 'older queued text', attachments: [{ mediaType: 'image/png', dataBase64: 'AAA' }], origin: 'desktop' }],
+    })
+    const s = useWorkspace.getState().sessions.a
+    expect(s.draft).toBe('older queued text\nnewer text')
+    expect(s.attachments).toEqual([{ mediaType: 'image/png', dataBase64: 'AAA' }])
+  })
+
+  it('raises the retryable banner only when the return came from a failed dispatch', () => {
+    // Not the active session, so raiseAttention marks it without reaching document.hasFocus() (node lane).
+    const a = { ...session('a'), queuedTurn: { text: 'q', attachmentCount: 0 } }
+    useWorkspace.setState({ sessions: { a }, order: ['a'], activeId: null })
+    useWorkspace.getState().applyEngineEvent({
+      type: 'QueuedTurnCleared',
+      sessionId: 'a',
+      reason: 'returned',
+      revision: 2,
+      failed: true,
+      message: 'The engine did not accept this turn. Try again.',
+      segments: [{ text: 'ship it', origin: 'desktop' }],
+    })
+    const s = useWorkspace.getState().sessions.a
+    expect(s.draft).toBe('ship it')
+    expect(s.error).toEqual({ message: 'The engine did not accept this turn. Try again.', fatal: false })
+    expect(s.attention).toBe(true)
+  })
+
+  it('queueSend hands the engine text + raw displayText to main and clears the composer', async () => {
+    const queueTurn = vi.fn(async () => {})
+    installBridge({ queueTurn })
+    // A plain draft (no @mention, no active file) has engine text === display text.
+    const a = { ...session('a'), busy: true, draft: 'queue me' }
+    useWorkspace.setState({ sessions: { a }, order: ['a'], activeId: 'a' })
+    await useWorkspace.getState().queueSend()
+    expect(queueTurn).toHaveBeenCalledWith({ sessionId: 'a', text: 'queue me', displayText: 'queue me' })
+    expect(useWorkspace.getState().sessions.a.draft).toBe('')
+  })
+
+  it('queueSend passes all attachments through and clears them from the composer', async () => {
+    const queueTurn = vi.fn(async (_args: { text: string; displayText: string; images?: unknown[] }) => {})
+    // Scratch save succeeds so the image note is baked into the engine text (a live-send parity check).
+    const saveScratchImage = vi.fn(async () => ({ path: '/scratch/x.png' }))
+    installBridge({ queueTurn, saveScratchImage })
+    const a = {
+      ...session('a'),
+      busy: true,
+      draft: 'look at this',
+      attachments: [{ mediaType: 'image/png', dataBase64: 'IMG' }],
+    }
+    useWorkspace.setState({ sessions: { a }, order: ['a'], activeId: 'a' })
+    await useWorkspace.getState().queueSend()
+    const arg = queueTurn.mock.calls[0][0]
+    expect(arg.displayText).toBe('look at this') // the raw words, no scratch note
+    expect(arg.text).toContain('/scratch/x.png') // engine text carries the image path note
+    expect(arg.images).toEqual([{ mediaType: 'image/png', dataBase64: 'IMG' }])
+    const s = useWorkspace.getState().sessions.a
+    expect(s.draft).toBe('')
+    expect(s.attachments).toEqual([])
+  })
+
+  it('queueSend restores the draft when main refuses the queue', async () => {
+    const queueTurn = vi.fn(async () => {
+      throw new Error("Error invoking remote method 'engine:queueTurn': Error: nope")
+    })
+    installBridge({ queueTurn })
+    const a = { ...session('a'), busy: true, draft: 'queue me' }
+    useWorkspace.setState({ sessions: { a }, order: ['a'], activeId: 'a' })
+    await useWorkspace.getState().queueSend()
+    const s = useWorkspace.getState().sessions.a
+    expect(s.draft).toBe('queue me')
+    expect(s.error).toEqual({ message: 'nope', fatal: false })
+  })
+
+  it('queueSend degrades to a no-op when the preload lacks the API (stale HMR)', async () => {
+    installBridge() // no queueTurn on window.koda
+    const a = { ...session('a'), busy: true, draft: 'queue me' }
+    useWorkspace.setState({ sessions: { a }, order: ['a'], activeId: 'a' })
+    await useWorkspace.getState().queueSend()
+    // The message stays in the composer rather than being silently lost.
+    expect(useWorkspace.getState().sessions.a.draft).toBe('queue me')
+  })
+
+  it('cancelQueued asks main to cancel the active session’s slot', () => {
+    const cancelQueuedTurn = vi.fn(async () => {})
+    installBridge({ cancelQueuedTurn })
+    const a = { ...session('a'), queuedTurn: { text: 'q', attachmentCount: 0 } }
+    useWorkspace.setState({ sessions: { a }, order: ['a'], activeId: 'a' })
+    useWorkspace.getState().cancelQueued()
+    expect(cancelQueuedTurn).toHaveBeenCalledWith({ sessionId: 'a' })
+  })
+
+  it('applyQueuedTurns rebuilds chips from main’s reload catch-up snapshot', () => {
+    const a = session('a')
+    useWorkspace.setState({ sessions: { a }, order: ['a'], activeId: 'a' })
+    useWorkspace.getState().applyQueuedTurns([{ sessionId: 'a', text: 'held message', attachmentCount: 2 }])
+    expect(useWorkspace.getState().sessions.a.queuedTurn).toEqual({ text: 'held message', attachmentCount: 2 })
+  })
+})

@@ -338,6 +338,13 @@ export function useEngineBridge(): void {
         // Pull in any live sessions this project's already running headless (started from the phone) so
         // they show up alongside the restored ones. Runs after hydrate so it can skip already-open tabs.
         void adoptHeadless()
+        // Rebuild any queued-message chips main still holds for this project (the slot is ephemeral and
+        // never persisted). Runs after hydrate so the sessions exist to carry the chip; without it a
+        // reload would show no chip while main still delivers the message when the current turn ends.
+        window.koda
+          .listQueuedTurns?.()
+          .then((snaps) => useWorkspace.getState().applyQueuedTurns(snaps))
+          .catch(console.error)
       })
       .catch((err) => {
         // The call itself failed (main gone, an older main that still rejected, a preload without the

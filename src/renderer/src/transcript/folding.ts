@@ -175,15 +175,26 @@ export function buildTurns(
       return { id: turn.id, header: turn.header, fold: null, body }
     }
     // The turn's answer is its LAST prose block; earlier prose is narration of work that's now folded.
+    // That split leans on the agent putting substance last, and an agent that breaks the contract
+    // would have its real reply silently swallowed behind the fold. So the fold fails OPEN: an
+    // earlier block that outweighs BOTH the final one and a tweet-sized floor reads as substance,
+    // not narration, and stays visible. The floor is what keeps a status line above a terse closer
+    // from surfacing as noise — a genuinely swallowed answer runs paragraphs, not a sentence.
     let answer: Entry | undefined
+    let answerLength = 0
     for (let i = turn.entries.length - 1; i >= 0; i--) {
-      if (turn.entries[i].kind === 'assistant') {
-        answer = turn.entries[i]
+      const entry = turn.entries[i]
+      if (entry.kind === 'assistant') {
+        answer = entry
+        answerLength = entry.markdown.length
         break
       }
     }
     const liveFleet = turn.entries.some((entry) => isFleetEntry(entry) && fleetEntryIsLive(entry))
-    const kept = turn.entries.filter((e) => e === answer || survivesFold(e, liveFleet))
+    const substanceFloor = Math.max(answerLength, 280)
+    const kept = turn.entries.filter(
+      (e) => e === answer || (e.kind === 'assistant' && e.markdown.length > substanceFloor) || survivesFold(e, liveFleet),
+    )
     const count = turn.entries.length - kept.length
     if (count === 0) {
       return { id: turn.id, header: turn.header, fold: null, body: toNodes(turn.entries, false, expandedRuns) }

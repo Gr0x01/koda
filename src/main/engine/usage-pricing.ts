@@ -173,7 +173,7 @@ function resolveRate(model: string, table: Record<string, RatePerToken>): { rate
       rate: {
         input,
         output: named.outputPerMTok / 1_000_000,
-        cacheRead: input * CACHE_READ_MULTIPLIER,
+        cacheRead: input * (named.cacheReadMultiplier ?? CACHE_READ_MULTIPLIER),
         cacheCreation: input * CACHE_WRITE_MULTIPLIER,
       },
       source: 'published',

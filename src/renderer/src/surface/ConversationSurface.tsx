@@ -43,6 +43,8 @@ export function ConversationSurface() {
   const pendingForActive = pending.filter((r) => r.sessionId === activeId && r.toolName !== 'AskUserQuestion')
   const setDraft = useWorkspace((s) => s.setDraft)
   const send = useWorkspace((s) => s.send)
+  const queueSend = useWorkspace((s) => s.queueSend)
+  const cancelQueued = useWorkspace((s) => s.cancelQueued)
   const answerApproval = useWorkspace((s) => s.answerApproval)
   const interrupt = useWorkspace((s) => s.interrupt)
   const openAgents = useWorkspace((s) => s.openAgents)
@@ -247,14 +249,19 @@ export function ConversationSurface() {
     return () => cancelAnimationFrame(raf)
   }, [activeId, settle])
 
-  // "Btw" / aside: while the agent is BUSY, typing means a side question (answered from context, never
-  // entering the conversation) rather than a queued instruction. It tracks busy LIVE — the instant the
-  // turn finishes, a half-typed aside becomes a normal message (the banner/placeholder/send button flip,
-  // so it's visible, not silent), because with the agent idle there's nothing to avoid interrupting.
+  // Queued-send: while the agent is BUSY, typing queues by default — the message is delivered as a normal
+  // turn the instant this turn ends (main owns the slot). Enter and the accent primary button queue; the
+  // side question ("btw" / aside, answered from context without entering the conversation) becomes an
+  // explicit muted secondary button. A stale dev-HMR preload without the queue API falls back to the old
+  // aside-first behavior so typing-while-busy still does something.
   const draftHasText = (session?.draft.trim().length ?? 0) > 0
-  // A note staged from "Add to chat" (replyStaged) is a real message, so it stays OUT of aside-mode even
-  // while the agent is busy — that's how a side answer flows back to the agent.
-  const asideMode = !!session && draftHasText && !session.replyStaged && session.busy
+  // Composer content = text OR attachments, so an attachment-only follow-up can queue too (its Enter used
+  // to fall into send()'s silent busy guard). A side question stays text-only — there's nothing to ask
+  // about with no words.
+  const hasComposerContent = !!session && (draftHasText || session.attachments.length > 0)
+  const queueAvailable = typeof window.koda.queueTurn === 'function'
+  const busyWithContent = !!session && session.busy && hasComposerContent
+  const canQueue = busyWithContent && queueAvailable
 
   // The trailing "agent is working" one-liner. Shown whenever work is in flight, EXCEPT while the
   // streaming caret already signals activity or an active thinking line is the tail (no double cue).
@@ -266,20 +273,32 @@ export function ConversationSurface() {
       ? busyActivity(session)
       : null
 
-  // Submit the composer: an aside while in aside-mode, otherwise a normal turn. (`send` guards
-  // empty / image-only / busy itself.) Pin to the tail before a real turn so the new item snaps
-  // into view.
+  // Submit the composer's primary action: queue while busy (delivered when the turn ends), otherwise a
+  // normal turn. Without the queue API, busy+draft falls back to an aside so typing still does something.
+  // (`send`/`queueSend` guard empty / image-only / busy themselves.)
   const submitComposer = (): void => {
     if (!activeId || !session) return
-    if (asideMode) {
-      askAside(activeId, session.draft)
+    if (session.busy && hasComposerContent) {
+      if (queueAvailable) queueSend()
+      // Fallback for a stale dev-HMR preload without the queue API: an aside if there's text, otherwise
+      // leave attachment-only content in the composer rather than dropping it into send()'s busy guard.
+      else if (draftHasText) askAside(activeId, session.draft)
       return
     }
     // A turn you just sent belongs at the top of the viewport, with its answer filling the room below.
+    // (There's a millisecond window where the turn just ended for the renderer but main still has a
+    // queued dispatch's admission claimed; a fast Enter here does an ordinary send that main rejects into
+    // the calm retryable banner — an accepted, deliberately-unfixed edge, not a lost message.)
     pinnedRef.current = true
     modeRef.current = 'anchor'
     setAtBottom(true)
     send()
+  }
+
+  // The explicit secondary action while busy: ask a side question from this chat's context.
+  const submitAside = (): void => {
+    if (!activeId || !session) return
+    askAside(activeId, session.draft)
   }
 
   // Drag-and-drop feedback: light up the whole surface while a file is dragged over it.
@@ -463,17 +482,41 @@ export function ConversationSurface() {
             </motion.div>
           )}
         </AnimatePresence>
+        {/* Queued-send: the message waiting to go out the instant this turn finishes. Main owns the slot,
+            so the chip reflects the real queued message (not an optimistic guess). Cancel returns its text
+            to the composer. */}
+        <AnimatePresence initial={false}>
+          {session.queuedTurn && (
+            <motion.div key="queued-turn" variants={cardVariants} initial="hidden" animate="visible" exit="hidden">
+              <div className="mb-2 flex items-center gap-2 rounded-xl border border-border bg-surface px-3 py-2 shadow-soft">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" className="shrink-0 text-accent" aria-hidden>
+                  <circle cx="12" cy="12" r="9" />
+                  <path d="M12 7v5l3 2" />
+                </svg>
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-[13px] leading-5 text-text">{session.queuedTurn.text || '(attachment)'}</div>
+                  <div className="text-[11px] text-text-muted">
+                    Queued. Sends when this turn finishes.
+                    {session.queuedTurn.attachmentCount > 0 &&
+                      ` · ${session.queuedTurn.attachmentCount} attachment${session.queuedTurn.attachmentCount === 1 ? '' : 's'}`}
+                  </div>
+                </div>
+                <button
+                  onClick={cancelQueued}
+                  title="Cancel queued message"
+                  aria-label="Cancel queued message"
+                  className="shrink-0 text-[13px] text-text-muted underline decoration-text-muted/40 underline-offset-2 transition-colors hover:text-text"
+                >
+                  Cancel
+                </button>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
         {/* The input box is the app's hero control: one raised card (soft shadow, generous radius)
             holding the prompt, its attachments, AND the per-session controls strip under a hairline
-            divider. In aside mode it shifts to a calm secondary look so a side question never reads
-            as an action on the project. */}
-        <div
-          className={
-            asideMode
-              ? 'relative rounded-2xl border border-aside/50 bg-aside-tint px-3 py-2 shadow-soft'
-              : 'relative rounded-2xl border border-border bg-surface px-3 py-2 shadow-soft focus-within:border-accent/50'
-          }
-        >
+            divider. */}
+        <div className="relative rounded-2xl border border-border bg-surface px-3 py-2 shadow-soft focus-within:border-accent/50">
           {mentions.menu}
           {/* A failed turn (API error / fatal engine stop) reports as a quiet section fused onto the top
               of the composer, under a hairline divider — one object, not a floating alert. Try again
@@ -491,16 +534,6 @@ export function ConversationSurface() {
                 text={session.attachNotice}
                 onDismiss={() => activeId && setAttachNotice(activeId, null)}
               />
-            </div>
-          )}
-          {asideMode && (
-            <div className="mb-1 flex items-center gap-1.5 px-0.5 pt-0.5 text-[11px] text-aside">
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                <path d="M8 10h8M8 14h5" />
-                <path d="M21 12a9 9 0 1 1-3.6-7.2" />
-                <circle cx="20" cy="6" r="2" fill="currentColor" stroke="none" />
-              </svg>
-              <span>Side question — answers from this chat, won&rsquo;t interrupt or change anything</span>
             </div>
           )}
           {session.attachments.length > 0 && (
@@ -590,8 +623,8 @@ export function ConversationSurface() {
                 }
               }}
               placeholder={
-                asideMode
-                  ? "Ask a quick question — won't interrupt or change anything"
+                session.busy && queueAvailable
+                  ? 'Queue a message for when this turn finishes…'
                   : 'Message the agent…'
               }
               className="block max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-1 py-1.5 text-sm leading-5 outline-none placeholder:text-text-muted"
@@ -621,9 +654,9 @@ export function ConversationSurface() {
                 composerRef.current?.focus()
               }}
             />
-            {/* Mid-turn, Stop is ALWAYS reachable (graceful interrupt) — so anyone who didn't mean to ask a
-                side question can still just stop the agent. When they're typing an aside, the muted
-                aside-send appears beside it. Idle → the one morphing mic/Send button.
+            {/* Mid-turn, Stop is ALWAYS reachable (graceful interrupt). With a draft, the accent primary
+                QUEUES it (delivered when the turn ends) and a muted aside button stays beside it for a
+                side question. Idle → the one morphing mic/Send button.
                 These stay as plain rounded-full buttons — <Button> is rounded-lg and would change the shape. */}
             {session.busy ? (
               <>
@@ -637,14 +670,29 @@ export function ConversationSurface() {
                     <rect x="6" y="6" width="12" height="12" rx="2" />
                   </svg>
                 </button>
-                {asideMode && (
+                {/* Secondary, muted: ask a side question from this chat's context. Keeps its bg-aside
+                    identity; sits before the accent primary so queue reads as the default action. Text
+                    only — an aside needs words. */}
+                {session.busy && draftHasText && (
                   <button
-                    onClick={submitComposer}
+                    onClick={submitAside}
                     title="Ask aside"
                     aria-label="Ask aside"
-                    className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-white transition-colors hover:opacity-90 ${
-                      asideMode ? 'bg-aside' : 'bg-accent'
-                    }`}
+                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-aside/80 text-white transition-opacity hover:opacity-90"
+                  >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                      <path d="M8 10h8M8 14h5" />
+                      <path d="M21 12a9 9 0 1 1-3.6-7.2" />
+                    </svg>
+                  </button>
+                )}
+                {/* Primary while busy: queue the draft. Accent send-style, matching the idle Send button. */}
+                {canQueue && (
+                  <button
+                    onClick={submitComposer}
+                    title="Queue message"
+                    aria-label="Queue message"
+                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-accent text-white transition-opacity hover:opacity-90"
                   >
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
                       <path d="M12 19V5M5 12l7-7 7 7" />
@@ -663,11 +711,7 @@ export function ConversationSurface() {
           </div>
           {/* Per-session controls ride inside the card under a hairline divider: defaults on the
               left, how full the conversation is on the right. */}
-          <div
-            className={`mt-1.5 flex items-center justify-between gap-2 border-t px-1 pt-1.5 ${
-              asideMode ? 'border-aside/25' : 'border-border/60'
-            }`}
-          >
+          <div className="mt-1.5 flex items-center justify-between gap-2 border-t border-border/60 px-1 pt-1.5">
             <div className="flex min-w-0 items-center gap-1.5">
               <ApprovalModeControl
                 sessionId={session.id}

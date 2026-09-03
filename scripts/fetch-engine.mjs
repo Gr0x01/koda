@@ -28,26 +28,26 @@ const execFileP = promisify(execFile)
 
 // ── Claude ─────────────────────────────────────────────────────────────────────────────────────────
 // Normally pinned to the npm `stable` dist-tag (not `latest`) — our posture favors stable over
-// bleeding-edge. 2.1.221 is a deliberate exception: it's `latest` (stable was 2.1.220 at pin time)
-// because the fixes that motivate this bump land only in 221 — the `-p` stream-json MCP first-turn
-// connect fix (Koda's exact launch path) and the zsh `[[ ]]` Bash permission-bypass fix — while 220
-// was bug-fixes-only. Re-converge on `stable` at the next bump. The engine-contract workflow verifies,
-// writes, and merges only a strictly newer compatible stable pin. NOTE: check-engine-floor.mjs + the
-// workflow read `PINNED_VERSION` by regex — keep the name.
-const PINNED_VERSION = '2.1.236'
+// bleeding-edge. 2.1.258 is a deliberate exception: it's `latest` (stable was 2.1.236 at pin time)
+// because day-one support for Fable 5.1, the new default Fable model, lands only in 2.1.257+, and
+// 2.1.258 also carries the fix for 2.1.255's macOS launch regression. Verified through the full
+// engine-contract gate before pinning (2026-09-02). Re-converge on `stable` at the next bump. The
+// engine-contract workflow verifies, writes, and merges only a strictly newer compatible stable pin.
+// NOTE: check-engine-floor.mjs + the workflow read `PINNED_VERSION` by regex — keep the name.
+const PINNED_VERSION = '2.1.258'
 const CLAUDE_BASE = 'https://downloads.claude.ai/claude-code-releases'
 
 // ── Codex ──────────────────────────────────────────────────────────────────────────────────────────
 // Latest GitHub-releases `stable` (non-prerelease) at pin time. The codex-contract job updates BOTH the
 // version and the per-platform tarball SHA only after its real app-server contract and repository gate.
-const PINNED_CODEX_VERSION = '0.151.0'
+const PINNED_CODEX_VERSION = '0.152.1'
 const CODEX_BASE = 'https://github.com/openai/codex/releases/download'
 // koda platform → codex release triple.
 const CODEX_TRIPLE = { 'darwin-arm64': 'aarch64-apple-darwin' }
 // SHA-256 of the plain `codex-<triple>.tar.gz` asset, per koda platform. Self-pinned (OpenAI publishes no
 // checksum for the plain binary). Recompute when bumping PINNED_CODEX_VERSION.
 const CODEX_TARBALL_SHA256 = {
-  'darwin-arm64': '6409e2c65994d294a92bc7330148ebc447ab23908bd7f5c71e718425a622c965',
+  'darwin-arm64': '8ddde1fcf5c9842e9baa09c7c108088bb22a39feb86e4344e45dc0986764b9d7',
 }
 
 const PLATFORMS = ['darwin-arm64']

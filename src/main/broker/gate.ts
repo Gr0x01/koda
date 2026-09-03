@@ -470,9 +470,11 @@ export class ApprovalGate {
   }
 
   /** The user answered a pending approval. No-op if it's already gone (resolved/cancelled). */
-  resolve(requestId: string, decision: ToolDecision): void {
+  /** Returns the session whose approval was resolved (undefined for an already-gone request), so a
+   *  caller can re-evaluate that session's state once its last prompt clears (e.g. queued-send). */
+  resolve(requestId: string, decision: ToolDecision): string | undefined {
     const slot = this.pending.get(requestId)
-    if (!slot) return
+    if (!slot) return undefined
     this.pending.delete(requestId)
     // Broadcast the resolution so every head clears this one prompt — the answering head already
     // dropped it optimistically (idempotent there); a second head that didn't answer needs telling.
@@ -482,9 +484,10 @@ export class ApprovalGate {
     // the tools whose deny has its own meaning (TOOL_DENY_REASONS).
     if (decision.kind === 'deny' && !decision.reason && !isUserQuestion(slot.toolName)) {
       slot.resolve({ kind: 'deny', reason: TOOL_DENY_REASONS[slot.toolName] ?? USER_DENY_REASON })
-      return
+      return slot.sessionId
     }
     slot.resolve(decision)
+    return slot.sessionId
   }
 
   /**

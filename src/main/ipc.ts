@@ -15,6 +15,8 @@ import {
   StartSessionRequestSchema,
   StartSessionResponseSchema,
   SendTurnRequestSchema,
+  QueueTurnRequestSchema,
+  QueuedTurnSnapshotsSchema,
   SessionRefSchema,
   StopSubagentRequestSchema,
   AskAsideRequestSchema,
@@ -524,6 +526,23 @@ export function registerIpcHandlers(): void {
     // Await: the turn-boundary safety checkpoint must land before the turn reaches the engine.
     await getEngineSessions().sendTurn(sessionId, text, images)
   })
+
+  ipcMain.handle(IpcChannels.queueTurn, (_event, rawArgs: unknown) => {
+    const { sessionId, text, displayText, images } = QueueTurnRequestSchema.parse(rawArgs)
+    // Queue-or-send: main decides whether the turn is live and never rejects with "already running".
+    // Delivery is async and reported over the engine-event stream, so this resolves as soon as the slot
+    // is accepted rather than awaiting the eventual turn.
+    getEngineSessions().queueTurn(sessionId, text, displayText ?? text, images)
+  })
+
+  ipcMain.handle(IpcChannels.cancelQueuedTurn, (_event, rawArgs: unknown) => {
+    const { sessionId } = SessionRefSchema.parse(rawArgs)
+    getEngineSessions().cancelQueuedTurn(sessionId)
+  })
+
+  ipcMain.handle(IpcChannels.queuedTurnsList, (event) =>
+    QueuedTurnSnapshotsSchema.parse(getEngineSessions().queuedTurnsForProject(rootForSender(event.sender))),
+  )
 
   ipcMain.handle(IpcChannels.interruptSession, (_event, rawArgs: unknown) => {
     const { sessionId } = SessionRefSchema.parse(rawArgs)

@@ -244,11 +244,17 @@ jobs:
           # Pin policy: latest GitHub-releases `stable` (newest non-prerelease `rust-v*` tag), NOT prereleases.
           # The workflow_dispatch `version` input is Claude-only (different version scheme) — Codex always
           # resolves its own stable so a Claude version can't be mis-fed here.
-          # --paginate + --jq emits one result PER PAGE (multi-line broke the $GITHUB_OUTPUT write and
-          # failed this job daily) — filter the empty pages and take the newest across all of them.
-          TAG=$(gh api repos/openai/codex/releases --paginate \
-            --jq 'map(select(.prerelease==false and (.tag_name|startswith("rust-v")))) | first | select(. != null) | .tag_name' \
-            | head -n1)
+          # `releases/latest` is GitHub's own "newest non-prerelease, non-draft" — one cheap call. The full
+          # --paginate sweep it replaced walked every release page and flaked two separate ways (multi-line
+          # $GITHUB_OUTPUT writes, then mid-stream CANCELs/504s from GitHub), failing nights when nothing was
+          # wrong. Retries cover the endpoint itself blipping; a non-rust-v tag falls through to the version
+          # check below and fails loudly.
+          TAG=""
+          for attempt in 1 2 3; do
+            TAG=$(gh api repos/openai/codex/releases/latest --jq '.tag_name') && break
+            echo "::warning::releases/latest attempt $attempt failed; retrying"
+            sleep 10
+          done
           TARGET="${TAG#rust-v}"
           if [ -z "$TARGET" ] || [[ ! "$TARGET" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::invalid Codex version from upstream: $TARGET"; exit 1

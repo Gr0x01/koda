@@ -40,7 +40,7 @@ export default tseslint.config(
   },
   // Build/packaging scripts and server infrastructure run under plain Node.
   {
-    files: ['scripts/**/*.mjs', 'infra/**/*.mjs', '*.mjs'],
+    files: ['scripts/**/*.mjs', 'infra/**/*.mjs', 'build/**/*.mjs', '*.mjs'],
     languageOptions: { globals: globals.node },
   },
   // React renderers (desktop + mobile): the hooks rules catch real stale-closure bugs.

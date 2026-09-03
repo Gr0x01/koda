@@ -10,17 +10,61 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-09-02
+
 ### Changed
 
-- Updated the bundled Codex engine to 0.151.0.
+- Picking Fable now runs Fable 5.1, Claude's newest and most capable model, released the day
+  before this update.
 
-- Updated the bundled Claude engine to 2.1.236.
+- Updated the bundled Claude engine to 2.1.258.
+
+- Updated the bundled Codex engine to 0.152.1.
+
+- Usage prices now match Anthropic's latest published rates. Sonnet 5 keeps its lower launch price
+  for good, and the new Fable 5.1 model shows real dollar figures from day one, including its
+  cheaper cache reads.
+
+### Fixed
+
+- Sending a follow-up message to a background agent could leave the conversation saying "Agent still
+  working…" forever, even after that agent finished or was stopped. The newest engine changed the
+  wording of its "message delivered, agent resuming" receipt, and Koda keyed on the old wording, so
+  the resumed agent's card never learned its work had ended. Koda now recognizes the receipt by its
+  stable machine field instead of its phrasing, and marks a card opened by a message as
+  background-owned from birth, so the indicator clears the moment the agent actually stops. If a
+  session is stuck right now, restarting Koda clears it.
+
+## [0.1.14] - 2026-08-30
+
+### Added
+
+- You can line up your next message while the agent is still working. Type it and press Enter, and it
+  waits in a small chip above the composer, then sends on its own the instant the current turn
+  finishes. Cancelling the chip puts the text back in the box, and Stop returns it too, so a queued
+  instruction never fires into a turn you meant to redirect. Asking a side question is still one click
+  away when you would rather check something without interrupting.
+
+### Changed
 
 - Long-running agent work now keeps its place on disk. When the agent fans work out across several
   waves, or carries a goal through many milestones, it writes a small progress ledger inside the
   project and marks a step done only once its evidence checked out. If the session is interrupted,
   restarted, or simply runs long, the agent picks up from what was actually verified instead of
   guessing from memory, and the ledger is removed once the work is delivered.
+
+- Updated the bundled Claude engine to 2.1.236.
+
+- Updated the bundled Codex engine to 0.151.0.
+
+### Fixed
+
+- The agent could write the substance of its reply in the middle of a turn, between tool steps,
+  where it folded away with the rest of the work. Only a short closing line stayed visible, and it
+  sometimes referred to things you never saw. Two fixes, on both engines: the agent's Core now tells
+  it to land the complete, self-contained answer in the final message of every turn, and the
+  transcript fold now fails open as a backstop, so a substantial mid-turn passage that outweighs
+  the closing line stays visible on Mac and phone instead of folding away as narration.
 
 ### Removed
 
@@ -612,7 +656,9 @@ _First versioned build — the baseline the auto-updater ships from._
 - Settings now shows the Koda version, the bundled Claude engine version, and a
   "Check for updates" button.
 
-[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.13...HEAD
+[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.15...HEAD
+[0.1.15]: https://github.com/Gr0x01/koda/releases/tag/v0.1.15
+[0.1.14]: https://github.com/Gr0x01/koda/releases/tag/v0.1.14
 [0.1.13]: https://github.com/Gr0x01/koda/releases/tag/v0.1.13
 [0.1.12]: https://github.com/Gr0x01/koda/releases/tag/v0.1.12
 [0.1.10]: https://github.com/Gr0x01/koda/releases/tag/v0.1.10

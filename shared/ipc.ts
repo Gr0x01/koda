@@ -748,6 +748,58 @@ const RawEnvelopeSchema = z.object({
   raw: RawEngineEventSchema.optional(),
 })
 
+/** An inline image attached to a turn — base64 + its media type. `name` is present for a phone-side
+ * document attachment that uses the same transport envelope. Defined ahead of the event union because
+ * the queued-send events below carry the exact attachment payload. */
+export const ImageAttachmentSchema = z.object({
+  mediaType: z.string(), // image/png | image/jpeg | image/gif | image/webp
+  dataBase64: z.string(),
+  name: z.string().optional(),
+})
+export type ImageAttachment = z.infer<typeof ImageAttachmentSchema>
+
+/** Queued-send (both engines, above the driver): a session holds one human message waiting to go out
+ *  the instant its running turn ends. Emitted whenever the single slot is set or appended to. `text` is
+ *  the full queued message (the renderer truncates it for the chip); `attachmentCount` drives the chip
+ *  without shipping bytes on every keystroke — the exact attachments ride only the returned clear. */
+export const QueuedTurnUpdatedSchema = z.object({
+  type: z.literal('QueuedTurnUpdated'),
+  sessionId: z.string(),
+  text: z.string(),
+  attachmentCount: z.number().int().nonnegative(),
+  /** Monotonic slot revision — a head applies a queued-slot source (event / poll / snapshot) only when
+   *  this is newer than what it last applied, so a stale poll can't resurrect a cleared chip. */
+  revision: z.number().int().nonnegative(),
+})
+
+/** Which head queued a segment. A returned clear restores each head only its own. */
+export const QueuedHeadSchema = z.enum(['desktop', 'phone'])
+export type QueuedHead = z.infer<typeof QueuedHeadSchema>
+
+/** The queued slot emptied. `delivered` = the turn ended and the message was dispatched as a normal
+ *  human turn (its bubble arrives over the ordinary remote-user-turn echo, so nothing to restore).
+ *  `returned` = it came back to the composer (Stop, cancel, or a failed dispatch) and carries the per-head
+ *  SEGMENTS (each with the raw display words + its origin) so each composer restores only its own; `failed`
+ *  + `message` mark the dispatch-error case so the renderer raises its retryable banner. A Stop/cancel
+ *  return is not a failure. `revision` orders this clear against a stale poll. */
+export const QueuedTurnClearedSchema = z.object({
+  type: z.literal('QueuedTurnCleared'),
+  sessionId: z.string(),
+  reason: z.enum(['delivered', 'returned']),
+  revision: z.number().int().nonnegative(),
+  segments: z
+    .array(
+      z.object({
+        text: z.string(),
+        attachments: z.array(ImageAttachmentSchema).optional(),
+        origin: QueuedHeadSchema,
+      }),
+    )
+    .optional(),
+  failed: z.boolean().optional(),
+  message: z.string().optional(),
+})
+
 export const EngineEventSchema = z
   .discriminatedUnion('type', [
     SessionStartedSchema,
@@ -774,6 +826,8 @@ export const EngineEventSchema = z
     RateLimitUpdateSchema,
     ApprovalModeChangedSchema,
     ModelEffortChangedSchema,
+    QueuedTurnUpdatedSchema,
+    QueuedTurnClearedSchema,
   ])
   .and(ReplaySequenceSchema)
   .and(RawEnvelopeSchema)
@@ -901,15 +955,6 @@ export const StageLinkTargetSchema = z.union([
   z.object({ kind: z.enum(['declined', 'missing']), reason: z.string().optional() }),
 ])
 export type StageLinkTarget = z.infer<typeof StageLinkTargetSchema>
-
-/** An inline image attached to a turn — base64 + its media type. `name` is present for a phone-side
- * document attachment that uses the same transport envelope. */
-export const ImageAttachmentSchema = z.object({
-  mediaType: z.string(), // image/png | image/jpeg | image/gif | image/webp
-  dataBase64: z.string(),
-  name: z.string().optional(),
-})
-export type ImageAttachment = z.infer<typeof ImageAttachmentSchema>
 
 /** Lightweight attachment identity safe to retain after a successful turn. Exact base64 bytes are
  * bounded, temporary retry material; replay keeps only this provenance unless the turn is unresolved. */
@@ -1171,6 +1216,33 @@ export const SendTurnRequestSchema = z
     message: 'a turn needs text or an image',
   })
 export type SendTurnRequest = z.infer<typeof SendTurnRequestSchema>
+
+/** Queue a human message to send the instant this session's running turn ends (queued-send). `text` is
+ *  the ENGINE text (mentions expanded, active-file and scratch notes baked in — the same preflight a live
+ *  send runs); `displayText` is the raw words the user typed, shown on the chip, the delivered bubble, and
+ *  restored to the composer on a return. Distinct exactly the way `send()` keeps sentText vs the visible
+ *  transcript row. No remote-attempt identity, since queuing is a local composer act. */
+export const QueueTurnRequestSchema = z
+  .object({
+    sessionId: z.string(),
+    text: z.string(),
+    displayText: z.string().optional(),
+    images: z.array(ImageAttachmentSchema).optional(),
+  })
+  .refine((r) => r.text.trim().length > 0 || (r.images?.length ?? 0) > 0, {
+    message: 'a queued turn needs text or an image',
+  })
+export type QueueTurnRequest = z.infer<typeof QueueTurnRequestSchema>
+
+/** Catch-up snapshot of a session's held queued message, so a reloaded renderer can rebuild the chip
+ *  main still owns. `text` is the display text (raw words); the exact payload rides delivery/return. */
+export const QueuedTurnSnapshotSchema = z.object({
+  sessionId: z.string(),
+  text: z.string(),
+  attachmentCount: z.number().int().nonnegative(),
+})
+export type QueuedTurnSnapshot = z.infer<typeof QueuedTurnSnapshotSchema>
+export const QueuedTurnSnapshotsSchema = z.array(QueuedTurnSnapshotSchema)
 
 /** Shared shape for the session-targeted commands that take no other args. */
 export const SessionRefSchema = z.object({ sessionId: z.string() })
@@ -3507,6 +3579,15 @@ export interface KodaApi {
   // Engine adapter.
   startSession: (args: StartSessionRequest) => Promise<StartSessionResponse>
   sendTurn: (args: SendTurnRequest) => Promise<void>
+  /** Queue a human message to send the instant this session's running turn ends (queued-send). Never
+   *  rejects with "a turn is already running"; if the session is idle it dispatches immediately. Optional
+   *  so a stale dev-HMR preload (missing the new API) degrades to hiding the queue affordance. */
+  queueTurn?: (args: QueueTurnRequest) => Promise<void>
+  /** Cancel this session's queued message; main returns its text to the composer. */
+  cancelQueuedTurn?: (args: SessionRef) => Promise<void>
+  /** Catch-up read of the queued-message chips main holds for this window's project, so a renderer
+   *  reload rebuilds them (they are ephemeral and never persisted). Optional for a stale preload. */
+  listQueuedTurns?: () => Promise<QueuedTurnSnapshot[]>
   interruptSession: (args: SessionRef) => Promise<void>
   stopSubagent: (args: StopSubagentRequest) => Promise<void>
   disposeSession: (args: SessionRef) => Promise<void>

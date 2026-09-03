@@ -4353,3 +4353,297 @@ describe('TurnComplete sweeps a stranded approval so the next turn is admissible
     expect(decision.reason).toContain('ended along with its turn')
   })
 })
+
+describe('queued-send delivery', () => {
+  type SessionStub = { sendTurn: ReturnType<typeof vi.fn>; interrupt?: ReturnType<typeof vi.fn> }
+  type QueueManager = {
+    sessions: Map<string, SessionStub>
+    projectDirs: Map<string, string>
+    working: Set<string>
+    turnAdmissions: Map<string, unknown>
+    processReplacements: Map<string, unknown>
+    queuedTurns: Map<string, { segments: { text: string; displayText: string; attachments?: unknown[]; origin: string }[] }>
+    gate: {
+      pendingRequests: (id: string) => unknown[]
+      resolve: (id: string, decision: unknown) => string | undefined
+    }
+    send: ReturnType<typeof vi.fn>
+    sendTurn: ReturnType<typeof vi.fn>
+    forward: (event: unknown) => unknown
+    queueTurn: (id: string, text: string, displayText: string, attachments?: unknown[], attemptId?: string, origin?: string) => void
+    cancelQueuedTurn: (id: string) => void
+    resolveApproval: (requestId: string, decision: unknown) => void
+    interrupt: (id: string) => Promise<void>
+    dispose: (id: string) => Promise<void>
+  }
+
+  // setTimeout(0) drains the queueMicrotask-deferred delivery AND the mocked sendTurn's .then chain.
+  const flush = (): Promise<void> => new Promise((r) => setTimeout(r, 0))
+
+  function queueManager(): { mgr: QueueManager; send: ReturnType<typeof vi.fn> } {
+    const mgr = new EngineSessionManager() as unknown as QueueManager
+    mgr.projectDirs.set('chat', '/tmp/koda-queued-send')
+    const send = vi.fn()
+    mgr.send = send
+    return { mgr, send }
+  }
+
+  const engineEvents = (send: ReturnType<typeof vi.fn>): { type: string; [k: string]: unknown }[] =>
+    send.mock.calls.filter((c) => c[0] === IpcChannels.engineEvent).map((c) => c[2])
+
+  it('publishes exactly one RemoteUserTurn (raw display text) for a remote-attached delivery', async () => {
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), 'koda-queued-remote-')))
+    const { mgr } = queueManager()
+    const m = mgr as unknown as {
+      remoteAttached: Set<string>
+      remoteEventLog: Map<string, { type: string; text?: string }[]>
+      projectDirs: Map<string, string>
+    }
+    m.projectDirs.set('chat', cwd) // a real dir so the durable replay append is exercised
+    m.remoteAttached.add('chat')
+    mgr.sendTurn = vi.fn().mockResolvedValue({ status: 'accepted' })
+    try {
+      mgr.working.add('chat')
+      mgr.queueTurn('chat', 'ENGINE: ship it', 'ship it')
+      mgr.forward({ type: 'TurnComplete', sessionId: 'chat', stopReason: 'success' })
+      await flush()
+      const userRows = (m.remoteEventLog.get('chat') ?? []).filter((e) => e.type === 'RemoteUserTurn')
+      expect(userRows).toHaveLength(1)
+      expect(userRows[0].text).toBe('ship it') // the raw words a phone catch-up shows, not the engine text
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('stores and emits the display text when queuing while a turn is running', () => {
+    const { mgr, send } = queueManager()
+    mgr.working.add('chat')
+
+    mgr.queueTurn('chat', 'ENGINE: also add tests', 'also add tests')
+
+    expect(mgr.queuedTurns.get('chat')).toEqual({
+      segments: [{ text: 'ENGINE: also add tests', displayText: 'also add tests', origin: 'desktop' }],
+    })
+    expect(send).toHaveBeenCalledWith(
+      IpcChannels.engineEvent,
+      'chat',
+      expect.objectContaining({
+        type: 'QueuedTurnUpdated',
+        sessionId: 'chat',
+        text: 'also add tests', // the chip shows the raw words, not the engine text
+        attachmentCount: 0,
+      }),
+    )
+  })
+
+  it('delivers the engine text on a genuine TurnComplete, marked as a queued send', async () => {
+    const { mgr, send } = queueManager()
+    mgr.sendTurn = vi.fn().mockResolvedValue({ status: 'accepted' })
+    mgr.working.add('chat')
+    mgr.queueTurn('chat', 'ENGINE: read @/abs/doc.md', 'read @doc.md')
+    expect(mgr.queuedTurns.has('chat')).toBe(true)
+
+    mgr.forward({ type: 'TurnComplete', sessionId: 'chat', stopReason: 'success' })
+    await flush()
+
+    expect(mgr.sendTurn).toHaveBeenCalledWith('chat', 'ENGINE: read @/abs/doc.md', undefined, 'local', { queued: true })
+    expect(mgr.queuedTurns.has('chat')).toBe(false)
+    expect(send).toHaveBeenCalledWith(
+      IpcChannels.engineEvent,
+      'chat',
+      expect.objectContaining({ type: 'QueuedTurnCleared', sessionId: 'chat', reason: 'delivered' }),
+    )
+  })
+
+  it('returns the payload on a fatal end instead of dispatching into a dead turn', async () => {
+    const { mgr, send } = queueManager()
+    mgr.sendTurn = vi.fn()
+    mgr.working.add('chat')
+    mgr.queueTurn('chat', 'do not fire this', 'do not fire this')
+
+    mgr.forward({ type: 'EngineError', sessionId: 'chat', message: 'boom', fatal: true })
+    await flush()
+
+    expect(mgr.sendTurn).not.toHaveBeenCalled()
+    expect(mgr.queuedTurns.has('chat')).toBe(false)
+    expect(send).toHaveBeenCalledWith(
+      IpcChannels.engineEvent,
+      'chat',
+      expect.objectContaining({ type: 'QueuedTurnCleared', reason: 'returned', failed: true }),
+    )
+  })
+
+  it('returns on a turnRejected end and its paired compatibility TurnComplete does not re-dispatch', async () => {
+    const { mgr } = queueManager()
+    mgr.sendTurn = vi.fn()
+    mgr.working.add('chat')
+    mgr.queueTurn('chat', 'q', 'q')
+
+    // Codex emits the rejection then a compatibility completion; neither may fire the queued turn.
+    mgr.forward({ type: 'EngineError', sessionId: 'chat', message: 'rejected', category: 'turnRejected', fatal: false })
+    mgr.forward({ type: 'TurnComplete', sessionId: 'chat', stopReason: TURN_REJECTED_STOP_REASON })
+    await flush()
+
+    expect(mgr.sendTurn).not.toHaveBeenCalled()
+    expect(mgr.queuedTurns.has('chat')).toBe(false)
+  })
+
+  it('holds while a gate request is pending and delivers once it clears', async () => {
+    const { mgr } = queueManager()
+    mgr.sendTurn = vi.fn().mockResolvedValue({ status: 'accepted' })
+    mgr.gate.pendingRequests = vi.fn((id: string) => (id === 'chat' ? [{ requestId: 'r' }] : []))
+    mgr.gate.resolve = vi.fn(() => 'chat')
+    mgr.working.add('chat')
+    mgr.queueTurn('chat', 'follow up', 'follow up')
+
+    // The turn ends, but a stranded approval is still pending → held, not delivered or dropped.
+    mgr.forward({ type: 'TurnComplete', sessionId: 'chat', stopReason: 'success' })
+    await flush()
+    expect(mgr.sendTurn).not.toHaveBeenCalled()
+    expect(mgr.queuedTurns.has('chat')).toBe(true)
+
+    // The prompt clears → the held message goes out.
+    mgr.gate.pendingRequests = vi.fn(() => [])
+    mgr.resolveApproval('r', { kind: 'allow' })
+    await flush()
+    expect(mgr.sendTurn).toHaveBeenCalledWith('chat', 'follow up', undefined, 'local', { queued: true })
+    expect(mgr.queuedTurns.has('chat')).toBe(false)
+  })
+
+  it('returns the payload on interrupt and never fires it into the post-Stop state', async () => {
+    const { mgr, send } = queueManager()
+    mgr.sendTurn = vi.fn()
+    mgr.sessions.set('chat', { sendTurn: vi.fn(() => true), interrupt: vi.fn() })
+    mgr.working.add('chat')
+    mgr.queueTurn('chat', 'stale instruction', 'stale instruction')
+
+    await mgr.interrupt('chat')
+
+    expect(mgr.queuedTurns.has('chat')).toBe(false)
+    expect(mgr.sendTurn).not.toHaveBeenCalled()
+    expect(send).toHaveBeenCalledWith(
+      IpcChannels.engineEvent,
+      'chat',
+      expect.objectContaining({
+        type: 'QueuedTurnCleared',
+        sessionId: 'chat',
+        reason: 'returned',
+        // The raw display text (not engine text), tagged with its origin head so each composer restores its own.
+        segments: [{ text: 'stale instruction', origin: 'desktop' }],
+      }),
+    )
+  })
+
+  it('dispatches immediately when the session is idle (closing the busy-check race)', async () => {
+    const { mgr, send } = queueManager()
+    mgr.sendTurn = vi.fn().mockResolvedValue({ status: 'accepted' })
+
+    mgr.queueTurn('chat', 'do it now', 'do it now')
+
+    expect(mgr.queuedTurns.has('chat')).toBe(false)
+    await flush()
+    expect(mgr.sendTurn).toHaveBeenCalledWith('chat', 'do it now', undefined, 'local', { queued: true })
+    // No chip was ever shown for an immediate send.
+    expect(send).not.toHaveBeenCalledWith(
+      IpcChannels.engineEvent,
+      'chat',
+      expect.objectContaining({ type: 'QueuedTurnUpdated' }),
+    )
+  })
+
+  it('re-asserts a successor chip after a stale delivered clear', async () => {
+    const { mgr, send } = queueManager()
+    let resolveSend!: (v: unknown) => void
+    mgr.sendTurn = vi.fn(() => new Promise((r) => { resolveSend = r }))
+
+    // Q1 is delivering (its dispatch is in flight, working still set for its turn).
+    mgr.working.add('chat')
+    mgr.queueTurn('chat', 'q1', 'q1')
+    mgr.forward({ type: 'TurnComplete', sessionId: 'chat', stopReason: 'success' })
+    await flush() // tryDeliverQueued deletes the slot and calls the (pending) sendTurn
+
+    // The delivered Q1 turn is now running; Q2 queues into the slot while Q1's clear is still pending.
+    mgr.working.add('chat')
+    mgr.queueTurn('chat', 'q2', 'q2')
+    resolveSend({ status: 'accepted' })
+    await flush()
+
+    const events = engineEvents(send)
+    const deliveredIdx = events.findIndex((e) => e.type === 'QueuedTurnCleared' && e.reason === 'delivered')
+    expect(deliveredIdx).toBeGreaterThanOrEqual(0)
+    // The stale delivered clear wiped the chip in the renderer, so the successor's chip is re-asserted AFTER it.
+    expect(events.slice(deliveredIdx + 1).some((e) => e.type === 'QueuedTurnUpdated' && e.text === 'q2')).toBe(true)
+    expect(mgr.queuedTurns.get('chat')?.segments).toEqual([{ text: 'q2', displayText: 'q2', origin: 'desktop' }])
+  })
+
+  it('appends a second queue: engine and display texts joined by a blank line, attachments concatenated', () => {
+    const { mgr } = queueManager()
+    mgr.working.add('chat')
+
+    mgr.queueTurn('chat', 'first', 'first-shown', [{ mediaType: 'image/png', dataBase64: 'A' }])
+    mgr.queueTurn('chat', 'second', 'second-shown', [{ mediaType: 'image/png', dataBase64: 'B' }])
+
+    // Two ordered segments; the merged whole (engine 'first\n\nsecond', display 'first-shown\n\nsecond-shown',
+    // attachments [A,B]) is what the chip and delivery use, computed on read.
+    expect(mgr.queuedTurns.get('chat')).toEqual({
+      segments: [
+        { text: 'first', displayText: 'first-shown', attachments: [{ mediaType: 'image/png', dataBase64: 'A' }], origin: 'desktop' },
+        { text: 'second', displayText: 'second-shown', attachments: [{ mediaType: 'image/png', dataBase64: 'B' }], origin: 'desktop' },
+      ],
+    })
+  })
+
+  it('keeps the queued slot across a respawn (dispose)', async () => {
+    const { mgr } = queueManager()
+    mgr.working.add('chat')
+    mgr.queueTurn('chat', 'survive the respawn', 'survive the respawn')
+
+    await mgr.dispose('chat')
+
+    expect(mgr.queuedTurns.get('chat')).toEqual({
+      segments: [{ text: 'survive the respawn', displayText: 'survive the respawn', origin: 'desktop' }],
+    })
+  })
+
+  it('lists a project’s held queued chips for renderer reload catch-up', () => {
+    const { mgr } = queueManager()
+    const list = mgr as unknown as { queuedTurnsForProject: (p: string) => unknown[] }
+    mgr.working.add('chat')
+    mgr.queueTurn('chat', 'ENGINE: read @doc', 'read @doc', [{ mediaType: 'image/png', dataBase64: 'A' }])
+
+    expect(list.queuedTurnsForProject('/tmp/koda-queued-send')).toEqual([
+      { sessionId: 'chat', text: 'read @doc', attachmentCount: 1 },
+    ])
+    expect(list.queuedTurnsForProject('/tmp/other-project')).toEqual([])
+  })
+
+  it('folds a queue-attempt id in at most once, even AFTER the slot delivered (finding 3)', async () => {
+    const { mgr } = queueManager()
+    mgr.sendTurn = vi.fn().mockResolvedValue({ status: 'accepted' })
+    mgr.working.add('chat')
+    mgr.queueTurn('chat', 'ship it', 'ship it', undefined, 'a1', 'phone')
+    mgr.forward({ type: 'TurnComplete', sessionId: 'chat', stopReason: 'success' }) // deliver the slot
+    await flush()
+    expect(mgr.sendTurn).toHaveBeenCalledTimes(1)
+    expect(mgr.queuedTurns.has('chat')).toBe(false)
+
+    // A lost-ack retry of the SAME attempt arrives after delivery — the ledger outlives the slot, so it
+    // re-acks silently instead of re-queuing a duplicate.
+    mgr.queueTurn('chat', 'ship it', 'ship it', undefined, 'a1', 'phone')
+    expect(mgr.queuedTurns.has('chat')).toBe(false)
+    // The same id carrying a DIFFERENT payload is a client bug — rejected.
+    expect(() => mgr.queueTurn('chat', 'other', 'other', undefined, 'a1', 'phone')).toThrow('already used')
+  })
+
+  it('bumps a monotonic slot revision on every mutation (finding 6)', () => {
+    const { mgr, send } = queueManager()
+    mgr.working.add('chat')
+    mgr.queueTurn('chat', 'a', 'a')
+    mgr.queueTurn('chat', 'b', 'b') // append
+    const revs = engineEvents(send)
+      .filter((e) => e.type === 'QueuedTurnUpdated')
+      .map((e) => e.revision as number)
+    expect(revs).toHaveLength(2)
+    expect(revs[1]).toBeGreaterThan(revs[0])
+  })
+})

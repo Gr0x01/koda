@@ -343,6 +343,36 @@ interface RemoteTurnPayload {
   failed: boolean
 }
 
+/** Which head contributed a queued segment. A returned clear restores each head only its OWN segments,
+ *  so two heads queuing into one session don't each get the other's words back. */
+type QueuedHead = 'desktop' | 'phone'
+
+/** One head's contribution to a session's queued message. `text` is ENGINE text (the desktop ran the same
+ *  composer preflight a live send does — mentions expanded, scratch notes baked in; the phone runs none,
+ *  so its engine text equals its display text); `displayText` is the raw words shown on the chip, echoed
+ *  as the delivered bubble, and restored to that head's composer on a return. */
+interface QueuedSegment {
+  text: string
+  displayText: string
+  attachments?: TurnAttachment[]
+  origin: QueuedHead
+}
+
+/** Queued-send: the single human message a session may hold while its turn runs — an ordered list of
+ *  per-head segments (append order). The chip and delivery use the MERGED whole; a returned clear carries
+ *  the segments so each head restores only its own. Delivered as a normal turn the instant the turn
+ *  genuinely ends, or returned to the composer(s) on Stop/cancel/failed dispatch. */
+interface QueuedTurnPayload {
+  segments: QueuedSegment[]
+}
+
+const queuedMergedText = (segments: readonly QueuedSegment[]): string =>
+  segments.map((s) => s.text).filter((t) => t.length > 0).join('\n\n')
+const queuedMergedDisplay = (segments: readonly QueuedSegment[]): string =>
+  segments.map((s) => s.displayText).filter((t) => t.length > 0).join('\n\n')
+const queuedMergedAttachments = (segments: readonly QueuedSegment[]): TurnAttachment[] =>
+  segments.flatMap((s) => s.attachments ?? [])
+
 export class EngineSessionManager {
   private readonly sessions = new Map<string, EngineSession>()
   /** Exact process incarnation behind each installed session id. A bounded driver dispose can return
@@ -573,6 +603,22 @@ export class EngineSessionManager {
    *  survive a respawn's `dispose()` for the same reason `resumeAfterReconnect`/`pendingWorkflowResults`
    *  do (dispose() is also the respawn teardown path); cleared on a true end by `forgetSession`. */
   private readonly turnEndWaiters = new Map<string, () => void>()
+  /** Queued-send: at most one human message per session, typed while its turn runs and delivered as a
+   *  normal turn the instant that turn genuinely ends. Deliberately NOT cleared by `dispose()` — like
+   *  `pendingWorkflowResults` it must survive a settings/broker respawn (app restart may lose it, which
+   *  is fine). Cleared on delivery, on Stop/cancel (returned to the composer), and at a true session end
+   *  (`forgetSession`). */
+  private readonly queuedTurns = new Map<string, QueuedTurnPayload>()
+  /** Queued-send idempotency for the phone: accepted queue-attempt ids → payload fingerprint. OUTLIVES the
+   *  slot (unlike the slot itself) so a lost-ack retry arriving AFTER delivery/return re-acks silently
+   *  instead of re-queuing a duplicate; a same-id re-send with a different payload is rejected. Bounded per
+   *  session (LRU) like `acceptedRemoteAttempts`; cleared only at a true session end. */
+  private readonly acceptedQueueAttempts = new Map<string, Map<string, string>>()
+  /** Queued-send monotonic slot revision per session — bumped on EVERY slot mutation (set/append/clear).
+   *  It rides QueuedTurnUpdated/Cleared, the launcher-poll row, and the session-open snapshot so the phone
+   *  applies any queued-slot source only when its revision is newer, and a stale poll/catch-up can't
+   *  resurrect a chip a live clear already took down. Cleared at a true session end. */
+  private readonly queuedRevision = new Map<string, number>()
   /** `${sessionId}:${toolUseId}` → every stop sweep currently parked on that child. A SET, not one
    *  resolver: two overlapping stops (the user pressing Stop twice, or a window close racing a remote
    *  stop) both wait on the same child, and one terminal event has to release both. Each sweep also
@@ -926,6 +972,9 @@ export class EngineSessionManager {
       } catch (err) {
         // Spawn failed before onClose could wire — unregister the broker route we just minted.
         await this.broker.unregister(sessionId)
+        // Return any held queued message to the composer BEFORE ownership is dropped below, or its
+        // returned-clear would have no window to route to (queued-send Finding 5).
+        this.returnQueuedTurn(sessionId, true)
         removeSessionFromWindow(sessionId)
         throw err
       }
@@ -1011,6 +1060,9 @@ export class EngineSessionManager {
       // Spawn failed after register — no child means onClose never fires, so the broker transport
       // would leak (and keep a live /mcp/<id> route). Undo both registrations explicitly.
       await this.broker.unregister(sessionId)
+      // Return any held queued message to the composer BEFORE ownership is dropped below, or its
+      // returned-clear would have no window to route to (queued-send Finding 5).
+      this.returnQueuedTurn(sessionId, true)
       removeSessionFromWindow(sessionId)
       throw err
     }
@@ -1079,6 +1131,10 @@ export class EngineSessionManager {
       projectMutationScope?: ProjectMutationScope
       attemptId?: string
       clientTurnId?: string
+      // Queued-send delivery: this turn was held in the queue and has no optimistic desktop row, so skip
+      // the remote-user-turn publication (which assumes one). deliverQueued echoes the bubble on
+      // acceptance instead — no pre-acceptance replay record, no append:false stamp, nothing on failure.
+      queued?: boolean
     } = {},
   ): Promise<RemoteTurnReceipt> {
     requireRealAccountAccess()
@@ -1299,8 +1355,9 @@ export class EngineSessionManager {
       }
     }
     // Desktop already rendered its optimistic row. Preserve its existing early identity stamp; only a
-    // remote-origin row must wait for the Mac's synchronous engine-acceptance boundary.
-    if (origin !== 'remote') publishUserTurn()
+    // remote-origin row must wait for the Mac's synchronous engine-acceptance boundary. A queued turn has
+    // no optimistic row, so its bubble is echoed by deliverQueued on acceptance, not here.
+    if (origin !== 'remote' && !internal.queued) publishUserTurn()
     // Label the checkpoint with the prompt text; fall back when it's an image-only turn.
     if (cwd && !continuingLogicalTurn) {
       const baseline = await this.runExclusive(cwd, () => this.safeCheckpointResult(cwd, text || '(image)'))
@@ -1488,6 +1545,276 @@ export class EngineSessionManager {
     // records what this turn carried so forward() can discharge it at the genuine TurnComplete.
     if (notice) this.armedRestoreNotices.set(sessionId, notice)
     return { status: 'accepted' }
+  }
+
+  // ── Queued-send ─────────────────────────────────────────────────────────────
+  // The user types while the agent works; the message rides one per-session slot and is delivered as a
+  // normal human turn the instant the running turn genuinely ends. This is deliberately above the driver
+  // — both engines share it — and reuses `sendTurn`, so a queued turn is indistinguishable from one the
+  // user sent at that moment.
+
+  /** Queue-or-send a human message. NEVER throws "a turn is already running": if the session admits a
+   *  turn right now (closing the race where the turn ended between the renderer's busy check and this
+   *  call landing), it dispatches immediately as a normal turn; otherwise it holds the message in the
+   *  single slot and emits the queued event. A second queue while one is held appends — texts joined by
+   *  a blank line, attachments concatenated. `text` is engine text, `displayText` the visible words. */
+  queueTurn(
+    sessionId: string,
+    text: string,
+    displayText: string,
+    attachments?: TurnAttachment[],
+    attemptId?: string,
+    origin: QueuedHead = 'desktop',
+  ): void {
+    requireRealAccountAccess()
+    // Idempotency (finding 3): the accepted ledger OUTLIVES the slot, so a lost-ack retry that arrives
+    // after this queue already delivered/returned re-acks silently instead of re-queuing a duplicate. A
+    // same-id re-send with a different payload is a client bug — reject it rather than silently mis-fold.
+    if (attemptId) {
+      const fingerprint = remoteTurnFingerprint(displayText, attachments)
+      const accepted = this.acceptedQueueAttempts.get(sessionId)
+      const prior = accepted?.get(attemptId)
+      if (prior !== undefined) {
+        if (prior !== fingerprint)
+          throw new Error('This queue attempt was already used for a different message or attachments.')
+        return
+      }
+      this.rememberAcceptedQueueAttempt(sessionId, attemptId, fingerprint)
+    }
+    const segment: QueuedSegment = { text, displayText, ...(attachments?.length ? { attachments } : {}), origin }
+    const existing = this.queuedTurns.get(sessionId)
+    const payload: QueuedTurnPayload = { segments: existing ? [...existing.segments, segment] : [segment] }
+    // Nothing is waiting yet and the session can take a turn now → send it straight through. Only this
+    // first-in-empty-slot case may bypass the slot; an append is by definition mid-turn.
+    if (!existing && this.admitsImmediateTurn(sessionId)) {
+      this.deliverQueued(sessionId, payload)
+      return
+    }
+    this.queuedTurns.set(sessionId, payload)
+    this.emitQueuedUpdated(sessionId, payload)
+  }
+
+  /** Cancel a session's queued message, returning its text to the sender's composer. */
+  cancelQueuedTurn(sessionId: string): void {
+    this.returnQueuedTurn(sessionId, false)
+  }
+
+  private rememberAcceptedQueueAttempt(sessionId: string, attemptId: string, fingerprint: string): void {
+    let attempts = this.acceptedQueueAttempts.get(sessionId)
+    if (!attempts) {
+      attempts = new Map()
+      this.acceptedQueueAttempts.set(sessionId, attempts)
+    }
+    attempts.delete(attemptId) // insertion order is the bounded LRU; a refresh must not grow it
+    attempts.set(attemptId, fingerprint)
+    while (attempts.size > REMOTE_ATTEMPT_HISTORY_PER_SESSION) {
+      const oldest = attempts.keys().next().value
+      if (oldest === undefined) break
+      attempts.delete(oldest)
+    }
+  }
+
+  /** Bump and return a session's monotonic queued-slot revision (finding 6) — called on every slot
+   *  mutation so the phone can ignore a stale poll/catch-up that would resurrect a cleared chip. */
+  private bumpQueuedRevision(sessionId: string): number {
+    const next = (this.queuedRevision.get(sessionId) ?? 0) + 1
+    this.queuedRevision.set(sessionId, next)
+    return next
+  }
+
+  /** Catch-up snapshot of the queued chips main holds for a project's live sessions, so a reloaded
+   *  DESKTOP renderer rebuilds them — the slot is in-memory only and never persisted (see `queuedTurns`).
+   *  Desktop reload is not polled, so it needs no revision ordering (the phone path does — see
+   *  `queuedTurnFor`). */
+  queuedTurnsForProject(projectPath: string): { sessionId: string; text: string; attachmentCount: number }[] {
+    const root = realpathOrSelf(projectPath)
+    return [...this.queuedTurns.entries()].flatMap(([sessionId, payload]) =>
+      realpathOrSelf(this.projectDirs.get(sessionId) ?? '') === root
+        ? [{ sessionId, text: queuedMergedDisplay(payload.segments), attachmentCount: queuedMergedAttachments(payload.segments).length }]
+        : [],
+    )
+  }
+
+  /** One session's held queued message for the PHONE — always an object (present = this Mac supports
+   *  queued-send, the presence-vs-absence capability convention), carrying the slot's monotonic revision so
+   *  the phone can order this poll/snapshot against live events. `text: null` = the slot is empty as of
+   *  that revision. Read in the launcher-poll row and the session-open snapshot. */
+  queuedTurnFor(sessionId: string): { revision: number; text: string | null; attachmentCount: number } {
+    const revision = this.queuedRevision.get(sessionId) ?? 0
+    const payload = this.queuedTurns.get(sessionId)
+    return payload
+      ? { revision, text: queuedMergedDisplay(payload.segments), attachmentCount: queuedMergedAttachments(payload.segments).length }
+      : { revision, text: null, attachmentCount: 0 }
+  }
+
+  /** The exact admission conditions `sendTurn` re-checks synchronously at its top (sessions.ts). Kept in
+   *  lockstep so a queued delivery only fires when the real send would also be accepted — no await sits
+   *  between this check and `sendTurn`'s own guard, so the state cannot drift in between. */
+  private admitsImmediateTurn(sessionId: string): boolean {
+    return (
+      !this.processReplacements.has(sessionId) &&
+      !this.working.has(sessionId) &&
+      !this.turnAdmissions.has(sessionId) &&
+      this.gate.pendingRequests(sessionId).length === 0
+    )
+  }
+
+  /** Deliver a queued message the moment the session admits a turn again. Idempotent and safe to call
+   *  from every point that can make a held slot deliverable (a genuine turn end, an answered approval, a
+   *  finished process replacement); if the session is not yet admissible it HOLDS the slot untouched.
+   *  Only a GENUINE, successful TurnComplete may call this — a fatal/turnRejected end returns instead. */
+  private tryDeliverQueued(sessionId: string): void {
+    const payload = this.queuedTurns.get(sessionId)
+    if (!payload) return
+    if (!this.admitsImmediateTurn(sessionId)) return // hold: still working / waiting / replacing
+    this.queuedTurns.delete(sessionId)
+    this.deliverQueued(sessionId, payload)
+  }
+
+  /** Dispatch a queued payload (the MERGED whole) as a normal human turn. On success the human bubble is
+   *  echoed to the owning window (the engine event stream never carries the user's prompt, and a queued
+   *  turn had no optimistic bubble), then the slot's cleared/delivered is emitted. A dispatch that throws
+   *  returns the exact segments to their composer(s) rather than dropping the user's words. */
+  private deliverQueued(sessionId: string, payload: QueuedTurnPayload): void {
+    // Capture the owning window now: a drift/broker respawn that fails DURING this dispatch removes the
+    // session from its window (start()'s catch), which would otherwise leave the returned-clear with no
+    // live route and silently lose the payload.
+    const ownerAtDispatch = contextForSession(sessionId)?.win
+    const engineText = queuedMergedText(payload.segments)
+    const attachments = queuedMergedAttachments(payload.segments)
+    // `internal.queued` makes sendTurn skip its own pre-acceptance remote-user-turn publication (which
+    // assumes an optimistic row a queued turn never had, records on preflight failure, and stamps
+    // append:false). echoQueuedUserTurn publishes exactly one row on acceptance instead — append:true,
+    // and a durable RemoteUserTurn + exact retry bytes for the phone when a phone is attached.
+    void this.sendTurn(sessionId, engineText, attachments.length ? attachments : undefined, 'local', { queued: true }).then(
+      () => {
+        this.echoQueuedUserTurn(sessionId, payload)
+        this.emitQueuedCleared(sessionId, 'delivered')
+        this.reEmitQueuedIfPresent(sessionId)
+      },
+      (err) => {
+        const message = err instanceof Error ? err.message : String(err)
+        log.warn('engine', 'queued turn dispatch failed; returning it to the composer', message)
+        const event = this.queuedClearedEvent(sessionId, 'returned', payload, message)
+        this.forward(event) // routes to the live owner (if any) + remote sinks
+        if (!contextForSession(sessionId)?.win && ownerAtDispatch && !ownerAtDispatch.isDestroyed())
+          ownerAtDispatch.webContents.send(IpcChannels.engineEvent, event) // ownership torn down mid-dispatch
+        this.reEmitQueuedIfPresent(sessionId)
+      },
+    )
+  }
+
+  /** A stale delivered/returned clear wipes the chip in the renderer, but a successor may have queued
+   *  during the async dispatch and main still holds it. Re-assert the current slot so the chip matches
+   *  truth. Single-slot, so this is a cheap self-correcting re-emit. */
+  private reEmitQueuedIfPresent(sessionId: string): void {
+    const payload = this.queuedTurns.get(sessionId)
+    if (payload) this.emitQueuedUpdated(sessionId, payload)
+  }
+
+  /** Take a queued message out of the slot and return its segments to their originating composer(s).
+   *  `failed` distinguishes a Stop or a cancel (clean return) from a dispatch error (return with a
+   *  retryable banner). */
+  private returnQueuedTurn(sessionId: string, failed: boolean): void {
+    const payload = this.queuedTurns.get(sessionId)
+    if (!payload) return
+    this.queuedTurns.delete(sessionId)
+    this.emitQueuedCleared(sessionId, 'returned', payload, failed ? 'That queued message could not be sent.' : undefined)
+  }
+
+  /** Publish a delivered queued turn's human bubble the way a phone turn's bubble is published — the
+   *  engine stream never echoes the user's prompt, and a queued turn had no optimistic row on EITHER head
+   *  (desktop or phone showed a chip, not a bubble), so this appends exactly one, ONLY after the engine
+   *  accepted the turn (called from deliverQueued's success path). A remote-attached session also records
+   *  ONE RemoteUserTurn into the durable replay log so a phone catch-up shows the prompt; the append:true
+   *  window echo carries that replaySeq so the desktop stamps the same row. Shows the raw `displayText`,
+   *  never the engine text. */
+  private echoQueuedUserTurn(sessionId: string, payload: QueuedTurnPayload): void {
+    const displayText = queuedMergedDisplay(payload.segments)
+    const attachments = queuedMergedAttachments(payload.segments)
+    const inline = attachments.filter((a) => a.mediaType.startsWith('image/'))
+    const provenance = attachments.map(({ mediaType, name }) => ({ mediaType, ...(name ? { name } : {}) }))
+    const hadAttachments = attachments.length > 0
+    const hadImages = inline.length > 0
+    // Record the durable replay row only when a phone might read it. A plain desktop session has no replay
+    // log, so a lone entry would be inconsistent; the window echo below still shows the desktop bubble.
+    let replaySeq: number | undefined
+    if (this.remoteAttached.has(sessionId)) {
+      const recorded = this.recordRemoteEntry({
+        type: 'RemoteUserTurn',
+        sessionId,
+        text: displayText,
+        hadAttachments,
+        ...(provenance.length ? { attachments: provenance } : {}),
+        hadImages,
+      })
+      replaySeq = recorded.replaySeq
+      // Finding 5: register the exact bytes against this replaySeq so an engine failure on the delivered
+      // turn can PROMOTE them into the replay row (retryable), instead of the phone reporting them lost.
+      // The existing promote-on-failure/strip-on-success lifecycle in forward() owns them from here.
+      const exactChars = attachments.reduce((n, a) => n + a.dataBase64.length, 0)
+      if (attachments.length && exactChars <= MAX_DURABLE_TURN_ATTACHMENT_BASE64_CHARS)
+        this.setRemoteTurnPayload(sessionId, { replaySeq, attachments, failed: false })
+    }
+    const win = contextForSession(sessionId)?.win
+    if (win && !win.isDestroyed())
+      win.webContents.send(IpcChannels.sessionRemoteUserTurn, {
+        sessionId,
+        text: displayText,
+        hadAttachments,
+        ...(provenance.length ? { attachments: provenance } : {}),
+        hadImages,
+        ...(inline.length ? { images: inline } : {}),
+        ...(replaySeq !== undefined ? { replaySeq } : {}),
+        append: true,
+      })
+  }
+
+  private emitQueuedUpdated(sessionId: string, payload: QueuedTurnPayload): void {
+    this.forward({
+      type: 'QueuedTurnUpdated',
+      sessionId,
+      text: queuedMergedDisplay(payload.segments),
+      attachmentCount: queuedMergedAttachments(payload.segments).length,
+      revision: this.bumpQueuedRevision(sessionId),
+    })
+  }
+
+  /** Build a QueuedTurnCleared event. A returned clear carries the per-head SEGMENTS (each with the raw
+   *  display words + its origin) so each composer restores only its own; a delivered one carries none.
+   *  `message` (a failed dispatch) is the only thing that flips `failed`. Bumps the slot revision so a
+   *  stale poll/catch-up can't resurrect the chip this clear takes down (finding 6). */
+  private queuedClearedEvent(
+    sessionId: string,
+    reason: 'delivered' | 'returned',
+    payload?: QueuedTurnPayload,
+    message?: string,
+  ): EngineEvent {
+    return {
+      type: 'QueuedTurnCleared',
+      sessionId,
+      reason,
+      revision: this.bumpQueuedRevision(sessionId),
+      segments:
+        reason === 'returned' && payload
+          ? payload.segments.map((s) => ({
+              text: s.displayText,
+              attachments: s.attachments?.length ? s.attachments : undefined,
+              origin: s.origin,
+            }))
+          : undefined,
+      failed: message !== undefined ? true : undefined,
+      message,
+    }
+  }
+
+  private emitQueuedCleared(
+    sessionId: string,
+    reason: 'delivered' | 'returned',
+    payload?: QueuedTurnPayload,
+    message?: string,
+  ): void {
+    this.forward(this.queuedClearedEvent(sessionId, reason, payload, message))
   }
 
   /** Only the scheduler holding the exact in-memory scope object may start its reserved turn. A
@@ -1999,7 +2326,11 @@ export class EngineSessionManager {
 
   // ── Approval gate surface (delegated from IPC) ──────────────────────────────
   resolveApproval(requestId: string, decision: ToolDecision): void {
-    this.gate.resolve(requestId, decision)
+    const sessionId = this.gate.resolve(requestId, decision)
+    // Queued-send: answering the LAST pending prompt can be the point a held message becomes deliverable
+    // (a stranded approval that outlived its turn). Defer so any synchronous gate/turn bookkeeping settles
+    // first; tryDeliverQueued holds while the turn is still running.
+    if (sessionId) queueMicrotask(() => this.tryDeliverQueued(sessionId))
   }
   /** Set ONE session's posture (per-session, ui-workspace.md §7a). The renderer owns persistence
    *  (it's saved in the session blob and re-pushed on reattach), so the gate just caches it. A real
@@ -2080,6 +2411,11 @@ export class EngineSessionManager {
     this.processReplacements.delete(sessionId)
     this.turnEndWaiters.delete(sessionId)
     this.pendingTurns.delete(sessionId)
+    // A true end, not a respawn: drop any queued message (there is no composer left to return it to), plus
+    // the accepted-attempt ledger and revision that outlive the slot.
+    this.queuedTurns.delete(sessionId)
+    this.acceptedQueueAttempts.delete(sessionId)
+    this.queuedRevision.delete(sessionId)
     this.sessionFirstPrompts.delete(sessionId)
     this.resumeCursors.delete(sessionId)
     this.remoteAttached.delete(sessionId)
@@ -3163,7 +3499,11 @@ export class EngineSessionManager {
       event.type === 'AssistantDelta' ||
       event.type === 'ThinkingDelta' ||
       event.type === 'ResumeCursorUpdated' ||
-      event.type === 'SessionCapabilitiesUpdated'
+      event.type === 'SessionCapabilitiesUpdated' ||
+      // Queued-send chip state is ephemeral control state, not transcript: buffering it would resurrect a
+      // phantom chip/draft after restart and drop attachment bytes into the durable replay sidecar.
+      event.type === 'QueuedTurnUpdated' ||
+      event.type === 'QueuedTurnCleared'
     )
       return event
     const delegated =
@@ -3438,7 +3778,11 @@ export class EngineSessionManager {
   }
 
   private releaseProcessReplacement(sessionId: string, claim: ProcessReplacementClaim): void {
-    if (this.processReplacements.get(sessionId) === claim) this.processReplacements.delete(sessionId)
+    if (this.processReplacements.get(sessionId) === claim) {
+      this.processReplacements.delete(sessionId)
+      // Queued-send: a finished posture/plan respawn can be the point a held message becomes deliverable.
+      queueMicrotask(() => this.tryDeliverQueued(sessionId))
+    }
   }
 
   /** Model/effort and Plan-boundary changes can replace the engine process. Main owns the final guard:
@@ -4133,6 +4477,9 @@ export class EngineSessionManager {
    * want the sweep; the void callers (IPC, remote ops) are unaffected.
    */
   async interrupt(sessionId: string): Promise<void> {
+    // Queued-send: Stop means the user is taking control. A stale queued instruction must never fire into
+    // the post-interrupt state, so return it to the composer before anything else.
+    this.returnQueuedTurn(sessionId, false)
     // Cancel the exact prepared turn synchronously, before the child-stop await. The send owns cleanup
     // when its current preflight await resumes. Capturing the engine handle here also prevents a slow
     // child sweep from interrupting a later replacement process that reused the same session id.
@@ -4375,6 +4722,9 @@ export class EngineSessionManager {
     // (dispose() is also the broker-recovery / model-effort teardown, and a workflow result stashed
     // before the respawn still needs to ride the next human turn). It's drained on delivery; a truly
     // abandoned entry is one small string that evaporates with the process — no unbounded growth.
+    // NB: queuedTurns is NOT cleared here either, for the same reason — a message queued before a
+    // settings/broker respawn must still be delivered when the replacement child's turn ends. Only a
+    // true end (forgetSession) drops it.
     stopLanForward(sessionId) // reap any LAN preview forwarder + forget its (now dead) URL
     clearSessionPreview(sessionId)
     // NB: recoveringBroker is NOT cleared here — a broker recovery calls start()→dispose() on the old
@@ -4776,6 +5126,16 @@ export class EngineSessionManager {
         this.turnEndWaiters.delete(event.sessionId)
         waiter()
       }
+      // Queued-send: a held message may go out ONLY at a genuine, successful TurnComplete. A fatal or
+      // turnRejected end — including Codex's pre-start rejection paired with a compatibility TurnComplete
+      // (stopReason TURN_REJECTED_STOP_REASON) — must NOT dispatch: the microtask could fire the queued
+      // turn between the rejection and that compatibility completion, and the old completion would then
+      // clear the NEW turn's working/acceptedTurns/pendingTurns. Return the payload to the composer
+      // instead. Delivery is deferred to a microtask so this event's own bookkeeping (gate sweep,
+      // working cleanup) finishes first before sendTurn re-arms them.
+      if (event.type === 'TurnComplete' && event.stopReason !== TURN_REJECTED_STOP_REASON)
+        queueMicrotask(() => this.tryDeliverQueued(event.sessionId))
+      else this.returnQueuedTurn(event.sessionId, true)
     }
 
     // Keep the transport attempt's real usage/account activity, but do not expose a false logical

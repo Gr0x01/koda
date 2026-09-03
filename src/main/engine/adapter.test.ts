@@ -57,6 +57,30 @@ describe('background subagent notifications', () => {
     expect(isBackgroundSubagentLaunchResult('The child inspected the adapter and found no issue.')).toBe(false)
   })
 
+  it('recognizes a resume receipt by resumedAgentId across CLI phrasings', () => {
+    // 2.1.236 dropped the "in the background" phrasing; the field is the stable signal.
+    expect(
+      isBackgroundSubagentLaunchResult(
+        JSON.stringify({
+          success: true,
+          message: 'Resuming agent a293f15',
+          resumedAgentId: 'a293f15998f7b6c95',
+          pin: { id: 'a293f15998f7b6c95', name: 'a293f15998f7b6c95', ref: '1080f6' },
+        }),
+      ),
+    ).toBe(true)
+    expect(
+      isBackgroundSubagentLaunchResult(
+        JSON.stringify({
+          success: true,
+          message: 'Agent had no active task; resumed from transcript in the background.',
+          resumedAgentId: 'agent-a',
+        }),
+      ),
+    ).toBe(true)
+    expect(isBackgroundSubagentLaunchResult(JSON.stringify({ success: true, message: 'Message delivered' }))).toBe(false)
+  })
+
   it('turns a completed task notification into the child result Koda persists', () => {
     expect(
       taskNotificationToCompletion('s1', 'tool-1', {
@@ -246,6 +270,87 @@ describe('Claude driver: delegated task ownership', () => {
       toolUseId: 'send-followup',
       taskId: 'agent-a',
       outcome: 'completed',
+    })
+  })
+
+  // The dogfood-observed 2026-08-30 sequence that left "Agent still working…" forever: task_started
+  // outran the receipt, the receipt said only "Resuming agent <id>", and the stop notification then
+  // hit the foreground branch, which waits for a tool_result a SendMessage card never gets.
+  it('closes a stopped resumed agent whose receipt used the 2.1.236 phrasing', async () => {
+    const child = new FakeClaudeProcess()
+    spawnMock.mockReturnValue(child)
+    const events: EngineEvent[] = []
+    startClaudeSession((event) => events.push(event), {
+      sessionId: 'resumed-agent-stopped',
+      cwd: '/tmp/koda-delegation-test',
+    })
+
+    child.stdout.write(
+      `${JSON.stringify({
+        type: 'assistant',
+        message: {
+          content: [
+            {
+              type: 'tool_use',
+              id: 'send-correction',
+              name: 'SendMessage',
+              input: { to: 'a293f15', summary: 'Redo insurance analysis', message: 'Major correction.' },
+            },
+          ],
+        },
+      })}\n`,
+    )
+    child.stdout.write(
+      `${JSON.stringify({
+        type: 'system',
+        subtype: 'task_started',
+        tool_use_id: 'send-correction',
+        task_id: 'a293f15',
+        task_type: 'local_agent',
+        subagent_type: 'general-purpose',
+        description: 'Research pregnancy travel insurance',
+      })}\n`,
+    )
+    child.stdout.write(
+      `${JSON.stringify({
+        type: 'user',
+        message: {
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'send-correction',
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({
+                    success: true,
+                    message: 'Resuming agent a293f15',
+                    resumedAgentId: 'a293f15',
+                    pin: { id: 'a293f15', name: 'a293f15', ref: '1080f6' },
+                  }),
+                },
+              ],
+            },
+          ],
+        },
+      })}\n`,
+    )
+    child.stdout.write(
+      `${JSON.stringify({
+        type: 'system',
+        subtype: 'task_notification',
+        tool_use_id: 'send-correction',
+        task_id: 'a293f15',
+        status: 'stopped',
+      })}\n`,
+    )
+    await tick()
+
+    expect(events.at(-1)).toMatchObject({
+      type: 'SubagentCompleted',
+      toolUseId: 'send-correction',
+      taskId: 'a293f15',
+      outcome: 'interrupted',
     })
   })
 })

@@ -44,6 +44,7 @@ import type {
   PreviewRestart,
   PersistedSession,
   PersistedSessions,
+  QueuedTurnSnapshot,
   ProviderKind,
   ProviderStatusEvent,
   RateLimitInfo,
@@ -180,6 +181,11 @@ export interface SessionState {
    *  the composer OUT of aside-mode even while the agent is busy, so bringing a side answer back reaches
    *  the agent instead of looping into another aside. Cleared when the box empties or the message sends. */
   replyStaged?: boolean
+  /** Queued-send: a message the user queued while this session's turn was running, waiting for main to
+   *  deliver it as a normal turn the instant the turn ends. Fed ONLY by main's QueuedTurn events (never
+   *  assumed locally), so the chip always reflects the real single slot. `attachmentCount` drives the
+   *  chip; the exact bytes come back on the returned clear. Ephemeral — not persisted. */
+  queuedTurn?: { text: string; attachmentCount: number }
   /** This session was started from the phone and adopted into this window (its transcript was replayed
    *  from the live event log, not rendered here from turn one). Drives the "from your phone" sidebar
    *  marker. Not persisted — on the next boot it restores as an ordinary local session. */
@@ -855,6 +861,9 @@ interface WorkspaceStore {
 
   // engine + approvals
   applyEngineEvent: (e: EngineEvent) => void
+  /** Rebuild queued-message chips from main's catch-up snapshot after a renderer reload (the slot is
+   *  ephemeral and never persisted). Authoritative: sessions absent from the list carry no chip. */
+  applyQueuedTurns: (snapshots: QueuedTurnSnapshot[]) => void
   /** Apply a streamed side-question answer (delta/done/error) to the matching session's aside. */
   applyAsideEvent: (e: AsideEvent) => void
   addPending: (req: ApprovalRequest) => void
@@ -912,6 +921,12 @@ interface WorkspaceStore {
    *  index write is acknowledged before the transcript file is deleted. */
   deleteArchived: (id: string) => Promise<void>
   send: () => Promise<void>
+  /** Queued-send: hold the current draft + attachments to send the instant the active session's running
+   *  turn ends. Clears the composer optimistically; the chip is driven by main's QueuedTurn events, and a
+   *  refused queue restores the draft. No-op when the preload lacks the API (stale dev-HMR reload). */
+  queueSend: () => Promise<void>
+  /** Cancel the active session's queued message — main returns its exact text to the composer. */
+  cancelQueued: () => void
   /** Canvas edit: the user selected a passage in the doc surface and asked the active session's agent
    *  to change it. Composes a targeted-edit turn (the selection is the anchor) and dispatches it to the
    *  active session — the agent's normal Edit tool closes the loop (gate → checkpoint → live re-render). */
@@ -1451,6 +1466,48 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     return true
   }
 
+  // Build the ENGINE text for the active session's composer snapshot: @mention paths expanded, the
+  // ambient active-file context appended, and images saved to `.koda/scratch/` with their path notes
+  // (which also refreshes the Recent images strip). The raw visible `text` is NOT baked in here — the
+  // caller keeps it distinct for the transcript row / queued chip. Shared by send() and queueSend() so a
+  // queued turn reaches the engine with the same grounding a live send has. Documents are NOT handled
+  // here: send() folds them into its own text, and queueSend hands them to main to write at delivery.
+  async function prepareTurnSnapshot(text: string, images: ImageDraft[]): Promise<string> {
+    const ed = activeEditor(get())
+    // `kind` is optional (undefined = a file); test for what qualifies, not the one kind ('preview') that
+    // doesn't, so the terminal/changes stage tabs don't leak in as a file called ` terminal`.
+    const activeFile = ed.surfaces.find((s) => s.path === ed.activeSurfaceId && (s.kind ?? 'file') === 'file')
+    const noun = activeFile && opensAsDocument(activeFile.path) ? 'document' : 'file'
+    const engineText = await resolveDocMentions(text)
+    let sentText =
+      activeFile && text.trim()
+        ? `${engineText}\n\n(I'm currently looking at the ${noun} \`${activeFile.path}\` in Koda — if this is about it, work with that file.)`
+        : engineText
+    if (images.length) {
+      const saved = await Promise.all(
+        images.map(async (img) => {
+          // A Recent images attachment already has a durable scratch copy — reuse it instead of writing
+          // the same bytes under a new timestamped name on every re-send.
+          if (img.scratchPath) return img.scratchPath
+          try {
+            return (await window.koda.saveScratchImage({ mediaType: img.mediaType, dataBase64: img.dataBase64 })).path
+          } catch {
+            return null
+          }
+        }),
+      )
+      const paths = saved.filter((p): p is string => p !== null)
+      if (paths.length) {
+        const one = paths.length === 1
+        const list = paths.map((p) => `\`${p}\``).join(', ')
+        sentText = `${sentText}\n\n(${one ? 'This image is' : 'These images are'} saved in the project at ${list} — read that path if you need to refer back to ${one ? 'it' : 'them'} later.)`
+      }
+      // Durable copies just landed — nudge the Recent images strip to refetch the folder.
+      set((s) => ({ scratchTick: s.scratchTick + 1 }))
+    }
+    return sentText
+  }
+
   // If no card matches a subagent event, drop it (never leak to the main flow) — but warn so a
   // missing card surfaces in the dogfood log instead of vanishing.
   function warnNoCard(parentToolUseId: string): void {
@@ -1794,6 +1851,16 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       })
     },
 
+    applyQueuedTurns: (snapshots) => {
+      // Catch-up after a renderer reload — main is authoritative for the single slot. Apply the reported
+      // chips to their (hydrated) sessions; a session with no snapshot simply carries no chip.
+      for (const snap of snapshots)
+        patchSession(snap.sessionId, (s) => ({
+          ...s,
+          queuedTurn: { text: snap.text, attachmentCount: snap.attachmentCount },
+        }))
+    },
+
     applyEngineEvent: (e) => {
       const sid = e.sessionId
       const replaySeq = e.replaySeq
@@ -1890,6 +1957,42 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
               : {}),
           }))
           break
+        case 'QueuedTurnUpdated':
+          // Main is the sole authority for the queued slot — the chip shows exactly what it holds.
+          patchSession(sid, (s) => ({ ...s, queuedTurn: { text: e.text, attachmentCount: e.attachmentCount } }))
+          break
+        case 'QueuedTurnCleared': {
+          // The slot emptied either way. A delivered turn's bubble arrives over the remote-user-turn
+          // echo, so nothing else to do; a returned turn comes home to the composer — but only THIS head's
+          // own segments, never the phone's (finding 8).
+          patchSession(sid, (s) => ({ ...s, queuedTurn: undefined }))
+          if (e.reason === 'returned' && e.segments) {
+            const mine = e.segments.filter((seg) => seg.origin === 'desktop')
+            const text = mine.map((seg) => seg.text).filter((t) => t.length > 0).join('\n')
+            const restored: ImageDraft[] = mine.flatMap((seg) =>
+              (seg.attachments ?? []).map((a) => ({
+                mediaType: a.mediaType,
+                dataBase64: a.dataBase64,
+                ...(a.name ? { name: a.name } : {}),
+              })),
+            )
+            if (text || restored.length) {
+              // Never overwrite or drop what the user has typed since queuing: fold the returned (earlier)
+              // text in ahead of the current draft, and prepend the returned attachments to the current set.
+              patchSession(sid, (s) => ({
+                ...s,
+                draft: text ? (s.draft ? `${text}\n${s.draft}` : text) : s.draft,
+                attachments: restored.length ? [...restored, ...s.attachments] : s.attachments,
+                // Only a failed dispatch raises the calm retryable banner; a Stop/cancel return is silent.
+                ...(e.failed ? { error: { message: e.message ?? 'That queued message could not be sent.', fatal: false } } : {}),
+              }))
+            } else if (e.failed) {
+              patchSession(sid, (s) => ({ ...s, error: { message: e.message ?? 'That queued message could not be sent.', fatal: false } }))
+            }
+            if (e.failed) raiseAttention(sid, 'error')
+          }
+          break
+        }
         case 'ThinkingDelta':
           thinkingTick(sid, e.estimatedTokens)
           break
@@ -3042,52 +3145,9 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       // typing the next message during preflight is never erased by this continuation.
       sending.add(id)
       try {
-        // Ambient open-file context: tell the agent which file the user is looking at — a doc OR a code
-        // file (a diff counts; a preview doesn't) — so "shorten the intro" / "fix this" work without an
-        // explicit selection. The transcript shows the raw text; only the engine sees the hint, and only
-        // when the user actually typed something. The composer shows the same file as a visible cue.
-        const ed = activeEditor(get())
-      // Test for what qualifies, not for the one kind that doesn't: `kind` is optional (undefined means
-      // a file), so excluding only 'preview' let the `terminal` and `changes` stage tabs through and
-      // told the engine it was looking at a file called ` terminal`.
-        const activeFile = ed.surfaces.find(
-        (s) => s.path === ed.activeSurfaceId && (s.kind ?? 'file') === 'file',
-      )
-        const noun = activeFile && opensAsDocument(activeFile.path) ? 'document' : 'file'
-      // Engine-facing text restores the full path behind any pretty `@`-mention; the transcript keeps
-      // the clean name (displayItem uses `text` below).
-        const engineText = await resolveDocMentions(text)
-        const docText =
-        activeFile && text.trim()
-          ? `${engineText}\n\n(I'm currently looking at the ${noun} \`${activeFile.path}\` in Koda — if this is about it, work with that file.)`
-          : engineText
-      // Persist the attached images to the project's scratch folder so they outlive the conversation and
-      // the agent can re-read them by path later (they're ALSO sent inline below for the immediate turn).
-      // Best-effort: a save failure (no project open, fs error) just means no durable copy — never blocks
-      // the turn. The saved paths are appended to the ENGINE text only (the transcript shows raw text).
-        let sentText = docText
-        if (images.length) {
-        const saved = await Promise.all(
-          images.map(async (img) => {
-            // A Recent images attachment already has a durable scratch copy. Reuse it instead of
-            // writing the same bytes under a new timestamped name on every re-send.
-            if (img.scratchPath) return img.scratchPath
-            try {
-              return (await window.koda.saveScratchImage({ mediaType: img.mediaType, dataBase64: img.dataBase64 })).path
-            } catch {
-              return null
-            }
-          }),
-        )
-        const paths = saved.filter((p): p is string => p !== null)
-        if (paths.length) {
-          const one = paths.length === 1
-          const list = paths.map((p) => `\`${p}\``).join(', ')
-          sentText = `${sentText}\n\n(${one ? 'This image is' : 'These images are'} saved in the project at ${list} — read that path if you need to refer back to ${one ? 'it' : 'them'} later.)`
-        }
-        // Durable copies just landed — nudge the Recent images strip to refetch the folder.
-        set((s) => ({ scratchTick: s.scratchTick + 1 }))
-        }
+        // Ambient open-file context, @mention expansion, and image scratch saves — the shared composer
+        // preflight (also run by queueSend). The transcript keeps the raw `text` (displayItem below).
+        let sentText = await prepareTurnSnapshot(text, images)
       // Document attachments: the scratch path IS the delivery (no inline copy), so unlike images a
       // failed save is surfaced to the agent by omission from the list below. Staged in scratch, the
       // agent is told to promote anything load-bearing out of it (scratch prunes by age).
@@ -3138,6 +3198,70 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       } finally {
         sending.delete(id)
       }
+    },
+
+    queueSend: async () => {
+      const { activeId, sessions } = get()
+      const active = activeId ? sessions[activeId] : null
+      if (!active) return
+      // A stale dev-HMR preload can lack the new API — degrade gracefully rather than throw. The composer
+      // hides the queue affordance in the same case, so this is just belt-and-suspenders. Captured to a
+      // local so narrowing survives the patchSession call below.
+      const queueTurn = window.koda.queueTurn
+      if (!queueTurn) return
+      const text = active.draft
+      const attachments = active.attachments
+      const images = attachments.filter((a) => a.mediaType.startsWith('image/'))
+      if (!text.trim() && attachments.length === 0) return // nothing to queue
+      const id = active.id
+      if (sending.has(id)) return // a queue/send preflight is already consuming this composer
+      sending.add(id)
+      // Clear the composer optimistically; main's QueuedTurnUpdated event owns the chip. Only consume the
+      // exact snapshot queued — a draft/attachment added during the IPC belongs to the next message.
+      patchSession(id, (s) => ({
+        ...s,
+        draft: s.draft === text ? '' : s.draft,
+        attachments: s.attachments.filter((a) => !attachments.includes(a)),
+        replyStaged: s.draft === text ? false : s.replyStaged,
+        error: undefined, // a queued turn clears any prior error banner, same as a live send
+      }))
+      try {
+        // Run the SAME composer preflight a live send does (@mention expansion, active-file context,
+        // images to scratch) so a queued turn is grounded identically. `displayText` keeps the raw words
+        // for the chip / delivered bubble / restore; documents ride as attachments and main writes them
+        // to scratch at delivery, so a returned queue restores every attachment.
+        const sentText = await prepareTurnSnapshot(text, images)
+        await queueTurn({
+          sessionId: id,
+          text: sentText,
+          displayText: text,
+          ...(attachments.length ? { images: attachments } : {}),
+        })
+      } catch (err) {
+        // Main refused the queue before accepting it. Put the exact draft + attachments back, folding
+        // ahead of anything typed since, so nothing is silently lost.
+        const raw = err instanceof Error ? err.message : String(err)
+        const message = raw
+          .replace(/^Error:\s*/, '')
+          .replace(/^Error invoking remote method '[^']+':\s*/, '')
+          .replace(/^Error:\s*/, '')
+        patchSession(id, (s) => ({
+          ...s,
+          draft: s.draft ? `${text}\n${s.draft}` : text,
+          attachments: [...attachments, ...s.attachments],
+          error: { message, fatal: false },
+        }))
+      } finally {
+        sending.delete(id)
+      }
+    },
+
+    cancelQueued: () => {
+      const id = get().activeId
+      if (!id) return
+      // The chip clears and the draft is restored when main's QueuedTurnCleared:returned event lands, so
+      // this window and any other head stay in lockstep on the single slot.
+      window.koda.cancelQueuedTurn?.({ sessionId: id }).catch(console.error)
     },
 
     sendCanvasEdit: async ({ path, selection, instruction }) => {

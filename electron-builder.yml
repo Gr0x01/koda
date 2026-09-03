@@ -62,6 +62,8 @@ extraResources:
 # are in the env — with them absent it logs "skipped notarization" and still produces the dmg,
 # so local builds keep working. When enrolling: the extra Mach-Os under Resources/ (engine,
 # voice/assist helpers, playwright's node) are the usual hardened-runtime signing fight.
+# Strip Finder/provenance xattrs between packing and signing; see the hook's comment.
+afterPack: build/after-pack-strip-xattrs.mjs
 mac:
   category: public.app-category.developer-tools
   # The .dmg is the first manual download; the .zip is what Squirrel.Mac auto-updates FROM (electron-

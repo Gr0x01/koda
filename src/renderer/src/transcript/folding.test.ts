@@ -165,6 +165,28 @@ describe('buildTurns — the settled turn', () => {
     expect(turn.body.map((node) => node.type)).toEqual(['fleet', 'item'])
   })
 
+  it('keeps a substantial mid-turn passage out of the fold when the closing line is smaller', () => {
+    const substance =
+      'Here is the verbatim quote you asked about, with the full explanation of where it came from and ' +
+      'why it matters. This is the real reply: several sentences the reader was meant to see, written ' +
+      'before the edits ran. If the fold swallowed it, the closing line below would reference a quote ' +
+      'the reader never saw, which is exactly the silent failure the fail-open rule exists to stop.'
+    const items = [user('go'), say(substance), tool('Edit'), tool('Edit'), say('Done.')]
+    const [turn] = buildTurns(items, { live: false })
+    expect(turn.fold).toMatchObject({ count: 2 }) // only the two edits
+    expect(turn.body.map((n) => n.type === 'item' && n.entry.kind === 'assistant' && n.entry.markdown)).toEqual([
+      substance,
+      'Done.',
+    ])
+  })
+
+  it('still folds a status line that merely outruns a terse closer', () => {
+    const items = [user('go'), say('Confirmed the pack is the right seam, adding the rule there now.'), tool('Edit'), say('Done.')]
+    const [turn] = buildTurns(items, { live: false })
+    expect(turn.fold).toMatchObject({ count: 2 }) // the status line and the edit
+    expect(turn.body).toHaveLength(1)
+  })
+
   it('folds an interrupted turn that never produced an answer', () => {
     const [turn] = buildTurns([user('go'), tool('Read'), tool('Bash')], { live: false })
     expect(turn.fold).toMatchObject({ count: 2 })

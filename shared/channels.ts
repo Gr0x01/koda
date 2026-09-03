@@ -9,6 +9,14 @@ export const IpcChannels = {
   // flow main→renderer (push) over the single `engineEvent` channel.
   startSession: 'engine:startSession',
   sendTurn: 'engine:sendTurn',
+  // Queued-send: a message typed while a turn runs, held in a single per-session slot and delivered as
+  // a normal turn the instant the turn genuinely ends. queue/cancel = invoke; the queued/cleared state
+  // comes back over the ordinary `engineEvent` stream (QueuedTurnUpdated / QueuedTurnCleared).
+  queueTurn: 'engine:queueTurn',
+  cancelQueuedTurn: 'engine:cancelQueuedTurn',
+  // Catch-up read of the queued-message chips main holds for a window's project — a reloaded renderer
+  // rebuilds them (the slot is ephemeral, never persisted).
+  queuedTurnsList: 'engine:queuedTurnsList',
   interruptSession: 'engine:interrupt',
   stopSubagent: 'engine:stopSubagent',
   disposeSession: 'engine:dispose',

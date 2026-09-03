@@ -34,6 +34,10 @@ import { buildEngineEnv, type EngineEnvOptions } from './env'
 const SIDE_DISALLOWED = [
   'Bash', 'Read', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Glob', 'Grep',
   'WebFetch', 'WebSearch', 'Task', 'Agent', 'Skill', 'Workflow',
+  // External-effect and scheduling tools from the 2.1.24x–2.1.25x vocabulary: a side question must
+  // never message another session, schedule future work, stop running work, or send anything out.
+  'SendMessage', 'SendFeedback', 'ScheduleWakeup', 'Monitor', 'TaskStop',
+  'CronCreate', 'CronDelete', 'CronList', 'PushNotification', 'RemoteTrigger',
   'mcp__*', 'ListMcpResources', 'ReadMcpResource',
 ]
 

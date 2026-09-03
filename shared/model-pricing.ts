@@ -7,46 +7,51 @@
  * Nothing here is a projection: no forecast, no burn rate, no "at this pace" (see the usage-tracker
  * lesson — measured facts only).
  *
- * SOURCE, and the rule for editing it: the Anthropic list prices below are the `claude-api` skill's
- * "Current Models" table (cached 2026-06-24), which mirrors
- * https://platform.claude.com/docs/en/pricing. The cache multipliers are that skill's
- * `shared/prompt-caching.md` economics section: a cache read is ~0.1x the base input price and a
- * 5-minute cache write is 1.25x. A model we cannot cite a published rate for is NOT priced — it gets
- * a tokens-only row rather than an invented number. That includes every OpenAI/Codex model (Koda has
- * no published-rate source wired for them) and every engine alias (`opus`, `sonnet`, `opusplan`, …),
- * which resolve to a concrete model we can't see from the id alone.
+ * SOURCE, and the rule for editing it: the Anthropic list prices below are the published pricing page,
+ * https://platform.claude.com/docs/en/about-claude/pricing (verified 2026-09-02). The cache
+ * multipliers are the same page's cache economics: a cache read is 0.1x the base input price (0.025x
+ * on Fable/Mythos 5.1, carried per-row) and a 5-minute cache write is 1.25x. A model we cannot cite
+ * a published rate for is NOT priced — it gets a tokens-only row rather than an invented number. That
+ * includes every OpenAI/Codex model (Koda has no published-rate source wired for them) and every
+ * engine alias (`opus`, `sonnet`, `opusplan`, …), which resolve to a concrete model we can't see from
+ * the id alone.
  */
 
 /** $ per million tokens, at the published list rate. */
 export type PublishedRate = {
   inputPerMTok: number
   outputPerMTok: number
+  /** Published cache-read price as a fraction of the input rate, when it differs from the standard
+   *  CACHE_READ_MULTIPLIER (Fable/Mythos 5.1 publish $0.25/MTok on $10 input = 0.025x). */
+  cacheReadMultiplier?: number
   /** Where this pair came from, shown nowhere but kept so the next editor can re-verify it. */
   source: string
 }
 
-/** A cached input token bills at ~0.1x the base input rate. */
+/** A cached input token bills at 0.1x the base input rate, unless the row cites its own multiplier. */
 export const CACHE_READ_MULTIPLIER = 0.1
 /** Writing the 5-minute cache costs 1.25x the base input rate — the premium the savings must clear. */
 export const CACHE_WRITE_MULTIPLIER = 1.25
 
-const ANTHROPIC_LIST = 'claude-api skill, Current Models table (cached 2026-06-24)'
+const ANTHROPIC_LIST = 'platform.claude.com/docs/en/about-claude/pricing (verified 2026-09-02)'
 
 /**
  * Keyed by the model FAMILY left after `normalizeModelId` strips the vendor prefix, the context-window
  * suffix, and the release datestamp. Add a row only with a citable published price.
  */
 const RATES: Record<string, PublishedRate> = {
+  // Fable/Mythos 5.1 (2026-09-01) publish a $0.25/MTok cache read — 0.025x, not the standard 0.1x.
+  'fable-5-1': { inputPerMTok: 10, outputPerMTok: 50, cacheReadMultiplier: 0.025, source: ANTHROPIC_LIST },
+  'mythos-5-1': { inputPerMTok: 10, outputPerMTok: 50, cacheReadMultiplier: 0.025, source: ANTHROPIC_LIST },
   'fable-5': { inputPerMTok: 10, outputPerMTok: 50, source: ANTHROPIC_LIST },
   'mythos-5': { inputPerMTok: 10, outputPerMTok: 50, source: ANTHROPIC_LIST },
   'opus-5': { inputPerMTok: 5, outputPerMTok: 25, source: ANTHROPIC_LIST },
   'opus-4-8': { inputPerMTok: 5, outputPerMTok: 25, source: ANTHROPIC_LIST },
   'opus-4-7': { inputPerMTok: 5, outputPerMTok: 25, source: ANTHROPIC_LIST },
   'opus-4-6': { inputPerMTok: 5, outputPerMTok: 25, source: ANTHROPIC_LIST },
-  // Sonnet 5 carries an introductory $2/$10 through 2026-08-31. We price at the standing list rate on
-  // purpose: this figure answers "what would the full API rate have been", and a date-triggered rate
-  // would silently change the number one night with nothing in the UI to explain it.
-  'sonnet-5': { inputPerMTok: 3, outputPerMTok: 15, source: ANTHROPIC_LIST },
+  // Sonnet 5 launched at an introductory $2/$10; Anthropic made that the standard list price (the
+  // scheduled 2026-09-01 increase to $3/$15 was cancelled — pricing-page note, read 2026-09-02).
+  'sonnet-5': { inputPerMTok: 2, outputPerMTok: 10, source: ANTHROPIC_LIST },
   'sonnet-4-6': { inputPerMTok: 3, outputPerMTok: 15, source: ANTHROPIC_LIST },
   'haiku-4-5': { inputPerMTok: 1, outputPerMTok: 5, source: ANTHROPIC_LIST },
 }
@@ -75,9 +80,10 @@ export function publishedRate(id: string): PublishedRate | null {
  *
  * Both sides are the same arithmetic over the same measured token counts, so only the per-token rate
  * differs: without a cache every prompt token bills at the full input rate; with it, reads bill at
- * 0.1x and writes cost a 1.25x premium. The difference is therefore
- * `cacheRead x 0.9 x input − cacheWrite x 0.25 x input`. It can go negative on a session that wrote
- * far more cache than it ever read back; that is a real (small) loss, not an error, and the UI says so.
+ * the model's read multiplier (0.1x standard) and writes cost a 1.25x premium. The difference is
+ * therefore `cacheRead x (1 − readMult) x input − cacheWrite x 0.25 x input`. It can go negative on a
+ * session that wrote far more cache than it ever read back; that is a real (small) loss, not an
+ * error, and the UI says so.
  */
 export function cacheSavingsUsd(
   id: string,
@@ -86,7 +92,8 @@ export function cacheSavingsUsd(
   const rate = publishedRate(id)
   if (!rate) return null
   const perToken = rate.inputPerMTok / 1_000_000
-  const saved = tokens.cacheReadTokens * (1 - CACHE_READ_MULTIPLIER) * perToken
+  const readMultiplier = rate.cacheReadMultiplier ?? CACHE_READ_MULTIPLIER
+  const saved = tokens.cacheReadTokens * (1 - readMultiplier) * perToken
   const premium = tokens.cacheCreationTokens * (CACHE_WRITE_MULTIPLIER - 1) * perToken
   return saved - premium
 }

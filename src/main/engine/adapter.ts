@@ -908,6 +908,10 @@ class ClaudeSession implements EngineSession {
     if (!toolUseId || (ev.task_type !== 'local_agent' && !this.subagentLaunchIds.has(toolUseId))) return
     switch (ev.subtype) {
       case 'task_started':
+        // A task_started can outrun its SendMessage receipt. A card born from a SendMessage has no
+        // evidence-bearing tool_result coming — its only terminal proof is a task_notification — so
+        // mark it background at birth instead of trusting the receipt phrasing to arrive and match.
+        if (this.sendMessageInputs.has(toolUseId)) this.backgroundSubagentIds.add(toolUseId)
         this.emitSubagentStarted(toolUseId, ev)
         break
       case 'task_progress':
@@ -1059,19 +1063,16 @@ function isSendMessageTool(name: unknown): boolean {
   return name === 'SendMessage'
 }
 
-/** The exact metadata receipt Claude 2.1.x returns immediately for an async Agent launch. It is not
- *  the child's answer; treating it as one is the empty/premature-card bug the background spike found. */
+/** The metadata receipt Claude 2.1.x returns immediately for an async Agent launch. It is not the
+ *  child's answer; treating it as one is the empty/premature-card bug the background spike found.
+ *  A `resumedAgentId` receipt qualifies on that field alone: a resumed agent's answer only ever
+ *  arrives via task_notification, and the human phrasing around it has already drifted across CLI
+ *  versions ("resumed from transcript in the background" → 2.1.236's "Resuming agent <id>"). Keying
+ *  on the phrasing left the card foreground, waiting forever for a tool_result that never comes. */
 export function isBackgroundSubagentLaunchResult(text: string): boolean {
   if (/^Async agent launched successfully\./.test(text) && text.includes('working in the background'))
     return true
-  const taskId = resumedAgentId(text)
-  if (!taskId) return false
-  try {
-    const receipt = JSON.parse(text) as Record<string, unknown>
-    return typeof receipt.message === 'string' && receipt.message.includes('in the background')
-  } catch {
-    return false
-  }
+  return resumedAgentId(text) !== undefined
 }
 
 function resumedAgentId(text: string): string | undefined {

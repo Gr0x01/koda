@@ -158,4 +158,23 @@ describe('published rates', () => {
     })
     expect(saved).toBeLessThan(0)
   })
+
+  it('prices Sonnet 5 at the made-permanent $2/$10 list rate', () => {
+    expect(publishedRate('claude-sonnet-5')?.inputPerMTok).toBe(2)
+    expect(publishedRate('claude-sonnet-5')?.outputPerMTok).toBe(10)
+  })
+
+  it('applies Fable 5.1\'s published 0.025x cache-read rate to savings', () => {
+    // 1M cache reads at $10/MTok input: standard 0.1x saves $9; 5.1's 0.025x saves $9.75.
+    const saved = cacheSavingsUsd('claude-fable-5-1', {
+      cacheReadTokens: 1_000_000,
+      cacheCreationTokens: 0,
+    })
+    expect(saved).toBeCloseTo(9.75, 10)
+    const standard = cacheSavingsUsd('claude-fable-5', {
+      cacheReadTokens: 1_000_000,
+      cacheCreationTokens: 0,
+    })
+    expect(standard).toBeCloseTo(9, 10)
+  })
 })
