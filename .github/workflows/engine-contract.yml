@@ -298,15 +298,20 @@ jobs:
           DARWIN_SHA=$(curl -fsSL "https://github.com/openai/codex/releases/download/rust-v$TARGET/codex-aarch64-apple-darwin.tar.gz" | sha256sum | cut -d' ' -f1)
           if [[ ! "$DARWIN_SHA" =~ ^[a-f0-9]{64}$ ]]; then echo "::error::could not verify darwin tarball for $TARGET"; exit 1; fi
           echo "sha=$DARWIN_SHA" >> "$GITHUB_OUTPUT"
+          # The code-mode helper ships as its own asset of the same release and is bundled beside the CLI.
+          HOST_SHA=$(curl -fsSL "https://github.com/openai/codex/releases/download/rust-v$TARGET/codex-code-mode-host-aarch64-apple-darwin.tar.gz" | sha256sum | cut -d' ' -f1)
+          if [[ ! "$HOST_SHA" =~ ^[a-f0-9]{64}$ ]]; then echo "::error::could not verify darwin code-mode host tarball for $TARGET"; exit 1; fi
+          echo "host_sha=$HOST_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Apply guarded version bump
         if: success() && steps.v.outputs.go == 'true'
         env:
           TARGET: ${{ steps.v.outputs.target }}
           DARWIN_SHA: ${{ steps.darwin.outputs.sha }}
+          HOST_SHA: ${{ steps.darwin.outputs.host_sha }}
         run: |
-          node scripts/apply-engine-bump.mjs apply --engine codex --version "$TARGET" --darwin-sha "$DARWIN_SHA"
-          node scripts/apply-engine-bump.mjs verify --engine codex --version "$TARGET" --darwin-sha "$DARWIN_SHA"
+          node scripts/apply-engine-bump.mjs apply --engine codex --version "$TARGET" --darwin-sha "$DARWIN_SHA" --darwin-host-sha "$HOST_SHA"
+          node scripts/apply-engine-bump.mjs verify --engine codex --version "$TARGET" --darwin-sha "$DARWIN_SHA" --darwin-host-sha "$HOST_SHA"
 
       # The unit suite resolves resources/engine/linux-x64/claude even in the Codex job (Claude
       # adapter/pack tests run in `npm test`), and this job downloads only the codex candidate.
@@ -333,8 +338,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TARGET: ${{ steps.v.outputs.target }}
           DARWIN_SHA: ${{ steps.darwin.outputs.sha }}
+          HOST_SHA: ${{ steps.darwin.outputs.host_sha }}
         run: |
-          node scripts/apply-engine-bump.mjs verify --engine codex --version "$TARGET" --darwin-sha "$DARWIN_SHA"
+          node scripts/apply-engine-bump.mjs verify --engine codex --version "$TARGET" --darwin-sha "$DARWIN_SHA" --darwin-host-sha "$HOST_SHA"
           BRANCH="engine/bump-codex-$TARGET-${GITHUB_RUN_ID}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

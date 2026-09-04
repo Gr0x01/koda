@@ -28,7 +28,16 @@ export function prettyModel(id: string): string {
   const [family, ...rest] = stripped.split('-')
   if (!family) return id
   const cap = (w: string) => w.charAt(0).toUpperCase() + w.slice(1)
-  const label = rest.length ? `${cap(family)} ${rest.join('.')}` : cap(family)
+  let label: string
+  if (family === 'gpt') {
+    // OpenAI ids carry a tier word after the version (`gpt-5.6-sol`), and the tier is what tells two
+    // same-version models apart, so it is kept as a word rather than folded into the number.
+    const version = rest.filter((part) => /^\d/.test(part)).join('.')
+    const tier = rest.filter((part) => !/^\d/.test(part)).map(cap).join(' ')
+    label = `${version ? `GPT-${version}` : 'GPT'}${tier ? ` ${tier}` : ''}`
+  } else {
+    label = rest.length ? `${cap(family)} ${rest.join('.')}` : cap(family)
+  }
   return ctx ? `${label} · ${ctx}M context` : label
 }
 

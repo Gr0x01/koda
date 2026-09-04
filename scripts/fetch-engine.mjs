@@ -40,14 +40,22 @@ const CLAUDE_BASE = 'https://downloads.claude.ai/claude-code-releases'
 // ── Codex ──────────────────────────────────────────────────────────────────────────────────────────
 // Latest GitHub-releases `stable` (non-prerelease) at pin time. The codex-contract job updates BOTH the
 // version and the per-platform tarball SHA only after its real app-server contract and repository gate.
-const PINNED_CODEX_VERSION = '0.152.1'
+const PINNED_CODEX_VERSION = '0.153.1'
 const CODEX_BASE = 'https://github.com/openai/codex/releases/download'
 // koda platform → codex release triple.
 const CODEX_TRIPLE = { 'darwin-arm64': 'aarch64-apple-darwin' }
 // SHA-256 of the plain `codex-<triple>.tar.gz` asset, per koda platform. Self-pinned (OpenAI publishes no
 // checksum for the plain binary). Recompute when bumping PINNED_CODEX_VERSION.
 const CODEX_TARBALL_SHA256 = {
-  'darwin-arm64': '8ddde1fcf5c9842e9baa09c7c108088bb22a39feb86e4344e45dc0986764b9d7',
+  'darwin-arm64': '818f3c65c6973ae54586ba52f8e37c7673f3f5b8e09c74858c19e25c74479226',
+}
+// SHA-256 of the sibling `codex-code-mode-host-<triple>.tar.gz` asset from the SAME release. Every
+// GPT-5.6 model and GPT-6 Astra run `tool_mode: code_mode_only`, and the CLI spawns this helper from
+// the directory the `codex` binary lives in; without it Code Mode "fails closed" and those models
+// have no working shell or file tools (Koda's own dev logs showed the spawn failure from 2026-08-26).
+// Homebrew and npm install both binaries side by side; this reproduces that layout.
+const CODEX_HOST_TARBALL_SHA256 = {
+  'darwin-arm64': '4a87aa89a198976ebc68a85017b36234edd1b126dfb63d94c10a20fcfab81479',
 }
 
 const PLATFORMS = ['darwin-arm64']
@@ -90,48 +98,66 @@ async function fetchClaude(platform) {
   console.log(`✓ ${platform} claude verified + written → ${dest}`)
 }
 
+/** The two Codex release assets that make one working install: the CLI and the code-mode helper it
+ *  spawns beside itself. Both come from the same `rust-v<version>` release and land as siblings. */
+const CODEX_ASSETS = [
+  { name: 'codex', checksums: CODEX_TARBALL_SHA256 },
+  { name: 'codex-code-mode-host', checksums: CODEX_HOST_TARBALL_SHA256 },
+]
+
 async function fetchCodex(platform) {
   const triple = CODEX_TRIPLE[platform]
-  const expected = CODEX_TARBALL_SHA256[platform]
-  if (!triple || !expected) throw new Error(`no codex triple/checksum configured for ${platform}`)
-  const dest = join(outRoot, platform, 'codex')
+  if (!triple) throw new Error(`no codex triple configured for ${platform}`)
+  const dests = CODEX_ASSETS.map((asset) => join(outRoot, platform, asset.name))
 
-  // The extracted binary can't be re-verified against the tarball SHA, so a version marker records what's
-  // on disk; matching marker + present binary ⇒ skip the ~95 MB download.
+  // The extracted binaries can't be re-verified against the tarball SHAs, so a version marker records
+  // what's on disk; matching marker + both binaries present ⇒ skip the ~115 MB download.
   const marker = join(outRoot, platform, '.codex-version')
-  if (existsSync(dest) && existsSync(marker) && (await readFile(marker, 'utf8')).trim() === PINNED_CODEX_VERSION) {
+  if (
+    dests.every((dest) => existsSync(dest)) &&
+    existsSync(marker) &&
+    (await readFile(marker, 'utf8')).trim() === PINNED_CODEX_VERSION
+  ) {
     console.log(`✓ ${platform} codex already present (${PINNED_CODEX_VERSION})`)
     return
   }
 
-  console.log(`↓ ${platform} codex ${PINNED_CODEX_VERSION}…`)
-  const res = await fetch(`${CODEX_BASE}/rust-v${PINNED_CODEX_VERSION}/codex-${triple}.tar.gz`)
-  if (!res.ok) throw new Error(`codex download failed for ${platform}: HTTP ${res.status}`)
+  for (const asset of CODEX_ASSETS) await fetchCodexAsset(platform, triple, asset)
+  await writeFile(marker, `${PINNED_CODEX_VERSION}\n`)
+}
+
+async function fetchCodexAsset(platform, triple, { name, checksums }) {
+  const expected = checksums[platform]
+  if (!expected) throw new Error(`no ${name} checksum configured for ${platform}`)
+  const dest = join(outRoot, platform, name)
+
+  console.log(`↓ ${platform} ${name} ${PINNED_CODEX_VERSION}…`)
+  const res = await fetch(`${CODEX_BASE}/rust-v${PINNED_CODEX_VERSION}/${name}-${triple}.tar.gz`)
+  if (!res.ok) throw new Error(`${name} download failed for ${platform}: HTTP ${res.status}`)
   const buf = Buffer.from(await res.arrayBuffer())
 
   const actual = sha256(buf)
   if (actual !== expected) {
-    throw new Error(`codex checksum mismatch for ${platform}: expected ${expected}, got ${actual}`)
+    throw new Error(`${name} checksum mismatch for ${platform}: expected ${expected}, got ${actual}`)
   }
 
-  // Extract the single self-contained binary (`codex-<triple>`) from the tarball → dest.
+  // Extract the single self-contained binary (`<name>-<triple>`) from the tarball → dest.
   await mkdir(dirname(dest), { recursive: true })
   const tarPath = `${dest}.tar.gz`
-  const stage = join(outRoot, platform, '.codex-stage')
+  const stage = join(outRoot, platform, `.${name}-stage`)
   await writeFile(tarPath, buf)
   await rm(stage, { recursive: true, force: true })
   await mkdir(stage, { recursive: true })
   await execFileP('tar', ['-xzf', tarPath, '-C', stage])
   const entries = await readdir(stage)
-  if (entries.length !== 1) throw new Error(`unexpected codex tarball layout for ${platform}: ${entries.join(', ')}`)
+  if (entries.length !== 1) throw new Error(`unexpected ${name} tarball layout for ${platform}: ${entries.join(', ')}`)
   const tmp = `${dest}.tmp`
   await rename(join(stage, entries[0]), tmp)
   await chmod(tmp, 0o755)
   await rename(tmp, dest)
-  await writeFile(marker, `${PINNED_CODEX_VERSION}\n`)
   await rm(tarPath, { force: true })
   await rm(stage, { recursive: true, force: true })
-  console.log(`✓ ${platform} codex verified + written → ${dest}`)
+  console.log(`✓ ${platform} ${name} verified + written → ${dest}`)
 }
 
 for (const platform of PLATFORMS) {
@@ -139,10 +165,10 @@ for (const platform of PLATFORMS) {
   await fetchCodex(platform)
 }
 
-// Loud failure before packaging: every target platform must have both engines on disk.
+// Loud failure before packaging: every target platform must have both engines, and Codex's helper, on disk.
 const missing = []
 for (const p of PLATFORMS) {
-  for (const name of ['claude', 'codex']) {
+  for (const name of ['claude', ...CODEX_ASSETS.map((asset) => asset.name)]) {
     if (!existsSync(join(outRoot, p, name))) missing.push(`${p}/${name}`)
   }
 }

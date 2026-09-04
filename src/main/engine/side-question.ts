@@ -327,15 +327,18 @@ export function askCodexSideQuestion(
   }
 }
 
+/** Same rule as the driver's `pickModel`: the session's own model goes to the engine untouched (it may
+ *  be an id the account's list hides or lacks; the engine accepts or refuses it), and only a session
+ *  without a pick falls back to what the account lists. */
 async function pickCodexSideModel(
   rpc: (method: string, params: unknown) => Promise<unknown>,
   preferred?: string,
 ): Promise<string | undefined> {
+  if (preferred) return preferred
   const res = (await rpc('model/list', {}).catch(() => null)) as
     | { data?: Array<{ id?: string; isDefault?: boolean }> }
     | null
   const models = (res?.data ?? []).filter((m): m is { id: string; isDefault?: boolean } => !!m.id)
-  if (models.length === 0) return preferred
-  if (preferred && models.some((m) => m.id === preferred)) return preferred
+  if (models.length === 0) return undefined
   return (models.find((m) => m.isDefault) ?? models.find((m) => !m.id.endsWith('-codex')) ?? models[0]).id
 }

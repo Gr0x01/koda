@@ -28,6 +28,8 @@ class FakeCodexProcess extends EventEmitter {
   readonly stderr = new PassThrough()
   readonly requests: Array<{ id: number; method: string; params: Record<string, unknown> }> = []
   readonly responses: Array<{ id: number; result?: unknown; error?: unknown }> = []
+  /** What `model/list` answers — the account's picker-visible catalog. */
+  models: Array<{ id: string; isDefault?: boolean }> = [{ id: 'gpt-5.5', isDefault: true }]
   /** Methods the engine should ANSWER with a JSON-RPC error — how a gone thread actually reads. */
   failMethods = new Set<string>()
   /** Methods whose request kills the transport before any response — distinct from an RPC error. */
@@ -75,7 +77,7 @@ class FakeCodexProcess extends EventEmitter {
         )
         const result =
           request.method === 'model/list'
-            ? { data: [{ id: 'gpt-5.5', isDefault: true }] }
+            ? { data: this.models }
             : request.method === 'thread/start'
               ? { thread: { id: 'parent-thread' }, model: 'gpt-5.5' }
               : request.method === 'thread/resume'
@@ -171,6 +173,33 @@ describe('Codex process configuration', () => {
     expect(child.requests.some((request) => request.method.startsWith('hooks/'))).toBe(false)
 
     await session.dispose()
+  })
+
+  it('sends an explicit model pick to the engine untouched, and defaults only from the account list', async () => {
+    const start = async (model?: string) => {
+      const child = new FakeCodexProcess()
+      child.models = [{ id: 'gpt-5.5', isDefault: true }]
+      spawnMock.mockReturnValue(child)
+      const events: EngineEvent[] = []
+      const session = startCodexSession((event) => events.push(event), {
+        sessionId: `pick-${model ?? 'default'}`,
+        cwd: '/tmp/project',
+        binaryPath: '/fake/codex',
+        decide: async () => ({ kind: 'allow' }),
+        model,
+      })
+      await vi.waitFor(() => expect(events.some((event) => event.type === 'SessionStarted')).toBe(true))
+      const thread = child.requests.find((request) => request.method === 'thread/start')
+      await session.dispose()
+      return thread?.params.model
+    }
+
+    // A new model can be hidden from, or missing in, the account's list before OpenAI switches it on
+    // broadly. A typed pick of it must reach the engine as typed: the engine accepts or refuses it,
+    // and a silent swap to the default would leave the footer naming a model that is not running.
+    expect(await start('gpt-next')).toBe('gpt-next')
+    // Without a pick, the account's listed default runs.
+    expect(await start()).toBe('gpt-5.5')
   })
 
   it('attests workspace skills and MCP tools without starting a hidden model turn', async () => {

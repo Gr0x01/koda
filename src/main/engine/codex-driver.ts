@@ -66,8 +66,9 @@ export interface CodexSessionOpts {
   /** Whether this project's switches intentionally leave any Koda playbook enabled. Runtime
    * `skills/list` still decides ready vs degraded. */
   playbooksExpected?: boolean
-  /** Preferred model id; ignored if the account's `model/list` doesn't include it (we fall back to the
-   *  account default — a ChatGPT subscription rejects the `-codex` thread/start default). */
+  /** Explicit model id, passed to the engine as given (it accepts or refuses it). Absent ⇒ the driver
+   *  picks from the account's `model/list` — a ChatGPT subscription rejects the `-codex` thread/start
+   *  default, so the pick prefers the listed default and skips `-codex` ids. */
   model?: string
   /** Reasoning effort, passed through to the first turn (engine's own terms). */
   effort?: string
@@ -492,15 +493,20 @@ class CodexSession implements EngineSession {
     }
   }
 
-  /** Pick a model the account can actually use: the caller's choice if `model/list` includes it, else
-   *  the account default, else the first non-`-codex` model (a ChatGPT subscription rejects `-codex`). */
+  /** The model this thread starts on. An explicit pick goes to the engine untouched: OpenAI ships a
+   *  new model hidden from `model/list` (or absent from an account's list) before switching it on
+   *  broadly, and the user may type such an id, so the engine is the one to accept or refuse it. A
+   *  refusal surfaces as a session or turn error the user can read; a silent swap to the default would
+   *  leave the footer naming one model while another runs. Without a pick, choose from what the
+   *  account lists: its default, else the first non-`-codex` model (a ChatGPT subscription rejects
+   *  `-codex`). */
   private async pickModel(): Promise<string | undefined> {
+    if (this.opts.model) return this.opts.model
     const res = (await this.rpc('model/list', {}).catch(() => null)) as
       | { data?: Array<{ id?: string; isDefault?: boolean }> }
       | null
     const models = (res?.data ?? []).filter((m): m is { id: string; isDefault?: boolean } => !!m.id)
-    if (models.length === 0) return this.opts.model // empty list → let the engine decide
-    if (this.opts.model && models.some((m) => m.id === this.opts.model)) return this.opts.model
+    if (models.length === 0) return undefined // empty list → let the engine decide
     const def = models.find((m) => m.isDefault)
     if (def) return def.id
     return (models.find((m) => !m.id.endsWith('-codex')) ?? models[0]).id

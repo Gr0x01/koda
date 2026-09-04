@@ -11,6 +11,7 @@ import type {
   ProviderCatalogAvailability,
   ProviderModelCatalogs,
 } from '@shared/ipc'
+import { engineOfModel } from '@shared/usage-value'
 
 /** Per-engine display metadata (brand label, sort order, chart accent) — ONE source so the Usage view,
  *  status bar, and every model picker read the same names/colors. These are ENGINE brands, not model
@@ -126,9 +127,7 @@ const MODEL_CHOICE_BUILDERS: Record<
       description: alias.description,
       badge: alias.recommended ? 'Recommended' : undefined,
     })),
-    ...context.recentModels
-      .filter((id) => id !== context.model && !isModelAlias(id))
-      .map((id) => ({ id, label: prettyModel(id), description: id })),
+    ...recentChoices('claude', context, new Set()),
     defaultChoice('claude', context),
   ],
   codex: (context) => [
@@ -137,8 +136,32 @@ const MODEL_CHOICE_BUILDERS: Record<
       label: item.label,
       badge: item.isDefault ? 'Recommended' : undefined,
     })),
+    ...recentChoices(
+      'codex',
+      context,
+      new Set(context.providerCatalogs.codex.models.map((item) => item.id)),
+    ),
     defaultChoice('codex', context),
   ],
+}
+
+/** Typed full ids the user has run before, as quick-picks under the provider they belong to. One
+ *  shared recents list serves both engines, so each picker keeps only the ids shaped like its own and
+ *  skips anything the provider catalog already offers. */
+function recentChoices(
+  provider: EngineId,
+  context: ModelChoiceContext,
+  offered: ReadonlySet<string>,
+): ModelChoice[] {
+  return context.recentModels
+    .filter(
+      (id) =>
+        id !== context.model &&
+        !isModelAlias(id) &&
+        !offered.has(id) &&
+        engineOfModel(id) === provider,
+    )
+    .map((id) => ({ id, label: prettyModel(id), description: id }))
 }
 
 export function modelChoicesFor(
@@ -206,12 +229,23 @@ export function isModelAlias(id: string): boolean {
  */
 export function prettyModel(id: string): string {
   if (ALIAS_LABELS[id]) return ALIAS_LABELS[id]
-  const body = id.replace(/^claude-/, '')
-  const m = /^([a-z]+)-(\d+(?:[-.]\d+)*)/.exec(body)
-  if (m) {
-    // 'gpt' is an initialism (GPT-5.5), not a title-cased word (Opus 4.8).
-    const family = m[1] === 'gpt' ? 'GPT' : `${m[1][0].toUpperCase()}${m[1].slice(1)}`
-    return `${family} ${m[2].replace(/-/g, '.')}`
+  // The 1M-context suffix is a variant flag, not part of the name (`claude-opus-5[1m]` → "Opus 5").
+  const body = id.replace(/^claude-/, '').replace(/\[\d+m\]$/i, '')
+  const m = /^([a-z]+)-(\d+(?:[-.]\d+)*)(?:-([a-z][a-z0-9-]*))?$/.exec(body)
+  if (!m) return id
+  const version = m[2].replace(/-/g, '.')
+  // OpenAI ids are an initialism plus a tier word after the version (`gpt-5.6-sol`, `gpt-6-astra`),
+  // and the tier is what tells two same-version models apart, so it stays: "GPT-5.6 Sol".
+  if (m[1] === 'gpt') {
+    const tier = m[3] ? ` ${titleWords(m[3])}` : ''
+    return `GPT-${version}${tier}`
   }
-  return id
+  return `${titleWords(m[1])} ${version}`
+}
+
+function titleWords(slug: string): string {
+  return slug
+    .split('-')
+    .map((w) => `${w[0].toUpperCase()}${w.slice(1)}`)
+    .join(' ')
 }

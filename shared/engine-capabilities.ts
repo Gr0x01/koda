@@ -54,8 +54,10 @@ export interface EngineCapabilities {
    */
   transcriptOnDisk: boolean
   /**
-   * Does the engine accept an arbitrary model id the user typed, beyond the offered catalog? Claude
-   * does (and Koda remembers the ones that worked as quick-picks); Codex answers from `model/list`.
+   * Does the engine accept an arbitrary model id the user typed, beyond the offered catalog? Both do,
+   * and Koda remembers the ones that worked as quick-picks. Claude has no enumerable catalog at all;
+   * Codex lists one from `model/list`, but OpenAI ships a new model hidden from that picker list before
+   * it is switched on broadly, so a typed id is how an entitled account reaches it on day one.
    */
   customModelIds: boolean
   /**
@@ -111,7 +113,7 @@ export const CODEX_CAPABILITIES: EngineCapabilities = {
   planMode: 'turnText',
   approvals: 'native',
   transcriptOnDisk: false,
-  customModelIds: false,
+  customModelIds: true,
   anchorsFiveHourWindow: false,
   apiKeyFallback: false,
   delegation: 'collab',

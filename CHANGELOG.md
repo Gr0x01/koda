@@ -10,20 +10,46 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
 
 ## [Unreleased]
 
+## [0.1.16] - 2026-09-03
+
+### Added
+
+- GPT-6 Astra, OpenAI's newest model, runs in Koda from the day it reaches your ChatGPT plan. OpenAI
+  ships a new model hidden from the Codex model list until it is switched on for everyone, so the
+  Codex model menu now takes a typed model ID the same way the Claude menu does, remembers it as a
+  quick pick, and sends it to the engine unchanged. If your plan does not have the model yet, the
+  engine says so on the first message instead of Koda quietly running a different model.
+
+### Changed
+
+- Updated the bundled Codex engine to 0.153.1, the first build that knows GPT-6 Astra.
+
+- Visual design work now pushes harder for variety. New looks get seeded so two runs don't land on
+  the same design, an open direction gets two or three small mocks to choose from instead of one,
+  and a fresh critic checks the rendered page against the brief's bar before you see it.
+
+- OpenAI model names now keep their tier, so the footer and Usage screens read "GPT-5.6 Sol" and
+  "GPT-6 Astra" instead of "GPT 5.6" for every tier.
+
+### Fixed
+
+- Codex sessions on the GPT-5.6 models could quietly lose their shell and file tools. Those models,
+  and GPT-6 Astra, run every tool through a small helper program that OpenAI ships beside the Codex
+  command, and Koda bundled the command without the helper. The helper now ships with Koda, so the
+  agent can read, edit, and run things again on every current OpenAI model.
+
 ## [0.1.15] - 2026-09-02
 
 ### Changed
 
-- Picking Fable now runs Fable 5.1, Claude's newest and most capable model, released the day
-  before this update.
+- Picking Fable now runs Fable 5.1, the newest Claude model.
 
 - Updated the bundled Claude engine to 2.1.258.
 
 - Updated the bundled Codex engine to 0.152.1.
 
-- Usage prices now match Anthropic's latest published rates. Sonnet 5 keeps its lower launch price
-  for good, and the new Fable 5.1 model shows real dollar figures from day one, including its
-  cheaper cache reads.
+- Usage prices now match Anthropic's current published rates. Sonnet 5 keeps its lower launch
+  price for good, and Fable 5.1 is priced with its cheaper cache reads.
 
 ### Fixed
 
@@ -656,7 +682,8 @@ _First versioned build — the baseline the auto-updater ships from._
 - Settings now shows the Koda version, the bundled Claude engine version, and a
   "Check for updates" button.
 
-[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.15...HEAD
+[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.16...HEAD
+[0.1.16]: https://github.com/Gr0x01/koda/releases/tag/v0.1.16
 [0.1.15]: https://github.com/Gr0x01/koda/releases/tag/v0.1.15
 [0.1.14]: https://github.com/Gr0x01/koda/releases/tag/v0.1.14
 [0.1.13]: https://github.com/Gr0x01/koda/releases/tag/v0.1.13

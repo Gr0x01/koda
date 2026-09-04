@@ -25,12 +25,16 @@ export function compareStableVersions(left, right) {
   return 0
 }
 
-function validateInputs(engine, version, darwinSha) {
+function validateInputs(engine, version, darwinSha, darwinHostSha) {
   if (engine !== 'claude' && engine !== 'codex') throw new Error('engine must be claude or codex')
   if (!VERSION_RE.test(version)) throw new Error(`invalid stable engine version: ${version}`)
-  if (engine === 'claude' && darwinSha !== undefined) throw new Error('Claude bumps do not accept a tarball SHA')
-  if (engine === 'codex' && !SHA256_RE.test(darwinSha ?? '')) {
-    throw new Error('Codex bumps require a 64-character lowercase SHA-256')
+  if (engine === 'claude' && (darwinSha !== undefined || darwinHostSha !== undefined)) {
+    throw new Error('Claude bumps do not accept a tarball SHA')
+  }
+  // The CLI and its code-mode helper ship as two assets of one release; a bump that pins only one
+  // would fetch a helper from a different version than the CLI that spawns it.
+  if (engine === 'codex' && !(SHA256_RE.test(darwinSha ?? '') && SHA256_RE.test(darwinHostSha ?? ''))) {
+    throw new Error('Codex bumps require a 64-character lowercase SHA-256 for both the CLI and the code-mode host')
   }
 }
 
@@ -65,7 +69,7 @@ export function updateUnreleasedEngineLine(changelog, engine, version) {
   return `${before}${separator}### Changed\n\n${line}\n${after}`
 }
 
-function updatedEngineSource(source, engine, version, darwinSha) {
+function updatedEngineSource(source, engine, version, darwinSha, darwinHostSha) {
   const currentPattern = engine === 'claude'
     ? /const PINNED_VERSION = '([^']+)'/
     : /const PINNED_CODEX_VERSION = '([^']+)'/
@@ -89,31 +93,45 @@ function updatedEngineSource(source, engine, version, darwinSha) {
       `const PINNED_CODEX_VERSION = '${version}'`,
       'Codex pin',
     )
+    // Two sibling assets, two checksum maps; each pattern is anchored to its own map so neither
+    // replacement can land in the other.
     source = replaceExactlyOnce(
       source,
-      /'darwin-arm64': '[a-f0-9]+'/,
-      `'darwin-arm64': '${darwinSha}'`,
+      /(const CODEX_TARBALL_SHA256 = \{\n\s*'darwin-arm64': ')[a-f0-9]+(')/,
+      `$1${darwinSha}$2`,
       'Codex darwin-arm64 checksum',
+    )
+    source = replaceExactlyOnce(
+      source,
+      /(const CODEX_HOST_TARBALL_SHA256 = \{\n\s*'darwin-arm64': ')[a-f0-9]+(')/,
+      `$1${darwinHostSha}$2`,
+      'Codex code-mode host darwin-arm64 checksum',
     )
   }
 
   return source
 }
 
-export function applyEngineBump({ root = SCRIPT_ROOT, engine, version, darwinSha }) {
-  validateInputs(engine, version, darwinSha)
+export function applyEngineBump({ root = SCRIPT_ROOT, engine, version, darwinSha, darwinHostSha }) {
+  validateInputs(engine, version, darwinSha, darwinHostSha)
 
   const enginePath = join(root, 'scripts', 'fetch-engine.mjs')
   const changelogPath = join(root, 'CHANGELOG.md')
-  const source = updatedEngineSource(readFileSync(enginePath, 'utf8'), engine, version, darwinSha)
+  const source = updatedEngineSource(
+    readFileSync(enginePath, 'utf8'),
+    engine,
+    version,
+    darwinSha,
+    darwinHostSha,
+  )
 
   const changelog = updateUnreleasedEngineLine(readFileSync(changelogPath, 'utf8'), engine, version)
   writeFileSync(enginePath, source)
   writeFileSync(changelogPath, changelog)
 }
 
-export function verifyEngineBumpWorktree({ root = SCRIPT_ROOT, engine, version, darwinSha }) {
-  validateInputs(engine, version, darwinSha)
+export function verifyEngineBumpWorktree({ root = SCRIPT_ROOT, engine, version, darwinSha, darwinHostSha }) {
+  validateInputs(engine, version, darwinSha, darwinHostSha)
   const gitOutput = (args) => {
     const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' })
     if (result.status !== 0) throw new Error(result.stderr.trim() || `git ${args[0]} failed`)
@@ -139,6 +157,7 @@ export function verifyEngineBumpWorktree({ root = SCRIPT_ROOT, engine, version, 
     engine,
     version,
     darwinSha,
+    darwinHostSha,
   )
   if (readFileSync(enginePath, 'utf8') !== expectedEngine) {
     throw new Error('engine file differs from the exact guarded pin update')
@@ -170,10 +189,11 @@ async function main() {
   const engine = arg('engine')
   const version = arg('version')
   const darwinSha = arg('darwin-sha')
+  const darwinHostSha = arg('darwin-host-sha')
   if ((verb !== 'apply' && verb !== 'verify') || !engine || !version) {
-    throw new Error('usage: apply-engine-bump.mjs <apply|verify> --engine <claude|codex> --version <version> [--darwin-sha <sha256>]')
+    throw new Error('usage: apply-engine-bump.mjs <apply|verify> --engine <claude|codex> --version <version> [--darwin-sha <sha256> --darwin-host-sha <sha256>]')
   }
-  const options = { engine, version, darwinSha }
+  const options = { engine, version, darwinSha, darwinHostSha }
   if (verb === 'apply') applyEngineBump(options)
   else verifyEngineBumpWorktree(options)
 }
