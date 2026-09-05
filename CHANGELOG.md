@@ -10,6 +10,10 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
 
 ## [Unreleased]
 
+### Changed
+
+- Updated the bundled Codex engine to 0.153.2.
+
 ## [0.1.16] - 2026-09-03
 
 ### Added
