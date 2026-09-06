@@ -40,14 +40,14 @@ const CLAUDE_BASE = 'https://downloads.claude.ai/claude-code-releases'
 // ── Codex ──────────────────────────────────────────────────────────────────────────────────────────
 // Latest GitHub-releases `stable` (non-prerelease) at pin time. The codex-contract job updates BOTH the
 // version and the per-platform tarball SHA only after its real app-server contract and repository gate.
-const PINNED_CODEX_VERSION = '0.153.2'
+const PINNED_CODEX_VERSION = '0.153.4'
 const CODEX_BASE = 'https://github.com/openai/codex/releases/download'
 // koda platform → codex release triple.
 const CODEX_TRIPLE = { 'darwin-arm64': 'aarch64-apple-darwin' }
 // SHA-256 of the plain `codex-<triple>.tar.gz` asset, per koda platform. Self-pinned (OpenAI publishes no
 // checksum for the plain binary). Recompute when bumping PINNED_CODEX_VERSION.
 const CODEX_TARBALL_SHA256 = {
-  'darwin-arm64': '91dfc270f0dfbaec16d814f1aa90d4f27e74dc9e3784e64006bef3b79fe9e09c',
+  'darwin-arm64': '8cf911ea676523bfb2121ec561848d2aba564890ad536db4d8a3353f2b9850b1',
 }
 // SHA-256 of the sibling `codex-code-mode-host-<triple>.tar.gz` asset from the SAME release. Every
 // GPT-5.6 model and GPT-6 Astra run `tool_mode: code_mode_only`, and the CLI spawns this helper from
@@ -55,7 +55,7 @@ const CODEX_TARBALL_SHA256 = {
 // have no working shell or file tools (Koda's own dev logs showed the spawn failure from 2026-08-26).
 // Homebrew and npm install both binaries side by side; this reproduces that layout.
 const CODEX_HOST_TARBALL_SHA256 = {
-  'darwin-arm64': '3471e54a6141fbcbe94cec87d14370353667d40f350ef16faa005ebc1854300b',
+  'darwin-arm64': '45a9b0fdf53b98b85a6bb91e175dd90e961328a7a14fb50a40902205199df1df',
 }
 
 const PLATFORMS = ['darwin-arm64']
