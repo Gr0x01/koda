@@ -670,8 +670,14 @@ class ClaudeSession implements EngineSession {
             // text; a signed-out engine instead prints a terse "Not logged in · Please run /login". Lift
             // either out of the transcript into a typed EngineError so the UI shows a calm, actionable
             // banner (auth → a Sign in button) instead of raw prose a non-engineer can't act on.
-            if (!parentToolUseId && (isApiErrorText(block.text) || isAuthRequiredText(block.text))) {
-              this.emitApiError(block.text)
+            if (!parentToolUseId && (ev?.is_api_error_message === true || isApiErrorText(block.text) || isAuthRequiredText(block.text))) {
+              // `is_api_error_message` is the CLI's own marking (it pairs with `model: "<synthetic>"`
+              // and a typed `error` code), so it catches failures whose prose the two matchers below
+              // never anticipated — a rejected `--model` reads like ordinary assistant text otherwise,
+              // and rendering it as conversation is how a session silently keeps running the model the
+              // user thought they had changed. The text matchers stay as the fallback for any build
+              // that reports an API error without the flag.
+              this.emitApiError(block.text, typeof ev?.error === 'string' ? ev.error : undefined)
             } else {
               this.emit({ type: 'AssistantBlock', sessionId: this.id, markdown: block.text, parentToolUseId })
             }
@@ -969,13 +975,16 @@ class ClaudeSession implements EngineSession {
 
   /** A turn-level API failure the CLI printed as assistant text. Non-fatal (the process stays alive for
    *  the next turn); `category: 'apiError'` flags it for the composer error banner. */
-  private emitApiError(message: string): void {
+  private emitApiError(message: string, errorCode?: string): void {
     this.emit({
       type: 'EngineError',
       sessionId: this.id,
       message,
       fatal: false,
       category: 'apiError',
+      ...(errorCode ? { errorCode } : {}),
+      // `this.model` is the id the engine echoed at `system/init`, which is the one it then refused.
+      ...(errorCode === 'model_not_found' && this.model ? { model: this.model } : {}),
       ...(looksLikeProviderDown(message) ? { providerStatus: 'down' as const } : {}),
     })
   }

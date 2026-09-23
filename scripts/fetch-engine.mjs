@@ -34,20 +34,20 @@ const execFileP = promisify(execFile)
 // engine-contract gate before pinning (2026-09-02). Re-converge on `stable` at the next bump. The
 // engine-contract workflow verifies, writes, and merges only a strictly newer compatible stable pin.
 // NOTE: check-engine-floor.mjs + the workflow read `PINNED_VERSION` by regex — keep the name.
-const PINNED_VERSION = '2.1.278'
+const PINNED_VERSION = '2.1.280'
 const CLAUDE_BASE = 'https://downloads.claude.ai/claude-code-releases'
 
 // ── Codex ──────────────────────────────────────────────────────────────────────────────────────────
 // Latest GitHub-releases `stable` (non-prerelease) at pin time. The codex-contract job updates BOTH the
 // version and the per-platform tarball SHA only after its real app-server contract and repository gate.
-const PINNED_CODEX_VERSION = '0.155.1'
+const PINNED_CODEX_VERSION = '0.156.1'
 const CODEX_BASE = 'https://github.com/openai/codex/releases/download'
 // koda platform → codex release triple.
 const CODEX_TRIPLE = { 'darwin-arm64': 'aarch64-apple-darwin' }
 // SHA-256 of the plain `codex-<triple>.tar.gz` asset, per koda platform. Self-pinned (OpenAI publishes no
 // checksum for the plain binary). Recompute when bumping PINNED_CODEX_VERSION.
 const CODEX_TARBALL_SHA256 = {
-  'darwin-arm64': '5e5a51470dce2423f9d96bd191d0bbc4cc0e2848a6833df5178eaf47a07a3768',
+  'darwin-arm64': '2bd64af14dedd47795f2f6bfd5d125cf79199acc2c7ba222144e08127111a5ca',
 }
 // SHA-256 of the sibling `codex-code-mode-host-<triple>.tar.gz` asset from the SAME release. Every
 // GPT-5.6 model and GPT-6 Astra run `tool_mode: code_mode_only`, and the CLI spawns this helper from
@@ -55,7 +55,7 @@ const CODEX_TARBALL_SHA256 = {
 // have no working shell or file tools (Koda's own dev logs showed the spawn failure from 2026-08-26).
 // Homebrew and npm install both binaries side by side; this reproduces that layout.
 const CODEX_HOST_TARBALL_SHA256 = {
-  'darwin-arm64': 'e8957108eebd70963b0906857ceb7f7a2b477d1972a7147041c625d4071b508a',
+  'darwin-arm64': '2625d023e2b6e03d2bcc437a3e0e0831c25d3c722d2854638a8e74921ff79bd9',
 }
 
 const PLATFORMS = ['darwin-arm64']

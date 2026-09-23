@@ -10,7 +10,10 @@ import { useWorkspace, type EngineErrorBanner } from '../../workspace/store'
  * get a one-click button straight to the fix, so a signed-out user never has to go hunting for Settings.
  */
 export function ComposerError({ error, onRetry }: { error: EngineErrorBanner; onRetry: () => void }) {
-  const { title, detail, retryable, action } = friendlyEngineError(error.message, error.fatal)
+  const { title, detail, retryable, action } = friendlyEngineError(error.message, error.fatal, {
+    code: error.errorCode,
+    model: error.model,
+  })
   const openSettingsTo = useWorkspace((s) => s.openSettingsTo)
   return (
     <div className="flex items-center gap-2 text-[13px] leading-5">

@@ -643,3 +643,75 @@ describe('Claude driver: child stop and parent interrupt are separate verbs', ()
     ])
   })
 })
+
+describe('Claude driver: a refused model', () => {
+  it('reports the engine’s own rejection as a typed error instead of conversation text', async () => {
+    const child = new FakeClaudeProcess()
+    spawnMock.mockReturnValue(child)
+    const events: EngineEvent[] = []
+    startClaudeSession((event) => events.push(event), {
+      sessionId: 'bad-model',
+      cwd: '/tmp/koda-model-test',
+      model: 'claude-opus-5.5',
+    })
+
+    child.stdout.write(
+      `${JSON.stringify({
+        type: 'system',
+        subtype: 'init',
+        model: 'claude-opus-5.5',
+        tools: [],
+        cwd: '/tmp/koda-model-test',
+      })}\n`,
+    )
+    // The shape the CLI really sends (2.1.280): synthetic author, typed code, error flag.
+    child.stdout.write(
+      `${JSON.stringify({
+        type: 'assistant',
+        error: 'model_not_found',
+        is_api_error_message: true,
+        message: {
+          model: '<synthetic>',
+          role: 'assistant',
+          content: [
+            {
+              type: 'text',
+              text: "There's an issue with the selected model (claude-opus-5.5). It may not exist or you may not have access to it. Run --model to pick a different model.",
+            },
+          ],
+        },
+      })}\n`,
+    )
+    await tick()
+
+    expect(events.some((e) => e.type === 'AssistantBlock')).toBe(false)
+    const error = events.find((e) => e.type === 'EngineError')
+    expect(error).toMatchObject({
+      category: 'apiError',
+      errorCode: 'model_not_found',
+      model: 'claude-opus-5.5',
+      fatal: false,
+    })
+  })
+
+  it('leaves an ordinary answer in the transcript', async () => {
+    const child = new FakeClaudeProcess()
+    spawnMock.mockReturnValue(child)
+    const events: EngineEvent[] = []
+    startClaudeSession((event) => events.push(event), { sessionId: 'good-model', cwd: '/tmp/koda-model-test' })
+
+    child.stdout.write(
+      `${JSON.stringify({ type: 'system', subtype: 'init', model: 'claude-opus-5-5', tools: [], cwd: '/tmp/koda-model-test' })}\n`,
+    )
+    child.stdout.write(
+      `${JSON.stringify({
+        type: 'assistant',
+        message: { model: 'claude-opus-5-5', role: 'assistant', content: [{ type: 'text', text: 'Here you go.' }] },
+      })}\n`,
+    )
+    await tick()
+
+    expect(events.some((e) => e.type === 'EngineError')).toBe(false)
+    expect(events.find((e) => e.type === 'AssistantBlock')).toMatchObject({ markdown: 'Here you go.' })
+  })
+})

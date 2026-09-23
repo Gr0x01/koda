@@ -45,8 +45,35 @@ export function looksLikeProviderDown(message: string): boolean {
   )
 }
 
-export function friendlyEngineError(message: string, fatal: boolean): FriendlyEngineError {
+/** What the engine itself said about the failure, when it said anything machine-readable. Passed
+ *  straight through from `EngineError`; absent on older events and on failures the engine only
+ *  described in prose. */
+export interface EngineErrorFacts {
+  code?: string
+  model?: string
+}
+
+export function friendlyEngineError(
+  message: string,
+  fatal: boolean,
+  facts: EngineErrorFacts = {},
+): FriendlyEngineError {
   const m = message.toLowerCase()
+
+  // Checked before every prose test below: a typed code from the engine outranks pattern-matching its
+  // sentence. `model_not_found` covers both halves of what the CLI reports ("may not exist or you may
+  // not have access"), and neither half is fixed by retrying, so the banner offers no Try again.
+  if (facts.code === 'model_not_found')
+    return {
+      tone: 'engine',
+      title: 'That model is not available',
+      // Wording stays true on both heads: the desktop picker sits under this row, the phone's lives in
+      // the session sheet, so the copy points at the choice rather than at a place on one screen.
+      detail: facts.model
+        ? `No model called ${facts.model}. Choose a different one and send again.`
+        : 'Your engine does not have the model this chat asked for. Choose a different one and send again.',
+      retryable: false,
+    }
 
   if (message === RELAY_UNREACHABLE)
     return {

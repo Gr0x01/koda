@@ -473,6 +473,14 @@ export const EngineErrorSchema = z.object({
    *  Consumed by the session manager (it restarts the session clean and posts the recovery notice), so
    *  it never reaches a surface. */
   category: z.enum(['apiError', 'turnRejected', 'resumeMiss']).optional(),
+  /** The engine's OWN machine-readable failure code when it gives one (Claude 2.1.280 puts `error`
+   *  on the synthetic assistant event, e.g. `model_not_found`). Copy keys on this instead of matching
+   *  the sentence, which is rewritten between CLI releases while the code stays put. */
+  errorCode: z.string().optional(),
+  /** The model the failed turn asked for, carried only when the failure is ABOUT the model. Naming the
+   *  rejected id is the whole fix: `claude-opus-5.5` and `claude-opus-5-5` are one character apart and
+   *  a user cannot tell which one they picked from a menu that shows a friendly label. */
+  model: z.string().optional(),
 })
 
 /** The severity the provider's status page is reporting, so the chip's word stays honest — a slowdown is

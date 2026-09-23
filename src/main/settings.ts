@@ -201,6 +201,22 @@ export function addRecentModel(model: string): string[] {
   return next
 }
 
+/** Drop a model id the engine refused. The list above is sold as "built from real usage", but it is
+ *  written the moment the user picks an id, before any turn proves the id exists. Leaving a refused one
+ *  in place turns a typo into a permanent quick-pick that fails the same way every time it is tapped. */
+export function forgetRecentModel(model: string): string[] {
+  const id = model.trim()
+  const current = loadRecentModels()
+  if (!id || !current.includes(id)) return current
+  const next = current.filter((m) => m !== id)
+  try {
+    writeFileAtomic(settingsPath(), JSON.stringify({ ...readSettings(), recentModels: next }, null, 2))
+  } catch (err) {
+    log.warn('settings', 'failed to persist recent models', err instanceof Error ? err.message : err)
+  }
+  return next
+}
+
 /**
  * Local-assist toggle — Apple-style default-on (does the considerate polish unless turned off). Read
  * live by the assist engine, so the Settings toggle (`settings:set assistEnabled`) takes effect on the

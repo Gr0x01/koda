@@ -10,6 +10,25 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-09-23
+
+### Changed
+
+- Choosing Opus now runs Claude Opus 5.5, Anthropic's newest Opus model. The last update taught Usage
+  what Opus 5.5 costs, but the Claude engine it shipped with could not run the model yet. This one can.
+
+- Updated the bundled Claude engine to 2.1.280.
+
+- Updated the bundled Codex engine to 0.156.1.
+
+### Fixed
+
+- A model your engine does not have now fails as a short notice that names the exact ID it refused.
+  Until now Koda passed the engine's refusal through as ordinary conversation text, so a chat could go
+  on running the model you thought you had just changed, and the only clue was a paragraph that looked
+  like it came from the agent. The refused ID also leaves the model menu's recent picks, so a typo
+  cannot sit there waiting to be tapped again.
+
 ## [0.1.18] - 2026-09-23
 
 ### Changed
@@ -733,7 +752,8 @@ _First versioned build — the baseline the auto-updater ships from._
 - Settings now shows the Koda version, the bundled Claude engine version, and a
   "Check for updates" button.
 
-[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.18...HEAD
+[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.19...HEAD
+[0.1.19]: https://github.com/Gr0x01/koda/releases/tag/v0.1.19
 [0.1.18]: https://github.com/Gr0x01/koda/releases/tag/v0.1.18
 [0.1.17]: https://github.com/Gr0x01/koda/releases/tag/v0.1.17
 [0.1.16]: https://github.com/Gr0x01/koda/releases/tag/v0.1.16

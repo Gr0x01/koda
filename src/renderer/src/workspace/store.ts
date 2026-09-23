@@ -205,6 +205,27 @@ export interface SessionState {
 export interface EngineErrorBanner {
   message: string
   fatal: boolean
+  /** The engine's typed failure code and the model it refused, when it gave them. The banner keys its
+   *  copy on these rather than on the sentence, which the CLI rewords between releases. */
+  errorCode?: string
+  model?: string
+}
+
+/** The one lift from an engine failure into banner state. Live turns and reload restores both go through
+ *  it, because a restore that drops the typed fields silently downgrades a named model rejection back to
+ *  "Something went wrong" and the user loses the one detail that explains the failure. */
+export function engineErrorBanner(e: {
+  message: string
+  fatal: boolean
+  errorCode?: string
+  model?: string
+}): EngineErrorBanner {
+  return {
+    message: e.message,
+    fatal: e.fatal,
+    ...(e.errorCode ? { errorCode: e.errorCode } : {}),
+    ...(e.model ? { model: e.model } : {}),
+  }
 }
 
 /** A side question's lifecycle in the renderer. `id` correlates the streamed answer from main. */
@@ -512,7 +533,7 @@ function sessionStateFromPersisted(
     live: false,
     attention: false,
     ...(turnFailure
-      ? { error: { message: turnFailure.error.message, fatal: turnFailure.error.fatal } }
+      ? { error: engineErrorBanner(turnFailure.error) }
       : {}),
     approvalMode: s.approvalMode ?? defaultApprovalMode,
     model: s.model,
@@ -2371,7 +2392,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
               // Otherwise a renderer reload has neither the transient banner nor an eligible replay tail.
               items: banner ? attachTurnFailureToTranscript(terminal.items, e) : terminal.items,
               errored: e.fatal || turnRejected ? true : s.errored,
-              ...(banner ? { error: { message: e.message, fatal: e.fatal } } : {}),
+              ...(banner ? { error: engineErrorBanner(e) } : {}),
             }
           })
           // A terminal error drops any now-stale prompt so the session cannot die stuck on "Needs your
@@ -2676,7 +2697,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
               ),
               errored: !!turnFailure?.error.fatal || turnFailure?.error.category === 'turnRejected',
               ...(turnFailure
-                ? { error: { message: turnFailure.error.message, fatal: turnFailure.error.fatal } }
+                ? { error: engineErrorBanner(turnFailure.error) }
                 : { error: undefined }),
             }
           })

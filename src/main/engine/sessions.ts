@@ -153,6 +153,7 @@ import {
   loadImageDetail,
   loadSettings,
   loadRecentModels,
+  forgetRecentModel,
   loadLastPosture,
   saveLastPosture,
   loadCritiquePass,
@@ -5251,6 +5252,11 @@ export class EngineSessionManager {
       void this.recoverResumeMiss(event.sessionId)
       return undefined
     }
+    // The engine refused the model this turn asked for. The banner tells the user; this keeps the dead
+    // id from staying one tap away in the picker's recents, where it was written at pick time without
+    // any turn ever proving it existed.
+    if (event.type === 'EngineError' && event.errorCode === 'model_not_found' && event.model)
+      forgetRecentModel(event.model)
     this.logEvent(event)
     this.trackSubagentLifecycle(event)
     // Delegates can start or finish after the parent turn; their posture also invalidates older polls.

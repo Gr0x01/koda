@@ -4,7 +4,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  addRecentModel,
+  forgetRecentModel,
   loadCritiquePass,
+  loadRecentModels,
   loadRemEnabled,
   loadSessionAgentRole,
   loadSettings,
@@ -27,6 +30,23 @@ function cleanSettings(): void {
 afterEach(() => {
   vi.restoreAllMocks()
   cleanSettings()
+})
+
+describe('recent models', () => {
+  it('forgets an id the engine refused and keeps the rest in order', () => {
+    addRecentModel('claude-opus-4-6')
+    addRecentModel('claude-opus-5.5')
+    expect(loadRecentModels()).toEqual(['claude-opus-5.5', 'claude-opus-4-6'])
+
+    expect(forgetRecentModel('claude-opus-5.5')).toEqual(['claude-opus-4-6'])
+    expect(loadRecentModels()).toEqual(['claude-opus-4-6'])
+  })
+
+  it('leaves the list alone when the id was never in it', () => {
+    addRecentModel('claude-opus-4-6')
+    expect(forgetRecentModel('gpt-6-astra')).toEqual(['claude-opus-4-6'])
+    expect(forgetRecentModel('  ')).toEqual(['claude-opus-4-6'])
+  })
 })
 
 describe('REM dogfood gate', () => {
