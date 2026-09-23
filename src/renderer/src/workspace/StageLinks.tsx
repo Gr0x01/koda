@@ -51,10 +51,9 @@ export function StageLinkProvider({ children }: { children: ReactNode }) {
       void window.koda
         .resolveStageLink({ ...(activeId ? { sessionId: activeId } : {}), href })
         .then((target) => {
-          if (target.kind !== 'file') {
-            if (target.reason) reportRefusal(target.reason)
-            return
-          }
+          // A refusal always speaks. A click that resolves to nothing and says nothing is
+          // indistinguishable from a broken app, which is how these links were being experienced.
+          if (target.kind !== 'file') return reportRefusal(target.reason ?? "Koda couldn't open that link.")
           const state = useWorkspace.getState()
           const cwd = activeId ? state.sessions[activeId]?.cwd : state.projectPath
           const absolute = target.absolutePath ?? (cwd ? `${cwd.replace(/\/+$/, '')}/${target.path}` : null)

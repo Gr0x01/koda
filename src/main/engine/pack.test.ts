@@ -70,6 +70,30 @@ describe('ambient context assembly', () => {
     expect(wired.length).toBeLessThan(5_000)
   })
 
+  it('routes private self-use toward Koda mini apps without hijacking standalone products', () => {
+    const cwd = project()
+    for (const engine of ['claude', 'codex'] as const) {
+      const text = assembleGuardrailText({ cwd, brokerWired: true, miniAppsWired: true, engine })
+      expect(text).toContain('wants an app for their own use')
+      expect(text).toContain('has not asked for a standalone destination')
+      expect(text).toContain('intend to publish or distribute it')
+      expect(text).toContain('including a game')
+      expect(text).toContain('use the normal project route')
+      expect(text).toContain('Do not infer a mini app merely from the word app')
+      expect(text).not.toContain('app with its own screen or data')
+      expect(text.length).toBeLessThan(5_000)
+    }
+
+    const shaping = readFileSync(join(resolvePack()!.dir, 'skills', 'shape-new-work', 'SKILL.md'), 'utf8')
+    expect(shaping).toContain("Private apps for the user's own use with no standalone destination")
+
+    const recipe = readFileSync(
+      join(resolveStagingPack()!.dir, 'skills', 'create-mini-app', 'SKILL.md'),
+      'utf8',
+    )
+    expect(recipe).toContain('Do not use when the user wants to publish or distribute it')
+  })
+
   it('bounds and sanitizes the card, and fails soft to the folder name', () => {
     const cwd = project('project card ')
     mkdirSync(join(cwd, '.koda', 'memory'), { recursive: true })

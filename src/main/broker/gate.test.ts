@@ -14,17 +14,38 @@ import { ApprovalGate } from './gate'
 function makeGate(checkpoint: (sessionId: string, label: string) => Promise<boolean> = async () => true) {
   const cancelled: string[] = []
   const resolved: Array<{ sessionId: string; requestId: string }> = []
+  // Every gate frame's pending revision, in push order. A remote head orders a launcher row against
+  // these, so what matters is that each frame carries the value the set actually moved to.
+  const pushedRevisions: number[] = []
   const gate = new ApprovalGate(
     checkpoint,
-    () => {}, // pushRequest
-    (sessionId) => cancelled.push(sessionId), // pushCancelled
-    (sessionId, requestId) => resolved.push({ sessionId, requestId }), // pushResolved
+    (req) => {
+      if (typeof req.revision === 'number') pushedRevisions.push(req.revision)
+    },
+    (sessionId, revision) => {
+      cancelled.push(sessionId)
+      pushedRevisions.push(revision)
+    },
+    (sessionId, requestId, revision) => {
+      resolved.push({ sessionId, requestId })
+      pushedRevisions.push(revision)
+    },
     () => {}, // warn
   )
-  return { gate, cancelled, resolved }
+  return { gate, cancelled, resolved, pushedRevisions }
 }
 
 describe('cancelSession vs forgetSession: process-exit vs session-identity', () => {
+  it('keeps status identity through process replacement and renews it after true session end', () => {
+    const { gate } = makeGate()
+    const epoch = gate.statusEpoch('s1')
+    gate.cancelSession('s1')
+    expect(gate.statusEpoch('s1')).toBe(epoch)
+    gate.forgetSession('s1')
+    expect(gate.statusEpoch('s1')).not.toBe(epoch)
+    expect(makeGate().gate.statusEpoch('s1')).not.toBe(epoch)
+  })
+
   it('keeps the full pending prompt available for a head that reloads after the live push', async () => {
     const { gate } = makeGate()
     gate.setSessionMode('s1', 'ask')
@@ -51,6 +72,60 @@ describe('cancelSession vs forgetSession: process-exit vs session-identity', () 
     expect(gate.getSessionMode('s1')).toBe('ask') // the respawn case — mode survives
     expect(cancelled).toEqual(['s1'])
     expect(await pending).toEqual({ kind: 'deny', reason: 'session ended' })
+  })
+
+  it('moves the pending revision on every add and every remove, and pushes the value it moved to', async () => {
+    const { gate, pushedRevisions } = makeGate()
+    gate.setSessionMode('s1', 'ask')
+    expect(gate.pendingRevision('s1')).toBe(0) // nothing has happened yet, truthfully
+
+    const first = gate.decide('s1', { toolUseId: 't1', toolName: 'Bash', input: { command: 'ls' } })
+    expect(gate.pendingRevision('s1')).toBe(1)
+    const second = gate.decide('s1', { toolUseId: 't2', toolName: 'Bash', input: { command: 'pwd' } })
+    expect(gate.pendingRevision('s1')).toBe(2)
+
+    gate.resolve('t1', { kind: 'allow' })
+    expect(gate.pendingRevision('s1')).toBe(3)
+    // Answering an id that is already gone changes no set and must move no revision, or a head would
+    // treat an unchanged row as newer than the prompt it still holds.
+    gate.resolve('t1', { kind: 'allow' })
+    expect(gate.pendingRevision('s1')).toBe(3)
+
+    // Revisions are per session: another session's churn never ages this one's rows.
+    gate.setSessionMode('s2', 'ask')
+    void gate.decide('s2', { toolUseId: 'o1', toolName: 'Bash', input: { command: 'ls' } })
+    expect(gate.pendingRevision('s1')).toBe(3)
+    expect(gate.pendingRevision('s2')).toBe(1)
+
+    // Each frame carried the value its own change produced, in order.
+    expect(pushedRevisions).toEqual([1, 2, 3, 1])
+
+    // Unblock the handlers still awaiting, so nothing is left pending at teardown.
+    gate.cancelSession('s1')
+    gate.cancelSession('s2')
+    expect(await first).toEqual({ kind: 'allow' })
+    expect((await second).kind).toBe('deny')
+  })
+
+  it('moves the revision when a respawn cancels a session, even with nothing pending', () => {
+    // The case that could not recover before. The prompts vanish from the gate, so the launcher reports
+    // nothing waiting — indistinguishable, without a revision move, from a row that simply predated
+    // them. A phone holding those cards had no way to learn they were retired.
+    const { gate, cancelled, pushedRevisions } = makeGate()
+    gate.setSessionMode('s1', 'ask')
+    void gate.decide('s1', { toolUseId: 't1', toolName: 'AskUserQuestion', input: { questions: [] } })
+    expect(gate.pendingRevision('s1')).toBe(1)
+
+    gate.cancelSession('s1')
+    // One move for the slot it dropped, one for the cancellation itself.
+    expect(gate.pendingRevision('s1')).toBe(3)
+    expect(cancelled).toEqual(['s1'])
+
+    // A session holding NOTHING still moves: this head's own stale echoes are exactly what a bare
+    // cancellation retires, so the report has to read as newer than whatever they came from.
+    gate.cancelSession('s1')
+    expect(gate.pendingRevision('s1')).toBe(4)
+    expect(pushedRevisions.at(-1)).toBe(4)
   })
 
   it('forgetSession (a true end) drops the posture entirely, back to the default', () => {
@@ -175,6 +250,45 @@ describe('cancelSession vs forgetSession: process-exit vs session-identity', () 
           input: { file_path: 'src/outside.ts' },
         }),
       ).toEqual({ kind: 'allow' })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('writes the contained memory edit under a strict posture nobody is awake to answer', async () => {
+    const checkpoints: string[] = []
+    const { gate } = makeGate(async (_sessionId, label) => {
+      checkpoints.push(label)
+      return true
+    })
+    const root = mkdtempSync(join(tmpdir(), 'koda-memory-unattended-'))
+    const memory = join(root, '.koda', 'memory')
+    mkdirSync(memory, { recursive: true })
+    writeFileSync(join(memory, 'MEMORY.md'), '# Memory\n')
+    try {
+      // The posture a tidy inherits is whatever the user left as their default. Under `ask` the only
+      // head that could answer is asleep, so a posture-decided edit would be denied unattended and the
+      // whole opted-in pass would silently do nothing.
+      gate.setSessionMode('s1', 'ask')
+      gate.setUnattended('s1', true)
+      gate.setMemoryTidyRoot('s1', root)
+      expect(
+        await gate.decide('s1', {
+          toolUseId: 'w1',
+          toolName: 'Edit',
+          input: { file_path: '.koda/memory/MEMORY.md' },
+        }),
+      ).toEqual({ kind: 'allow' })
+      expect(checkpoints).toHaveLength(1) // containment relaxes the posture, never the recovery point
+      expect(gate.pendingRequests('s1')).toEqual([]) // and it never raises a card no one can answer
+
+      const outside = await gate.decide('s1', {
+        toolUseId: 'w2',
+        toolName: 'Write',
+        input: { file_path: 'src/outside.ts' },
+      })
+      expect(outside.kind).toBe('deny')
+      expect(outside.kind === 'deny' && outside.reason).toContain('overnight memory tidy')
     } finally {
       rmSync(root, { recursive: true, force: true })
     }

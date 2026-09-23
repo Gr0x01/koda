@@ -1,6 +1,6 @@
 ---
 name: shape-new-work
-description: Shape a genuinely new app, product, or major feature before construction. Use when the user asks for a whole new thing, when the first useful version is not yet agreed, or when audience, device, ownership, or the core job would materially change what gets built. Do not use for a bounded addition or fix to an existing thing. Personal app requests route to create-mini-app instead.
+description: Shape a genuinely new app, product, or major feature before construction. Use when the user asks for a whole new thing, when the first useful version is not yet agreed, or when audience, device, ownership, or the core job would materially change what gets built. Do not use for a bounded addition or fix to an existing thing. Private apps for the user's own use with no standalone destination route to create-mini-app; products meant for distribution and explicit native, mobile, desktop, game, website, or service destinations stay here.
 user-invocable: false
 ---
 
@@ -8,7 +8,7 @@ user-invocable: false
 
 Turn a broad new-build request into one explicit, useful first slice before writing code or scaffolding.
 
-1. First decide whether this is genuinely new. A bounded feature or repair in an existing product proceeds normally. A personal app with its own screen or data belongs to `create-mini-app`; its shaping replaces this playbook.
+1. First decide whether this is genuinely new. A bounded feature or repair in an existing product proceeds normally. A private app for the user's own use with no standalone destination belongs to `create-mini-app`; its shaping replaces this playbook. If the user intends to publish or distribute it, or names a standalone native, mobile, desktop, game, public-website, or hosted-service destination, it stays here.
 2. Ask only the two or three questions whose answers change the result: usually the first job it must do, who will use it, and where they will use it. Do not ask the user to choose libraries or setup details.
 3. Name one consequential hole they may not have seen, such as data that could be lost, a flow that dead-ends, or a service they would have to maintain. Explain it in terms of their experience, once.
 4. Propose the smallest usable first slice in their terms. Trim the slice, not the larger ambition. Features are not "too big" because implementation is difficult; weigh only costs that reach the user, such as accounts, bills, maintenance, privacy, or fragility.

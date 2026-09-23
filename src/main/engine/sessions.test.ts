@@ -1245,6 +1245,7 @@ describe('remote turn attachment provenance', () => {
     forwardProcessEvent: (event: EngineEvent, processGeneration?: symbol) => unknown
     handleClose: (sessionId: string, processGeneration?: symbol) => void
     interrupt: (sessionId: string) => Promise<void>
+    awaitTurnEnd: (sessionId: string) => Promise<void>
     stopDelegatedChildren: (sessionId: string, session?: unknown) => Promise<void>
     dispose: (sessionId: string) => Promise<void>
     start: (opts: { sessionId: string; cwd: string }) => Promise<{ sessionId: string; cwd: string }>
@@ -1256,8 +1257,24 @@ describe('remote turn attachment provenance', () => {
       images?: Array<{ mediaType: string; dataBase64: string; name?: string }>,
       origin?: 'local' | 'remote',
       identity?: { attemptId?: string; clientTurnId?: string },
-    ) => Promise<{ status: 'accepted' | 'already-running' | 'already-complete' }>
+    ) => Promise<TurnReceipt>
   }
+
+  type TurnReceipt = {
+    status: 'accepted' | 'already-running' | 'already-complete'
+    statusEpoch: string
+    workingRevision: number
+  }
+
+  /** The receipt is a contract a remote head decides posture from, so these assertions stay EXACT — the
+   *  whole receipt, including the revision, never `objectContaining`. `workingRevision` counts this
+   *  session's `working` transitions: 1 after a first send claims it, +1 on every later flip (a turn
+   *  ending, a Stop, a close). A duplicate attempt reports whatever the count is NOW, so it names the
+   *  state the caller is really being told about rather than the one it asked about. */
+  const receipt = (
+    status: TurnReceipt['status'],
+    workingRevision: number,
+  ): TurnReceipt => ({ status, workingRevision, statusEpoch: expect.any(String) })
 
   const image = { mediaType: 'image/png', dataBase64: 'AAAA' }
 
@@ -1400,7 +1417,7 @@ describe('remote turn attachment provenance', () => {
     try {
       await expect(
         mgr.sendTurn('owned-remote', 'keep running', [image], 'remote', identity),
-      ).resolves.toEqual({ status: 'accepted' })
+      ).resolves.toEqual(receipt('accepted', 1))
 
       expect(send).toHaveBeenCalledTimes(1)
       expect(mgr.working.has('owned-remote')).toBe(true)
@@ -1435,12 +1452,13 @@ describe('remote turn attachment provenance', () => {
     mgr.remoteAttached.add('headless')
     const identity = { attemptId: 'attempt-a', clientTurnId: 'logical-a' }
 
-    await expect(mgr.sendTurn('headless', 'ship it', undefined, 'remote', identity)).resolves.toEqual({
-      status: 'accepted',
-    })
-    await expect(mgr.sendTurn('headless', 'ship it', undefined, 'remote', identity)).resolves.toEqual({
-      status: 'already-running',
-    })
+    await expect(mgr.sendTurn('headless', 'ship it', undefined, 'remote', identity)).resolves.toEqual(
+      receipt('accepted', 1),
+    )
+    // The duplicate changes no state, so it reports the same revision the accepted turn did.
+    await expect(mgr.sendTurn('headless', 'ship it', undefined, 'remote', identity)).resolves.toEqual(
+      receipt('already-running', 1),
+    )
     await expect(
       mgr.sendTurn('headless', 'different message', undefined, 'remote', {
         attemptId: 'attempt-a',
@@ -1450,9 +1468,10 @@ describe('remote turn attachment provenance', () => {
     expect(send).toHaveBeenCalledTimes(1)
 
     mgr.forward({ type: 'TurnComplete', sessionId: 'headless', stopReason: 'success' })
-    await expect(mgr.sendTurn('headless', 'ship it', undefined, 'remote', identity)).resolves.toEqual({
-      status: 'already-complete',
-    })
+    // The completion released `working`, so the next duplicate names the revision that flip produced.
+    await expect(mgr.sendTurn('headless', 'ship it', undefined, 'remote', identity)).resolves.toEqual(
+      receipt('already-complete', 2),
+    )
     expect(send).toHaveBeenCalledTimes(1)
   })
 
@@ -1469,7 +1488,7 @@ describe('remote turn attachment provenance', () => {
 
     await expect(
       mgr.sendTurn('headless', 'inspect these', attachments, 'remote', identity),
-    ).resolves.toEqual({ status: 'accepted' })
+    ).resolves.toEqual(receipt('accepted', 1))
     await expect(
       mgr.sendTurn(
         'headless',
@@ -1478,7 +1497,7 @@ describe('remote turn attachment provenance', () => {
         'remote',
         identity,
       ),
-    ).resolves.toEqual({ status: 'already-running' })
+    ).resolves.toEqual(receipt('already-running', 1))
 
     await expect(
       mgr.sendTurn('headless', 'inspect something else', attachments, 'remote', identity),
@@ -1513,10 +1532,12 @@ describe('remote turn attachment provenance', () => {
     await expect(
       mgr.sendTurn('headless', 'ship it', undefined, 'remote', identity),
     ).rejects.toThrow('already running')
+    // This fixture pokes the raw set, so no transition is counted for it; the accepted send is the
+    // session's first real claim and therefore its first revision.
     mgr.working.delete('headless')
-    await expect(mgr.sendTurn('headless', 'ship it', undefined, 'remote', identity)).resolves.toEqual({
-      status: 'accepted',
-    })
+    await expect(mgr.sendTurn('headless', 'ship it', undefined, 'remote', identity)).resolves.toEqual(
+      receipt('accepted', 1),
+    )
     expect(send).toHaveBeenCalledTimes(1)
   })
 
@@ -1581,13 +1602,18 @@ describe('remote turn attachment provenance', () => {
     })
 
     // The same unaccepted transport attempt can retry. Only its real engine acceptance supersedes A.
+    // Five flips by here: A claims (1), A's rejection releases (2), B claims before its checkpoint (3),
+    // Stop releases it (4), this acceptance claims again (5). The Stop release is the new one, and it is
+    // the point of the change: the session comes back the moment the user asks, not when an engine event
+    // that may never arrive says so. Reaching this receipt at all also proves the stopped-turn admission
+    // guard does not over-block — B never reached the engine, so there is no abort to wait out.
     mgr.projectDirs.delete('headless')
     await expect(
       mgr.sendTurn('headless', 'inspect', [attachment], 'remote', {
         attemptId: 'attempt-b',
         clientTurnId: 'logical-a',
       }),
-    ).resolves.toEqual({ status: 'accepted' })
+    ).resolves.toEqual(receipt('accepted', 5))
     expect(send).toHaveBeenCalledTimes(2)
     const afterAcceptance = mgr.remoteEventLog.get('headless') ?? []
     expect(afterAcceptance.filter((entry) => entry.type === 'RemoteUserTurn')).toHaveLength(2)
@@ -1603,6 +1629,56 @@ describe('remote turn attachment provenance', () => {
       attachments: [attachment],
       failed: false,
     })
+  })
+
+  it('settles the turn after a Stop the engine swallowed instead of stranding it', async () => {
+    // The stopped-turn marker exists to recognise turn A's LATE terminal so it cannot settle a
+    // replacement. Its bound exists for the case where that terminal never comes at all — a Claude child
+    // whose stdin already closed, a Codex Stop that beats the turn id it needs, a wedged process, or
+    // Koda's own refusal to send a Stop across a replaced generation. In exactly that case the marker
+    // outlived its job: turn B then completed normally, was misread as A's stale terminal, and the whole
+    // settle block was skipped — `working` left set with no event remaining that could ever clear it.
+    // That is the stranding this branch removes, so it must not come back one turn after a swallowed Stop.
+    const mgr = new EngineSessionManager() as unknown as ProvenanceManager
+    const interrupt = vi.fn() // accepts the Stop and answers with nothing, forever
+    mgr.sessions.set('headless', { sendTurn: vi.fn(() => true), interrupt })
+    mgr.remoteAttached.add('headless')
+
+    await mgr.sendTurn('headless', 'turn A', undefined, 'remote', {
+      attemptId: 'attempt-a',
+      clientTurnId: 'logical-a',
+    })
+
+    // Fake timers cover ONLY the bound, so the Stop's own timer is created under them and the sends stay
+    // on real ones. A raised bound makes this fail loudly at turn B's admission rather than quietly
+    // stopping testing the expiry.
+    vi.useFakeTimers()
+    try {
+      await mgr.interrupt('headless')
+      expect(interrupt).toHaveBeenCalledTimes(1)
+      // Stop hands the session back at once; the bound only releases the replacement-admission block.
+      expect(mgr.working.has('headless')).toBe(false)
+      await vi.advanceTimersByTimeAsync(20_000)
+    } finally {
+      vi.useRealTimers()
+    }
+
+    let turnEnded = false
+    void mgr.awaitTurnEnd('headless').then(() => {
+      turnEnded = true
+    })
+    await mgr.sendTurn('headless', 'turn B', undefined, 'remote', {
+      attemptId: 'attempt-b',
+      clientTurnId: 'logical-b',
+    })
+    expect(mgr.working.has('headless')).toBe(true)
+
+    mgr.forward({ type: 'TurnComplete', sessionId: 'headless', stopReason: 'success' })
+    await Promise.resolve()
+
+    expect(turnEnded).toBe(true)
+    expect(mgr.working.has('headless')).toBe(false)
+    expect(mgr.acceptedTurns.has('headless')).toBe(false)
   })
 
   it('lets an accepted desktop follow-up supersede a failed phone payload', async () => {
@@ -1635,9 +1711,10 @@ describe('remote turn attachment provenance', () => {
       images: [attachment],
     })
 
-    await expect(mgr.sendTurn('shared', 'desktop follow-up', undefined, 'local')).resolves.toEqual({
-      status: 'accepted',
-    })
+    // Three flips: the phone turn claims (1), its rejection releases (2), this follow-up claims (3).
+    await expect(mgr.sendTurn('shared', 'desktop follow-up', undefined, 'local')).resolves.toEqual(
+      receipt('accepted', 3),
+    )
 
     expect(send).toHaveBeenCalledTimes(2)
     expect(mgr.remoteTurnPayloads.has('shared')).toBe(false)
@@ -1759,12 +1836,14 @@ describe('remote turn attachment provenance', () => {
     expect(mgr.remoteTurnPayloads.size).toBe(16)
 
     mgr.forward({ type: 'TurnComplete', sessionId: 'headless-0', stopReason: 'success' })
+    // Revisions are per session, so this one counts only its own two flips: its send, then its
+    // completion. The sixteen other live sessions never touch it.
     await expect(
       mgr.sendTurn('headless-0', 'inspect', [image], 'remote', {
         attemptId: 'attempt-0',
         clientTurnId: 'logical-0',
       }),
-    ).resolves.toEqual({ status: 'already-complete' })
+    ).resolves.toEqual(receipt('already-complete', 2))
   })
 
   it('settles an accepted remote attempt as a retryable terminal failure when its driver crashes', async () => {
@@ -1797,9 +1876,10 @@ describe('remote turn attachment provenance', () => {
       clientTurnId: 'logical-a',
       images: [document],
     })
+    // Two flips: the send claimed `working`, the crash released it (asserted above).
     await expect(
       mgr.sendTurn('headless', 'inspect', [document], 'remote', identity),
-    ).resolves.toEqual({ status: 'already-complete' })
+    ).resolves.toEqual(receipt('already-complete', 2))
     expect(send).toHaveBeenCalledTimes(1)
   })
 
@@ -2089,12 +2169,14 @@ describe('remote turn attachment provenance', () => {
     expect(
       mgr.remoteEventLog.get('replaced')?.some((entry) => entry.type === 'EngineError'),
     ).toBe(false)
+    // Still revision 1: the stale close returned before touching anything, which is the same fact the
+    // `working.has` assertion above states. A second flip here would mean it had settled the successor.
     await expect(
       mgr.sendTurn('replaced', 'successor turn', undefined, 'remote', {
         attemptId: 'attempt-successor',
         clientTurnId: 'logical-successor',
       }),
-    ).resolves.toEqual({ status: 'already-running' })
+    ).resolves.toEqual(receipt('already-running', 1))
     expect(successor.sendTurn).toHaveBeenCalledTimes(1)
   })
 
@@ -3506,11 +3588,17 @@ describe('delegated children survive posture changes and targeted stops', () => 
 
   it('reports actual workflow activity after the parent turn ends', () => {
     const mgr = manager()
+    // The live driver is the precondition isWorking now checks first: a watcher outliving its engine
+    // process is exactly the stale liveness that used to strand a phone chat on "working".
+    mgr.sessions.set('s1', {})
     mgr.workflowWatchers.set('review', {
       sessionId: 's1',
       watcher: workflowWatcher({ agents: ['critic'] }),
     })
     expect(mgr.isWorking('s1')).toBe(true)
+
+    mgr.sessions.delete('s1')
+    expect(mgr.isWorking('s1')).toBe(false)
   })
 
   it('sends Stop only to a currently tracked task and requires adapter acceptance', () => {
@@ -4645,5 +4733,27 @@ describe('queued-send delivery', () => {
       .map((e) => e.revision as number)
     expect(revs).toHaveLength(2)
     expect(revs[1]).toBeGreaterThan(revs[0])
+  })
+})
+
+
+describe('phone status evidence', () => {
+  it('stamps live parent and delegated activity after advancing the shared revision', () => {
+    const manager = new EngineSessionManager()
+    const runtime = manager as unknown as { forward: (event: EngineEvent) => EngineEvent | undefined }
+    const parent = runtime.forward({ type: 'AssistantDelta', sessionId: 'status-proof', text: 'Working' })!
+    const child = runtime.forward({
+      type: 'SubagentStarted', sessionId: 'status-proof', toolUseId: 'child-proof',
+      taskId: 'child-thread', subagentType: 'codex', description: 'Review',
+    })!
+    expect(parent.statusEpoch).toBe(manager.statusEpoch('status-proof'))
+    expect(parent.workingRevision).toBe(1)
+    expect(child.statusEpoch).toBe(parent.statusEpoch)
+    expect(child.workingRevision).toBeGreaterThan(parent.workingRevision!)
+    const completed = runtime.forward({
+      type: 'SubagentCompleted', sessionId: 'status-proof', toolUseId: 'child-proof',
+      taskId: 'child-thread', outcome: 'completed',
+    })!
+    expect(completed.workingRevision).toBeGreaterThan(child.workingRevision!)
   })
 })

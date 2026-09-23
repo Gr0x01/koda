@@ -10,9 +10,48 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-09-22
+
+### Added
+
+- GPT-6 Sol, Terra, and Luna work in Koda as soon as OpenAI enables them for your account. The model
+  menu refreshes OpenAI's live catalog whenever it opens, and a model ID can still be entered directly
+  during a staged rollout instead of waiting for Koda to ship another hardcoded list.
+
 ### Changed
 
-- Updated the bundled Codex engine to 0.153.4.
+- Updated the bundled Claude engine to 2.1.278.
+
+- Updated the bundled Codex engine to 0.155.1.
+
+### Fixed
+
+- The overnight memory tidy now saves what it consolidates. Some nights it spent the whole pass
+  unable to write, so the morning summary told you what it found and nothing had changed.
+- A question the agent needs answered now always arrives as something you can answer. It used to
+  sometimes write the question as ordinary text and then keep working, and anything you typed in that
+  state only waited in the queue until the turn ended, which left the stop button as the only way to
+  reply. The agent now asks with a card you can answer while it is still working, or it finishes the
+  turn on the question and waits.
+- Codex follow-up messages to an idle subagent no longer leave an empty agent card marked as working
+  or block session controls. A card opens when the child actually starts work and closes when Codex
+  reports that work finished.
+- Links the agent writes in the conversation open again. The agent writes a link the way it writes one
+  inside a document, relative to the folder it was working in, but a reply has no folder, so a link like
+  `../../notes/plan.md` or a bare `plan.md` pointed nowhere and the click did nothing at all. Koda now
+  matches the end of the path against the files in your project and opens the file when exactly one
+  matches. When several match, or none do, it says so instead of going quiet.
+- Asking Koda to make a standalone app, game, public website, or hosted service no longer pulls in
+  the mini-app playbook just because the project has a screen or saves data. Private tools made for
+  your own use can still take the fast mini-app route, while an explicit native, public, or
+  distributed destination stays on the normal product path.
+- When another session is already working in the same checkout, Koda now moves the work into its own
+  isolated copy and keeps going instead of stopping to ask where the work should live. It asks only
+  about the last step that genuinely touches shared files, and it asks once the rest is already done.
+- An overnight run no longer waits out its full time limit after the engine stops on a temporary API
+  error. Koda counted only an outright failure as the end of a turn, so a rate limit or a brief
+  provider problem left the run believing work was still going. It now sees that the turn ended and
+  moves on to the next thing it had planned.
 
 ## [0.1.16] - 2026-09-03
 
@@ -686,7 +725,8 @@ _First versioned build — the baseline the auto-updater ships from._
 - Settings now shows the Koda version, the bundled Claude engine version, and a
   "Check for updates" button.
 
-[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.16...HEAD
+[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.17...HEAD
+[0.1.17]: https://github.com/Gr0x01/koda/releases/tag/v0.1.17
 [0.1.16]: https://github.com/Gr0x01/koda/releases/tag/v0.1.16
 [0.1.15]: https://github.com/Gr0x01/koda/releases/tag/v0.1.15
 [0.1.14]: https://github.com/Gr0x01/koda/releases/tag/v0.1.14

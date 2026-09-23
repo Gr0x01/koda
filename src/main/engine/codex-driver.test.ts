@@ -880,7 +880,7 @@ describe('Codex delegation labels', () => {
       turn: { id: 'child-b-turn-1', status: 'completed' },
     })
 
-    // A follow-up on an idle child creates a fresh card and remains individually stoppable.
+    // A follow-up on an idle child is only a delivery receipt: the card waits for the child to act.
     child.notify('item/completed', {
       threadId: 'parent-thread',
       item: {
@@ -891,11 +891,16 @@ describe('Codex delegation labels', () => {
         agentPath: '/root/package-inspector',
       },
     })
-    expect(session.stopTask?.('child-a')).toBe(true)
+    expect(
+      events.filter((event) => event.type === 'SubagentStarted' && event.toolUseId === 'followup-a'),
+    ).toHaveLength(0)
+    expect(session.stopTask?.('child-a')).toBe(false)
     child.notify('turn/started', {
       threadId: 'child-a',
       turn: { id: 'child-a-turn-2', status: 'inProgress' },
     })
+    // Now the child is really working, so the fresh card exists and is individually stoppable.
+    expect(session.stopTask?.('child-a')).toBe(true)
     await vi.waitFor(() =>
       expect(child.requests).toContainEqual({
         id: expect.any(Number),
@@ -1022,6 +1027,83 @@ describe('Codex delegation labels', () => {
     )
 
     await session.dispose()
+  })
+
+  // The 2026-09-17 dogfood ghost: the lead sent a follow-up message to an agent that had already
+  // finished, so nothing on the wire could ever close the card Koda opened on that receipt.
+  it('settles a child on the engine\'s own terminal item and opens no card for an unanswered follow-up', async () => {
+    const child = new FakeCodexProcess()
+    spawnMock.mockReturnValue(child)
+    const events: EngineEvent[] = []
+    const session = startCodexSession((event) => events.push(event), {
+      sessionId: 'koda-session',
+      cwd: '/tmp/project',
+      binaryPath: '/fake/codex',
+      decide: async () => ({ kind: 'allow' }),
+    })
+    await vi.waitFor(() => expect(events.some((event) => event.type === 'SessionStarted')).toBe(true))
+
+    session.sendTurn('review this')
+    await vi.waitFor(() => expect(child.requests.some((request) => request.method === 'turn/start')).toBe(true))
+    child.notify('turn/started', {
+      threadId: 'parent-thread',
+      turn: { id: 'parent-turn', status: 'inProgress' },
+    })
+    child.notify('item/completed', {
+      threadId: 'parent-thread',
+      item: {
+        type: 'subAgentActivity',
+        id: 'spawn-a',
+        kind: 'started',
+        agentThreadId: 'child-a',
+        agentPath: '/root/resource_review',
+      },
+    })
+    child.notify('turn/started', {
+      threadId: 'child-a',
+      turn: { id: 'child-a-turn-1', status: 'inProgress' },
+    })
+    // The child's own turn/completed never arrives; the lead thread's terminal item is enough.
+    child.notify('item/completed', {
+      threadId: 'parent-thread',
+      item: {
+        type: 'subAgentActivity',
+        id: 'subagent-completed-child-a-turn-1',
+        kind: 'completed',
+        agentThreadId: 'child-a',
+        agentPath: '/root/resource_review',
+      },
+    })
+    await vi.waitFor(() =>
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: 'SubagentCompleted',
+          toolUseId: 'spawn-a',
+          taskId: 'child-a',
+          outcome: 'completed',
+        }),
+      ),
+    )
+
+    // send_message to that now-idle agent completes instantly and it never takes another turn.
+    child.notify('item/completed', {
+      threadId: 'parent-thread',
+      item: {
+        type: 'subAgentActivity',
+        id: 'followup-a',
+        kind: 'interacted',
+        agentThreadId: 'child-a',
+        agentPath: '/root/resource_review',
+      },
+    })
+    child.notify('turn/completed', {
+      threadId: 'parent-thread',
+      turn: { id: 'parent-turn', status: 'completed' },
+    })
+
+    await vi.waitFor(() => expect(events.some((event) => event.type === 'TurnComplete')).toBe(true))
+    expect(events.filter((event) => event.type === 'SubagentStarted')).toHaveLength(1)
+    expect(session.stopTask?.('child-a')).toBe(false)
   })
 
   it('gives every child in a legacy multi-agent spawn a distinct lifecycle identity', async () => {

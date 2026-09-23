@@ -30,7 +30,11 @@ describe('shared model picker catalog', () => {
 
   it('renders a provider-reported Codex catalog without a surface-specific model map', () => {
     const catalogs = providerModelCatalogs({
-      codexModels: [{ id: 'gpt-current', label: 'GPT Current', isDefault: true }],
+      codexModels: [
+        { id: 'gpt-6-sol', label: 'GPT-6 Sol', isDefault: true },
+        { id: 'gpt-6-terra', label: 'GPT-6 Terra', isDefault: false },
+        { id: 'gpt-6-luna', label: 'GPT-6 Luna', isDefault: false },
+      ],
       codexAuthStatus: {
         signedIn: true,
         authMethod: 'chatgpt',
@@ -45,7 +49,9 @@ describe('shared model picker catalog', () => {
         providerCatalogs: catalogs,
       }),
     ).toEqual([
-      { id: 'gpt-current', label: 'GPT Current', badge: 'Recommended' },
+      { id: 'gpt-6-sol', label: 'GPT-6 Sol', badge: 'Recommended' },
+      { id: 'gpt-6-terra', label: 'GPT-6 Terra', badge: undefined },
+      { id: 'gpt-6-luna', label: 'GPT-6 Luna', badge: undefined },
       {
         id: undefined,
         label: 'Engine default',
@@ -79,6 +85,9 @@ describe('shared model picker catalog', () => {
     expect(prettyModel('gpt-5.5')).toBe('GPT-5.5')
     expect(prettyModel('gpt-5.6-sol')).toBe('GPT-5.6 Sol')
     expect(prettyModel('gpt-6-astra')).toBe('GPT-6 Astra')
+    expect(prettyModel('gpt-6-sol')).toBe('GPT-6 Sol')
+    expect(prettyModel('gpt-6-terra')).toBe('GPT-6 Terra')
+    expect(prettyModel('gpt-6-luna')).toBe('GPT-6 Luna')
     expect(prettyModel('gpt-5.3-codex-spark')).toBe('GPT-5.3 Codex Spark')
     expect(prettyModel('fable')).toBe('Fable')
     expect(prettyModel('something-odd')).toBe('something-odd')

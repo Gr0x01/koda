@@ -1,4 +1,4 @@
-import { existsSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, statSync, type Dirent } from 'node:fs'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
 import {
   StageLinkTargetSchema,
@@ -6,7 +6,7 @@ import {
   type StageLinkTarget,
 } from '@shared/ipc'
 import { resolveDocFormat } from '@shared/document-contract'
-import { containedReal } from './fs-browse'
+import { containedReal, HIDDEN_DIRS } from './fs-browse'
 
 export type PresentFileView = 'auto' | 'document' | 'file' | 'diff'
 
@@ -149,26 +149,95 @@ function tryFile(root: string, candidate: Candidate): StageLinkTarget | null {
   }
 }
 
+/** Bounded so a click can never walk an enormous tree synchronously. A project past this is already
+ *  past what the Files tree and project search enumerate. */
+const LINK_SEARCH_MAX_FILES = 20_000
+
+/** Every file in the workspace as a posix path relative to `root`. Same universe as `searchProject`:
+ *  hidden/noise dirs skipped, symlinked dirs never followed. */
+function workspaceFiles(root: string): string[] {
+  const found: string[] = []
+  const walk = (dir: string, prefix: string): void => {
+    if (found.length >= LINK_SEARCH_MAX_FILES) return
+    let entries: Dirent[]
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return // unreadable dir — skip it rather than abandoning the search
+    }
+    for (const entry of entries) {
+      if (found.length >= LINK_SEARCH_MAX_FILES) return
+      if (entry.isSymbolicLink()) continue
+      if (entry.isDirectory()) {
+        if (HIDDEN_DIRS.has(entry.name)) continue
+        walk(resolve(dir, entry.name), `${prefix}${entry.name}/`)
+      } else if (entry.isFile()) {
+        found.push(`${prefix}${entry.name}`)
+      }
+    }
+  }
+  walk(resolve(root), '')
+  return found
+}
+
+/**
+ * The forgiving second pass, for a link whose literal path does not exist here.
+ *
+ * An agent writes chat links the way it writes links inside a document: relative to the folder it was
+ * thinking in. So `../../art/review/world_studies/README.md` and a bare `domain.json` are both ordinary
+ * and both wrong against a workspace root, which made the single most common kind of link Koda renders
+ * a dead one. Chat has no base folder to be relative to, so instead of guessing one, match the link's
+ * trailing segments against the workspace and take the answer only when it is unambiguous: longest tail
+ * first, exactly one file, or nothing. Traversal is dropped rather than followed, and the hit is still
+ * resolved through `tryFile`, so a forgiving AUTHOR never widens what a link can REACH.
+ */
+function searchWorkspaceForLink(root: string, candidate: Candidate): StageLinkTarget | null {
+  const wanted = candidate.path.split(/[\\/]/).filter((part) => part && part !== '.' && part !== '..')
+  if (!wanted.length) return null
+  const files = workspaceFiles(root)
+  for (let depth = wanted.length; depth >= 1; depth--) {
+    const tail = `/${wanted.slice(-depth).join('/')}`
+    const hits = files.filter((file) => `/${file}`.endsWith(tail))
+    if (hits.length === 1) return tryFile(root, { ...candidate, path: hits[0]! })
+    if (hits.length > 1)
+      return {
+        kind: 'missing',
+        reason: 'Several files in this workspace match that link, so Koda cannot tell which one it means.',
+      }
+  }
+  return null
+}
+
 /** Resolve an assistant Markdown href against a main-owned workspace root. Exact filenames win over
  * `:line[:column]` parsing so a real `notes:12` file remains reachable. */
 export function resolveStageLink(root: string, href: string): StageLinkTarget {
   const candidate = hrefCandidate(href)
-  if (!candidate) return { kind: 'declined' }
+  if (!candidate) return { kind: 'declined', reason: "Koda can't open that kind of link." }
 
-  const exact = tryFile(root, candidate)
-  if (exact) return exact
-
+  // A `:line[:column]` suffix is a second reading of the SAME href, not a second link: both readings
+  // get a literal try before either gets the forgiving one, so a real `notes:12` file still wins.
+  const readings: Candidate[] = [candidate]
   if (candidate.line === undefined) {
     const suffix = candidate.path.match(/^(.*):(\d+)(?::(\d+))?$/)
-    if (suffix?.[1]) {
-      const located = tryFile(root, {
+    if (suffix?.[1])
+      readings.push({
         path: suffix[1],
         line: Number(suffix[2]),
         ...(suffix[3] ? { column: Number(suffix[3]) } : {}),
       })
-      if (located) return located
-    }
   }
 
-  return { kind: 'missing', reason: "Koda couldn't find that file in this workspace." }
+  let refused: StageLinkTarget | null = null
+  for (const reading of readings) {
+    const literal = tryFile(root, reading)
+    if (literal?.kind === 'file') return literal
+    refused ??= literal
+  }
+  for (const reading of readings) {
+    const found = searchWorkspaceForLink(root, reading)
+    if (found) return found
+  }
+
+  // A link that pointed outside the workspace and matched nothing inside it keeps the truer sentence.
+  return refused ?? { kind: 'missing', reason: "Koda couldn't find that file in this workspace." }
 }

@@ -68,8 +68,9 @@ import { runGit } from './safety-git/repo'
 /** Cap a single file read so a giant/log file can't blow up the IPC payload or the editor. */
 const MAX_FILE_BYTES = 1_000_000
 
-/** Directories never worth showing a non-engineer (noise / huge / our own internals). */
-const HIDDEN_DIRS = new Set(['.git', 'node_modules', '.koda'])
+/** Directories never worth showing a non-engineer (noise / huge / our own internals). Exported so the
+ *  Stage's link search walks the same universe the tree and project search do. */
+export const HIDDEN_DIRS = new Set(['.git', 'node_modules', '.koda'])
 
 /**
  * The doc-first sidebar's flat Documents list excludes the tree's hidden noise PLUS the engine's

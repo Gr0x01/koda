@@ -1,5 +1,5 @@
-# Daily guard on the bundled engines (both `claude` and `codex`). Each job resolves the current `stable`
-# release (our pin policy — NOT `latest`/bleeding-edge; see architecture/engine-updates.md), and if it's
+# Daily guard on the bundled engines (both `claude` and `codex`). Each job resolves the current `latest`
+# release (our pin policy — see architecture/engine-updates.md), and if it's
 # ahead of the version pinned in scripts/fetch-engine.mjs, downloads + verifies that build (linux) and
 # drives it through the engine-contract smoke test (the real driver). Green → opens and merges a tightly
 # scoped bot PR; red → opens or updates an issue before the candidate can enter a nightly.
@@ -28,7 +28,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Engine version to test (blank = npm `stable` dist-tag)'
+        description: 'Engine version to test (blank = npm `latest` dist-tag)'
         required: false
 
 permissions:
@@ -64,8 +64,12 @@ jobs:
           echo "attempted=true" >> "$GITHUB_OUTPUT"
           PINNED=$(node -p "require('fs').readFileSync('scripts/fetch-engine.mjs','utf8').match(/PINNED_VERSION\s*=\s*'([^']+)'/)[1]")
           TARGET="${{ inputs.version }}"
-          # Pin policy: track the `stable` dist-tag, NOT `latest`. See architecture/engine-updates.md.
-          [ -z "$TARGET" ] && TARGET=$(npm view @anthropic-ai/claude-code dist-tags.stable)
+          # Pin policy: track `latest`. `stable` is promoted rarely — it sat seven releases and a week
+          # behind `latest` through September 2026, so the guard had nothing to test for days at a time
+          # while upstream shipped daily. The gate below is what makes this safe: a candidate still has
+          # to pass checksum verification, the real driver contract, the two-file diff guard, and CI
+          # before its bump PR merges. See architecture/engine-updates.md.
+          [ -z "$TARGET" ] && TARGET=$(npm view @anthropic-ai/claude-code dist-tags.latest)
           if [[ ! "$TARGET" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::invalid Claude version from upstream: $TARGET"; exit 1
           fi
@@ -74,7 +78,7 @@ jobs:
           echo "::notice::pinned=$PINNED stable-target=$TARGET"
           ORDER=$(node --input-type=module -e "import { compareStableVersions } from './scripts/apply-engine-bump.mjs'; console.log(compareStableVersions(process.argv[1], process.argv[2]))" "$TARGET" "$PINNED")
           if [ "$ORDER" -le 0 ]; then
-            echo "::notice::Claude pin $PINNED is already at or ahead of stable $TARGET — nothing to test."
+            echo "::notice::Claude pin $PINNED is already at or ahead of $TARGET — nothing to test."
             echo "go=false" >> "$GITHUB_OUTPUT"
           # A candidate that already failed must not be re-tested nightly. The smoke test bills the API in
           # full, and a failing check bills MORE than a passing one (each check burns its whole timeout with

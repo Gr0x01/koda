@@ -12,7 +12,7 @@ Keep the task's changes isolated, recoverable, and attributable without sweeping
 
 1. Inspect the current branch, status, remotes, and worktrees. Read any project-specific repository map before branch, push, publish, or release work.
 2. Continue in the current branch/worktree when it already belongs to this workstream. For materially different work, create a short human-named topic branch from the repository's main branch before the first substantive edit.
-3. Use a separate worktree when the current checkout belongs to another topic or may be in use. If that relationship is genuinely unclear, ask once because the answer changes where the work lands.
+3. Use a separate worktree when the current checkout belongs to another topic or may be in use, including when another session is working in it. Unclear ownership is answered by isolating, not by stopping: open the worktree and keep going. Ask once only about the step that still touches shared state, such as a merge or a file both sessions own, and do the isolated work first so the question arrives with the rest of the task already done.
 4. Never run destructive Git without explicit approval: no force-push, hard reset, history rewrite, tag deletion, or force-deletion of unmerged work.
 
 ## Close only this task

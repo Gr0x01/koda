@@ -6,6 +6,7 @@
  * No Electron, no HTTP, no MCP — the broker (server.ts) calls `decide`, and the manager injects
  * the checkpoint + renderer-push callbacks. That keeps the policy testable and the wiring obvious.
  */
+import { randomUUID } from 'node:crypto'
 import type { ApprovalMode, ApprovalRequest, ToolDecision } from '@shared/ipc'
 import type { ApproveRequest } from './types'
 import { existsSync, realpathSync, statSync } from 'node:fs'
@@ -43,18 +44,30 @@ function destructiveGitReason(hit: DestructiveGitHit): string {
  */
 export type CheckpointFn = (sessionId: string, label: string) => Promise<boolean>
 
-/** Push a pending tool-approval to the renderer (Ask-me mode). */
+/** Push a pending tool-approval to the renderer (Ask-me mode). Carries the pending revision this push
+ *  was produced at, so a remote head can order it against the launcher row's count. */
 export type PushRequest = (req: ApprovalRequest) => void
 
 /** Tell the renderer to clear all pending approvals for a session whose engine ended. */
-export type PushCancelled = (sessionId: string) => void
+export type PushCancelled = (sessionId: string, revision: number) => void
 
 /** Tell every head one specific request was answered, so a head that DIDN'T answer it (e.g. the Mac
  *  while the phone resolved) clears its now-stale prompt instead of latching on "Needs your approval". */
-export type PushResolved = (sessionId: string, requestId: string) => void
+export type PushResolved = (sessionId: string, requestId: string, revision: number) => void
 
 /** Tell the renderer recovery may be limited for the action just allowed (checkpoint failed). */
 export type WarnFn = (sessionId: string, message: string) => void
+
+/** One unanswered "Ask me" slot. `at` feeds the phone's "Needs you · waiting Xm" readout;
+ *  `toolName`/`input` let a late-joining head rebuild the prompt it never saw pushed live. */
+type PendingSlot = {
+  resolve: (d: ToolDecision) => void
+  sessionId: string
+  at: number
+  toolName: string
+  input: unknown
+  reason?: string
+}
 
 /** What an unattended (overnight-dream) session hears instead of a prompt. */
 const UNATTENDED_REASON =
@@ -202,17 +215,24 @@ export class ApprovalGate {
   /** requestId (= engine tool_use_id) → pending "Ask me" resolver. `at` feeds the phone's
    *  "Needs you · waiting Xm" readout; `toolName`/`input` let a late-joining head (the phone) rebuild
    *  the prompt it never saw pushed live (pendingRequests). */
-  private readonly pending = new Map<
-    string,
-    {
-      resolve: (d: ToolDecision) => void
-      sessionId: string
-      at: number
-      toolName: string
-      input: unknown
-      reason?: string
+  private readonly pending = new Map<string, PendingSlot>()
+  /** sessionId → a monotonic count of pending-set TRANSITIONS for that session. A remote head has no
+   *  clock it can compare with this Mac's, so it compares this instead: it keeps the highest revision it
+   *  has seen from a live approval frame, and a launcher row at or above that revision demonstrably
+   *  accounts for everything the head knows. Below it, the row was built before a prompt this head
+   *  already holds and must not be allowed to erase it. Same idea as the engine's working revision and
+   *  the queued-send slot revision; the ONLY writer is markPending/clearPending below. */
+  private readonly pendingRevisions = new Map<string, number>()
+  private readonly statusEpochs = new Map<string, string>()
+
+  statusEpoch(sessionId: string): string {
+    let epoch = this.statusEpochs.get(sessionId)
+    if (!epoch) {
+      epoch = randomUUID()
+      this.statusEpochs.set(sessionId, epoch)
     }
-  >()
+    return epoch
+  }
 
   constructor(
     private readonly checkpoint: CheckpointFn,
@@ -290,12 +310,9 @@ export class ApprovalGate {
     const memoryRoot = this.memoryTidyRoots.get(sessionId)
     if (memoryRoot) {
       if (req.toolName === 'Skill' && isMemorySkill(req.input)) return { kind: 'allow' }
+      const memoryEdit = isEditTool(req.toolName) && containedMemoryEdit(memoryRoot, req.input)
       const memoryDelete = req.toolName === 'Bash' && containedMemoryDelete(memoryRoot, req.input)
-      if (
-        !MEMORY_TIDY_READ_TOOLS.has(req.toolName) &&
-        !(isEditTool(req.toolName) && containedMemoryEdit(memoryRoot, req.input)) &&
-        !memoryDelete
-      ) {
+      if (!MEMORY_TIDY_READ_TOOLS.has(req.toolName) && !memoryEdit && !memoryDelete) {
         return {
           kind: 'deny',
           reason:
@@ -314,6 +331,16 @@ export class ApprovalGate {
               kind: 'deny',
               reason: 'Koda could not make the recovery point required before deleting that memory note. Leave it in place and mention it in the digest.',
             }
+      }
+      // The contained memory edit IS the night the user opted into, and a tidy session is unattended by
+      // construction — no window will ever show its prompt. Decide it here on containment rather than
+      // letting a strict default posture turn the whole pass into an approval nobody can answer (the
+      // same reasoning as the deletion above). Nothing under .koda/memory can reach the protected-target
+      // or destructive-Git tiers, so no forced ask is skipped by deciding early.
+      if (memoryEdit) {
+        const ok = await this.checkpoint(sessionId, checkpointLabel(req.toolName, req.input))
+        if (!ok) this.warn(sessionId, `couldn't snapshot before ${req.toolName} — recovery may be limited for this action`)
+        return { kind: 'allow' }
       }
     }
 
@@ -424,7 +451,7 @@ export class ApprovalGate {
         resolve({ kind: 'deny', reason: STRANDED_ABANDONED_REASON })
         return
       }
-      this.pending.set(req.toolUseId, {
+      const revision = this.markPending(req.toolUseId, {
         resolve,
         sessionId,
         at: Date.now(),
@@ -432,13 +459,48 @@ export class ApprovalGate {
         input: req.input,
         reason,
       })
-      this.pushRequest({ sessionId, requestId: req.toolUseId, toolName: req.toolName, input: req.input, reason })
+      // The revision rides the push so a head learns this prompt AND the set state it belongs to in one
+      // frame; a launcher row built before this moment then reads as stale instead of authoritative.
+      this.pushRequest({ sessionId, requestId: req.toolUseId, toolName: req.toolName, input: req.input, reason, revision, statusEpoch: this.statusEpoch(sessionId) })
       // Idempotent with a user answer (resolve/cancel already dropped the slot) and with the turn-end
       // sweep — whichever lands first wins; discardPending no-ops once the slot is gone.
       signal?.addEventListener('abort', () => this.discardPending(req.toolUseId, STRANDED_ABANDONED_REASON), {
         once: true,
       })
     })
+  }
+
+  /** The pending-set transition count a remote head compares against the highest revision it has seen
+   *  live. Monotonic per session; 0 before this session has ever raised a prompt, which is a truthful
+   *  "nothing has happened yet" rather than a gap. */
+  pendingRevision(sessionId: string): number {
+    return this.pendingRevisions.get(sessionId) ?? 0
+  }
+
+  /**
+   * The two seams that own `pending`. EVERY add and remove goes through them, because the revision is
+   * only meaningful if it cannot drift from the set it describes: a direct mutation that moves the set
+   * without moving the revision would let a stale launcher row look current and erase a live prompt on
+   * somebody's phone. Mirrors markWorking/clearWorking in the engine session manager.
+   */
+  private markPending(requestId: string, slot: PendingSlot): number {
+    this.pending.set(requestId, slot)
+    return this.bumpPendingRevision(slot.sessionId)
+  }
+
+  /** Drop a slot and report it with the revision that removal produced, so the caller pushes the exact
+   *  value the set moved to. Undefined when the slot was already gone — no set change, no bump. */
+  private clearPending(requestId: string): { slot: PendingSlot; revision: number } | undefined {
+    const slot = this.pending.get(requestId)
+    if (!slot) return undefined
+    this.pending.delete(requestId)
+    return { slot, revision: this.bumpPendingRevision(slot.sessionId) }
+  }
+
+  private bumpPendingRevision(sessionId: string): number {
+    const next = this.pendingRevision(sessionId) + 1
+    this.pendingRevisions.set(sessionId, next)
+    return next
   }
 
   /** Sessions currently blocked on a human answer (approvals AND AskUserQuestion ride the same map) —
@@ -473,12 +535,12 @@ export class ApprovalGate {
   /** Returns the session whose approval was resolved (undefined for an already-gone request), so a
    *  caller can re-evaluate that session's state once its last prompt clears (e.g. queued-send). */
   resolve(requestId: string, decision: ToolDecision): string | undefined {
-    const slot = this.pending.get(requestId)
-    if (!slot) return undefined
-    this.pending.delete(requestId)
+    const dropped = this.clearPending(requestId)
+    if (!dropped) return undefined
+    const { slot, revision } = dropped
     // Broadcast the resolution so every head clears this one prompt — the answering head already
     // dropped it optimistically (idempotent there); a second head that didn't answer needs telling.
-    this.pushResolved(slot.sessionId, requestId)
+    this.pushResolved(slot.sessionId, requestId, revision)
     // A bare deny from the user gets the standing register: the no covers the outcome, not this one
     // phrasing. Exceptions: AskUserQuestion ("deny" = answer in the composer instead, not a no) and
     // the tools whose deny has its own meaning (TOOL_DENY_REASONS).
@@ -503,16 +565,21 @@ export class ApprovalGate {
    * the sites where the session itself is truly over.
    */
   cancelSession(sessionId: string): void {
-    for (const [requestId, slot] of this.pending) {
-      if (slot.sessionId === sessionId) {
-        this.pending.delete(requestId)
-        slot.resolve({ kind: 'deny', reason: 'session ended' })
-      }
+    // Through the seam like every other removal. This is the path that could not recover before: the
+    // prompts vanish from the gate, so the launcher reports nothing waiting, while a phone still holds
+    // their cards and an unresolved question row. Without a revision move here the head had no way to
+    // tell that report from a row that simply predated the prompt, so it could never clear them.
+    for (const [requestId, slot] of [...this.pending]) {
+      if (slot.sessionId !== sessionId) continue
+      this.clearPending(requestId)
+      slot.resolve({ kind: 'deny', reason: 'session ended' })
     }
     // The process that was running the steered turn is gone, so nothing is in flight to protect. Left
     // pinned, a stale mode would judge the FIRST turn of the respawned process.
     this.turnMode.delete(sessionId)
-    this.pushCancelled(sessionId)
+    // Always a fresh revision, even when this session held no prompts: the head's own echoes may be
+    // exactly what this cancellation retires, and it must be able to see that this report is newer.
+    this.pushCancelled(sessionId, this.bumpPendingRevision(sessionId))
   }
 
   /** Drop one pending slot, clear its card on every head, and unblock the awaiting broker handler with
@@ -520,10 +587,10 @@ export class ApprovalGate {
    *  register, which is the wrong voice for a slot no one is answering. No-op if already gone, so the
    *  turn-end sweep, an engine-side abort, and a user answer can race without double-clearing a card. */
   private discardPending(requestId: string, reason: string): void {
-    const slot = this.pending.get(requestId)
-    if (!slot) return
-    this.pending.delete(requestId)
-    this.pushResolved(slot.sessionId, requestId)
+    const dropped = this.clearPending(requestId)
+    if (!dropped) return
+    const { slot, revision } = dropped
+    this.pushResolved(slot.sessionId, requestId, revision)
     slot.resolve({ kind: 'deny', reason })
   }
 
@@ -564,5 +631,9 @@ export class ApprovalGate {
     this.planFenced.delete(sessionId)
     this.turnMode.delete(sessionId)
     this.memoryTidyRoots.delete(sessionId)
+    // No head can still be ordering rows for an id that is over, and ids are randomUUID()s so this one
+    // never returns. Dropping the counter keeps it from outliving every session the app ever ran.
+    this.pendingRevisions.delete(sessionId)
+    this.statusEpochs.delete(sessionId)
   }
 }

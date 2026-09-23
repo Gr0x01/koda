@@ -102,4 +102,39 @@ describe('resolveStageLink', () => {
     expect(resolveStageLink(root, 'src/escape.txt').kind).toBe('declined')
     expect(resolveStageLink(root, 'src/missing.ts').kind).toBe('missing')
   })
+
+  // The link an agent actually writes: relative to the document it was thinking in, not to the root.
+  it('finds a doc-relative or bare link by its unambiguous tail', () => {
+    const root = project()
+    expect(resolveStageLink(root, '../../Documents/Build plan.md')).toMatchObject({
+      kind: 'file',
+      path: 'Documents/Build plan.md',
+    })
+    expect(resolveStageLink(root, 'app.ts')).toMatchObject({ kind: 'file', path: 'src/app.ts' })
+    expect(resolveStageLink(root, './notes/../app.ts:2')).toMatchObject({
+      kind: 'file',
+      path: 'src/app.ts',
+      line: 2,
+    })
+    // An absolute path from some other checkout of the same project still lands on the local file.
+    expect(resolveStageLink(root, '/elsewhere/project/src/app.ts')).toMatchObject({
+      kind: 'file',
+      path: 'src/app.ts',
+    })
+  })
+
+  it('refuses rather than guesses when several files share the tail', () => {
+    const root = project()
+    mkdirSync(join(root, 'src', 'ui'))
+    writeFileSync(join(root, 'src', 'ui', 'app.ts'), 'other')
+    const target = resolveStageLink(root, 'app.ts')
+    expect(target.kind).toBe('missing')
+    expect(target).toMatchObject({ reason: expect.stringMatching(/several files/i) })
+  })
+
+  it('gives every refusal something to say', () => {
+    const root = project()
+    for (const href of ['javascript:alert(1)', 'src/missing.ts', '../secret.txt'])
+      expect(resolveStageLink(root, href)).toMatchObject({ reason: expect.stringMatching(/.+/) })
+  })
 })

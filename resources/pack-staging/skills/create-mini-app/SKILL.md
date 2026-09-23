@@ -1,11 +1,13 @@
 ---
 name: create-mini-app
-description: Turn a Koda project into a durable, view-first mini app that Koda can make and run. Use when creating, extending, or repairing a personal app with a persistent face, local data, Koda-managed lifecycle, or an in-app line to its agent—for requests such as “make me a fitness tracker,” “turn this project into an app,” or “add a dashboard to this app.”
+description: Turn a Koda project into a durable, view-first mini app that Koda can make and run. Use for a private app the user wants for their own use when they have not named a standalone destination, or when they explicitly want a persistent Koda project face, local data, Koda-managed lifecycle, or an in-app line to its agent—for requests such as “make me a fitness tracker,” “turn this project into a Koda app,” or “add a dashboard to this Koda app.” Do not use when the user wants to publish or distribute it, or asks for a standalone destination: a native, mobile, or desktop app (including a game), a public website, or a hosted service.
 ---
 
 # Create a Koda mini app
 
 Build a project that grew a face, not a generated artifact that leaves its workshop behind. The app must remain useful as a normal project without Koda-specific lifecycle metadata.
+
+A private app for the user's own use is the positive cue; they do not need to know to ask for a “Koda mini app.” A named destination or audience overrides that cue: if they want a native executable or app-store product, a standalone game, their own public website or hosted service, or something to distribute to other users, use normal project shaping instead. Koda can still help build it; it is not a Koda mini app.
 
 ## Shape before you build
 

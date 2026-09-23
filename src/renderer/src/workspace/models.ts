@@ -234,8 +234,8 @@ export function prettyModel(id: string): string {
   const m = /^([a-z]+)-(\d+(?:[-.]\d+)*)(?:-([a-z][a-z0-9-]*))?$/.exec(body)
   if (!m) return id
   const version = m[2].replace(/-/g, '.')
-  // OpenAI ids are an initialism plus a tier word after the version (`gpt-5.6-sol`, `gpt-6-astra`),
-  // and the tier is what tells two same-version models apart, so it stays: "GPT-5.6 Sol".
+  // OpenAI ids are an initialism plus a tier word after the version (`gpt-6-sol`, `gpt-6-luna`),
+  // and the tier is what tells two same-version models apart, so it stays: "GPT-6 Sol".
   if (m[1] === 'gpt') {
     const tier = m[3] ? ` ${titleWords(m[3])}` : ''
     return `GPT-${version}${tier}`

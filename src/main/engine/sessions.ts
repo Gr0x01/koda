@@ -108,6 +108,7 @@ import {
 } from '../terminal'
 import { compactTranscriptToolOutput } from '@shared/tool-output'
 import {
+  isRetryableTerminalEngineError,
   isTopLevelTurnActivity,
   mergeReplayIntoTranscript,
   normalizeReplaySequence,
@@ -221,6 +222,10 @@ const CHILD_STOP_TIMEOUT_MS = 3_000
 /** …and the whole sweep gets this long, however many children are live, before the parent is
  *  interrupted anyway. Bounds carried from the T3 pattern (research doc, harness verdict). */
 const CHILD_STOP_TOTAL_MS = 10_000
+/** …and after the parent interrupt goes out, this long for the engine to produce the stopped turn's own
+ *  terminal event before a replacement turn is admitted anyway. Stop hands the session back to the user,
+ *  so an engine that never answers must not re-lock the composer it just unlocked. */
+const STOPPED_TURN_SETTLE_MS = 15_000
 const REMOTE_ATTEMPT_HISTORY_PER_SESSION = 64
 const REMOTE_ATTACHMENT_PAYLOAD_SESSIONS = 16
 /** Stand-in session id on a poll-derived RateLimitUpdate. The windows are an ACCOUNT fact with no
@@ -557,6 +562,19 @@ export class EngineSessionManager {
    *  launcher polls, it doesn't subscribe) read this to show a live working/idle glyph per session. Kept
    *  in lockstep with the client-side `busy` reducer: set on a turn's send, cleared when the turn ends. */
   private readonly working = new Set<string>()
+  /** sessionId → a monotonic count of `working` TRANSITIONS. A remote head has no clock it can compare
+   *  with this Mac's, so it compares this instead: it keeps the revision its own send receipt returned,
+   *  and a launcher row at or above that revision demonstrably accounts for that send. Below it, the row
+   *  was built before the Mac saw the turn and may not lower the head's local posture. */
+  private readonly workingRevisions = new Map<string, number>()
+  /** sessionId → the accepted-turn generation whose terminal event a Stop is still waiting for.
+   *  `settling` blocks a replacement turn from entering an engine that is still aborting; it expires on
+   *  its own so an engine that never produces that terminal cannot hold the session hostage, while the
+   *  generation itself lives until the terminal really lands so a late one can be recognised as stale. */
+  private readonly stoppedTurns = new Map<
+    string,
+    { generation: number; settling: boolean; timer: ReturnType<typeof setTimeout> }
+  >()
   /** Latest noteworthy terminal edge for each live session. Main owns only the event fact; a phone keeps
    *  its own seen-completion revision so opening work on one head cannot clear another head's attention. */
   private readonly terminalAttention = new Map<string, RemoteTerminalAttention>()
@@ -638,8 +656,8 @@ export class EngineSessionManager {
     this.gate = new ApprovalGate(
       (sessionId, label) => this.checkpointForSession(sessionId, label),
       (req) => this.pushApprovalRequest(req),
-      (sessionId) => this.pushApprovalCancelled(sessionId),
-      (sessionId, requestId) => this.pushApprovalResolved(sessionId, requestId),
+      (sessionId, revision) => this.pushApprovalCancelled(sessionId, revision),
+      (sessionId, requestId, revision) => this.pushApprovalResolved(sessionId, requestId, revision),
       (sessionId, message) => this.forward({ type: 'EngineError', sessionId, message, fatal: false }),
     )
     this.broker = new PermissionBroker(
@@ -1152,7 +1170,11 @@ export class EngineSessionManager {
           prior.fingerprint !== attemptFingerprint
         )
           throw new Error('This turn attempt was already used for a different message or attachment payload.')
-        return { status: prior.state === 'running' ? 'already-running' : 'already-complete' }
+        return {
+          status: prior.state === 'running' ? 'already-running' : 'already-complete',
+          workingRevision: this.workingRevision(sessionId),
+          statusEpoch: this.statusEpoch(sessionId),
+        }
       }
     }
     // Main is the final admission boundary for every head. A cold phone can open before its local stream
@@ -1168,6 +1190,12 @@ export class EngineSessionManager {
         throw new Error('This session is changing settings. Let that finish before sending another message.')
       if (this.working.has(sessionId) || this.turnAdmissions.has(sessionId))
         throw new Error('A turn is already running. Let it finish or stop it before sending another message.')
+      // Stop clears `working` immediately so the user gets their session back, which means `working`
+      // alone no longer covers the gap between the interrupt going out and the engine actually aborting.
+      // A turn admitted inside that gap would be a second top-level turn on a child still unwinding the
+      // first. The block expires on its own, so a wedged engine cannot make Stop a new kind of lock.
+      if (this.stoppedTurns.get(sessionId)?.settling)
+        throw new Error('That turn is still stopping. Try again in a moment.')
       if (this.gate.pendingRequests(sessionId).length > 0)
         throw new Error('This session is waiting for your answer. Resolve it before sending another message.')
       admission = { generation: ++this.nextTurnAdmissionGeneration, cancelled: false }
@@ -1183,7 +1211,7 @@ export class EngineSessionManager {
       // Only this exact generation may release session-level liveness. A true end can retire it and a
       // later session can reuse the id before an old await resumes; that successor remains untouched.
       if (releaseAdmission() && workingClaimed) {
-        this.working.delete(sessionId)
+        this.clearWorking(sessionId)
         this.pendingTurns.delete(sessionId)
         this.maybeFinishCompletionTurn(sessionId)
       }
@@ -1229,7 +1257,7 @@ export class EngineSessionManager {
       releaseAdmission()
       throw error
     }
-    this.working.add(sessionId)
+    this.markWorking(sessionId)
     workingClaimed = true
     const continuedBoundary = internal.logicalContinuation
       ? this.completionTurns.get(sessionId)
@@ -1467,7 +1495,7 @@ export class EngineSessionManager {
     } catch (error) {
       // A synchronous driver write failure is the throwing form of `false`: no engine turn exists to
       // publish a terminal event, so release every lifecycle claim here and preserve the driver error.
-      this.working.delete(sessionId)
+      this.clearWorking(sessionId)
       this.pendingTurns.delete(sessionId)
       this.maybeFinishCompletionTurn(sessionId)
       throw error
@@ -1479,7 +1507,7 @@ export class EngineSessionManager {
     if (sent === false) {
       // A dead/unwritable child refused the turn synchronously. Release canonical liveness and reject
       // the caller so a remote outbox keeps the exact bubble retryable instead of treating it as acked.
-      this.working.delete(sessionId)
+      this.clearWorking(sessionId)
       this.pendingTurns.delete(sessionId)
       this.maybeFinishCompletionTurn(sessionId)
       throw new Error('The engine did not accept this turn. Try again.')
@@ -1498,6 +1526,12 @@ export class EngineSessionManager {
         cancelled: false,
         session,
       })
+      // A replacement turn owns the session now, so any stopped-turn marker has no job left. Admission
+      // could not have passed while it was settling, which means its suppression window is already over;
+      // keeping the generation past that point is what made THIS turn's own terminal look like the
+      // stopped predecessor's, skip the whole settle block, and strand the session one turn later —
+      // reintroducing the exact lock this branch removes, in the no-terminal case the bound exists for.
+      this.clearStoppedTurn(sessionId)
     } else if (internal.logicalContinuation) {
       // Stop must follow the logical turn onto its replacement child. Keeping the old AcceptedTurn object
       // would make interrupt() correctly reject the dead process but then decline to stop the live resend.
@@ -1544,7 +1578,9 @@ export class EngineSessionManager {
     // and broker recovery can respawn mid-turn. The notice therefore STAYS pending — armed only
     // records what this turn carried so forward() can discharge it at the genuine TurnComplete.
     if (notice) this.armedRestoreNotices.set(sessionId, notice)
-    return { status: 'accepted' }
+    // The revision rides the receipt so the sending head learns, in the same round trip, which launcher
+    // rows already account for this turn. Read AFTER the working claim above, never before it.
+    return { status: 'accepted', workingRevision: this.workingRevision(sessionId), statusEpoch: this.statusEpoch(sessionId) }
   }
 
   // ── Queued-send ─────────────────────────────────────────────────────────────
@@ -2136,6 +2172,19 @@ export class EngineSessionManager {
     })
   }
 
+  /** Re-arm the scheduler's one-use turn token for ONE more reserved turn on the same scope. Dream's
+   *  wrote-nothing nudge is the only caller. The token exists so that no renderer or phone send can
+   *  replace the reserved turn, not to cap the scheduler at a single turn: a human send carries no
+   *  token and is refused whether or not this has been called, so re-arming opens no window. Call it
+   *  immediately before the send — the only state it relaxes is the broker-recovery continuation's
+   *  "has the turn started" check. False means the scope is no longer live and nothing was re-armed. */
+  rearmProjectMutationScopeTurn(scope: ProjectMutationScope): boolean {
+    const live = [...this.projectMutationScopes].find((candidate) => candidate === scope)
+    if (!live) return false
+    live.turnStarted = false
+    return true
+  }
+
   /** Finish a scheduler scope inside the project chain. Completion reconciliation stays open until
    * the callback lands every scheduler-owned write. When `version` is present, that same evidence may
    * create one path-scoped user-Git commit before the scope closes; mixed, overlapping, out-of-scope,
@@ -2404,6 +2453,13 @@ export class EngineSessionManager {
     if (admission) admission.cancelled = true
     this.turnAdmissions.delete(sessionId)
     this.acceptedTurns.delete(sessionId)
+    // No future terminal will arrive for this id, so nothing is owed and nothing needs the revision that
+    // told a remote head how current a launcher row was. A head still pointed here finds no row at all.
+    this.clearStoppedTurn(sessionId)
+    this.workingRevisions.delete(sessionId)
+    // A true end also outranks the respawn exemption: whatever `dispose()` held back for a recovery that
+    // will now never finish belongs to nobody, and keeping it would leave a represented row behind.
+    this.releasePreservedSessionState(sessionId)
     this.acceptedRemoteAttempts.delete(sessionId)
     this.activeRemoteAttemptIds.delete(sessionId)
     this.remoteTurnPayloads.delete(sessionId)
@@ -2936,10 +2992,34 @@ export class EngineSessionManager {
     this.notifyDesktopOfHeadless(cwd)
   }
 
+  /** Every session a remote head should still be shown. `this.sessions` holds engine HANDLES, and an
+   *  infrastructure respawn deliberately has none for the moment it takes to replace the child — the same
+   *  gap `isWorking` keeps reporting as working, and the gap `dispose` preserves `working` across. A row
+   *  that vanishes there erases that protection before it reaches the phone, which correctly reads a
+   *  missing row as "the Mac is not running this" and unlocks the composer mid-turn. Only ids that still
+   *  have a project dir are admitted, so a row is never half-built. */
+  private representedSessionIds(): string[] {
+    const ids = new Set(this.sessions.keys())
+    for (const id of [...this.recoveringBroker, ...this.resumeMissRecovery])
+      if (this.projectDirs.has(id)) ids.add(id)
+    return [...ids]
+  }
+
+  /** A respawn that produced no replacement child leaves the logical-session state `dispose()` held back
+   *  for it with no owner. Release it here, extending the cleanup recoverBroker already did for
+   *  `turnReplies`, so a failed recovery cannot leave a remote head looking at a session that is gone. */
+  private releasePreservedSessionState(sessionId: string): void {
+    this.projectDirs.delete(sessionId)
+    this.sessionEngines.delete(sessionId)
+    this.lastActivityAt.delete(sessionId)
+    this.lastLines.delete(sessionId)
+    this.turnReplies.delete(sessionId)
+  }
+
   /** Live sessions a remote client can pick: id + project dir + the session's human title.
    *  `lastActivityAt` (epoch ms, 0 = no turn yet) rides along so the phone can show ages + day-group. */
   remoteSessionList(): { id: string; cwd: string; label: string; engineId: EngineId; lastActivityAt: number; lastLine?: string }[] {
-    return [...this.sessions.keys()]
+    return this.representedSessionIds()
       .filter((id) => !this.hiddenDreamSessions.has(id))
       .filter((id) => !this.deferredDreamVisibility.has(id))
       .sort((a, b) => (this.lastActivityAt.get(b) ?? 0) - (this.lastActivityAt.get(a) ?? 0))
@@ -2959,7 +3039,80 @@ export class EngineSessionManager {
   /** Is parent or delegated work in flight for this session right now? Drives the remote launcher's
    *  live working glyph and unattended schedulers from the same main-owned runtime truth. */
   isWorking(sessionId: string): boolean {
+    // No live driver means no process that could be working, whatever leaked into the sets below: a
+    // relaunched Mac, a reaped headless session and a disposed one all used to keep reporting a turn in
+    // flight that nothing left alive could ever end, which is what strands a phone chat forever. The one
+    // exception is the recovery gap, where the transport is deliberately being replaced under the same
+    // logical turn — the same predicate the two `working.delete` teardown sites already use.
+    if (
+      !this.sessions.has(sessionId) &&
+      !this.recoveringBroker.has(sessionId) &&
+      !this.resumeMissRecovery.has(sessionId)
+    )
+      return false
     return this.working.has(sessionId) || this.hasActiveDelegation(sessionId)
+  }
+
+  /** Identity of this session runtime. Preserved across driver replacement, renewed after true end. */
+  statusEpoch(sessionId: string): string {
+    return this.gate.statusEpoch(sessionId)
+  }
+
+  /** Parent/delegation status revision, comparable only within the same status epoch. */
+  workingRevision(sessionId: string): number {
+    return this.workingRevisions.get(sessionId) ?? 0
+  }
+
+  /** The gate's pending-set transition count, the same idea one layer down: a head compares it against
+   *  the highest revision its own approval frames carried. The gate owns it; this is the read the
+   *  launcher row is built from. */
+  pendingRevision(sessionId: string): number {
+    return this.gate.pendingRevision(sessionId)
+  }
+
+  /** A Stop has gone out and the engine has not produced that turn's terminal event yet. Callers that
+   *  must not read or revert the working tree until the child really stops writing wait on THIS, because
+   *  `working` is now dropped the instant Stop is pressed so the user gets their session back. Bounded by
+   *  STOPPED_TURN_SETTLE_MS, so a wedged engine cannot hold a caller open indefinitely. */
+  stopSettling(sessionId: string): boolean {
+    return this.stoppedTurns.get(sessionId)?.settling === true
+  }
+
+  /** The two seams that own `working`. Every add and delete goes through them so the revision above can
+   *  never drift from the flag it describes; a no-op call is not a transition and must not bump it. */
+  private markWorking(sessionId: string): void {
+    if (this.working.has(sessionId)) return
+    this.working.add(sessionId)
+    this.bumpWorkingRevision(sessionId)
+  }
+
+  private clearWorking(sessionId: string): void {
+    if (!this.working.delete(sessionId)) return
+    this.bumpWorkingRevision(sessionId)
+  }
+
+  private bumpWorkingRevision(sessionId: string): void {
+    this.workingRevisions.set(sessionId, this.workingRevision(sessionId) + 1)
+  }
+
+  /** Remember which accepted turn a Stop is still owed a terminal event for. Two jobs, deliberately with
+   *  different lifetimes: `settling` keeps a replacement out of an engine that has not finished aborting,
+   *  and expires so a wedged engine cannot re-strand the session; the generation outlives that bound so
+   *  the stopped turn's late terminal is still recognised as belonging to it and not to its successor. */
+  private noteStoppedTurn(sessionId: string, generation: number): void {
+    this.clearStoppedTurn(sessionId)
+    const timer = setTimeout(() => {
+      const current = this.stoppedTurns.get(sessionId)
+      if (current) current.settling = false
+    }, STOPPED_TURN_SETTLE_MS)
+    this.stoppedTurns.set(sessionId, { generation, settling: true, timer })
+  }
+
+  private clearStoppedTurn(sessionId: string): void {
+    const current = this.stoppedTurns.get(sessionId)
+    if (!current) return
+    clearTimeout(current.timer)
+    this.stoppedTurns.delete(sessionId)
   }
 
   /** Epoch ms of this session's last engine event (0 = none yet) — engine liveness for unattended
@@ -4488,6 +4641,15 @@ export class EngineSessionManager {
     const session = this.sessions.get(sessionId)
     const accepted = this.acceptedTurns.get(sessionId)
     if (accepted) accepted.cancelled = true
+    // Stop is authoritative user intent, so drop the working flag now rather than waiting on a terminal
+    // engine event that a stuck turn never produces. Safe because forward() re-adds the session on ANY
+    // top-level activity, so an engine genuinely still working re-arms it within one event.
+    this.clearWorking(sessionId)
+    // …but `working` was also the admission guard. A turn that reached the engine is still aborting, so
+    // record the generation we are owed a terminal for: it keeps a replacement out of the engine until
+    // the abort lands (bounded), and lets a late terminal be attributed to this turn rather than to
+    // whatever was admitted after it.
+    if (accepted) this.noteStoppedTurn(sessionId, accepted.generation)
     await this.stopDelegatedChildren(sessionId, session)
     // A live admission has not crossed session.sendTurn yet. Its token is the stop; interrupting the
     // idle process after an awaited child sweep could instead hit a newer turn on that same process.
@@ -4670,8 +4832,13 @@ export class EngineSessionManager {
       }
     }
     // Drop the project mapping only after teardown (a crash keeps it so recovery still works;
-    // handleClose, which needs the dir to cancel approvals, has already run by here).
-    this.projectDirs.delete(sessionId)
+    // handleClose, which needs the dir to cancel approvals, has already run by here). An infrastructure
+    // respawn is not a teardown at all: the logical session keeps its project for the whole gap, and
+    // `start()` is about to set the identical value back. Keeping it is also what lets the session stay
+    // in `representedSessionIds()` while its handle is missing, so the remote head keeps seeing the row
+    // whose `working` the block below deliberately preserves.
+    if (!this.recoveringBroker.has(sessionId) && !this.resumeMissRecovery.has(sessionId))
+      this.projectDirs.delete(sessionId)
     // A broker recovery replaces only the engine transport under the same logical session. Preserve
     // Dream discovery state across that respawn: exposing a deferred tidy or a hidden REM snapshot
     // during the reconnect would reopen the exact human-handoff race those sets close.
@@ -4685,7 +4852,6 @@ export class EngineSessionManager {
     this.sessionModelEffort.delete(sessionId)
     this.spawnedWith.delete(sessionId)
     this.resolvedModels.delete(sessionId)
-    this.sessionEngines.delete(sessionId)
     // The replacement child republishes its cursor at SessionStarted; a resume-miss restart deliberately
     // clears it first so the fresh spawn can't be handed the dead blob back.
     this.resumeCursors.delete(sessionId)
@@ -4697,15 +4863,23 @@ export class EngineSessionManager {
     this.remoteFirstPrompt.delete(sessionId)
     this.remoteLastReply.delete(sessionId)
     this.remoteTitleGen.delete(sessionId)
-    this.lastActivityAt.delete(sessionId)
     // Infrastructure recovery replaces only the transport process; its logical human turn stays active
     // until the replacement child's TurnComplete. Keeping `working` also preserves overlap detection and
     // prevents the completion boundary from closing in the respawn gap.
     if (!this.recoveringBroker.has(sessionId) && !this.resumeMissRecovery.has(sessionId)) {
-      this.working.delete(sessionId)
+      this.clearWorking(sessionId)
       this.acceptedTurns.delete(sessionId)
+      // The process that owed the stopped turn a terminal event is gone, so nothing is coming; releasing
+      // the marker here is what keeps a dispose during an abort from blocking the next send for its bound.
+      this.clearStoppedTurn(sessionId)
+      // Engine, recency and the "what is it doing" line describe the LOGICAL session, not the process
+      // incarnation — the same reason `turnReplies` survives below. A respawn keeps them so the row the
+      // remote head still sees during the gap stays whole instead of flickering to a blank project on a
+      // default engine, and `start()` restores the same engine a beat later anyway.
+      this.sessionEngines.delete(sessionId)
+      this.lastActivityAt.delete(sessionId)
+      this.lastLines.delete(sessionId)
     }
-    this.lastLines.delete(sessionId)
     this.engineEventAt.delete(sessionId)
     // The reply accumulator belongs to the logical human turn, not the engine process. Broker
     // recovery tears that process down mid-turn and resumes it under the same completion boundary,
@@ -4818,8 +4992,10 @@ export class EngineSessionManager {
     // present through the respawn gap so another same-project turn cannot have its changes claimed by
     // the recovered boundary. A failed recovery's fatal EngineError clears it through forward().
     if (!this.recoveringBroker.has(sessionId) && !this.resumeMissRecovery.has(sessionId)) {
-      this.working.delete(sessionId)
+      this.clearWorking(sessionId)
       this.acceptedTurns.delete(sessionId)
+      // Same reason as dispose(): the child that owed the stopped turn its terminal has exited.
+      this.clearStoppedTurn(sessionId)
     }
     this.gate.cancelSession(sessionId)
     void this.broker.unregister(sessionId)
@@ -4890,9 +5066,9 @@ export class EngineSessionManager {
             ...(replay.visible.clientTurnId ? { clientTurnId: replay.visible.clientTurnId } : {}),
           },
         )
-      } else this.working.delete(sessionId)
+      } else this.clearWorking(sessionId)
     } catch (err) {
-      this.working.delete(sessionId)
+      this.clearWorking(sessionId)
       this.forward({
         type: 'EngineError',
         sessionId,
@@ -4904,6 +5080,9 @@ export class EngineSessionManager {
       if (replay) this.pendingTurns.set(sessionId, replay)
     } finally {
       this.resumeMissRecovery.delete(sessionId)
+      // A restart that never produced a replacement child owns none of the state dispose() held back
+      // for it, and leaving it would keep the session in the remote list with nothing behind it.
+      if (!this.sessions.has(sessionId)) this.releasePreservedSessionState(sessionId)
     }
   }
 
@@ -5024,7 +5203,7 @@ export class EngineSessionManager {
       if (this.sessions.has(sessionId)) this.brokerRecovery.set(sessionId, { count: streak + 1, at: Date.now() })
       else {
         this.brokerRecovery.delete(sessionId)
-        this.turnReplies.delete(sessionId)
+        this.releasePreservedSessionState(sessionId)
       }
     }
   }
@@ -5074,6 +5253,8 @@ export class EngineSessionManager {
     }
     this.logEvent(event)
     this.trackSubagentLifecycle(event)
+    // Delegates can start or finish after the parent turn; their posture also invalidates older polls.
+    if (isDelegationLifecycleEvent(event)) this.bumpWorkingRevision(event.sessionId)
     // A broker-drop ToolResult starts recovery synchronously before the adapter can drain the next
     // stdout line. If that old child then emits TurnComplete, it ended only the failed transport
     // attempt—not the logical human turn that the replacement child is about to continue.
@@ -5087,7 +5268,7 @@ export class EngineSessionManager {
     // sets it too, for the instant before the first delta lands). Ends on TurnComplete, fatal process
     // loss, or an explicit turn rejection that happened before any work could start.
     if (isTopLevelTurnActivity(event)) {
-      this.working.add(event.sessionId)
+      this.markWorking(event.sessionId)
       this.engineEventAt.set(event.sessionId, Date.now())
     }
     // ToolResult and delegation lifecycle events refresh the evidence clock WITHOUT joining
@@ -5101,41 +5282,66 @@ export class EngineSessionManager {
     else if (
       !brokerTransportTurnComplete &&
       (event.type === 'TurnComplete' ||
-        (event.type === 'EngineError' && (event.fatal || event.category === 'turnRejected')))
+        (event.type === 'EngineError' && isRetryableTerminalEngineError(event)))
     ) {
-      // A genuine TurnComplete proves the agent read the notice its turn carried — the one moment
-      // the pending notice is discharged. The text must still match: a restore DURING the turn
-      // queued a newer notice describing the current disk, which the finished turn never saw.
-      if (event.type === 'TurnComplete') {
-        const armed = this.armedRestoreNotices.get(event.sessionId)
-        if (armed && this.pendingRestoreNotices.get(event.sessionId) === armed)
-          this.pendingRestoreNotices.delete(event.sessionId)
+      // A terminal owed to a turn the user already stopped, arriving after a replacement turn was
+      // admitted, belongs to the OLD generation. Settling anything from it would clear the LIVE turn's
+      // working flag, accepted attempt and replay copy — the successor would look idle while it runs and
+      // lose its recovery material. Consume the marker either way and let the new turn's own terminal
+      // settle it. This is the generational half of the guard `working` used to provide by staying set.
+      const stopped = this.stoppedTurns.get(event.sessionId)
+      const staleStoppedTerminal =
+        stopped !== undefined &&
+        this.acceptedTurns.get(event.sessionId) !== undefined &&
+        this.acceptedTurns.get(event.sessionId)!.generation !== stopped.generation
+      if (stopped) this.clearStoppedTurn(event.sessionId)
+      if (!staleStoppedTerminal) {
+        // Every turn-ending error clears the working flag, classified by the one shared threshold the
+        // renderer banners and remote attention already use. A non-fatal apiError is the case that used
+        // to strand a session: it ends the turn for the reader, but the old guard only recognised fatal
+        // and turnRejected, so nothing ever lowered the flag again.
+        this.clearWorking(event.sessionId)
+        // ...and that is ALL a non-fatal error may do here. Both engines can still emit the same turn's
+        // real TurnComplete afterwards, so the accepted attempt, the resume-miss replay copy, the
+        // completion boundary, the awaitTurnEnd waiter (W3) and the queued slot still belong to the
+        // genuine terminal that owns them.
+        const processTurnEnded =
+          event.type === 'TurnComplete' || event.fatal || event.category === 'turnRejected'
+        if (processTurnEnded) {
+          // A genuine TurnComplete proves the agent read the notice its turn carried — the one moment
+          // the pending notice is discharged. The text must still match: a restore DURING the turn
+          // queued a newer notice describing the current disk, which the finished turn never saw.
+          if (event.type === 'TurnComplete') {
+            const armed = this.armedRestoreNotices.get(event.sessionId)
+            if (armed && this.pendingRestoreNotices.get(event.sessionId) === armed)
+              this.pendingRestoreNotices.delete(event.sessionId)
+          }
+          this.armedRestoreNotices.delete(event.sessionId)
+          this.acceptedTurns.delete(event.sessionId)
+          // The turn reached its end, so there is nothing left for a resume-miss recovery to replay.
+          this.pendingTurns.delete(event.sessionId)
+          // A scheduler-owned scope and a backgrounded delegate both still have writes to land after the
+          // engine stops. Keep the logical completion boundary open until the last of them is done.
+          this.maybeFinishCompletionTurn(event.sessionId)
+          // The genuine end-of-turn signal `awaitTurnEnd` waits for (W3) — resolved here, not off
+          // `working`, so a benign respawn's transient false (fatal: false) never fires it.
+          const waiter = this.turnEndWaiters.get(event.sessionId)
+          if (waiter) {
+            this.turnEndWaiters.delete(event.sessionId)
+            waiter()
+          }
+          // Queued-send: a held message may go out ONLY at a genuine, successful TurnComplete. A fatal or
+          // turnRejected end — including Codex's pre-start rejection paired with a compatibility
+          // TurnComplete (stopReason TURN_REJECTED_STOP_REASON) — must NOT dispatch: the microtask could
+          // fire the queued turn between the rejection and that compatibility completion. The stale-
+          // terminal guard above now also catches that completion when a Stop owned the earlier turn;
+          // for a plain rejection this restraint is still the whole protection. Delivery is deferred to a
+          // microtask so this event's own bookkeeping finishes before sendTurn re-arms it.
+          if (event.type === 'TurnComplete' && event.stopReason !== TURN_REJECTED_STOP_REASON)
+            queueMicrotask(() => this.tryDeliverQueued(event.sessionId))
+          else this.returnQueuedTurn(event.sessionId, true)
+        }
       }
-      this.armedRestoreNotices.delete(event.sessionId)
-      this.working.delete(event.sessionId)
-      this.acceptedTurns.delete(event.sessionId)
-      // The turn reached its end, so there is nothing left for a resume-miss recovery to replay.
-      this.pendingTurns.delete(event.sessionId)
-      // A scheduler-owned scope and a backgrounded delegate both still have writes to land after the
-      // engine stops. Keep the logical completion boundary open until the last of them is done.
-      this.maybeFinishCompletionTurn(event.sessionId)
-      // The genuine end-of-turn signal `awaitTurnEnd` waits for (W3) — resolved here, not off
-      // `working`, so a benign respawn's transient false (fatal: false) never fires it.
-      const waiter = this.turnEndWaiters.get(event.sessionId)
-      if (waiter) {
-        this.turnEndWaiters.delete(event.sessionId)
-        waiter()
-      }
-      // Queued-send: a held message may go out ONLY at a genuine, successful TurnComplete. A fatal or
-      // turnRejected end — including Codex's pre-start rejection paired with a compatibility TurnComplete
-      // (stopReason TURN_REJECTED_STOP_REASON) — must NOT dispatch: the microtask could fire the queued
-      // turn between the rejection and that compatibility completion, and the old completion would then
-      // clear the NEW turn's working/acceptedTurns/pendingTurns. Return the payload to the composer
-      // instead. Delivery is deferred to a microtask so this event's own bookkeeping (gate sweep,
-      // working cleanup) finishes first before sendTurn re-arms them.
-      if (event.type === 'TurnComplete' && event.stopReason !== TURN_REJECTED_STOP_REASON)
-        queueMicrotask(() => this.tryDeliverQueued(event.sessionId))
-      else this.returnQueuedTurn(event.sessionId, true)
     }
 
     // Keep the transport attempt's real usage/account activity, but do not expose a false logical
@@ -5151,10 +5357,7 @@ export class EngineSessionManager {
     // A retryable engine failure is the only point exact phone attachment bytes may enter durable
     // replay. A genuine terminal event also settles the accepted-attempt receipt used by app-kill
     // recovery; broker transport completions returned above are explicitly not logical terminals.
-    if (
-      event.type === 'EngineError' &&
-      (event.fatal || event.category === 'apiError' || event.category === 'turnRejected')
-    ) {
+    if (event.type === 'EngineError' && isRetryableTerminalEngineError(event)) {
       this.promoteRemoteTurnPayload(event.sessionId)
       if (event.fatal || event.category === 'turnRejected') {
         this.finishRemoteTurnPayload(event.sessionId, true)
@@ -5169,7 +5372,11 @@ export class EngineSessionManager {
     // The native envelope has done its job by here: the drivers stamped it and every main-side reader
     // above has seen it. Everything below this line serializes — the durable replay log, the relay
     // frame, the renderer send — so drop a payload no surface reads before it doubles disk and wire.
-    event = this.bufferRemoteEvent(stripRawEnvelope(event))
+    event = this.bufferRemoteEvent({
+      ...stripRawEnvelope(event),
+      statusEpoch: this.statusEpoch(event.sessionId),
+      workingRevision: this.workingRevision(event.sessionId),
+    })
     this.noteTerminalAttention(event)
 
     // The launcher's "what is it doing" line — the first non-empty line of the latest finalized reply.
@@ -5367,13 +5574,13 @@ export class EngineSessionManager {
     if (parsed.success) this.send(IpcChannels.approvalRequest, parsed.data.sessionId, parsed.data)
   }
 
-  private pushApprovalCancelled(sessionId: string): void {
-    const parsed = ApprovalCancelledSchema.safeParse({ sessionId })
+  private pushApprovalCancelled(sessionId: string, revision: number): void {
+    const parsed = ApprovalCancelledSchema.safeParse({ sessionId, revision, statusEpoch: this.statusEpoch(sessionId) })
     if (parsed.success) this.send(IpcChannels.approvalCancelled, sessionId, parsed.data)
   }
 
-  private pushApprovalResolved(sessionId: string, requestId: string): void {
-    const parsed = ApprovalResolvedSchema.safeParse({ sessionId, requestId })
+  private pushApprovalResolved(sessionId: string, requestId: string, revision: number): void {
+    const parsed = ApprovalResolvedSchema.safeParse({ sessionId, requestId, revision, statusEpoch: this.statusEpoch(sessionId) })
     if (parsed.success) this.send(IpcChannels.approvalResolved, sessionId, parsed.data)
   }
 

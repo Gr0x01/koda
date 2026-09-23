@@ -20,7 +20,8 @@
  * work and deleted during cleanup. Successful Git-backed runs finish with one user-Git commit of
  * clean, Dream-owned `.koda/memory/` paths; ambiguous or mixed work stays visible and uncommitted.
  */
-import { existsSync } from 'node:fs'
+import { existsSync, readdirSync, statSync } from 'node:fs'
+import type { Dirent } from 'node:fs'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { app, powerMonitor, powerSaveBlocker } from 'electron'
@@ -64,12 +65,57 @@ const HEADROOM_LIMIT_PCT = 80
 /** REM is optional and more speculative than the tidy, so it only spends a relatively empty window. */
 const REM_HEADROOM_LIMIT_PCT = 60
 
-const DREAM_PROMPT = `This is an unattended overnight maintenance turn — the user is asleep and nobody is watching. Your ONLY job is to consolidate THIS project's memory in .koda/memory/. Approvals are auto-declined tonight: if something would need one, skip it and flag it instead.
+const DREAM_PROMPT = `This is an unattended overnight maintenance turn — the user is asleep and nobody is watching. Your ONLY job is to consolidate THIS project's memory in .koda/memory/. Reading local evidence and editing files under .koda/memory/ with your normal file-edit tools is authorized tonight; only actions that would need a human are auto-declined, so skip those and flag them instead.
+
+Your harness may report this session's filesystem as read-only, because Koda decides every file change at its own approval gate instead of in the engine sandbox. That label is not a refusal of a memory edit: make the edit with your normal file-edit tool and let the gate answer. Never report that memory could not be written unless Koda actually rejected an edit — and if it does reject one, keep its stated reason, skip that change, and do not retry it through shell commands or another tool.
 
 1. Read .koda/memory/MEMORY.md and active-context.md. Skim today's transcripts for this project (under ~/.claude/projects/, matched by the cwd field inside the .jsonl files) only as far as needed to spot decisions, reversals, or shipped work the memory hasn't recorded — sample with Grep and targeted reads, never read multi-MB files wholesale.
 2. Load the \`memory\` playbook and apply its tidy and project-card contracts as DELTA edits, never wholesale rewrites: strike active-context lines whose work shipped or verified; keep active-context to one-liners + pointers, moving narrative into the right topic note; fold replaced approaches into their survivor (keep the lesson, delete the leftover and its index line); keep every index line in sync with its note. Update project-card.md only when its durable orientation changed, and never turn it into another index. KEEP WEIRD SPECIFICS — concrete gotchas relocate verbatim, only narrative compresses. Also prune rot while distilling: entries that were stale on arrival (PR numbers, commit hashes, task-progress logs — git already records those), negative claims about tools ("X is broken" — these harden into refusals that outlive the fix), and approaches that never actually worked recorded as if they were reliable workflows; a still-live blocker becomes a dated open problem in active-context, the rest goes. Never delete or archive a decision record. If memory is already lean, change nothing — a no-op is a valid result.
 3. Anything that needs a human (a contradiction you didn't fix, a distillation too risky to do blind, wrong-but-authoritative facts, a bug noticed in passing) goes as a dated one-liner under a "**Dream flags:**" section at the bottom of active-context.md — max 3 lines; delete your own stale flags whose issue is resolved. Flags must never accrete.
 4. Touch NOTHING outside .koda/memory/ — no code, no Documents/, no git. End with a 3–6 line plain-language summary of what you consolidated, flagged, or skipped; that message becomes the night's digest entry the user reads in the morning. If you changed nothing AND flagged nothing, your entire final message must be exactly "${QUIET_NIGHT}" — nothing else; never combine it with content.`
+
+/** The prod the user had to deliver in the morning, moved into the night. A pass that describes what
+ *  it found and writes nothing is the failure they could only fix by hand the next day, and no wording
+ *  in the opening prompt can be trusted to survive the next engine's sandbox vocabulary. This is sent
+ *  once, in the same session, while the findings are still in context — the evidence that it is
+ *  warranted is the untouched memory tree, not a phrase in the reply. */
+export const TIDY_NUDGE = `Nothing has been written yet: every file under .koda/memory is byte-for-byte unchanged since this turn started, so the consolidation you just described has not happened.
+
+Your memory edits ARE authorized. If you held back because a sandbox, permission profile, or approval policy read as read-only, that reading is wrong — Koda decides file changes at its own approval gate, and edits inside .koda/memory are allowed there. Make them now with your normal file-edit tool; do not ask first, and do not route around it with shell commands.
+
+Apply the deltas you already identified, then close with the same 3-6 line summary contract as before. If Koda genuinely rejects an edit, name that edit and quote what the rejection said. If on reflection there was nothing worth changing, reply with exactly "${QUIET_NIGHT}".`
+
+/** Every file under the project's memory tree with its size and modification time. Two of these, taken
+ *  across a turn, answer the one question that decides whether the night worked at all — without
+ *  needing the project to be versioned, and without trusting the agent's own account of itself. Null
+ *  means there is no memory tree here, so there was never anything for this pass to write. */
+function memoryFingerprint(cwd: string): string | null {
+  const root = join(cwd, '.koda', 'memory')
+  if (!existsSync(root)) return null
+  const entries: string[] = []
+  const walk = (dir: string): void => {
+    let listing: Dirent[]
+    try {
+      listing = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return // an unreadable subtree is not evidence of a write either way
+    }
+    for (const entry of listing) {
+      const full = join(dir, entry.name)
+      if (entry.isDirectory()) walk(full)
+      else if (entry.isFile()) {
+        try {
+          const stat = statSync(full)
+          entries.push(`${full}:${stat.size}:${stat.mtimeMs}`)
+        } catch {
+          entries.push(`${full}:gone`) // vanished mid-walk, which is itself a change
+        }
+      }
+    }
+  }
+  walk(root)
+  return entries.sort().join('\n')
+}
 
 export const NO_REM_PROBLEM = 'No REM problem — nothing previously worked and stuck.'
 
@@ -428,6 +474,7 @@ export class DreamScheduler {
     let remError: unknown
     try {
       try {
+        const before = memoryFingerprint(cwd)
         // The exact in-memory scope is a one-use scheduler capability. No renderer/phone caller can
         // start or replace this reserved turn while the session is still unpublished.
         await this.sessions.sendTurn(sessionId, DREAM_PROMPT, undefined, 'remote', {
@@ -435,6 +482,20 @@ export class DreamScheduler {
         })
         outcome = await this.waitForTurnEnd(sessionId)
         tidyReply = this.sessions.lastAssistantReply(sessionId)
+        // A completed pass that wrote nothing and did not claim a quiet night is the morning-prod bug:
+        // the agent decided it was read-only and reported findings it never saved. Nudge once, on the
+        // evidence of the untouched tree rather than on anything the reply says, and let the second
+        // turn's summary stand as the night's digest.
+        if (outcome === 'completed' && before !== null && memoryFingerprint(cwd) === before && tidyReply?.trim() !== QUIET_NIGHT) {
+          log.warn('dream', `tidy wrote nothing and did not report a quiet night; nudging once: ${cwd}`)
+          if (this.sessions.rearmProjectMutationScopeTurn(scope)) {
+            await this.sessions.sendTurn(sessionId, TIDY_NUDGE, undefined, 'remote', {
+              projectMutationScope: scope,
+            })
+            outcome = await this.waitForTurnEnd(sessionId)
+            tidyReply = this.sessions.lastAssistantReply(sessionId) ?? tidyReply
+          }
+        }
       } catch (err) {
         tidyError = err
         tidyReply = `Dream tidy failed before it could leave a summary: ${err instanceof Error ? err.message : String(err)}`
@@ -704,9 +765,14 @@ export class DreamScheduler {
           log.warn('dream', `${stalled ? 'idle cap' : 'turn cap'} hit; interrupting ${sessionId}`)
           this.sessions.interrupt(sessionId)
           // Let the engine finish flushing before the scope scan reads the tree — an in-flight
-          // write racing the revert is exactly the mess the tripwire exists to prevent.
+          // write racing the revert is exactly the mess the tripwire exists to prevent. `isWorking`
+          // alone is no longer enough to wait on: Stop drops that flag immediately so a human gets
+          // their session back, so the wait has to include the interrupt's own unfinished abort.
           const settle = Date.now() + 60_000
-          while (this.sessions.isWorking(sessionId) && Date.now() < settle)
+          while (
+            (this.sessions.isWorking(sessionId) || this.sessions.stopSettling(sessionId)) &&
+            Date.now() < settle
+          )
             await new Promise((r) => setTimeout(r, 5_000))
           return 'interrupted'
         }

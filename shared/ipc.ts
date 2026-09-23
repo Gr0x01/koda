@@ -831,6 +831,11 @@ export const EngineEventSchema = z
   ])
   .and(ReplaySequenceSchema)
   .and(RawEnvelopeSchema)
+  .and(z.object({
+    /** Main-owned status stamp; counters are comparable only within this session runtime. */
+    statusEpoch: z.string().optional(),
+    workingRevision: z.number().int().nonnegative().optional(),
+  }))
 export type EngineEvent = z.infer<typeof EngineEventSchema>
 
 /** Drop the native envelope before an event is serialized to disk or sent to another process. The
@@ -977,6 +982,13 @@ export type RemoteTurnIdentity = z.infer<typeof RemoteTurnIdentitySchema>
  * fresh acceptance and continue listening for the ordinary terminal event. */
 export const RemoteTurnReceiptSchema = z.object({
   status: z.enum(['accepted', 'already-running', 'already-complete']),
+  /** The session's `working` transition count as the Mac saw it while admitting this turn. A launcher row
+   * at or above this revision demonstrably accounts for the turn, which is how a remote head decides the
+   * Mac's answer may LOWER its local posture instead of only raising it — no clock on either side, since
+   * the two devices have no common one. Omitted by older Macs; a client treats that as never
+   * authoritative and keeps its previous optimistic behavior. */
+  workingRevision: z.number().int().nonnegative().optional(),
+  statusEpoch: z.string().optional(),
 })
 export type RemoteTurnReceipt = z.infer<typeof RemoteTurnReceiptSchema>
 
@@ -1409,23 +1421,40 @@ export type ToolDecision = z.infer<typeof ToolDecisionSchema>
  *  `reason` (optional): why the gate forced this ask when the posture wouldn't have — e.g. the
  *  self-protection tier naming what the action touches ("this project's guardrail switches"). An
  *  unexplained card in Auto gets rubber-stamped; the reason is what makes the forced ask meaningful. */
+/** `revision` on all three approval frames below is the gate's pending-set transition count at the
+ *  moment the frame was produced. A head keeps the highest it has seen and compares the launcher row's
+ *  own revision against it, which is what lets a poll clear a prompt the Mac has retired without ever
+ *  erasing one raised while that poll was in flight. Two devices share no clock, so this is a count for
+ *  the same reason the working revision and the queued-send slot revision are. Optional: an older Mac
+ *  sends none, and its heads must read that as never authoritative rather than as revision 0. */
 export const ApprovalRequestSchema = z.object({
   sessionId: z.string(),
   requestId: z.string(),
   toolName: z.string(),
   input: z.unknown(),
   reason: z.string().optional(),
+  revision: z.number().int().nonnegative().optional(),
+  statusEpoch: z.string().optional(),
 })
 export type ApprovalRequest = z.infer<typeof ApprovalRequestSchema>
 export const ApprovalRequestsSchema = z.array(ApprovalRequestSchema)
 
 /** main→renderer: every pending approval for a session is void (its engine ended). Clear the UI. */
-export const ApprovalCancelledSchema = z.object({ sessionId: z.string() })
+export const ApprovalCancelledSchema = z.object({
+  sessionId: z.string(),
+  revision: z.number().int().nonnegative().optional(),
+  statusEpoch: z.string().optional(),
+})
 export type ApprovalCancelled = z.infer<typeof ApprovalCancelledSchema>
 
 /** main→renderer: one specific request was answered (possibly on another head) — clear just that
  *  prompt so a stale "Needs your approval" doesn't latch on heads that didn't answer it. */
-export const ApprovalResolvedSchema = z.object({ sessionId: z.string(), requestId: z.string() })
+export const ApprovalResolvedSchema = z.object({
+  sessionId: z.string(),
+  requestId: z.string(),
+  revision: z.number().int().nonnegative().optional(),
+  statusEpoch: z.string().optional(),
+})
 export type ApprovalResolved = z.infer<typeof ApprovalResolvedSchema>
 
 /** renderer→main: the user's answer to a pending approval. */

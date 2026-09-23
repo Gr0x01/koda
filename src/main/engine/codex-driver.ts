@@ -331,6 +331,10 @@ class CodexSession implements EngineSession {
   /** A stop can race the child's first turn/started notification. Remember it and interrupt as soon
    *  as Codex gives us the turn id instead of telling the user the task could not be stopped. */
   private readonly pendingChildStops = new Set<string>()
+  /** A follow-up message to an IDLE child is delivery, not proof of work: Codex's send_message
+   *  completes instantly and the child may never take a turn on it. Hold the card until the child
+   *  actually acts, or the transcript keeps a delegated row that nothing will ever close. */
+  private readonly deferredChildStarts = new Map<string, { launchId: string; description: string }>()
   /** The native notification being translated right now — stamped onto every event it produces. */
   private nativeRaw: RawEngineEvent | undefined
   /** The session's posture RIGHT NOW. Every turn re-renders the steering block from it, so a switch
@@ -739,7 +743,12 @@ class CodexSession implements EngineSession {
   private translateNotification(method: string, params: unknown): void {
     const p = (params ?? {}) as Record<string, unknown>
     const eventThreadId = typeof p.threadId === 'string' ? p.threadId : ''
-    const childLaunchId = eventThreadId ? this.childLaunchIds.get(eventThreadId) : undefined
+    const childLaunchId = eventThreadId
+      ? this.childLaunchIds.get(eventThreadId) ??
+        (EARLY_CHILD_NOTIFICATION_METHODS.has(method)
+          ? this.openDeferredChild(eventThreadId)
+          : undefined)
+      : undefined
     if (
       eventThreadId &&
       this.threadId &&
@@ -828,22 +837,7 @@ class CodexSession implements EngineSession {
       case 'turn/completed': {
         const status = (p.turn as { status?: string })?.status
         if (childLaunchId) {
-          this.emit({
-            type: 'SubagentCompleted',
-            sessionId: this.id,
-            toolUseId: childLaunchId,
-            taskId: eventThreadId,
-            resultText: this.childFinalText.get(eventThreadId),
-            outcome: status === 'interrupted' ? 'interrupted' : 'completed',
-            isError: status === 'failed',
-          })
-          this.childLaunchIds.delete(eventThreadId)
-          this.childTurnIds.delete(eventThreadId)
-          this.childFinalText.delete(eventThreadId)
-          this.pendingChildStops.delete(eventThreadId)
-          // Collaboration spends the same account quota as the lead. Child usage must not replace the
-          // parent's context meter, but it must refresh the account windows when that spend lands.
-          this.refreshRateLimits()
+          this.completeChild(eventThreadId, status === 'interrupted' ? 'interrupted' : 'completed', status === 'failed')
           break
         }
         if (eventThreadId && eventThreadId !== this.threadId) break
@@ -977,18 +971,23 @@ class CodexSession implements EngineSession {
         }
         break
       case 'subAgentActivity': {
-        // 0.144.x's actual wire: `started` is a fresh child and `interacted` is a follow-up turn on an
-        // existing idle child. A live app-server capture pins both shapes. If interacted ever arrives
-        // while the child is still active, it is steering only — preserve that task's existing card.
+        // 0.153.x's actual wire, pinned by a live capture: `started` is a fresh child that will take a
+        // turn, `interacted` is a collaboration.send_message receipt (instant, and the target may stay
+        // idle forever), `completed` is the engine's own terminal fact for a child turn.
         if (parentToolUseId || phase !== 'completed') break
         const kind = String(item.kind ?? '')
         const childThreadId = typeof item.agentThreadId === 'string' ? item.agentThreadId : ''
-        if (!childThreadId || (kind !== 'started' && kind !== 'interacted')) break
-        if (kind === 'interacted' && this.childLaunchIds.has(childThreadId)) break
+        if (!childThreadId) break
         const path = typeof item.agentPath === 'string' ? item.agentPath : ''
         const name = path.split('/').filter(Boolean).at(-1) ?? 'Delegated task'
-        const description = kind === 'interacted' ? `Follow-up · ${name}` : name
-        this.startChildLifecycle(childThreadId, id, description)
+        if (kind === 'started') this.startChildLifecycle(childThreadId, id, name)
+        // Steering a live child belongs to the card that child already has.
+        else if (kind === 'interacted') {
+          if (!this.childLaunchIds.has(childThreadId))
+            this.deferChildLifecycle(childThreadId, id, `Follow-up · ${name}`)
+        } else if (kind === 'completed') this.completeChild(childThreadId, 'completed', false)
+        // A kind with no lifecycle meaning here is wire drift worth seeing, not a silent drop.
+        else this.unmapped(`item/${phase}/subAgentActivity/${kind || 'unknown'}`, item, codexIds({ item }))
         break
       }
       // reasoning/userMessage/etc. are covered by deltas or are the user's own input — not surfaced
@@ -1026,6 +1025,58 @@ class CodexSession implements EngineSession {
       })
     }
     this.replayPendingChildNotifications(childThreadId)
+  }
+
+  /** Remember a follow-up's card without opening it. Buffered notifications already prove that child
+   *  woke up, so that case opens immediately; otherwise the first real child event opens it. */
+  private deferChildLifecycle(childThreadId: string, launchId: string, description: string): void {
+    if (this.pendingChildNotifications.has(childThreadId)) {
+      this.startChildLifecycle(childThreadId, launchId, description)
+      return
+    }
+    if (this.deferredChildStarts.size >= MAX_PENDING_CHILD_THREADS) {
+      const oldest = this.deferredChildStarts.keys().next().value
+      if (oldest !== undefined) this.deferredChildStarts.delete(oldest)
+    }
+    this.deferredChildStarts.set(childThreadId, { launchId, description })
+  }
+
+  /** The child acted, so the deferred follow-up is real work now: open its card before its own event
+   *  is translated, so that event lands inside the card instead of the lead's transcript. */
+  private openDeferredChild(childThreadId: string): string | undefined {
+    const deferred = this.deferredChildStarts.get(childThreadId)
+    if (!deferred) return undefined
+    this.deferredChildStarts.delete(childThreadId)
+    this.startChildLifecycle(childThreadId, deferred.launchId, deferred.description)
+    return this.childLaunchIds.get(childThreadId)
+  }
+
+  /** One terminal settlement for a child, from whichever evidence reaches Koda first: the child's own
+   *  turn/completed, or the lead thread's subAgentActivity `completed` item. */
+  private completeChild(
+    childThreadId: string,
+    outcome: 'completed' | 'interrupted',
+    isError: boolean,
+  ): void {
+    const launchId = this.childLaunchIds.get(childThreadId)
+    this.deferredChildStarts.delete(childThreadId)
+    if (!launchId) return
+    this.emit({
+      type: 'SubagentCompleted',
+      sessionId: this.id,
+      toolUseId: launchId,
+      taskId: childThreadId,
+      resultText: this.childFinalText.get(childThreadId),
+      outcome,
+      isError,
+    })
+    this.childLaunchIds.delete(childThreadId)
+    this.childTurnIds.delete(childThreadId)
+    this.childFinalText.delete(childThreadId)
+    this.pendingChildStops.delete(childThreadId)
+    // Collaboration spends the same account quota as the lead. Child usage must not replace the
+    // parent's context meter, but it must refresh the account windows when that spend lands.
+    this.refreshRateLimits()
   }
 
   private bufferPendingChildNotification(threadId: string, method: string, params: unknown): void {

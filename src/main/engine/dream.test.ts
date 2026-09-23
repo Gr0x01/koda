@@ -1,3 +1,6 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { OwnedCompletionCommitResult } from '../completion-state'
 import type { EngineSessionManager } from './sessions'
@@ -315,6 +318,7 @@ describe('DreamScheduler.dreamProject: unattended flag lifecycle', () => {
       isWorking,
       lastEngineEventAt: vi.fn().mockReturnValue(Date.now()),
       interrupt: vi.fn(),
+      stopSettling: vi.fn().mockReturnValue(false),
       startDreamSession: vi.fn().mockResolvedValue({ sessionId: 's1' }),
       sendTurn: vi.fn().mockResolvedValue('sent'),
       lastAssistantReply: vi.fn().mockReturnValue('did stuff'),
@@ -357,6 +361,7 @@ describe('DreamScheduler.dreamProject: unattended flag lifecycle', () => {
       isWorking: vi.fn().mockReturnValue(false),
       lastEngineEventAt: vi.fn().mockReturnValue(Date.now()),
       interrupt: vi.fn(),
+      stopSettling: vi.fn().mockReturnValue(false),
       startDreamSession: vi.fn().mockResolvedValue({ sessionId: 's1' }),
       sendTurn: vi.fn().mockRejectedValue(new Error('unknown session')),
       lastAssistantReply: vi.fn().mockReturnValue(undefined),
@@ -375,6 +380,97 @@ describe('DreamScheduler.dreamProject: unattended flag lifecycle', () => {
   })
 })
 
+/**
+ * The morning-prod bug: the agent decides it is read-only, reports what it found, writes nothing, and
+ * the user has to open the session the next day and tell it that it does have access. The nudge fires
+ * on the untouched memory tree, never on what the reply claims, so it survives whatever vocabulary a
+ * future engine uses for its sandbox.
+ */
+describe('DreamScheduler.dreamProject: the wrote-nothing nudge', () => {
+  beforeEach(() => {
+    atomicWriteMock.mockReset()
+  })
+
+  function nudgeSessions(cwd: string, replies: string[], onTurn?: () => void) {
+    const reply = vi.fn(() => replies[Math.min(reply.mock.calls.length, replies.length) - 1])
+    return {
+      isWorking: vi.fn().mockReturnValue(false),
+      lastEngineEventAt: vi.fn().mockReturnValue(Date.now()),
+      interrupt: vi.fn(),
+      stopSettling: vi.fn().mockReturnValue(false),
+      startDreamSession: vi.fn().mockResolvedValue({ sessionId: 's1' }),
+      sendTurn: vi.fn(async (_sessionId: string, _text: string, ..._rest: unknown[]) => {
+        onTurn?.()
+        return 'sent'
+      }),
+      lastAssistantReply: reply,
+      clearUnattended: vi.fn(),
+      revealDreamSession: vi.fn(),
+      awaitTurnEnd: vi.fn().mockReturnValue(Promise.resolve()),
+      rearmProjectMutationScopeTurn: vi.fn().mockReturnValue(true),
+      ...passingOwnership(cwd),
+    }
+  }
+
+  function memoryProject() {
+    const cwd = mkdtempSync(join(tmpdir(), 'koda-dream-nudge-'))
+    mkdirSync(join(cwd, '.koda', 'memory'), { recursive: true })
+    writeFileSync(join(cwd, '.koda', 'memory', 'MEMORY.md'), '# Memory\n')
+    return cwd
+  }
+
+  async function runTidy(sessions: unknown, cwd: string) {
+    const scheduler = new DreamScheduler(sessions as unknown as EngineSessionManager)
+    await (scheduler as unknown as { dreamProject: (cwd: string) => Promise<unknown> }).dreamProject(cwd)
+  }
+
+  it('sends one corrective turn when the pass describes findings it never wrote', async () => {
+    const cwd = memoryProject()
+    const sessions = nudgeSessions(cwd, [
+      'I found three stale entries but this session has read-only access, so nothing was saved.',
+      'Folded the three stale entries into their topic notes.',
+    ])
+    try {
+      await runTidy(sessions, cwd)
+      expect(sessions.sendTurn).toHaveBeenCalledTimes(2)
+      expect(sessions.sendTurn.mock.calls[1][1]).toContain('Nothing has been written yet')
+      expect(sessions.rearmProjectMutationScopeTurn).toHaveBeenCalledTimes(1)
+      // The second turn's summary is the night's digest — the abandoned read-only report is not.
+      const digest = atomicWriteMock.mock.calls.map((call) => String(call[1])).join('\n')
+      expect(digest).toContain('Folded the three stale entries')
+      expect(digest).not.toContain('read-only access')
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('does not spend a second turn on a genuinely quiet night', async () => {
+    const cwd = memoryProject()
+    const sessions = nudgeSessions(cwd, [QUIET_NIGHT])
+    try {
+      await runTidy(sessions, cwd)
+      expect(sessions.sendTurn).toHaveBeenCalledTimes(1)
+      expect(sessions.rearmProjectMutationScopeTurn).not.toHaveBeenCalled()
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('leaves a pass that actually wrote something alone', async () => {
+    const cwd = memoryProject()
+    const sessions = nudgeSessions(cwd, ['Consolidated two notes.'], () => {
+      writeFileSync(join(cwd, '.koda', 'memory', 'new-note.md'), '# New\n')
+    })
+    try {
+      await runTidy(sessions, cwd)
+      expect(sessions.sendTurn).toHaveBeenCalledTimes(1)
+      expect(sessions.rearmProjectMutationScopeTurn).not.toHaveBeenCalled()
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('DreamScheduler.dreamProject: REM lifecycle', () => {
   beforeEach(() => {
     checkpointMock.mockReset().mockResolvedValue({ id: undefined })
@@ -390,6 +486,7 @@ describe('DreamScheduler.dreamProject: REM lifecycle', () => {
       isWorking: vi.fn().mockReturnValue(false),
       lastEngineEventAt: vi.fn().mockReturnValue(Date.now()),
       interrupt: vi.fn(),
+      stopSettling: vi.fn().mockReturnValue(false),
       startDreamSession: vi.fn()
         .mockResolvedValueOnce({ sessionId: 's-tidy' })
         .mockResolvedValueOnce({ sessionId: 's-rem' }),
@@ -671,6 +768,7 @@ describe('DreamScheduler.waitForTurnEnd: a respawn dip does not end the turn ear
       isWorking,
       lastEngineEventAt: vi.fn().mockReturnValue(Date.now()),
       interrupt: vi.fn(),
+      stopSettling: vi.fn().mockReturnValue(false),
       awaitTurnEnd: vi.fn().mockReturnValue(new Promise(() => {})), // no real TurnComplete in this fake
     }
   }
@@ -726,6 +824,7 @@ describe('DreamScheduler.waitForTurnEnd: a genuine finish beats the poll (W3)', 
         isWorking: vi.fn().mockReturnValue(true), // never reports done on its own in this fake
         lastEngineEventAt: vi.fn().mockReturnValue(Date.now()),
         interrupt: vi.fn(),
+        stopSettling: vi.fn().mockReturnValue(false),
         awaitTurnEnd: vi.fn().mockReturnValue(ended),
       }
       const scheduler = new DreamScheduler(sessions as unknown as EngineSessionManager)
