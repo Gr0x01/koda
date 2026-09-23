@@ -10,6 +10,14 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-09-23
+
+### Changed
+
+- Usage now shows what Claude Opus 5.5 costs. The model arrived with new, lower prices, so until now
+  Koda counted its tokens and left the dollars blank rather than show a number it could not stand
+  behind. Its cheaper cached reading is counted too, so the savings line stays accurate.
+
 ## [0.1.17] - 2026-09-22
 
 ### Added
@@ -725,7 +733,8 @@ _First versioned build — the baseline the auto-updater ships from._
 - Settings now shows the Koda version, the bundled Claude engine version, and a
   "Check for updates" button.
 
-[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.17...HEAD
+[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.18...HEAD
+[0.1.18]: https://github.com/Gr0x01/koda/releases/tag/v0.1.18
 [0.1.17]: https://github.com/Gr0x01/koda/releases/tag/v0.1.17
 [0.1.16]: https://github.com/Gr0x01/koda/releases/tag/v0.1.16
 [0.1.15]: https://github.com/Gr0x01/koda/releases/tag/v0.1.15

@@ -82,6 +82,7 @@ describe('shared model picker catalog', () => {
   it('labels ids generically, keeping the tier word that tells OpenAI models apart', () => {
     expect(prettyModel('claude-opus-4-8')).toBe('Opus 4.8')
     expect(prettyModel('claude-opus-5[1m]')).toBe('Opus 5')
+    expect(prettyModel('claude-opus-5-5')).toBe('Opus 5.5')
     expect(prettyModel('gpt-5.5')).toBe('GPT-5.5')
     expect(prettyModel('gpt-5.6-sol')).toBe('GPT-5.6 Sol')
     expect(prettyModel('gpt-6-astra')).toBe('GPT-6 Astra')

@@ -177,4 +177,17 @@ describe('published rates', () => {
     })
     expect(standard).toBeCloseTo(9, 10)
   })
+
+  it('prices Opus 5.5 below Opus 5, with its own 0.05x cache-read rate', () => {
+    expect(publishedRate('claude-opus-5-5')?.inputPerMTok).toBe(4)
+    expect(publishedRate('claude-opus-5-5')?.outputPerMTok).toBe(20)
+    // A datestamped or 1M id is the same family, not an unpriced stranger.
+    expect(publishedRate('claude-opus-5-5[1m]')).toEqual(publishedRate('claude-opus-5-5'))
+    // 1M cache reads at $4/MTok input: standard 0.1x saves $3.60; 5.5's 0.05x saves $3.80.
+    const saved = cacheSavingsUsd('claude-opus-5-5', {
+      cacheReadTokens: 1_000_000,
+      cacheCreationTokens: 0,
+    })
+    expect(saved).toBeCloseTo(3.8, 10)
+  })
 })

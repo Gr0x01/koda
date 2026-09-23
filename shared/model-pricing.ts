@@ -8,10 +8,11 @@
  * lesson — measured facts only).
  *
  * SOURCE, and the rule for editing it: the Anthropic list prices below are the published pricing page,
- * https://platform.claude.com/docs/en/about-claude/pricing (verified 2026-09-02). The cache
+ * https://platform.claude.com/docs/en/about-claude/pricing (verified 2026-09-22). The cache
  * multipliers are the same page's cache economics: a cache read is 0.1x the base input price (0.025x
- * on Fable/Mythos 5.1, carried per-row) and a 5-minute cache write is 1.25x. A model we cannot cite
- * a published rate for is NOT priced — it gets a tokens-only row rather than an invented number. That
+ * on Fable/Mythos 5.1 and 0.05x on Opus 5.5, both carried per-row) and a 5-minute cache write is
+ * 1.25x. A model we cannot cite a published rate for is NOT priced — it gets a tokens-only row
+ * rather than an invented number. That
  * includes every OpenAI/Codex model (Koda has no published-rate source wired for them) and every
  * engine alias (`opus`, `sonnet`, `opusplan`, …), which resolve to a concrete model we can't see from
  * the id alone.
@@ -22,7 +23,8 @@ export type PublishedRate = {
   inputPerMTok: number
   outputPerMTok: number
   /** Published cache-read price as a fraction of the input rate, when it differs from the standard
-   *  CACHE_READ_MULTIPLIER (Fable/Mythos 5.1 publish $0.25/MTok on $10 input = 0.025x). */
+   *  CACHE_READ_MULTIPLIER (Fable/Mythos 5.1 publish $0.25/MTok on $10 input = 0.025x; Opus 5.5
+   *  publishes $0.20/MTok on $4 input = 0.05x). */
   cacheReadMultiplier?: number
   /** Where this pair came from, shown nowhere but kept so the next editor can re-verify it. */
   source: string
@@ -45,6 +47,9 @@ const RATES: Record<string, PublishedRate> = {
   'mythos-5-1': { inputPerMTok: 10, outputPerMTok: 50, cacheReadMultiplier: 0.025, source: ANTHROPIC_LIST },
   'fable-5': { inputPerMTok: 10, outputPerMTok: 50, source: ANTHROPIC_LIST },
   'mythos-5': { inputPerMTok: 10, outputPerMTok: 50, source: ANTHROPIC_LIST },
+  // Opus 5.5 (2026-09-22) is the first Opus to undercut the $5/$25 line, and it publishes a
+  // $0.20/MTok cache read — 0.05x, its own multiplier again.
+  'opus-5-5': { inputPerMTok: 4, outputPerMTok: 20, cacheReadMultiplier: 0.05, source: ANTHROPIC_LIST },
   'opus-5': { inputPerMTok: 5, outputPerMTok: 25, source: ANTHROPIC_LIST },
   'opus-4-8': { inputPerMTok: 5, outputPerMTok: 25, source: ANTHROPIC_LIST },
   'opus-4-7': { inputPerMTok: 5, outputPerMTok: 25, source: ANTHROPIC_LIST },
