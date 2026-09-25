@@ -10,6 +10,10 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
 
 ## [Unreleased]
 
+### Changed
+
+- Updated the bundled Claude engine to 2.1.281.
+
 ## [0.1.19] - 2026-09-23
 
 ### Changed
