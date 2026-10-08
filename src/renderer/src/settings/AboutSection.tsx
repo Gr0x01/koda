@@ -21,7 +21,7 @@ export function AboutSection() {
       <SettingsRow label="Koda" control={<Mono>{info ? `v${info.appVersion}` : '…'}</Mono>} />
       <SettingsRow
         label="Engine"
-        description="The bundled Claude Code build that runs every session."
+        description="The Claude Code build that runs your sessions, which Koda keeps current on its own."
         control={<Mono>{engine ? `${engine.version} · ${engine.source}` : '…'}</Mono>}
       />
       <SettingsRow

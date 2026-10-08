@@ -4,10 +4,10 @@
  * never moves backward, so the timeline keeps every entry and an undo is itself undoable
  * (dual-git.md §2).
  */
-import { rmdir, unlink } from 'node:fs/promises'
+import { lstat, rmdir, unlink } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { runGit } from './repo'
-import { checkpoint, type Checkpoint } from './checkpoint'
+import { checkpoint, LARGE_FILE_BYTES, type Checkpoint } from './checkpoint'
 
 /** Tracked paths in a tree-ish, NUL-delimited so paths with spaces survive. */
 async function lsTree(projectDir: string, ref: string): Promise<Set<string>> {
@@ -19,17 +19,30 @@ export async function restore(projectDir: string, checkpointId: string): Promise
   // 1. Make the present recoverable before we touch anything.
   await checkpoint(projectDir, 'before recovery')
 
-  // 2. Restore tracked files to the target's content. `checkout <id> -- .` only WRITES files
-  //    present in the target; it won't delete files created afterward (handled next).
-  await runGit(projectDir, ['checkout', checkpointId, '--', '.'])
-
-  // 3. Remove exactly the files that exist now but not in the target (HEAD − target). Computed
-  //    from the trees, not `git clean`: clean would also delete excluded files (a later .env,
-  //    node_modules) that live in neither tree and aren't ours to touch.
   const [headFiles, targetFiles] = await Promise.all([
     lsTree(projectDir, 'HEAD'),
     lsTree(projectDir, checkpointId),
   ])
+
+  // 2. Restore tracked files to the target's content. `checkout <id> -- .` only WRITES files
+  //    present in the target; it won't delete files created afterward (handled next). A file that
+  //    grew past the size cap since the target is in the target but not in the snapshot just taken,
+  //    so writing the old copy over it would be a loss no later restore could undo — leave it be.
+  const unfollowed: string[] = []
+  for (const file of targetFiles) {
+    if (headFiles.has(file)) continue
+    const stats = await lstat(join(projectDir, file)).catch(() => null)
+    if (stats?.isFile() && stats.size > LARGE_FILE_BYTES) unfollowed.push(`:(exclude,literal)${file}`)
+  }
+  // git rejects a pathspec set that matches nothing, which is the case when every target file is
+  // one we're leaving alone.
+  if (unfollowed.length < targetFiles.size) {
+    await runGit(projectDir, ['checkout', checkpointId, '--', '.', ...unfollowed])
+  }
+
+  // 3. Remove exactly the files that exist now but not in the target (HEAD − target). Computed
+  //    from the trees, not `git clean`: clean would also delete excluded files (a later .env,
+  //    node_modules) that live in neither tree and aren't ours to touch.
   const removedDirs = new Set<string>()
   for (const file of headFiles) {
     if (!targetFiles.has(file)) {

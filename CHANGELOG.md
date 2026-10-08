@@ -10,11 +10,64 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
 
 ## [Unreleased]
 
+## [0.1.21] - 2026-10-07
+
+### Added
+
+- Koda keeps its Claude and Codex engines current on its own. It downloads each new engine build
+  shortly after launch and every few hours, checks it against the publisher's checksum, and uses it
+  for your next session. A session that is already running is left alone, and a new model no longer
+  waits for a Koda update.
+
+- You can zoom in on a picture. An image open in the workspace, or enlarged from the chat, starts
+  fitted to the window. Click it to see it at actual size, pinch or hold ⌘ and scroll to zoom
+  further, and scroll to move around. Click it again, or press Fit, to go back.
+
 ### Changed
 
-- Updated the bundled Codex engine to 0.157.1.
+- Choosing Haiku now runs Claude Haiku 5.5, Anthropic's newest Haiku model. It is the first Claude
+  model priced by prompt length, so Usage rates each request by its size: the lower rate up to
+  100,000 prompt tokens and the higher rate above that. Apps you make in Koda use it for their fast
+  tier.
 
-- Updated the bundled Claude engine to 2.1.283.
+- Usage rates Claude Sonnet 5.5's cached tokens at the published price, which is half what Koda
+  assumed. Its cache savings were shown slightly low.
+
+### Fixed
+
+- Undo no longer fills your disk in big projects or in a folder that holds several projects. Save
+  points skip files over 100 MB and each project's own history, a save point that fails no longer
+  leaves gigabytes behind, and the first save point in a large project gets time to finish instead
+  of failing on every step.
+
+- Koda no longer leaves stuck helper processes behind that pin your Mac's processor. With phone
+  access on, the connection helper could leak a stuck copy of itself each time it restarted, and
+  the copies kept running after Koda quit until they were force quit.
+
+- Side work stays visible in Versions. When Koda set work aside to keep it out of another
+  session's way, it sometimes made a whole separate copy of the project, and the branches and
+  saved versions inside that copy never showed up in Versions or reached GitHub. It now uses a
+  linked checkout of the same project, and it leaves another session's side work alone when it
+  tidies up.
+
+- The overnight memory tidy can search the day's conversations again. On the current Claude engine
+  its searches were refused, so it worked from the project's history alone and missed decisions
+  that were only made in chat. It can now run plain read-only searches, and still nothing that
+  writes outside the project's memory, runs a script, or reaches the network.
+
+- Recovery points no longer fail in a folder of projects when one of those projects is a new Git
+  project with nothing saved in it yet.
+
+## [0.1.20] - 2026-09-28
+
+### Changed
+
+- Choosing Sonnet now runs Claude Sonnet 5.5, Anthropic's newest Sonnet model. Usage shows what it
+  costs from your first message.
+
+- Updated the bundled Claude engine to 2.1.284.
+
+- Updated the bundled Codex engine to 0.158.0.
 
 ## [0.1.19] - 2026-09-23
 
@@ -758,7 +811,9 @@ _First versioned build — the baseline the auto-updater ships from._
 - Settings now shows the Koda version, the bundled Claude engine version, and a
   "Check for updates" button.
 
-[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.19...HEAD
+[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.21...HEAD
+[0.1.21]: https://github.com/Gr0x01/koda/releases/tag/v0.1.21
+[0.1.20]: https://github.com/Gr0x01/koda/releases/tag/v0.1.20
 [0.1.19]: https://github.com/Gr0x01/koda/releases/tag/v0.1.19
 [0.1.18]: https://github.com/Gr0x01/koda/releases/tag/v0.1.18
 [0.1.17]: https://github.com/Gr0x01/koda/releases/tag/v0.1.17

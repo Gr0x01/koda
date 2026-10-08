@@ -6,7 +6,8 @@
 import { realpathSync } from 'node:fs'
 import { lstat } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { runGit } from './repo'
+import { log } from '../logger'
+import { runGit, SLOW_GIT_TIMEOUT, sweepTempObjects, writeExcludes } from './repo'
 
 export interface Checkpoint {
   /** Commit SHA — the stable handle for restore. */
@@ -176,6 +177,57 @@ async function assertRequiredFileBlob(
 }
 
 /**
+ * Files above this size stay out of the undo net. Every change to a file is a full new copy in the
+ * store, so a multi-GB archive or asset pack costs more disk than the rest of the project's history
+ * combined — and hashing it on the checkpoint path is what stalled every tool call.
+ */
+export const LARGE_FILE_BYTES = 100 * 1024 * 1024
+
+/**
+ * Keep over-cap files out of the snapshot about to be taken. Recomputed from scratch each time (the
+ * exclude section is dropped first, so previously skipped files reappear as candidates) so a file
+ * that shrinks back under the cap is captured again and no stale list can drift. The walk only
+ * reports untracked and modified paths, so after the first snapshot it's a cheap stat pass. A
+ * tracked file that grew past the cap is untracked, not frozen at its old small version — restore
+ * must never "recover" an outdated copy of a file the net stopped following.
+ *
+ * Untracked nested git repos (a hub's child projects) are kept out the same way. `add -A` would only
+ * record their HEAD as a gitlink — no content, so no undo value — and a child repo with no commit
+ * yet makes the whole add fatal ("does not have a commit checked out"), failing every checkpoint.
+ */
+async function excludeLargeFiles(projectDir: string): Promise<void> {
+  await writeExcludes(projectDir)
+  const { stdout } = await runGit(projectDir, ['ls-files', '-z', '-t', '-o', '-m', '--exclude-standard'], {
+    timeoutMs: SLOW_GIT_TIMEOUT,
+  })
+  const large: string[] = []
+  const nested: string[] = []
+  const tracked: string[] = []
+  for (const entry of stdout.split('\0')) {
+    // `-t` tags: "? " untracked, "C " modified-tracked. A path with a newline can't be written as an
+    // exclude line, so it stays in the snapshot.
+    const rel = entry.slice(2)
+    if (!rel || rel.includes('\n')) continue
+    // Only a nested repo is listed as a directory (trailing slash) by `ls-files -o`.
+    if (rel.endsWith('/')) {
+      nested.push(rel)
+      continue
+    }
+    const stats = await lstat(join(projectDir, rel)).catch(() => null)
+    if (!stats?.isFile() || stats.size <= LARGE_FILE_BYTES) continue
+    large.push(rel)
+    if (entry.startsWith('C ')) tracked.push(rel)
+  }
+  if (large.length === 0 && nested.length === 0) return
+  await writeExcludes(projectDir, [...nested, ...large])
+  if (tracked.length > 0) {
+    await runGit(projectDir, ['rm', '--cached', '--force', '--quiet', '--', ...tracked.map((p) => `:(literal)${p}`)])
+  }
+  if (large.length === 0) return
+  log.info('safety-git', `left ${large.length} file(s) over ${LARGE_FILE_BYTES / 1024 / 1024} MB out of the checkpoint`, large.slice(0, 5))
+}
+
+/**
  * Snapshot the working tree under `label`. When nothing changed since the last checkpoint we
  * skip the commit and point at the prior one — an empty commit would only clutter the recovery
  * timeline a non-engineer reads (so no `--allow-empty`).
@@ -189,6 +241,22 @@ export async function checkpoint(
   label: string,
   options: CheckpointOptions = {},
 ): Promise<CheckpointResult> {
+  try {
+    return await takeCheckpoint(projectDir, label, options)
+  } catch (err) {
+    // Every caller holds the project's safety-git mutex, so any temp file left now is this failed
+    // attempt's. Without this each failure (retried on the very next tool call) leaks its partial
+    // pack for good.
+    await sweepTempObjects(projectDir).catch(() => {})
+    throw err
+  }
+}
+
+async function takeCheckpoint(
+  projectDir: string,
+  label: string,
+  options: CheckpointOptions,
+): Promise<CheckpointResult> {
   // Collapse to a single line so the commit subject (%s) is the full label and the log parses cleanly.
   const subject = label.replace(/\s+/g, ' ').trim() || 'checkpoint'
   const required = options.requiredFile
@@ -197,7 +265,8 @@ export async function checkpoint(
   // one regular file it already validated, never broaden the safety store's normal exclusion policy.
   if (required) await assertRequiredFileStable(projectDir, required)
 
-  await runGit(projectDir, ['add', '-A'])
+  await excludeLargeFiles(projectDir)
+  await runGit(projectDir, ['add', '-A'], { timeoutMs: SLOW_GIT_TIMEOUT })
   if (required) {
     await runGit(projectDir, ['add', '--force', '--', `:(literal)${required.rel}`])
     await assertRequiredFileStable(projectDir, required)

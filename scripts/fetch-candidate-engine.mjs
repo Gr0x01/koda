@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
  * Download + SHA-256-verify a SPECIFIC `claude` engine version/platform into an output dir, for the
- * engine-contract CI job (which then drives it through the smoke test before we re-bundle). Mirrors
- * fetch-engine.mjs's URL scheme + verify, but takes version/platform/out as args instead of the pinned
- * mac defaults — CI runs on linux-x64.
+ * engine-contract CI job and the Lab (which drive it through Koda's tests). Mirrors fetch-engine.mjs's
+ * URL scheme + verify, but takes version/platform/out as args instead of resolving latest for the
+ * mac — CI and the Lab run on linux-x64.
  *
  *   node scripts/fetch-candidate-engine.mjs --version 2.1.202 --platform linux-x64 --out /tmp/candidate
  *

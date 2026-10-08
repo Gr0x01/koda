@@ -15,7 +15,7 @@ files:
   - node_modules/node-pty/**
 asarUnpack:
   - node_modules/node-pty/**
-# The pinned native engine binary, fetched by scripts/fetch-engine.mjs (not committed).
+# The native engine binaries, newest upstream at build time, fetched by scripts/fetch-engine.mjs (not committed).
 # Lands at <App>.app/Contents/Resources/engine/<platform>/claude.
 extraResources:
   - from: resources/engine
@@ -83,8 +83,8 @@ mac:
     NSSpeechRecognitionUsageDescription: Koda transcribes your speech on your device to type messages.
 dmg:
   artifactName: ${productName}-${version}-${arch}.dmg
-  # The nightly Gatekeeper gate assesses the outer container's primary signature after notarization.
-  # Sign the DMG before its blockmap is generated and before the release runner submits it to Apple.
+  # Gatekeeper assesses the outer container's primary signature after notarization, so the DMG is
+  # signed before its blockmap is generated and before the release cut submits it to Apple.
   sign: true
 # Auto-update feed. electron-builder writes app-update.yml into the packaged app from this block, and
 # electron-updater's `github` provider reads signed releases from the koda repo with NO baked token.
@@ -93,7 +93,5 @@ publish:
   provider: github
   owner: Gr0x01
   repo: koda
-  # GitHub publishing does not infer a feed name from a prerelease version. Stable builds set this to
-  # `latest`; the nightly runner sets it to `nightly`, producing `nightly-mac.yml` without touching the
-  # stable feed consumed by ordinary installs.
-  channel: '${env.KODA_UPDATE_CHANNEL}'
+  # Pinned so the one feed is always `latest-mac.yml`, whatever the version string looks like.
+  channel: latest

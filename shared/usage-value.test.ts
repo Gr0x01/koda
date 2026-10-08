@@ -142,6 +142,7 @@ describe('published rates', () => {
   it('normalizes context-window and datestamp suffixes to one family rate', () => {
     expect(publishedRate('claude-opus-5[1m]')).toEqual(publishedRate('claude-opus-5'))
     expect(publishedRate('claude-haiku-4-5-20251001')?.inputPerMTok).toBe(1)
+    expect(publishedRate('claude-haiku-5-5')?.longPrompt?.inputPerMTok).toBe(0.5)
   })
 
   it('refuses to price an alias or an unknown model', () => {
@@ -162,6 +163,12 @@ describe('published rates', () => {
   it('prices Sonnet 5 at the made-permanent $2/$10 list rate', () => {
     expect(publishedRate('claude-sonnet-5')?.inputPerMTok).toBe(2)
     expect(publishedRate('claude-sonnet-5')?.outputPerMTok).toBe(10)
+  })
+
+  it('prices Sonnet 5.5 as its own family, not an unpriced stranger', () => {
+    expect(publishedRate('claude-sonnet-5-5')?.inputPerMTok).toBe(2)
+    expect(publishedRate('claude-sonnet-5-5')?.outputPerMTok).toBe(10)
+    expect(publishedRate('claude-sonnet-5-5[1m]')).toEqual(publishedRate('claude-sonnet-5-5'))
   })
 
   it('applies Fable 5.1\'s published 0.025x cache-read rate to savings', () => {

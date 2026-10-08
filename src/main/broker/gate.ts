@@ -87,8 +87,115 @@ const PLAN_FENCE_REASON =
 const REM_EVIDENCE_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LS', 'NotebookRead'])
 
 /** Tidy may inspect local project evidence and edit only the project's real memory tree. Network,
- * shell, browser/capability, and unknown tools are outside an unattended consolidation pass. */
+ * browser/capability, and unknown tools are outside an unattended consolidation pass; the shell is
+ * open only to the search grammar below. */
 const MEMORY_TIDY_READ_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LS', 'NotebookRead'])
+
+/** What a tidy may run in the shell to SEARCH local evidence. An engine build that ships no Grep or
+ * Glob tool has only the shell to search with, and Read alone cannot find a decision inside a day of
+ * multi-megabyte transcripts — those nights worked from git and missed what was only said in chat.
+ * Exact names only: a path (`./grep`) would run whatever the project put there. Nothing here can
+ * write a file, start another program, or reach the network once the flags below are refused. */
+const READ_ONLY_COMMANDS = new Set([
+  'grep', 'rg', 'jq', 'ls', 'cat', 'head', 'tail', 'wc', 'sort', 'uniq', 'cut', 'tr', 'find', 'stat', 'pwd', 'cd', 'git',
+])
+const READ_ONLY_GIT = new Set([
+  'log', 'show', 'diff', 'status', 'grep', 'ls-files', 'ls-tree', 'cat-file', 'rev-parse', 'blame', 'merge-base',
+])
+
+/** Split a one-line command into its `|` / `&&` / `;` segments, each a list of words, or null when
+ * it uses anything this tiny grammar cannot vouch for: redirection (bar a discarded stderr), command
+ * or process substitution, any `$` expansion, backgrounding, subshells, backslash escapes outside
+ * quotes. The
+ * rule that matters is agreeing with the shell on where every quoted string ENDS — a disagreement
+ * there hides an operator, and the command after it, inside what this parser took for an argument. */
+function shellSegments(command: unknown): string[][] | null {
+  if (typeof command !== 'string' || /[\r\n]/.test(command)) return null
+  const segments: string[][] = [[]]
+  let word: string | null = null
+  const endWord = (): void => {
+    if (word !== null) segments[segments.length - 1].push(word)
+    word = null
+  }
+  for (let at = 0; at < command.length; at++) {
+    const ch = command[at]
+    const quiet = word === null ? /^2>(?:\/dev\/null|&1)(?=$|[\s|;&])/.exec(command.slice(at)) : null
+    if (quiet) {
+      at += quiet[0].length - 1
+    } else if (ch === "'") {
+      const end = command.indexOf("'", at + 1)
+      if (end < 0) return null
+      word = (word ?? '') + command.slice(at + 1, end)
+      at = end
+    } else if (ch === '"') {
+      let text = ''
+      for (at++; command[at] !== '"'; at++) {
+        const inner = command[at]
+        if (inner === undefined || inner === '`') return null
+        // Only a `$` the shell leaves alone — a regex anchor before the closing quote, `\|`, `)` or a
+        // space. Every expansion is refused, not just `$(`: zsh's `${(e):-\$(cmd)}` re-evaluates text
+        // that was escaped when this parser read it, and runs it.
+        if (inner === '$' && !/["\\|) ]/.test(command[at + 1] ?? '')) return null
+        // A backslash never ends the string, whatever it escapes; take the pair so `\"` stays inside.
+        if (inner === '\\' && command[at + 1] === undefined) return null
+        text += inner === '\\' ? inner + command[++at] : inner
+      }
+      word = (word ?? '') + text
+    } else if (/\s/.test(ch)) {
+      endWord()
+    } else if (ch === '|' || ch === ';' || (ch === '&' && command[at + 1] === '&')) {
+      endWord()
+      if (ch === '&') at++
+      segments.push([])
+    } else if (/[`\\<>()&$]/.test(ch)) {
+      return null
+    } else {
+      word = (word ?? '') + ch
+    }
+  }
+  endWord()
+  return segments
+}
+
+function readOnlyGit(args: string[]): boolean {
+  let at = 0
+  // `-c` is not skipped on purpose: a config override can name a pager or alias to run.
+  while (args[at] === '-C' || args[at] === '--no-pager') at += args[at] === '-C' ? 2 : 1
+  const rest = args.slice(at + 1)
+  // The flags that write a file or hand the output to a program.
+  if (rest.some((arg) => /^(--output|--open-files-in-pager|-O|--ext-diff)/.test(arg))) return false
+  if (args[at] === 'branch') {
+    return rest.length > 0 && rest.every((arg) => /^(--show-current|--list|--all|--remotes|-a|-r|-v|-vv)$/.test(arg))
+  }
+  if (args[at] === 'worktree') return rest.length === 1 && rest[0] === 'list'
+  return READ_ONLY_GIT.has(args[at] ?? '')
+}
+
+function readOnlyInvocation([name, ...args]: string[]): boolean {
+  if (!READ_ONLY_COMMANDS.has(name)) return false
+  const has = (flag: RegExp): boolean => args.some((arg) => flag.test(arg))
+  switch (name) {
+    case 'find':
+      return !has(/^-(exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls)$/)
+    case 'rg':
+      return !has(/^--(pre|hostname-bin)(=|$)/) // both run a program of the caller's choosing
+    case 'sort':
+      return !has(/^-[A-Za-z]*o|^--(output|compress-program)/)
+    case 'uniq':
+      return args.every((arg) => arg.startsWith('-')) // a second operand is an output file
+    case 'tail':
+      return !has(/^-[A-Za-z0-9]*[fF]|^--(follow|retry)/) // would hold the night open
+    case 'git':
+      return readOnlyGit(args)
+    default:
+      return true
+  }
+}
+
+function readOnlyShell(input: unknown): boolean {
+  const segments = shellSegments((input as { command?: unknown } | null | undefined)?.command)
+  return Boolean(segments?.every((words) => words.length > 0 && readOnlyInvocation(words)))
+}
 
 function realMemoryTargets(projectRoot: string, targets: string[], existingOnly = false): string[] | null {
   if (!targets.length) return null
@@ -312,11 +419,16 @@ export class ApprovalGate {
       if (req.toolName === 'Skill' && isMemorySkill(req.input)) return { kind: 'allow' }
       const memoryEdit = isEditTool(req.toolName) && containedMemoryEdit(memoryRoot, req.input)
       const memoryDelete = req.toolName === 'Bash' && containedMemoryDelete(memoryRoot, req.input)
+      // A search cannot change the project, so it is decided here like the contained edit below: the
+      // posture tier would ask about a command with nobody awake to answer, and the mutation tier would
+      // cut a recovery point for every grep. The grammar cannot express a write, so neither the
+      // protected-target nor the destructive-Git ask is skipped by returning early.
+      if (!memoryDelete && req.toolName === 'Bash' && readOnlyShell(req.input)) return { kind: 'allow' }
       if (!MEMORY_TIDY_READ_TOOLS.has(req.toolName) && !memoryEdit && !memoryDelete) {
         return {
           kind: 'deny',
           reason:
-            'This is an overnight memory tidy. Only local reads, the memory playbook, realpath-contained memory edits, and simple deletion of contained Markdown notes are allowed. Do not use network tools or another path; skip the action and mention it in the digest instead.',
+            'This is an overnight memory tidy. Only local reads, the memory playbook, realpath-contained memory edits, and simple deletion of contained Markdown notes are allowed. A shell command passes only as a plain search: grep, rg, jq, ls, cat, head, tail, wc, sort, uniq, cut, tr, find, stat and read-only git, joined with | && or ; — single-quote the patterns, and no scripts, redirects, $ expansions (write ~ for the home folder) or other programs. Do not use network tools or another path; if a search was refused, rewrite it in that form, otherwise skip the action and mention it in the digest instead.',
         }
       }
       // The user opted into memory consolidation; a simple contained note deletion is the one shell

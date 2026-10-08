@@ -22,7 +22,7 @@ import { app } from 'electron'
 import { z } from 'zod'
 import { getApiKey } from './api-key'
 import { log } from './logger'
-import { publishedRate } from '@shared/model-pricing'
+import { publishedRate, rateForPrompt } from '@shared/model-pricing'
 
 // ── Tier map ──────────────────────────────────────────────────────────────────────────────────────
 
@@ -32,7 +32,7 @@ import { publishedRate } from '@shared/model-pricing'
  * catalog moves. Prices are USD per million tokens, used only for the user-facing spend estimate.
  */
 export const BRIDGE_TIERS = {
-  fast: { model: 'claude-haiku-4-5' },
+  fast: { model: 'claude-haiku-5-5' },
   smart: { model: 'claude-sonnet-5' },
 } as const
 export type BridgeTier = keyof typeof BRIDGE_TIERS
@@ -54,8 +54,9 @@ export type InferRequest = z.infer<typeof InferRequestSchema>
  * pointed at a model that table can't price bills 0 here, which `app-bridge.test.ts` guards against.
  */
 export function estimateUsd(tier: BridgeTier, inputTokens: number, outputTokens: number): number {
-  const rate = publishedRate(BRIDGE_TIERS[tier].model)
-  if (!rate) return 0
+  const named = publishedRate(BRIDGE_TIERS[tier].model)
+  if (!named) return 0
+  const rate = rateForPrompt(named, inputTokens)
   return (inputTokens * rate.inputPerMTok + outputTokens * rate.outputPerMTok) / 1_000_000
 }
 

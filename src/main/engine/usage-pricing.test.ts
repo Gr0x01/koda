@@ -27,6 +27,16 @@ const LITELLM_DOC = {
     cache_read_input_token_cost: 0.0000005,
     cache_creation_input_token_cost: 0.00000625,
   },
+  'claude-haiku-5-5': {
+    input_cost_per_token: 1e-7,
+    output_cost_per_token: 5e-7,
+    cache_read_input_token_cost: 1e-8,
+    cache_creation_input_token_cost: 1.25e-7,
+    input_cost_per_token_above_100k_tokens: 5e-7,
+    output_cost_per_token_above_100k_tokens: 2.5e-6,
+    cache_read_input_token_cost_above_100k_tokens: 5e-8,
+    cache_creation_input_token_cost_above_100k_tokens: 6.25e-7,
+  },
   'half-priced-model': { input_cost_per_token: 0.000001 },
   'sample_spec': { not: 'a rate' },
 }
@@ -65,7 +75,7 @@ afterAll(() => rmSync(dir, { recursive: true, force: true }))
 describe('parseRateTable', () => {
   it('keeps fully-priced entries under bare keys, drops half-priced ones, defaults cache rates', () => {
     const rates = parseRateTable(LITELLM_DOC)
-    expect(Object.keys(rates).sort()).toEqual(['claude-opus-5', 'gpt-5.3-codex'])
+    expect(Object.keys(rates).sort()).toEqual(['claude-haiku-5-5', 'claude-opus-5', 'gpt-5.3-codex'])
     // No cache_creation rate published → defaults to the input rate, never zero.
     expect(rates['gpt-5.3-codex'].cacheCreation).toBe(0.00000125)
     expect(rates['claude-opus-5'].cacheCreation).toBe(0.00000625)
@@ -96,7 +106,7 @@ describe('loadRateTable lifecycle', () => {
     const fetcher = okFetch()
     const first = await loadRateTable(fetcher)
     expect(first.provenance.status).toBe('fresh')
-    expect(first.provenance.knownModels).toBe(2)
+    expect(first.provenance.knownModels).toBe(3)
     const second = await loadRateTable(failFetch)
     expect(second.provenance.status).toBe('fresh')
     expect(second.rates['gpt-5.3-codex']).toBeDefined()
@@ -136,6 +146,29 @@ describe('priceScanBuckets', () => {
     const [b] = priceScanBuckets([bucket('claude-opus-4-8')], table)
     expect(b.costSource).toBe('published')
     expect(b.costUsd).toBeGreaterThan(0)
+  })
+
+  it('prices a long-prompt bucket at the second tier, from the table and from the named rate', async () => {
+    const cells = [bucket('claude-haiku-5-5'), bucket('claude-haiku-5-5', { longPrompt: true })]
+    for (const fetchImpl of [okFetch(), failFetch]) {
+      rmSync(cacheFile, { force: true })
+      const [short, long] = priceScanBuckets(cells, await loadRateTable(fetchImpl))
+      // 1000×1e-7 + 10000×1e-8 + 2000×1.25e-7 + 500×5e-7 = 0.0007
+      expect(short.costUsd).toBeCloseTo(0.0007, 10)
+      expect(long.costUsd).toBeCloseTo(0.0035, 10)
+      expect(long).not.toHaveProperty('longPrompt')
+    }
+    // A table row missing the tier must not flatten it: the named rate takes over for that model.
+    const flattened = { 'claude-haiku-5-5': { input_cost_per_token: 1e-7, output_cost_per_token: 5e-7 } }
+    rmSync(cacheFile, { force: true })
+    const [, viaNamed] = priceScanBuckets(cells, await loadRateTable(okFetch(flattened)))
+    expect(viaNamed.costSource).toBe('published')
+    expect(viaNamed.costUsd).toBeCloseTo(0.0035, 10)
+    rmSync(cacheFile, { force: true })
+    // A model with no second tier prices a long prompt like any other.
+    const table = await loadRateTable(okFetch())
+    const [flat] = priceScanBuckets([bucket('claude-opus-5', { longPrompt: true })], table)
+    expect(flat.costUsd).toBeCloseTo(0.035, 10)
   })
 
   it('never invents a dollar: unknown models carry null cost, not zero', async () => {

@@ -5,6 +5,7 @@ import { IpcChannels } from '@shared/channels'
 import { disposeEngineSessions, getEngineSessions, registerIpcHandlers, runDreamNow } from './ipc'
 import { probeEngine } from './engine/probe'
 import { initUpdater } from './updater'
+import { startLiveEngineUpdates } from './engine/live-engines'
 import { activateProvisionedRuntimes, activateToolsBinDir } from './runtime/provision'
 import { ensureGlobalSkillsSeeded } from './engine/skills-catalog'
 import { projectPathForWindow, registerWindow, unregisterWindow, windowForProject } from './window-registry'
@@ -29,6 +30,7 @@ import {
   isDocumentFrameEscape,
 } from './preview'
 import { stopAllLanForwards } from './lan-forward'
+import { stopAllStaticPreviewServers, stopStaticPreviewServersForWindow } from './static-preview-server'
 import { bootStartMiniApps, disposeMiniApps } from './mini-apps'
 import { voiceController } from './voice'
 import { resumePlaywrightIfEnabled } from './playwright'
@@ -37,7 +39,7 @@ import { startSuspensionWatchdog } from './suspension-watchdog'
 import { startProbeGovernor } from './probe-governor'
 import { startScratchRetentionSweep } from './scratch-retention'
 import { closeAllNeuralViews, openNeuralView } from './neural-view'
-import { appNameFor, runtimeProfile } from './runtime-profile'
+import { appNameFor, isE2EProfile, runtimeProfile } from './runtime-profile'
 
 // Pin the app name before any getPath() call (unpackaged Electron would otherwise name it
 // "Electron"). Dev and E2E deliberately get distinct identities: dev can coexist with the installed
@@ -192,6 +194,7 @@ function createWindow(projectPath: string, newProjectIntent = false): void {
   win.on('closed', () => {
     killDevServer(win.id) // a managed preview dev server must not outlive its window
     forgetWindowDocuments(win.id) // nor the paths its document origin was allowed to serve
+    stopStaticPreviewServersForWindow(win.id) // nor the phone's loopback server over its project
     killTerminal(win.id) // nor the window's interactive shell
     voiceController.killForWindow(win.id) // nor a live dictation helper holding the mic
     const ctx = unregisterWindow(win.id)
@@ -517,6 +520,13 @@ app.whenReady().then(async () => {
   buildAppMenu()
   app.on('browser-window-focus', buildAppMenu)
   initUpdater() // app self-update: check-on-launch + interval, background download (packaged-only)
+  // Engines update on their own track, dev builds included: RB's daily driver is the dev build, and a
+  // packaged app would otherwise wait for a Koda release to see a new engine. E2E never downloads.
+  startLiveEngineUpdates({
+    root: join(app.getPath('userData'), 'engines'),
+    enabled: !isE2EProfile() && process.env.KODA_LIVE_ENGINES !== '0',
+    log: (level, msg, data) => log[level]('engine-update', msg, data),
+  })
 
   // Reopen the projects that were open at last quit, one window each (sequential — avoids any race on
   // shared init). Drop any whose folder has since been deleted/moved (a stale path would wedge the
@@ -598,6 +608,7 @@ app.on('before-quit', (event) => {
     voiceController.killForWindow(win.id)
   }
   stopAllLanForwards()
+  stopAllStaticPreviewServers()
   closeAllNeuralViews()
   stopScratchRetentionSweep?.()
   stopScratchRetentionSweep = null

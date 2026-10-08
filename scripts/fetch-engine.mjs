@@ -1,20 +1,21 @@
 #!/usr/bin/env node
 /**
- * Fetch + verify the pinned engine binaries into resources/engine/<platform>/{claude,codex}.
+ * Fetch + verify the newest upstream engine binaries into resources/engine/<platform>/{claude,codex}.
  *
  * The binaries are NOT committed (gitignored, ~200 MB claude + ~95 MB codex). This runs before packaging
- * (`npm run dist`) and on demand for dev. Idempotent: an already-present binary whose SHA-256 matches the
- * pin is left alone. Both engines ship bundled + pinned so a Koda release carries known-good versions of
- * each (see architecture/engine-updates.md); the daily engine-contract workflow gates stable bumps.
+ * (`npm run dist`) and on demand for dev. There is no pinned version (RB, 2026-10-07): the app follows
+ * upstream `latest` at runtime (src/main/engine/live-engines.ts), so the bundled copy is only what a
+ * fresh install runs until its first download, and it is whatever is newest when the build is made.
+ * Both engines resolve and verify the same way the runtime does.
  *
  * Claude — the scheme the official install.sh uses (Anthropic publishes a per-platform checksum manifest):
+ *   <CLAUDE_BASE>/latest                        → the version string
  *   <CLAUDE_BASE>/<version>/manifest.json      → { platforms: { "<platform>": { checksum, size } } }
  *   <CLAUDE_BASE>/<version>/<platform>/claude   → the executable
  *
- * Codex — GitHub releases (openai/codex, tag `rust-v<version>`). OpenAI publishes checksums only for the
- * `-package-` tarballs, NOT the plain self-contained CLI binary Koda bundles, so we pin the tarball's
- * SHA-256 ourselves (captured when the version is chosen — a lockfile, verified on every fetch):
- *   <CODEX_BASE>/rust-v<version>/codex-<triple>.tar.gz  → tar of a single self-contained `codex` binary
+ * Codex — the GitHub `releases/latest` of openai/codex (newest non-prerelease `rust-v<version>`). Each
+ * asset carries the SHA-256 digest GitHub recorded at upload, which is what the tarball is checked against:
+ *   codex-<triple>.tar.gz, codex-code-mode-host-<triple>.tar.gz → tar of one self-contained binary each
  */
 import { createHash } from 'node:crypto'
 import { mkdir, writeFile, chmod, readFile, rename, rm, readdir } from 'node:fs/promises'
@@ -26,63 +27,45 @@ import { promisify } from 'node:util'
 
 const execFileP = promisify(execFile)
 
-// ── Claude ─────────────────────────────────────────────────────────────────────────────────────────
-// Normally pinned to the npm `stable` dist-tag (not `latest`) — our posture favors stable over
-// bleeding-edge. 2.1.258 is a deliberate exception: it's `latest` (stable was 2.1.236 at pin time)
-// because day-one support for Fable 5.1, the new default Fable model, lands only in 2.1.257+, and
-// 2.1.258 also carries the fix for 2.1.255's macOS launch regression. Verified through the full
-// engine-contract gate before pinning (2026-09-02). Re-converge on `stable` at the next bump. The
-// engine-contract workflow verifies, writes, and merges only a strictly newer compatible stable pin.
-// NOTE: check-engine-floor.mjs + the workflow read `PINNED_VERSION` by regex — keep the name.
-const PINNED_VERSION = '2.1.283'
 const CLAUDE_BASE = 'https://downloads.claude.ai/claude-code-releases'
-
-// ── Codex ──────────────────────────────────────────────────────────────────────────────────────────
-// Latest GitHub-releases `stable` (non-prerelease) at pin time. The codex-contract job updates BOTH the
-// version and the per-platform tarball SHA only after its real app-server contract and repository gate.
-const PINNED_CODEX_VERSION = '0.157.1'
-const CODEX_BASE = 'https://github.com/openai/codex/releases/download'
+const CODEX_LATEST = 'https://api.github.com/repos/openai/codex/releases/latest'
 // koda platform → codex release triple.
 const CODEX_TRIPLE = { 'darwin-arm64': 'aarch64-apple-darwin' }
-// SHA-256 of the plain `codex-<triple>.tar.gz` asset, per koda platform. Self-pinned (OpenAI publishes no
-// checksum for the plain binary). Recompute when bumping PINNED_CODEX_VERSION.
-const CODEX_TARBALL_SHA256 = {
-  'darwin-arm64': '3c45b162b7a76f51325015b1d0a8112c73219b7a9b59cd5762c37c9ba55894fa',
-}
-// SHA-256 of the sibling `codex-code-mode-host-<triple>.tar.gz` asset from the SAME release. Every
-// GPT-5.6 model and GPT-6 Astra run `tool_mode: code_mode_only`, and the CLI spawns this helper from
-// the directory the `codex` binary lives in; without it Code Mode "fails closed" and those models
-// have no working shell or file tools (Koda's own dev logs showed the spawn failure from 2026-08-26).
-// Homebrew and npm install both binaries side by side; this reproduces that layout.
-const CODEX_HOST_TARBALL_SHA256 = {
-  'darwin-arm64': '288332d2c970df5c61c8fbdfeac64a8bf72fb1ac1945942da4537ecf63138314',
-}
+// The CLI and the code-mode helper it spawns from its own directory. Every GPT-5.6 model and GPT-6
+// Astra run `tool_mode: code_mode_only`; without the helper beside the binary Code Mode fails closed
+// and those models have no working shell or file tools.
+const CODEX_ASSETS = ['codex', 'codex-code-mode-host']
 
 const PLATFORMS = ['darwin-arm64']
+const VERSION_RE = /^\d+\.\d+\.\d+$/
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const outRoot = join(root, 'resources', 'engine')
 
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex')
 
+async function fetchOk(url, init) {
+  const res = await fetch(url, init)
+  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`)
+  return res
+}
+
 async function fetchClaude(platform) {
   const dest = join(outRoot, platform, 'claude')
 
-  const manifestRes = await fetch(`${CLAUDE_BASE}/${PINNED_VERSION}/manifest.json`)
-  if (!manifestRes.ok) throw new Error(`claude manifest fetch failed: HTTP ${manifestRes.status}`)
-  const manifest = await manifestRes.json()
+  const version = (await (await fetchOk(`${CLAUDE_BASE}/latest`)).text()).trim()
+  if (!VERSION_RE.test(version)) throw new Error(`unexpected claude version: ${JSON.stringify(version)}`)
+  const manifest = await (await fetchOk(`${CLAUDE_BASE}/${version}/manifest.json`)).json()
   const entry = manifest.platforms?.[platform]
-  if (!entry?.checksum) throw new Error(`no checksum for ${platform} in ${PINNED_VERSION} manifest`)
+  if (!entry?.checksum) throw new Error(`no checksum for ${platform} in ${version} manifest`)
 
-  if (existsSync(dest) && (await sha256(await readFile(dest))) === entry.checksum) {
-    console.log(`✓ ${platform} claude already present + verified (${PINNED_VERSION})`)
-    return
+  if (existsSync(dest) && sha256(await readFile(dest)) === entry.checksum) {
+    console.log(`✓ ${platform} claude already present + verified (${version})`)
+    return version
   }
 
-  console.log(`↓ ${platform} claude ${PINNED_VERSION} (${(entry.size / 1e6).toFixed(0)} MB)…`)
-  const res = await fetch(`${CLAUDE_BASE}/${PINNED_VERSION}/${platform}/claude`)
-  if (!res.ok) throw new Error(`claude download failed for ${platform}: HTTP ${res.status}`)
-  const buf = Buffer.from(await res.arrayBuffer())
+  console.log(`↓ ${platform} claude ${version} (${(entry.size / 1e6).toFixed(0)} MB)…`)
+  const buf = Buffer.from(await (await fetchOk(`${CLAUDE_BASE}/${version}/${platform}/claude`)).arrayBuffer())
 
   const actual = sha256(buf)
   if (actual !== entry.checksum) {
@@ -96,45 +79,49 @@ async function fetchClaude(platform) {
   await chmod(tmp, 0o755)
   await rename(tmp, dest)
   console.log(`✓ ${platform} claude verified + written → ${dest}`)
+  return version
 }
-
-/** The two Codex release assets that make one working install: the CLI and the code-mode helper it
- *  spawns beside itself. Both come from the same `rust-v<version>` release and land as siblings. */
-const CODEX_ASSETS = [
-  { name: 'codex', checksums: CODEX_TARBALL_SHA256 },
-  { name: 'codex-code-mode-host', checksums: CODEX_HOST_TARBALL_SHA256 },
-]
 
 async function fetchCodex(platform) {
   const triple = CODEX_TRIPLE[platform]
   if (!triple) throw new Error(`no codex triple configured for ${platform}`)
-  const dests = CODEX_ASSETS.map((asset) => join(outRoot, platform, asset.name))
 
-  // The extracted binaries can't be re-verified against the tarball SHAs, so a version marker records
+  // GITHUB_TOKEN only lifts the anonymous API rate limit on shared CI addresses; it is never required.
+  const headers = { accept: 'application/vnd.github+json' }
+  if (process.env.GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`
+  const release = await (await fetchOk(CODEX_LATEST, { headers })).json()
+  const version = release.tag_name?.replace(/^rust-v/, '') ?? ''
+  if (!VERSION_RE.test(version)) throw new Error(`unexpected codex tag: ${JSON.stringify(release.tag_name)}`)
+
+  // The extracted binaries can't be re-verified against the tarball digests, so a version marker records
   // what's on disk; matching marker + both binaries present ⇒ skip the ~115 MB download.
   const marker = join(outRoot, platform, '.codex-version')
   if (
-    dests.every((dest) => existsSync(dest)) &&
+    CODEX_ASSETS.every((name) => existsSync(join(outRoot, platform, name))) &&
     existsSync(marker) &&
-    (await readFile(marker, 'utf8')).trim() === PINNED_CODEX_VERSION
+    (await readFile(marker, 'utf8')).trim() === version
   ) {
-    console.log(`✓ ${platform} codex already present (${PINNED_CODEX_VERSION})`)
-    return
+    console.log(`✓ ${platform} codex already present (${version})`)
+    return version
   }
 
-  for (const asset of CODEX_ASSETS) await fetchCodexAsset(platform, triple, asset)
-  await writeFile(marker, `${PINNED_CODEX_VERSION}\n`)
+  for (const name of CODEX_ASSETS) {
+    const asset = release.assets?.find((a) => a.name === `${name}-${triple}.tar.gz`)
+    // Without a recorded digest there is nothing to verify the download against, so the build stops
+    // rather than bundling an unchecked binary.
+    const expected = asset?.digest?.match(/^sha256:([a-f0-9]{64})$/)?.[1]
+    if (!asset || !expected) throw new Error(`codex ${version} has no verifiable ${name} asset for ${triple}`)
+    await fetchCodexAsset(platform, version, name, asset.browser_download_url, expected)
+  }
+  await writeFile(marker, `${version}\n`)
+  return version
 }
 
-async function fetchCodexAsset(platform, triple, { name, checksums }) {
-  const expected = checksums[platform]
-  if (!expected) throw new Error(`no ${name} checksum configured for ${platform}`)
+async function fetchCodexAsset(platform, version, name, url, expected) {
   const dest = join(outRoot, platform, name)
 
-  console.log(`↓ ${platform} ${name} ${PINNED_CODEX_VERSION}…`)
-  const res = await fetch(`${CODEX_BASE}/rust-v${PINNED_CODEX_VERSION}/${name}-${triple}.tar.gz`)
-  if (!res.ok) throw new Error(`${name} download failed for ${platform}: HTTP ${res.status}`)
-  const buf = Buffer.from(await res.arrayBuffer())
+  console.log(`↓ ${platform} ${name} ${version}…`)
+  const buf = Buffer.from(await (await fetchOk(url)).arrayBuffer())
 
   const actual = sha256(buf)
   if (actual !== expected) {
@@ -160,17 +147,17 @@ async function fetchCodexAsset(platform, triple, { name, checksums }) {
   console.log(`✓ ${platform} ${name} verified + written → ${dest}`)
 }
 
+const fetched = []
 for (const platform of PLATFORMS) {
-  await fetchClaude(platform)
-  await fetchCodex(platform)
+  fetched.push(`claude ${await fetchClaude(platform)}`, `codex ${await fetchCodex(platform)}`)
 }
 
 // Loud failure before packaging: every target platform must have both engines, and Codex's helper, on disk.
 const missing = []
 for (const p of PLATFORMS) {
-  for (const name of ['claude', ...CODEX_ASSETS.map((asset) => asset.name)]) {
+  for (const name of ['claude', ...CODEX_ASSETS]) {
     if (!existsSync(join(outRoot, p, name))) missing.push(`${p}/${name}`)
   }
 }
 if (missing.length) throw new Error(`engine missing after fetch: ${missing.join(', ')}`)
-console.log(`engine fetch complete (claude ${PINNED_VERSION}, codex ${PINNED_CODEX_VERSION}).`)
+console.log(`engine fetch complete (${[...new Set(fetched)].join(', ')}).`)

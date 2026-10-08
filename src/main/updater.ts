@@ -33,16 +33,6 @@ let staged: { version: string } | null = null
 // screen is locked, and a check that finds one pulls a whole .app down the wire.
 let checkProbe: GovernedProbe | null = null
 
-export type UpdateChannel = 'latest' | 'nightly'
-
-/** A prerelease follows only its named prerelease feed. Stable builds never opt into prereleases, so
- *  publishing a nightly cannot make an ordinary Koda install discover it. */
-export function updateChannelForVersion(version: string): UpdateChannel {
-  return version.match(/^[0-9]+\.[0-9]+\.[0-9]+-([0-9A-Za-z-]+)(?:\.|$)/)?.[1] === 'nightly'
-    ? 'nightly'
-    : 'latest'
-}
-
 function broadcast(next: UpdateStatus): void {
   // A staged update outlives every later check. The 6-hourly re-check emits checking / up-to-date /
   // error (and re-download churn for the version already on disk); none of that unstages anything, so
@@ -67,11 +57,11 @@ export function initUpdater(): void {
   }
 
   autoUpdater.autoDownload = true // background download the moment one is found
-  const channel = updateChannelForVersion(app.getVersion())
-  autoUpdater.channel = channel
-  autoUpdater.allowPrerelease = channel === 'nightly'
-  // Setting a channel makes electron-updater enable downgrades. Koda's feeds are monotonic; an older
-  // nightly must never replace a newer installed build, even if GitHub returns releases out of order.
+  // One feed. Both flags are set explicitly because electron-updater flips them on its own: a version
+  // with a prerelease component turns prereleases on, and setting a channel turns downgrades on. An
+  // older release must never replace a newer installed build, even if GitHub returns them out of order.
+  autoUpdater.channel = 'latest'
+  autoUpdater.allowPrerelease = false
   autoUpdater.allowDowngrade = false
   // Install ONLY on the user's explicit "Restart to update" — never on quit. (autoInstallOnAppQuit is
   // also dead here: Koda's before-quit force-exits via app.exit(), which skips the `quit` event the

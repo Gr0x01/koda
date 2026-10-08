@@ -12,7 +12,7 @@
  */
 import { createHash, randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
-import { basename, relative } from 'node:path'
+import { basename, relative, sep } from 'node:path'
 import { app, BrowserWindow } from 'electron'
 import { IpcChannels } from '@shared/channels'
 import {
@@ -43,6 +43,8 @@ import {
   type RemoteTerminalAttention,
   type RemoteTerminalStartResult,
   type RemoteTerminalState,
+  type DocKind,
+  type RemoteLibrary,
   type RemoteUsageSnapshot,
   type RemoteTurnReceipt,
   type AttachmentProvenance,
@@ -84,13 +86,24 @@ import {
   type CompletionUncertainty,
   type OwnedCompletionCommitResult,
 } from '../completion-state'
-import { browseDir, containedReal, docExcerpt, listProjectDocs, readProjectFile, readProjectImage, writeProjectFile } from '../fs-browse'
+import {
+  browseDir,
+  containedReal,
+  createProjectFile,
+  docExcerpt,
+  listProjectDocs,
+  readProjectFile,
+  readProjectImage,
+  writeProjectFile,
+} from '../fs-browse'
 import { installApp, startApp, stopApp, appStatus, projectHasMiniApp } from '../mini-apps'
 import {
   createDocument,
   createInteractiveDocument,
   readDocShelfForRecovery,
+  readRemoteLibrary,
   reconcileDocShelfAfterRestore,
+  setDocStar,
   starDocument,
 } from '../doc-commands'
 import { keepDocument } from '../keep-document'
@@ -173,6 +186,7 @@ import {
 import { startDevServer, captureWindowPreview, showStaticPreview, getSessionPreview, clearSessionPreview } from '../preview'
 import { showTerminal } from '../terminal'
 import { stopLanForward, stopAllLanForwards } from '../lan-forward'
+import { stopAllStaticPreviewServers, stopStaticPreviewServer } from '../static-preview-server'
 import { governProbe, type GovernedProbe } from '../probe-governor'
 import {
   archiveSession,
@@ -4378,11 +4392,43 @@ export class EngineSessionManager {
     }
   }
 
+  /** The phone's Library and starred shelf for the ref'd project (`readRemoteLibrary`). */
+  async remoteLibrary(
+    ref: { sessionId?: string; projectPath?: string },
+    req: { query?: string; kinds?: DocKind[] },
+  ): Promise<RemoteLibrary> {
+    return readRemoteLibrary(this.remoteRoot(ref), req)
+  }
+
+  /** Star or unstar from the phone. `setDocStar` is the same command the desktop star and the agent's
+   *  `star_document` call, so validation and the desktop's change event are its own. */
+  async remoteStarDoc(
+    ref: { sessionId?: string; projectPath?: string },
+    path: string,
+    starred: boolean,
+  ): Promise<{ starred: string[] }> {
+    const shelf = await setDocStar(this.remoteRoot(ref), { path, starred })
+    return { starred: shelf.starred }
+  }
+
+  /** New Document from the phone: the desktop button's own creation (`createProjectFile`), inside the
+   *  same project mutation boundary its IPC handler holds. A session ref becomes the document's
+   *  `source`, exactly as the desktop passes the active chat. */
+  async remoteCreateDoc(ref: { sessionId?: string; projectPath?: string }): Promise<{ path: string }> {
+    const cwd = this.remoteRoot(ref)
+    return this.withExternalProjectMutation(cwd, {}, async () => {
+      const file = await createProjectFile(cwd, undefined, undefined, ref.sessionId)
+      // createProjectFile answers a realpath, so the root is resolved the same way before subtracting.
+      return { path: relative(realpathSync(cwd), file).split(sep).join('/') }
+    })
+  }
+
   /** The remote tier was disabled: reap any headless session a remote client kept alive whose window is
    *  already gone (so its `claude` child doesn't linger unreachable), then forget all attachments. A
    *  session whose window is still open keeps running — it's still usable locally. */
   async disposeHeadlessRemote(): Promise<void> {
     stopAllLanForwards() // no phone can be watching once the tier is off
+    stopAllStaticPreviewServers()
     for (const id of [...this.remoteAttached]) {
       if (!contextForSession(id)) {
         try {
@@ -4901,6 +4947,7 @@ export class EngineSessionManager {
     // settings/broker respawn must still be delivered when the replacement child's turn ends. Only a
     // true end (forgetSession) drops it.
     stopLanForward(sessionId) // reap any LAN preview forwarder + forget its (now dead) URL
+    stopStaticPreviewServer(sessionId) // and the loopback server a phone's static preview rode on
     clearSessionPreview(sessionId)
     // NB: recoveringBroker is NOT cleared here — a broker recovery calls start()→dispose() on the old
     // child mid-flight, and its own finally removes the flag once the respawn settles. Clearing it here

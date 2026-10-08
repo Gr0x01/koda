@@ -8,10 +8,10 @@
  * lesson — measured facts only).
  *
  * SOURCE, and the rule for editing it: the Anthropic list prices below are the published pricing page,
- * https://platform.claude.com/docs/en/about-claude/pricing (verified 2026-09-22). The cache
+ * https://platform.claude.com/docs/en/about-claude/pricing (verified 2026-10-07). The cache
  * multipliers are the same page's cache economics: a cache read is 0.1x the base input price (0.025x
- * on Fable/Mythos 5.1 and 0.05x on Opus 5.5, both carried per-row) and a 5-minute cache write is
- * 1.25x. A model we cannot cite a published rate for is NOT priced — it gets a tokens-only row
+ * on Fable/Mythos 5.1 and 0.05x on Opus 5.5 and Sonnet 5.5, carried per-row) and a 5-minute cache
+ * write is 1.25x. Haiku 5.5 is the one model priced by prompt length, carried per-row as `longPrompt`. A model we cannot cite a published rate for is NOT priced — it gets a tokens-only row
  * rather than an invented number. That
  * includes every OpenAI/Codex model (Koda has no published-rate source wired for them) and every
  * engine alias (`opus`, `sonnet`, `opusplan`, …), which resolve to a concrete model we can't see from
@@ -26,6 +26,9 @@ export type PublishedRate = {
    *  CACHE_READ_MULTIPLIER (Fable/Mythos 5.1 publish $0.25/MTok on $10 input = 0.025x; Opus 5.5
    *  publishes $0.20/MTok on $4 input = 0.05x). */
   cacheReadMultiplier?: number
+  /** The base pair for a request whose prompt exceeds LONG_PROMPT_TOKENS, on the one model that
+   *  publishes a second tier (Haiku 5.5). Cache multipliers apply to it unchanged. */
+  longPrompt?: { inputPerMTok: number; outputPerMTok: number }
   /** Where this pair came from, shown nowhere but kept so the next editor can re-verify it. */
   source: string
 }
@@ -35,7 +38,15 @@ export const CACHE_READ_MULTIPLIER = 0.1
 /** Writing the 5-minute cache costs 1.25x the base input rate — the premium the savings must clear. */
 export const CACHE_WRITE_MULTIPLIER = 1.25
 
-const ANTHROPIC_LIST = 'platform.claude.com/docs/en/about-claude/pricing (verified 2026-09-02)'
+/**
+ * Haiku 5.5's published tier boundary: a prompt over this many tokens bills the whole request at
+ * the `longPrompt` pair. The pricing page says "prompts over 100,000 tokens" and nothing finer, so
+ * prompt size is read the way Anthropic's earlier long-context tier defined it: every input token
+ * the request carried, cached or not.
+ */
+export const LONG_PROMPT_TOKENS = 100_000
+
+const ANTHROPIC_LIST = 'platform.claude.com/docs/en/about-claude/pricing (verified 2026-10-07)'
 
 /**
  * Keyed by the model FAMILY left after `normalizeModelId` strips the vendor prefix, the context-window
@@ -54,17 +65,27 @@ const RATES: Record<string, PublishedRate> = {
   'opus-4-8': { inputPerMTok: 5, outputPerMTok: 25, source: ANTHROPIC_LIST },
   'opus-4-7': { inputPerMTok: 5, outputPerMTok: 25, source: ANTHROPIC_LIST },
   'opus-4-6': { inputPerMTok: 5, outputPerMTok: 25, source: ANTHROPIC_LIST },
+  // Sonnet 5.5 publishes a $0.10/MTok cache read — 0.05x, like Opus 5.5.
+  'sonnet-5-5': { inputPerMTok: 2, outputPerMTok: 10, cacheReadMultiplier: 0.05, source: ANTHROPIC_LIST },
   // Sonnet 5 launched at an introductory $2/$10; Anthropic made that the standard list price (the
   // scheduled 2026-09-01 increase to $3/$15 was cancelled — pricing-page note, read 2026-09-02).
   'sonnet-5': { inputPerMTok: 2, outputPerMTok: 10, source: ANTHROPIC_LIST },
   'sonnet-4-6': { inputPerMTok: 3, outputPerMTok: 15, source: ANTHROPIC_LIST },
+  // Haiku 5.5 (2026-10-07) is the first model priced by prompt length: $0.10/$0.50 up to 100K
+  // prompt tokens, $0.50/$2.50 over.
+  'haiku-5-5': {
+    inputPerMTok: 0.1,
+    outputPerMTok: 0.5,
+    longPrompt: { inputPerMTok: 0.5, outputPerMTok: 2.5 },
+    source: ANTHROPIC_LIST,
+  },
   'haiku-4-5': { inputPerMTok: 1, outputPerMTok: 5, source: ANTHROPIC_LIST },
 }
 
 /**
  * Engine model id → the family key used above. `claude-opus-5[1m]` → `opus-5`;
- * `claude-haiku-4-5-20251001` → `haiku-4-5`. The 1M context window is standard-priced on every model
- * in the table, so the suffix is dropped rather than treated as a tier.
+ * `claude-haiku-4-5-20251001` → `haiku-4-5`. The context-window suffix is dropped rather than treated
+ * as a tier: the one model with a length tier (Haiku 5.5) keys it on the request's actual prompt size.
  */
 export function normalizeModelId(id: string): string {
   return id
@@ -80,6 +101,14 @@ export function publishedRate(id: string): PublishedRate | null {
   return RATES[normalizeModelId(id)] ?? null
 }
 
+/** The base pair one request bills at, given how many prompt tokens it carried. */
+export function rateForPrompt(
+  rate: PublishedRate,
+  promptTokens: number,
+): { inputPerMTok: number; outputPerMTok: number } {
+  return rate.longPrompt && promptTokens > LONG_PROMPT_TOKENS ? rate.longPrompt : rate
+}
+
 /**
  * What the cache saved on one model's measured tokens, in USD, or `null` when the model is unpriced.
  *
@@ -89,6 +118,9 @@ export function publishedRate(id: string): PublishedRate | null {
  * therefore `cacheRead x (1 − readMult) x input − cacheWrite x 0.25 x input`. It can go negative on a
  * session that wrote far more cache than it ever read back; that is a real (small) loss, not an
  * error, and the UI says so.
+ *
+ * These tokens are summed across turns, so a length-tiered model is rated at its base pair. That
+ * understates the saving on its long prompts and never overstates it.
  */
 export function cacheSavingsUsd(
   id: string,

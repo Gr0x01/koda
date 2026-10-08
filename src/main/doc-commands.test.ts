@@ -9,6 +9,7 @@ import {
   INTERACTIVE_SOURCE_MARKER,
   readDocShelf,
   readDocShelfForRecovery,
+  readRemoteLibrary,
   rebaseDocStars,
   reconcileDocShelfAfterRestore,
   setDocStar,
@@ -469,5 +470,57 @@ describe('turning a passage into an interactive view', () => {
     expect(
       await createInteractiveDocument(root, { sourcePath: '../escape.md', selection: 'x', title: 'T' }),
     ).toEqual({ ok: false, reason: expect.stringContaining('no document at') })
+  })
+})
+
+describe('the phone\'s Library read', () => {
+  beforeEach(() => {
+    writeFileSync(
+      join(root, 'Documents', 'plans', 'tiers.md'),
+      '---\ntitle: Phone tiers\ndescription: What each paid tier unlocks.\nkind: plan\n---\n\n# Phone tiers\n\nConnect is the middle rung.\n',
+    )
+  })
+
+  it('lists every document by project-relative path, with authored metadata and a resolved kind', async () => {
+    const lib = await readRemoteLibrary(root)
+
+    const tiers = lib.docs.find((d) => d.rel === 'Documents/plans/tiers.md')
+    expect(tiers).toMatchObject({ title: 'Phone tiers', description: 'What each paid tier unlocks.', kind: 'plan' })
+    // A document with no frontmatter still has a kind, from its folder.
+    expect(lib.docs.find((d) => d.rel === 'Documents/plans/launch.md')?.kind).toBe('plan')
+    expect(lib.docs.find((d) => d.rel === 'Documents/brief.md')?.kind).toBe('note')
+    // The Mac's layout never crosses to the phone.
+    expect(JSON.stringify(lib)).not.toContain(root)
+  })
+
+  it('searches contents and filters by kind through the desktop query', async () => {
+    const hit = await readRemoteLibrary(root, { query: 'middle rung' })
+    expect(hit.docs.map((d) => d.rel)).toEqual(['Documents/plans/tiers.md'])
+    expect(hit.docs[0].matches[0].preview).toContain('middle rung')
+
+    const notes = await readRemoteLibrary(root, { kinds: ['note'] })
+    expect(notes.docs.map((d) => d.rel)).toEqual(['Documents/brief.md'])
+  })
+
+  it('carries the shelf in star order, titled, even when a search hides those documents', async () => {
+    await setDocStar(root, { path: 'Documents/plans/tiers.md', starred: true })
+    await setDocStar(root, { path: 'Documents/brief.md', starred: true })
+
+    const lib = await readRemoteLibrary(root, { query: 'no document says this' })
+
+    expect(lib.docs).toEqual([])
+    expect(lib.starred).toEqual([
+      { rel: 'Documents/plans/tiers.md', name: 'tiers.md', title: 'Phone tiers' },
+      { rel: 'Documents/brief.md', name: 'brief.md' },
+    ])
+  })
+
+  it('keeps a starred document whose file is gone, marked so it can only be unstarred', async () => {
+    await setDocStar(root, { path: 'Documents/brief.md', starred: true })
+    rmSync(join(root, 'Documents', 'brief.md'))
+
+    expect((await readRemoteLibrary(root)).starred).toEqual([
+      { rel: 'Documents/brief.md', name: 'brief.md', missing: true },
+    ])
   })
 })

@@ -43,10 +43,13 @@ describe('infer request contract', () => {
 
 describe('spend estimate', () => {
   it('prices by the shared published-rate table', () => {
-    // 1M input + 1M output at the fast tier = exactly the per-MTok prices summed.
     const rate = publishedRate(BRIDGE_TIERS.fast.model)!
+    expect(estimateUsd('fast', 50_000, 1_000_000)).toBeCloseTo(
+      rate.inputPerMTok * 0.05 + rate.outputPerMTok,
+    )
+    // A prompt past the tier boundary bills the whole call at the long-prompt pair.
     expect(estimateUsd('fast', 1_000_000, 1_000_000)).toBeCloseTo(
-      rate.inputPerMTok + rate.outputPerMTok,
+      rate.longPrompt!.inputPerMTok + rate.longPrompt!.outputPerMTok,
     )
     expect(estimateUsd('smart', 0, 0)).toBe(0)
   })

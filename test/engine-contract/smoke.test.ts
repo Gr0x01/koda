@@ -29,7 +29,7 @@ const CANDIDATE = process.env.KODA_ENGINE_CANDIDATE || undefined
 const API_KEY = process.env.ANTHROPIC_API_KEY || undefined
 /**
  * Model for every session the contract drives. Unset ⇒ the engine's own default, which is what a local
- * subscription run wants. CI sets it, because there the nightly bills the API and the default is Opus:
+ * subscription run wants. CI sets it, because there the daily check bills the API and the default is Opus:
  * these checks assert stream-json seams (event shapes, subagent lifecycle, interrupt, resume, usage
  * accounting) rather than model judgment, so the priciest model buys no extra signal. Behavioral
  * rehearsal is a separate opt-in run and keeps whatever model the operator points it at.

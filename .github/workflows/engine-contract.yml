@@ -1,8 +1,9 @@
-# Daily guard on the bundled engines (both `claude` and `codex`). Each job resolves the current `latest`
-# release (our pin policy — see architecture/engine-updates.md), and if it's
-# ahead of the version pinned in scripts/fetch-engine.mjs, downloads + verifies that build (linux) and
-# drives it through the engine-contract smoke test (the real driver). Green → opens and merges a tightly
-# scoped bot PR; red → opens or updates an issue before the candidate can enter a nightly.
+# Daily early warning on the upstream engines (both `claude` and `codex`). Koda pins no engine version:
+# the app downloads upstream `latest` at runtime and a build bundles whatever is newest when it is made
+# (.koda/memory/engine-updates.md). Each job resolves the current upstream release, downloads + verifies
+# that build (linux), and drives it through the engine-contract smoke test (the real driver). Green →
+# nothing to do, the version is remembered as passed; red → opens or updates an issue, because that
+# engine is already what the app runs.
 #
 # Each job is dormant until its API-key repo secret is set — the smoke tests bill to the API in CI
 # (claude: ANTHROPIC_API_KEY, codex: OPENAI_API_KEY). Without the key the job no-ops cleanly (never fails,
@@ -16,24 +17,23 @@ concurrency:
 
 on:
   schedule:
-    # Daily 06:00 UTC. Checking is cheap (a version compare, no engine spawn). Daily (not weekly) so a new
+    # Daily 06:00 UTC. Checking is cheap (a version lookup, no engine spawn). Daily (not weekly) so a new
     # release — e.g. a flagship model launch — is caught within ~1 day instead of up to 7.
     #
-    # The API-billing smoke test runs when `stable` is ahead of the pin — which is NOT the same as "on days
-    # stable advanced", because the pin only moves after a fully green run merges its bump PR. A red nightly
-    # leaves the pin behind forever, so every following night re-tested the same candidate and re-billed for
-    # it; that ran 17 nights straight in August 2026. The already-failed guard in the resolve step below is
-    # what bounds that, and it is the reason this cron can stay daily.
+    # The API-billing smoke test must run once per upstream version, not once per day. A version that
+    # passed is remembered by a cache entry keyed on it; a version that failed is remembered by its open
+    # issue. Without the second guard a red run re-billed the identical broken version every night, which
+    # ran 17 nights straight in August 2026. A passed entry unused for a week is evicted, so a quiet
+    # upstream costs at most one repeat run a week.
     - cron: '0 6 * * *'
   workflow_dispatch:
     inputs:
       version:
-        description: 'Engine version to test (blank = npm `latest` dist-tag)'
+        description: 'Claude engine version to test (blank = upstream latest). Always re-tests.'
         required: false
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
   issues: write
 
 jobs:
@@ -51,7 +51,7 @@ jobs:
           cache: npm
       - run: npm ci
 
-      - name: Resolve versions + preconditions
+      - name: Resolve version + preconditions
         id: v
         env:
           GH_TOKEN: ${{ github.token }}
@@ -62,54 +62,41 @@ jobs:
             echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           echo "attempted=true" >> "$GITHUB_OUTPUT"
-          PINNED=$(node -p "require('fs').readFileSync('scripts/fetch-engine.mjs','utf8').match(/PINNED_VERSION\s*=\s*'([^']+)'/)[1]")
           TARGET="${{ inputs.version }}"
-          # Pin policy: track `latest`. `stable` is promoted rarely — it sat seven releases and a week
-          # behind `latest` through September 2026, so the guard had nothing to test for days at a time
-          # while upstream shipped daily. The gate below is what makes this safe: a candidate still has
-          # to pass checksum verification, the real driver contract, the two-file diff guard, and CI
-          # before its bump PR merges. See architecture/engine-updates.md.
-          [ -z "$TARGET" ] && TARGET=$(npm view @anthropic-ai/claude-code dist-tags.latest)
+          # The same index the app's runtime download and the build's bundling step read.
+          [ -z "$TARGET" ] && TARGET=$(curl -fsSL --retry 3 https://downloads.claude.ai/claude-code-releases/latest)
           if [[ ! "$TARGET" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::invalid Claude version from upstream: $TARGET"; exit 1
           fi
-          echo "pinned=$PINNED" >> "$GITHUB_OUTPUT"
           echo "target=$TARGET" >> "$GITHUB_OUTPUT"
-          echo "::notice::pinned=$PINNED stable-target=$TARGET"
-          ORDER=$(node --input-type=module -e "import { compareStableVersions } from './scripts/apply-engine-bump.mjs'; console.log(compareStableVersions(process.argv[1], process.argv[2]))" "$TARGET" "$PINNED")
-          if [ "$ORDER" -le 0 ]; then
-            echo "::notice::Claude pin $PINNED is already at or ahead of $TARGET — nothing to test."
-            echo "go=false" >> "$GITHUB_OUTPUT"
-          # A candidate that already failed must not be re-tested nightly. The smoke test bills the API in
-          # full, and a failing check bills MORE than a passing one (each check burns its whole timeout with
-          # the model still working), so a red nightly used to charge for the identical broken version every
-          # day until someone read the bill. The failure issue below is already the record of that attempt;
-          # this reads it back. Retry when the issue is closed, when a newer version ships, or on a manual
+          echo "::notice::target=$TARGET"
+          # Retry a failed version when its issue is closed, when a newer version ships, or on a manual
           # dispatch — which is the escape hatch for a failure that was transient rather than real.
-          elif [ -z "$FORCE" ] && gh issue list --state open --limit 200 --json title --jq '.[].title' \
-            | grep -Fxq "Automated Claude engine update failed for $TARGET"; then
+          if [ -z "$FORCE" ] && gh issue list --state open --limit 200 --json title --jq '.[].title' \
+            | grep -Fxq "Claude engine $TARGET failed the Koda contract"; then
             echo "::notice::Claude $TARGET already failed and its issue is still open — not re-testing (close it or dispatch manually to retry)."
             echo "go=false" >> "$GITHUB_OUTPUT"
           else
             echo "go=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Look up a recorded pass for this version
+        id: seen
+        if: steps.v.outputs.go == 'true' && github.event_name != 'workflow_dispatch'
+        uses: actions/cache/restore@v4
+        with:
+          path: .engine-contract-pass
+          key: engine-contract-claude-${{ steps.v.outputs.target }}
+          lookup-only: true
+
       - name: Download + verify candidate binary
-        if: steps.v.outputs.go == 'true'
+        if: steps.v.outputs.go == 'true' && steps.seen.outputs.cache-hit != 'true'
         env:
           TARGET: ${{ steps.v.outputs.target }}
         run: node scripts/fetch-candidate-engine.mjs --version "$TARGET" --platform linux-x64 --out /tmp/candidate
 
-      # The contract executes the Linux build, while Koda ships darwin-arm64. Verify that the exact
-      # bundled-platform candidate exists and matches Anthropic's signed manifest before changing the pin.
-      - name: Download + verify bundled-platform candidate
-        if: steps.v.outputs.go == 'true'
-        env:
-          TARGET: ${{ steps.v.outputs.target }}
-        run: node scripts/fetch-candidate-engine.mjs --version "$TARGET" --platform darwin-arm64 --out /tmp/candidate-mac
-
       - name: Engine contract smoke test
-        if: steps.v.outputs.go == 'true'
+        if: steps.v.outputs.go == 'true' && steps.seen.outputs.cache-hit != 'true'
         env:
           KODA_ENGINE_CANDIDATE: /tmp/candidate/claude
           # The checks assert stream-json plumbing, not model judgment, and this run bills the API — so pin
@@ -117,84 +104,15 @@ jobs:
           KODA_ENGINE_CONTRACT_MODEL: sonnet
         run: npm run test:engine-contract
 
-      # Watch the server-advertised min_version floor — the one thing that breaks a frozen bundle (see
-      # architecture/engine-updates.md + the shared-home drift note). The smoke test above authenticates and
-      # drives real turns, which populates ~/.claude.json's cachedGrowthBookFeatures, so we read the floor
-      # off that — no extra engine spawn. Only meaningful when the smoke test ran (go==true); in steady state
-      # a newly available stable candidate is checked before the pin can move.
-      - name: Check server version floor
-        id: floor
-        if: success() && steps.v.outputs.go == 'true'
-        run: node scripts/check-engine-floor.mjs
-
-      # Surface a rising floor as a deduped tracking issue (a green-run ::warning:: would go unseen). Only
-      # one open issue at a time; re-runs update it rather than nagging on every run.
-      - name: Flag approaching floor
-        if: success() && steps.v.outputs.go == 'true' && (steps.floor.outputs.level == 'warn' || steps.floor.outputs.level == 'critical')
-        env:
-          GH_TOKEN: ${{ github.token }}
-          LEVEL: ${{ steps.floor.outputs.level }}
-          FLOOR: ${{ steps.floor.outputs.floor }}
-          FLOORKEY: ${{ steps.floor.outputs.floorKey }}
-          PINNED: ${{ steps.floor.outputs.pinned }}
-          BEHIND: ${{ steps.floor.outputs.patchesBehind }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          TITLE="Engine server floor approaching pinned version ($FLOORKEY)"
-          BODY="Server-advertised floor \`$FLOOR\` (\`$FLOORKEY\`) vs Koda's pinned bundled engine \`$PINNED\` — **$BEHIND patch releases** of headroom left (level: **$LEVEL**). If the floor reaches the pin, the frozen bundled engine starts refusing to run. Plan a re-bundle above the floor. Background: architecture/engine-updates.md. Run: $RUN_URL"
-          EXISTING=$(gh issue list --state open --search "$TITLE in:title" --json number -q '.[0].number')
-          if [ -n "$EXISTING" ]; then
-            gh issue comment "$EXISTING" --body "$BODY"
-          else
-            gh issue create --title "$TITLE" --body "$BODY" --label "engine" || \
-              gh issue create --title "$TITLE" --body "$BODY"
-          fi
-
-      - name: Apply guarded version bump
-        if: success() && steps.v.outputs.go == 'true'
-        env:
-          TARGET: ${{ steps.v.outputs.target }}
-        run: |
-          node scripts/apply-engine-bump.mjs apply --engine claude --version "$TARGET"
-          node scripts/apply-engine-bump.mjs verify --engine claude --version "$TARGET"
-
-      # GITHUB_TOKEN-authored PRs do not recursively trigger ordinary pull_request workflows. Run the
-      # repository's complete portable CI gate on the exact edited tree before this narrow bot PR merges.
-      # The unit suite resolves resources/engine/linux-x64/claude (adapter/pack tests; the lab's check
-      # lane installs it the same way). The bump above moved the pin to $TARGET, and /tmp/candidate
-      # already holds $TARGET's manifest-verified linux binary — install that, no second download.
-      - name: Install engine for the unit suite
-        if: success() && steps.v.outputs.go == 'true'
-        run: |
-          mkdir -p resources/engine/linux-x64
-          cp /tmp/candidate/claude resources/engine/linux-x64/claude
-      - name: Portable repository gate
-        if: success() && steps.v.outputs.go == 'true'
-        env:
-          NODE_OPTIONS: --max-old-space-size=6144
-        run: |
-          npm run lint
-          npm test
-          npm run build
-
-      - name: Open and merge guarded version-bump PR
-        if: success() && steps.v.outputs.go == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TARGET: ${{ steps.v.outputs.target }}
-        run: |
-          node scripts/apply-engine-bump.mjs verify --engine claude --version "$TARGET"
-          BRANCH="engine/bump-claude-$TARGET-${GITHUB_RUN_ID}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$BRANCH"
-          git add CHANGELOG.md scripts/fetch-engine.mjs
-          git commit -m "chore(engine): bump bundled Claude CLI to $TARGET"
-          git push -u origin "$BRANCH"
-          PR_URL=$(gh pr create --base main --head "$BRANCH" \
-            --title "chore(engine): bump bundled Claude CLI to $TARGET" \
-            --body "Automated: both upstream binaries verified, the real Koda engine contract passed against \`$TARGET\`, the diff guard accepted only the pin and changelog, and the portable repository gate passed. Safe engine bumps merge themselves and enter the next nightly.")
-          gh pr merge "$PR_URL" --repo "$GITHUB_REPOSITORY" --squash --delete-branch
+      - name: Mark this version as passed
+        if: success() && steps.v.outputs.go == 'true' && steps.seen.outputs.cache-hit != 'true'
+        run: echo "${{ steps.v.outputs.target }}" > .engine-contract-pass
+      - name: Record the pass
+        if: success() && steps.v.outputs.go == 'true' && steps.seen.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .engine-contract-pass
+          key: engine-contract-claude-${{ steps.v.outputs.target }}
 
       - name: Open failure issue (regressed)
         if: failure() && steps.v.outputs.attempted == 'true'
@@ -203,10 +121,10 @@ jobs:
           TARGET: ${{ steps.v.outputs.target }}
         run: |
           TARGET="${TARGET:-unknown}"
-          TITLE="Automated Claude engine update failed for $TARGET"
-          BODY="Koda stopped the automated update for \`$TARGET\` before nightly publication. The failure may be version resolution, candidate verification, the real engine contract, the exact-diff guard, portable CI, or guarded PR integration. Close this issue to let the nightly retry \`$TARGET\`. Logs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          TITLE="Claude engine $TARGET failed the Koda contract"
+          BODY="Upstream Claude \`$TARGET\` did not pass Koda's engine contract. The app follows upstream latest, so installs may already be running this version. The failure may be version resolution, candidate verification, or the real engine contract. Close this issue to let the daily check retry \`$TARGET\`. Logs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           # Exact title match, not `in:title` search: the resolve step reads these same titles back to decide
-          # whether a candidate already failed, and a fuzzy match across adjacent version numbers would make
+          # whether a version already failed, and a fuzzy match across adjacent version numbers would make
           # the two disagree — either skipping a version that never ran, or filing a fresh issue every night.
           EXISTING=$(gh issue list --state open --limit 200 --json number,title -q ".[] | select(.title == \"$TITLE\") | .number" | head -n1)
           if [ -n "$EXISTING" ]; then
@@ -224,8 +142,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Claude may have auto-merged a pin earlier in this same run. Start Codex from the current
-          # private main so two independent engine updates never race from one stale base.
           ref: main
       - uses: actions/setup-node@v4
         with:
@@ -233,7 +149,7 @@ jobs:
           cache: npm
       - run: npm ci
 
-      - name: Resolve versions + preconditions
+      - name: Resolve version + preconditions
         id: v
         env:
           GH_TOKEN: ${{ github.token }}
@@ -244,15 +160,13 @@ jobs:
             echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           echo "attempted=true" >> "$GITHUB_OUTPUT"
-          PINNED=$(node -p "require('fs').readFileSync('scripts/fetch-engine.mjs','utf8').match(/PINNED_CODEX_VERSION\s*=\s*'([^']+)'/)[1]")
-          # Pin policy: latest GitHub-releases `stable` (newest non-prerelease `rust-v*` tag), NOT prereleases.
           # The workflow_dispatch `version` input is Claude-only (different version scheme) — Codex always
-          # resolves its own stable so a Claude version can't be mis-fed here.
-          # `releases/latest` is GitHub's own "newest non-prerelease, non-draft" — one cheap call. The full
-          # --paginate sweep it replaced walked every release page and flaked two separate ways (multi-line
-          # $GITHUB_OUTPUT writes, then mid-stream CANCELs/504s from GitHub), failing nights when nothing was
-          # wrong. Retries cover the endpoint itself blipping; a non-rust-v tag falls through to the version
-          # check below and fails loudly.
+          # resolves its own latest so a Claude version can't be mis-fed here.
+          # `releases/latest` is GitHub's own "newest non-prerelease, non-draft" — one cheap call, and the
+          # same one the app and the build make. The full --paginate sweep it replaced walked every release
+          # page and flaked two separate ways (multi-line $GITHUB_OUTPUT writes, then mid-stream
+          # CANCELs/504s from GitHub), failing nights when nothing was wrong. Retries cover the endpoint
+          # itself blipping; a non-rust-v tag falls through to the version check below and fails loudly.
           TAG=""
           for attempt in 1 2 3; do
             TAG=$(gh api repos/openai/codex/releases/latest --jq '.tag_name') && break
@@ -263,99 +177,47 @@ jobs:
           if [ -z "$TARGET" ] || [[ ! "$TARGET" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::invalid Codex version from upstream: $TARGET"; exit 1
           fi
-          echo "pinned=$PINNED" >> "$GITHUB_OUTPUT"
           echo "target=$TARGET" >> "$GITHUB_OUTPUT"
-          echo "::notice::pinned=$PINNED stable-target=$TARGET"
-          ORDER=$(node --input-type=module -e "import { compareStableVersions } from './scripts/apply-engine-bump.mjs'; console.log(compareStableVersions(process.argv[1], process.argv[2]))" "$TARGET" "$PINNED")
-          if [ "$ORDER" -le 0 ]; then
-            echo "::notice::Codex pin $PINNED is already at or ahead of stable $TARGET — nothing to test."
-            echo "go=false" >> "$GITHUB_OUTPUT"
-          # Same guard as the Claude job: an already-failed candidate must not re-bill the API every night.
-          elif [ -z "$FORCE" ] && gh issue list --state open --limit 200 --json title --jq '.[].title' \
-            | grep -Fxq "Automated Codex engine update failed for $TARGET"; then
+          echo "::notice::target=$TARGET"
+          # Same guard as the Claude job: an already-failed version must not re-bill the API every night.
+          if [ -z "$FORCE" ] && gh issue list --state open --limit 200 --json title --jq '.[].title' \
+            | grep -Fxq "Codex engine $TARGET failed the Koda contract"; then
             echo "::notice::Codex $TARGET already failed and its issue is still open — not re-testing (close it or dispatch manually to retry)."
             echo "go=false" >> "$GITHUB_OUTPUT"
           else
             echo "go=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Look up a recorded pass for this version
+        id: seen
+        if: steps.v.outputs.go == 'true' && github.event_name != 'workflow_dispatch'
+        uses: actions/cache/restore@v4
+        with:
+          path: .engine-contract-pass
+          key: engine-contract-codex-${{ steps.v.outputs.target }}
+          lookup-only: true
+
       - name: Download + extract candidate binary
-        if: steps.v.outputs.go == 'true'
+        if: steps.v.outputs.go == 'true' && steps.seen.outputs.cache-hit != 'true'
         env:
           TARGET: ${{ steps.v.outputs.target }}
         run: node scripts/fetch-candidate-codex.mjs --version "$TARGET" --triple x86_64-unknown-linux-musl --out /tmp/candidate-codex
 
       - name: Codex contract smoke test
-        if: steps.v.outputs.go == 'true'
+        if: steps.v.outputs.go == 'true' && steps.seen.outputs.cache-hit != 'true'
         env:
           KODA_CODEX_CANDIDATE: /tmp/candidate-codex/codex
         run: npm run test:engine-contract-codex
 
-      - name: Resolve bundled-platform checksum
-        id: darwin
-        if: success() && steps.v.outputs.go == 'true'
-        env:
-          TARGET: ${{ steps.v.outputs.target }}
-        run: |
-          # Recompute the bundled-platform (darwin-arm64) tarball SHA the pin records — the smoke test ran
-          # the linux build, but fetch-engine bundles the mac one, so its self-pinned checksum must match.
-          DARWIN_SHA=$(curl -fsSL "https://github.com/openai/codex/releases/download/rust-v$TARGET/codex-aarch64-apple-darwin.tar.gz" | sha256sum | cut -d' ' -f1)
-          if [[ ! "$DARWIN_SHA" =~ ^[a-f0-9]{64}$ ]]; then echo "::error::could not verify darwin tarball for $TARGET"; exit 1; fi
-          echo "sha=$DARWIN_SHA" >> "$GITHUB_OUTPUT"
-          # The code-mode helper ships as its own asset of the same release and is bundled beside the CLI.
-          HOST_SHA=$(curl -fsSL "https://github.com/openai/codex/releases/download/rust-v$TARGET/codex-code-mode-host-aarch64-apple-darwin.tar.gz" | sha256sum | cut -d' ' -f1)
-          if [[ ! "$HOST_SHA" =~ ^[a-f0-9]{64}$ ]]; then echo "::error::could not verify darwin code-mode host tarball for $TARGET"; exit 1; fi
-          echo "host_sha=$HOST_SHA" >> "$GITHUB_OUTPUT"
-
-      - name: Apply guarded version bump
-        if: success() && steps.v.outputs.go == 'true'
-        env:
-          TARGET: ${{ steps.v.outputs.target }}
-          DARWIN_SHA: ${{ steps.darwin.outputs.sha }}
-          HOST_SHA: ${{ steps.darwin.outputs.host_sha }}
-        run: |
-          node scripts/apply-engine-bump.mjs apply --engine codex --version "$TARGET" --darwin-sha "$DARWIN_SHA" --darwin-host-sha "$HOST_SHA"
-          node scripts/apply-engine-bump.mjs verify --engine codex --version "$TARGET" --darwin-sha "$DARWIN_SHA" --darwin-host-sha "$HOST_SHA"
-
-      # The unit suite resolves resources/engine/linux-x64/claude even in the Codex job (Claude
-      # adapter/pack tests run in `npm test`), and this job downloads only the codex candidate.
-      # Install the PINNED Claude engine the same verified way the candidate fetcher works.
-      - name: Install pinned Claude engine for the unit suite
-        if: success() && steps.v.outputs.go == 'true'
-        run: |
-          PINNED=$(node -p "require('fs').readFileSync('scripts/fetch-engine.mjs','utf8').match(/PINNED_VERSION\s*=\s*'([^']+)'/)[1]")
-          node scripts/fetch-candidate-engine.mjs --version "$PINNED" --platform linux-x64 --out /tmp/pinned-claude
-          mkdir -p resources/engine/linux-x64
-          cp /tmp/pinned-claude/claude resources/engine/linux-x64/claude
-      - name: Portable repository gate
-        if: success() && steps.v.outputs.go == 'true'
-        env:
-          NODE_OPTIONS: --max-old-space-size=6144
-        run: |
-          npm run lint
-          npm test
-          npm run build
-
-      - name: Open and merge guarded version-bump PR
-        if: success() && steps.v.outputs.go == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TARGET: ${{ steps.v.outputs.target }}
-          DARWIN_SHA: ${{ steps.darwin.outputs.sha }}
-          HOST_SHA: ${{ steps.darwin.outputs.host_sha }}
-        run: |
-          node scripts/apply-engine-bump.mjs verify --engine codex --version "$TARGET" --darwin-sha "$DARWIN_SHA" --darwin-host-sha "$HOST_SHA"
-          BRANCH="engine/bump-codex-$TARGET-${GITHUB_RUN_ID}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$BRANCH"
-          git add CHANGELOG.md scripts/fetch-engine.mjs
-          git commit -m "chore(engine): bump bundled Codex CLI to $TARGET"
-          git push -u origin "$BRANCH"
-          PR_URL=$(gh pr create --base main --head "$BRANCH" \
-            --title "chore(engine): bump bundled Codex CLI to $TARGET" \
-            --body "Automated: the bundled-platform tarball verified, the real Koda app-server contract passed against \`$TARGET\`, the diff guard accepted only the pin, checksum, and changelog, and the portable repository gate passed. Safe engine bumps merge themselves and enter the next nightly.")
-          gh pr merge "$PR_URL" --repo "$GITHUB_REPOSITORY" --squash --delete-branch
+      - name: Mark this version as passed
+        if: success() && steps.v.outputs.go == 'true' && steps.seen.outputs.cache-hit != 'true'
+        run: echo "${{ steps.v.outputs.target }}" > .engine-contract-pass
+      - name: Record the pass
+        if: success() && steps.v.outputs.go == 'true' && steps.seen.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .engine-contract-pass
+          key: engine-contract-codex-${{ steps.v.outputs.target }}
 
       - name: Open failure issue (regressed)
         if: failure() && steps.v.outputs.attempted == 'true'
@@ -364,8 +226,8 @@ jobs:
           TARGET: ${{ steps.v.outputs.target }}
         run: |
           TARGET="${TARGET:-unknown}"
-          TITLE="Automated Codex engine update failed for $TARGET"
-          BODY="Koda stopped the automated update for \`$TARGET\` before nightly publication. The failure may be version resolution, candidate verification, the real app-server contract, the exact-diff guard, portable CI, or guarded PR integration. Close this issue to let the nightly retry \`$TARGET\`. Logs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          TITLE="Codex engine $TARGET failed the Koda contract"
+          BODY="Upstream Codex \`$TARGET\` did not pass Koda's app-server contract. The app follows upstream latest, so installs may already be running this version. The failure may be version resolution, candidate verification, or the real app-server contract. Close this issue to let the daily check retry \`$TARGET\`. Logs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           # Exact title match — the resolve step reads these titles back; see the note in the Claude job.
           EXISTING=$(gh issue list --state open --limit 200 --json number,title -q ".[] | select(.title == \"$TITLE\") | .number" | head -n1)
           if [ -n "$EXISTING" ]; then

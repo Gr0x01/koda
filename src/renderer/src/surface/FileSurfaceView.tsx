@@ -1,6 +1,7 @@
 import { Suspense, useEffect, useState } from 'react'
 import type { ReadFileResult } from '@shared/ipc'
 import { lazyWithRetry } from '../ui'
+import { ZoomableImage } from './ZoomableImage'
 
 // Lazy so `monaco-editor` is NOT in the conversation-only bundle — it loads only when a file is
 // actually opened (the editor + its workers are a heavy chunk).
@@ -71,13 +72,11 @@ export function FileSurfaceView({
         ) : !file ? (
           <p className="px-4 py-3 text-xs text-text-muted">Loading…</p>
         ) : file.imageUrl ? (
-          <div className="flex h-full items-center justify-center overflow-auto p-6">
-            <img
-              src={file.imageUrl}
-              alt={path.split('/').pop() ?? 'image'}
-              className="max-h-full max-w-full object-contain"
-            />
-          </div>
+          <ZoomableImage
+            src={file.imageUrl}
+            alt={path.split('/').pop() ?? 'image'}
+            className="h-full"
+          />
         ) : file.binary ? (
           <p className="px-4 py-3 text-xs text-text-muted">Binary file: can't display.</p>
         ) : (

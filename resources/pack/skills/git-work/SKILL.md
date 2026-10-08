@@ -12,7 +12,7 @@ Keep the task's changes isolated, recoverable, and attributable without sweeping
 
 1. Inspect the current branch, status, remotes, and worktrees. Read any project-specific repository map before branch, push, publish, or release work.
 2. Continue in the current branch/worktree when it already belongs to this workstream. For materially different work, create a short human-named topic branch from the repository's main branch before the first substantive edit.
-3. Use a separate worktree when the current checkout belongs to another topic or may be in use, including when another session is working in it. Unclear ownership is answered by isolating, not by stopping: open the worktree and keep going. Ask once only about the step that still touches shared state, such as a merge or a file both sessions own, and do the isolated work first so the question arrives with the rest of the task already done.
+3. Use a separate worktree when the current checkout belongs to another topic or may be in use, including when another session is working in it. Make it with `git worktree add` from this repository, never with `git clone` or a copy of the folder: a copy is its own repository, so its branches and saved versions stay out of the project's Versions and off its remote until someone remembers to pull them back, and work stranded there is lost with the folder. If a project note prescribes clones, say so once and follow the note. Unclear ownership is answered by isolating, not by stopping: open the worktree and keep going. Ask once only about the step that still touches shared state, such as a merge or a file both sessions own, and do the isolated work first so the question arrives with the rest of the task already done.
 4. Never run destructive Git without explicit approval: no force-push, hard reset, history rewrite, tag deletion, or force-deletion of unmerged work.
 
 ## Close only this task
@@ -21,5 +21,5 @@ Keep the task's changes isolated, recoverable, and attributable without sweeping
 - Never include pre-existing or unrelated changes. Prefer path-scoped commits and inspect the staged diff before committing.
 - If the repository is absent, do not initialize one automatically. For work the user would hate to lose, offer a permanent snapshot in their terms.
 - The user decides when to push, publish, merge, discard, or spend credentials. A local commit is not permission for any of those actions.
-- If a side branch is merged back, remove its fully merged worktree and safely delete the branch with `git branch -d`. If safe deletion refuses, stop: unmerged work remains.
+- If a side branch is merged back, remove its fully merged worktree and safely delete the branch with `git branch -d`. If safe deletion refuses, stop: unmerged work remains. Remove only worktrees and branches this task created; another session's are still in use until that session says otherwise.
 - Re-check status at the end and report the task's state truthfully. "This task is committed" is not the same claim as "the whole worktree is clean."

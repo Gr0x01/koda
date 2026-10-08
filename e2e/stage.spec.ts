@@ -105,3 +105,35 @@ test('the picker stages the terminal and the changes as tabs, like any file', as
     await app.close()
   }
 })
+
+test('an image on the stage opens fitted, zooms to actual size on a click, and fits again', async () => {
+  const project = makeProject()
+  // Far larger than any window, so "fitted" and "actual size" can never be the same width.
+  writeFileSync(
+    join(project, 'poster.svg'),
+    '<svg xmlns="http://www.w3.org/2000/svg" width="4000" height="3000"><rect width="4000" height="3000" fill="#246"/></svg>',
+  )
+  const app = await launchSeeded(project)
+  try {
+    const win = await app.firstWindow()
+    await win.getByRole('button', { name: 'New chat' }).waitFor({ timeout: 20_000 })
+    await openFileViaLibrary(win, 'poster.svg')
+
+    const picture = win.getByRole('img', { name: 'poster.svg' })
+    await expect(picture).toBeVisible({ timeout: 20_000 })
+    const width = (): Promise<number> => picture.evaluate((el) => el.getBoundingClientRect().width)
+    await expect.poll(width).toBeLessThan(4000)
+    const fit = win.getByRole('button', { name: 'Fit image to window' })
+    await expect(fit).toHaveCount(0)
+
+    await picture.click()
+    await expect.poll(width).toBe(4000)
+    await expect(fit).toHaveText('100% · Fit')
+
+    await fit.click()
+    await expect.poll(width).toBeLessThan(4000)
+    await expect(fit).toHaveCount(0)
+  } finally {
+    await app.close()
+  }
+})

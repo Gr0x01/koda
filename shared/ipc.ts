@@ -136,11 +136,11 @@ export const FeedbackResultSchema = z.discriminatedUnion('ok', [
 ])
 export type FeedbackResult = z.infer<typeof FeedbackResultSchema>
 
-// engine:probe — spawns the bundled engine's `--version` to prove it executes.
+// engine:probe — spawns the resolved engine's `--version` to prove it executes.
 export const EngineProbeSchema = z.object({
   version: z.string(),
   path: z.string(),
-  source: z.enum(['bundled', 'dev-fallback']),
+  source: z.enum(['live', 'bundled', 'dev-fallback']),
 })
 export type EngineProbe = z.infer<typeof EngineProbeSchema>
 
@@ -3024,6 +3024,45 @@ export const LibraryQueryResultSchema = z.object({
   docs: z.array(LibraryDocSchema),
 })
 export type LibraryQueryResult = z.infer<typeof LibraryQueryResultSchema>
+
+// ── The phone's Library (remote/ops.ts `library`, `starDoc`, `createDoc`) ─────────────────────────
+// A deliberately narrower shape than LibraryQueryResult: no absolute path (the phone never learns the
+// Mac's layout and addresses a document by `rel`), and the project's starred shelf rides the same
+// read so the list and its star marks cannot disagree on one screen.
+
+export const RemoteLibraryDocSchema = z.object({
+  rel: z.string(),
+  name: z.string(),
+  mtimeMs: z.number(),
+  title: z.string().optional(),
+  description: z.string().optional(),
+  /** Always present: `LibraryDoc.resolvedKind`, so the phone never re-derives the folder fallback. */
+  kind: DocKindSchema,
+  /** Whole for the first rows (the phone draws those as page cards), then only as the stand-in for a
+   *  missing `description` and cut to a row's worth: 300 full excerpts would be most of a relay frame
+   *  for text the list shows one line of. */
+  excerpt: z.string().optional(),
+  matches: z.array(SearchLineMatchSchema),
+})
+export type RemoteLibraryDoc = z.infer<typeof RemoteLibraryDocSchema>
+
+export const RemoteStarredDocSchema = z.object({
+  rel: z.string(),
+  name: z.string(),
+  title: z.string().optional(),
+  /** The file is gone or no longer a document. The row stays so it can be unstarred, as on the Mac. */
+  missing: z.literal(true).optional(),
+})
+export type RemoteStarredDoc = z.infer<typeof RemoteStarredDocSchema>
+
+export const RemoteLibrarySchema = z.object({
+  query: z.string(),
+  truncated: z.boolean(),
+  docs: z.array(RemoteLibraryDocSchema),
+  /** The project shelf, in the order the user starred. */
+  starred: z.array(RemoteStarredDocSchema),
+})
+export type RemoteLibrary = z.infer<typeof RemoteLibrarySchema>
 
 /** Where an ask looks. Documents alone is table stakes (Notion Q&A has done it since 2023); the
  *  differentiating half is `sessions`, because most decisions happened in a conversation and were

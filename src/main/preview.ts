@@ -31,13 +31,16 @@ export const PREVIEW_SCHEME = 'koda-preview'
 /**
  * The current preview URL per session — the one fact phone preview needs that main didn't keep (the URL
  * was pushed to the renderer and forgotten). Written when a dev server confirms serving or a static file
- * is shown; read by remote-control.ts to expose that session's dev server to the phone (LAN forwarder or
- * Connect). `kind` distinguishes a live dev server from a static koda-preview:// file.
+ * is shown; read through static-preview-server.ts `resolvePhonePreview` to expose that session's preview
+ * to the phone (LAN forwarder or Connect). `kind` distinguishes a live dev server from a static
+ * koda-preview:// file; `winId` names the window whose project root a static file is served from.
  */
 const sessionPreviews = new Map<string, { url: string; kind: 'dev' | 'static'; winId: number }>()
 
 /** The session's current preview URL (dev server or static), or undefined if it has none yet. */
-export function getSessionPreview(sessionId: string): { url: string; kind: 'dev' | 'static' } | undefined {
+export function getSessionPreview(
+  sessionId: string,
+): { url: string; kind: 'dev' | 'static'; winId: number } | undefined {
   return sessionPreviews.get(sessionId)
 }
 
@@ -271,16 +274,30 @@ export async function servePreviewRequest(rawUrl: string): Promise<Response> {
 
   const ctx = contextForPreviewToken(url.hostname)
   if (!ctx || !ctx.projectPath) return blankPreviewResponse(404)
+  return serveAppPreviewFile(ctx.projectPath, rel)
+}
+
+/**
+ * Read one app-preview file under `projectPath` (`rel` is already decoded and project-relative). The
+ * in-app `koda-preview://` scheme and the phone's loopback static server (static-preview-server.ts)
+ * both answer through this, so containment, content types and the 404 cannot drift between them.
+ */
+export async function serveAppPreviewFile(projectPath: string, rel: string): Promise<Response> {
   try {
     // Validation and bytes come from one opened descriptor. A path-only realpath check followed by
     // `readFile(path)` left a swap window where a project asset could become an outside symlink.
-    const { bytes, path } = await readWholeContainedRegularFile(ctx.projectPath, rel)
+    const { bytes, path } = await readWholeContainedRegularFile(projectPath, rel)
     return new Response(bytes, { headers: { 'Content-Type': contentType(path) } })
   } catch (err) {
     // Escapes, missing files and read failures are deliberately indistinguishable to the preview.
     log.warn('preview', 'read failed', err instanceof Error ? err.message : err)
-    return blankPreviewResponse(404)
+    return appPreviewNotFound()
   }
+}
+
+/** The one app-preview 404. Exported so a refusal decided before any read looks exactly like a miss. */
+export function appPreviewNotFound(): Response {
+  return blankPreviewResponse(404)
 }
 
 /**

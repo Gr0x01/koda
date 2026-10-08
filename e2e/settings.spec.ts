@@ -115,7 +115,7 @@ test('text generation picker shares the provider hierarchy and persists model an
         textGenerationModel: { provider: 'codex', model: 'gpt-5.6-sol', effort: 'high' },
       }),
     )
-    await expect(modelPicker).toContainText('Codex GPT 5.6')
+    await expect(modelPicker).toContainText('Codex GPT-5.6 Sol')
     await expect(effortPicker).toContainText('High')
 
     expect(pageErrors, 'page errors:\n' + pageErrors.join('\n')).toHaveLength(0)

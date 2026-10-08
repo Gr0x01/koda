@@ -26,10 +26,15 @@ import { join } from 'node:path'
 import { writeFileAtomic } from '../atomic-write'
 import { codexHome } from './codex-home'
 import { log } from '../logger'
+import { LONG_PROMPT_TOKENS } from '@shared/model-pricing'
 import type { EngineId, PricedScanBucket, ScanOrigin, ScanSource } from '@shared/ipc'
 
 /** The scanner's bucket is the shared wire shape minus the pricing fields usage-pricing.ts adds. */
-export type ScanBucket = Omit<PricedScanBucket, 'costUsd' | 'cacheSavingsUsd' | 'costSource'>
+export type ScanBucket = Omit<PricedScanBucket, 'costUsd' | 'cacheSavingsUsd' | 'costSource'> & {
+  /** Every record in the bucket carried a prompt over LONG_PROMPT_TOKENS. Tiers are decided per
+   *  request, and only the scanner still sees one, so it splits the cell for usage-pricing.ts. */
+  longPrompt?: boolean
+}
 
 export interface ScanSummary {
   buckets: ScanBucket[]
@@ -295,10 +300,11 @@ async function scanOnce(roots: ScanRoot[]): Promise<ScanSummary> {
     }
     const [hourStartMs, model, origin, uncached, cached, cacheCreation, output, reasoning] = row
     const day = localDayOf(hourStartMs)
-    const bKey = `${hourStartMs}|${day}|${engine}|${model}|${origin}`
+    const longPrompt = uncached + cached + cacheCreation > LONG_PROMPT_TOKENS
+    const bKey = `${hourStartMs}|${day}|${engine}|${model}|${origin}|${longPrompt}`
     const b =
       buckets.get(bKey) ??
-      ({ hourStartMs, day, engine, model, origin, uncachedInput: 0, cachedInput: 0, cacheCreation: 0, output: 0, reasoning: 0, records: 0 } as ScanBucket)
+      ({ hourStartMs, day, engine, model, origin, longPrompt, uncachedInput: 0, cachedInput: 0, cacheCreation: 0, output: 0, reasoning: 0, records: 0 } as ScanBucket)
     b.uncachedInput += uncached
     b.cachedInput += cached
     b.cacheCreation += cacheCreation

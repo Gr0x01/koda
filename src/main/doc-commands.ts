@@ -36,6 +36,7 @@ import {
   type DocShelf,
   type DocStarRequest,
   type LegacyDocStarsRequest,
+  type RemoteLibrary,
 } from '@shared/ipc'
 import { writeFileAtomic } from './atomic-write'
 import { docDateStamp, inferDocKind } from './doc-frontmatter'
@@ -44,7 +45,9 @@ import {
   createProjectFile,
   createProjectHtmlFile,
   DOCS_HOME,
+  queryLibrary,
   resolveDocumentsFolder,
+  resolveProjectDocs,
 } from './fs-browse'
 import { renderKodaHtmlDocument, escapeHtml } from './html-document'
 import { log } from './logger'
@@ -70,6 +73,56 @@ export async function readDocShelf(projectDir: string): Promise<DocShelf> {
     return await readForWrite(projectDir)
   } catch {
     return EMPTY_SHELF
+  }
+}
+
+/** `resolveProjectDocs` refuses a batch past 1,000; a shelf that long is cut rather than failing the read. */
+const REMOTE_STARRED_MAX = 1000
+/** The phone draws its first rows as page cards from the document's real first lines. */
+const REMOTE_LIBRARY_CARD_EXCERPTS = 24
+/** Past the cards, a row shows one line of excerpt and two match lines. */
+const REMOTE_LIBRARY_EXCERPT_CHARS = 240
+const REMOTE_LIBRARY_MATCHES = 2
+
+/**
+ * The phone's Library: the desktop Library's own query (`queryLibrary`, so search, kind filtering,
+ * ranking and the 300-row cap stay one implementation) reshaped to project-relative rows, with the
+ * starred shelf on the same read so the list and its star marks cannot disagree on one screen. No
+ * absolute path leaves here: the phone addresses a document by `rel` and never learns the Mac's layout.
+ */
+export async function readRemoteLibrary(
+  projectDir: string,
+  req: { query?: string; kinds?: DocKind[] } = {},
+): Promise<RemoteLibrary> {
+  const [result, shelf] = await Promise.all([queryLibrary(projectDir, req), readDocShelf(projectDir)])
+  // Resolved by exact path, not looked up in `result`: a search or a kind filter narrows the list,
+  // and the shelf must not lose its titles to it.
+  const starredRels = shelf.starred.slice(0, REMOTE_STARRED_MAX)
+  const resolved = new Map((await resolveProjectDocs(projectDir, starredRels)).map((d) => [d.rel, d]))
+  return {
+    query: result.query,
+    truncated: result.truncated,
+    docs: result.docs.map((d, i) => ({
+      rel: d.rel,
+      name: d.name,
+      mtimeMs: d.mtimeMs,
+      ...(d.title ? { title: d.title } : {}),
+      ...(d.description ? { description: d.description } : {}),
+      // Past the cards an excerpt is only the stand-in for a missing description.
+      ...(d.excerpt && i < REMOTE_LIBRARY_CARD_EXCERPTS
+        ? { excerpt: d.excerpt }
+        : d.excerpt && !d.description
+          ? { excerpt: d.excerpt.slice(0, REMOTE_LIBRARY_EXCERPT_CHARS) }
+          : {}),
+      kind: d.resolvedKind,
+      matches: d.matches.slice(0, REMOTE_LIBRARY_MATCHES),
+    })),
+    starred: starredRels.map((rel) => {
+      const doc = resolved.get(rel)
+      // The row stays so it can be unstarred, as the desktop shelf keeps it.
+      if (!doc) return { rel, name: rel.slice(rel.lastIndexOf('/') + 1), missing: true as const }
+      return { rel, name: doc.name, ...(doc.title ? { title: doc.title } : {}) }
+    }),
   }
 }
 

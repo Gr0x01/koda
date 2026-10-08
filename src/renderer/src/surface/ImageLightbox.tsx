@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import { AnimatePresence, Overlay } from '../motion'
 import { useWorkspace } from '../workspace/store'
+import { ZoomableImage } from './ZoomableImage'
 
 /**
  * The single full-screen image preview for the whole app. One instance is mounted at the Chassis root;
@@ -21,20 +22,22 @@ export function ImageLightbox() {
   }, [img, setLightbox])
 
   return (
-    // Centered scrim + scale-in image; click the scrim (or the image) or Esc to close.
+    // The picture's pane fills the scrim so a zoomed image has the whole window to pan in. A click on
+    // the space around it, or Esc, closes; a click on the picture itself zooms.
     <AnimatePresence>
       {img && (
         <Overlay
           onDismiss={() => setLightbox(null)}
           align="center"
-          scrimClassName="bg-black/70 p-10"
-          className="flex max-h-full max-w-full items-center justify-center"
+          scrimClassName="bg-black/70"
+          className="h-full w-full"
         >
-          <img
+          <ZoomableImage
             src={`data:${img.mediaType};base64,${img.dataBase64}`}
             alt="image preview"
-            onClick={() => setLightbox(null)}
-            className="max-h-full max-w-full rounded-lg object-contain shadow-2xl"
+            onBackdropClick={() => setLightbox(null)}
+            className="h-full w-full"
+            imgClassName="rounded-lg shadow-2xl"
           />
         </Overlay>
       )}

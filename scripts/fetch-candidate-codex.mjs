@@ -1,11 +1,10 @@
 #!/usr/bin/env node
 /**
  * Download + extract a SPECIFIC `codex` engine version into an output dir, for the codex-contract CI job
- * (which then drives it through the codex smoke test before we re-bundle). Mirrors fetch-engine.mjs's
- * codex path, but takes version/triple/out as args — CI runs on linux-x64 (musl static build).
+ * (which then drives it through the codex smoke test). Mirrors fetch-engine.mjs's codex path, but takes
+ * version/triple/out as args — CI runs on linux-x64 (musl static build).
  *
- * OpenAI publishes no checksum for the plain CLI tarball, so `--sha` is optional: when given it's verified,
- * otherwise the tarball's computed SHA-256 is printed (the bump workflow records it into fetch-engine.mjs).
+ * `--sha` is optional: when given it's verified, otherwise the tarball's computed SHA-256 is printed.
  *
  *   node scripts/fetch-candidate-codex.mjs --version 0.144.1 [--triple x86_64-unknown-linux-musl] [--out /tmp/candidate-codex] [--sha <hex>]
  *

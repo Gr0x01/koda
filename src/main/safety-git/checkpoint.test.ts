@@ -1,10 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises'
+import { execFileSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { mkdir, mkdtemp, readFile, rename, rm, stat, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { prepareProjectDocumentDelete } from '../fs-browse'
 import { ensureRepo, runGit } from './repo'
-import { checkpoint, listCheckpoints } from './checkpoint'
+import { checkpoint, LARGE_FILE_BYTES, listCheckpoints } from './checkpoint'
+import { restore } from './restore'
 
 let dir: string
 beforeEach(async () => {
@@ -91,5 +94,89 @@ describe('checkpoint on a brand-new project', () => {
     await expect(checkpoint(dir, 'delete replace-me.md', { requiredFile })).rejects.toThrow(
       'changed before it could be protected',
     )
+  })
+})
+
+// The 2026-09-28 hub failure: a session at a folder of projects snapshotted a 1.9 GB file, hit the
+// timeout, and orphaned a partial pack on every tool call until the disk filled.
+describe('checkpoint on large trees', () => {
+  const tracked = async (id: string) =>
+    (await runGit(dir, ['ls-tree', '-r', '--name-only', '-z', id])).stdout.split('\0').filter(Boolean)
+  // Sparse: reports the size without writing it, and the cap means git never reads it.
+  const makeLarge = (path: string) => truncate(path, LARGE_FILE_BYTES + 1)
+
+  it("leaves a child project's own safety store out of the parent's snapshot", async () => {
+    await mkdir(join(dir, 'child', '.koda', 'safety.git'), { recursive: true })
+    await writeFile(join(dir, 'child', '.koda', 'safety.git', 'HEAD'), 'ref: refs/heads/master\n')
+    await writeFile(join(dir, 'child', 'notes.md'), 'hello')
+
+    const result = await checkpoint(dir, 'hub turn')
+
+    expect(await tracked(result.id)).toEqual(['child/notes.md'])
+  })
+
+  // The 2026-09-29 hub failure: one child repo with no commit yet made every hub checkpoint fatal.
+  it("leaves child git repos out of the parent's snapshot, even one with no commit yet", async () => {
+    await mkdir(join(dir, 'fresh'))
+    execFileSync('git', ['init', '-q'], { cwd: join(dir, 'fresh') })
+    await writeFile(join(dir, 'fresh', 'a.md'), 'x')
+    await writeFile(join(dir, 'notes.md'), 'hello')
+
+    const result = await checkpoint(dir, 'hub turn')
+
+    expect(await tracked(result.id)).toEqual(['notes.md'])
+  })
+
+  it('skips files over the size cap and captures them again once they shrink', async () => {
+    await writeFile(join(dir, 'small.md'), 'hello')
+    await writeFile(join(dir, 'huge [v2].zip'), '')
+    await makeLarge(join(dir, 'huge [v2].zip'))
+
+    const first = await checkpoint(dir, 'with a huge file')
+    expect(await tracked(first.id)).toEqual(['small.md'])
+
+    await writeFile(join(dir, 'huge [v2].zip'), 'small now')
+    const second = await checkpoint(dir, 'huge file shrank')
+    expect(await tracked(second.id)).toEqual(['huge [v2].zip', 'small.md'])
+  })
+
+  it('stops following a tracked file once it grows past the cap instead of keeping a stale copy', async () => {
+    await writeFile(join(dir, 'asset.bin'), 'small')
+    await writeFile(join(dir, 'keep.md'), 'hello')
+    await checkpoint(dir, 'asset is small')
+
+    await makeLarge(join(dir, 'asset.bin'))
+    await writeFile(join(dir, 'keep.md'), 'changed')
+    const after = await checkpoint(dir, 'asset grew')
+
+    expect(await tracked(after.id)).toEqual(['keep.md'])
+  })
+
+  it('restoring past a file that outgrew the cap leaves its current contents alone', async () => {
+    await writeFile(join(dir, 'asset.bin'), 'small')
+    await writeFile(join(dir, 'keep.md'), 'v1')
+    const before = await checkpoint(dir, 'asset is small')
+    await makeLarge(join(dir, 'asset.bin'))
+    await writeFile(join(dir, 'keep.md'), 'v2')
+
+    await restore(dir, before.id)
+
+    expect((await stat(join(dir, 'asset.bin'))).size).toBe(LARGE_FILE_BYTES + 1)
+    expect(await readFile(join(dir, 'keep.md'), 'utf8')).toBe('v1')
+  })
+
+  it('cleans up after a failed checkpoint so the next one succeeds', async () => {
+    await writeFile(join(dir, 'notes.md'), 'hello')
+    const store = join(dir, '.koda', 'safety.git')
+    // What a killed `add -A` leaves: a partial pack and the index lock that blocks every later run.
+    await writeFile(join(store, 'index.lock'), '')
+    await writeFile(join(store, 'objects', 'pack', 'tmp_pack_orphan'), 'partial')
+
+    await expect(checkpoint(dir, 'blocked by the lock')).rejects.toThrow()
+    expect(existsSync(join(store, 'index.lock'))).toBe(false)
+    expect(existsSync(join(store, 'objects', 'pack', 'tmp_pack_orphan'))).toBe(false)
+
+    const retry = await checkpoint(dir, 'after cleanup')
+    expect(await tracked(retry.id)).toEqual(['notes.md'])
   })
 })

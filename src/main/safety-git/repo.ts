@@ -4,7 +4,7 @@
  * even when the project isn't a git repo, and must never touch the user's branches/HEAD/index.
  */
 import { execFile } from 'node:child_process'
-import { mkdir, readFile, appendFile, realpath, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, appendFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { log } from '../logger'
@@ -18,6 +18,14 @@ export function safetyGitDir(projectDir: string): string {
 }
 
 /**
+ * Budget for commands whose cost scales with the whole tree or store (`add -A`, the untracked walk,
+ * `gc`). The first snapshot of a large project must be allowed to finish once: its index is what
+ * makes every later `add -A` a cheap stat pass, so killing it at 30s meant every tool call re-hashed
+ * the whole project and died again (the 2026-09-28 hub-session failure).
+ */
+export const SLOW_GIT_TIMEOUT = 5 * 60_000
+
+/**
  * Run a git command against the safety store. Explicit `--git-dir`/`--work-tree` make it operate
  * over the project's files without ever seeing the user's own `.git` (git treats that as another
  * repo's git-dir and ignores it).
@@ -26,8 +34,9 @@ export function safetyGitDir(projectDir: string): string {
  * /etc/gitconfig and GLOBAL=/dev/null drops the user's ~/.gitconfig. Without the latter a global
  * `core.autocrlf` would rewrite line endings (restore wouldn't be byte-identical) and a global
  * `core.fsmonitor` would block every command on a daemon over the work-tree. So the store reads
- * ONLY its own local config. `timeout` is a backstop so a wedged git can never stall the broker.
- * Big maxBuffer so large-tree `ls-tree`/`log` don't clip.
+ * ONLY its own local config. `timeout` is a backstop so a wedged git can never stall the broker;
+ * whole-tree commands pass SLOW_GIT_TIMEOUT instead (see there). Big maxBuffer so large-tree
+ * `ls-tree`/`log` don't clip.
  *
  * PATH comes from gitEnv(): a Finder-launched .app inherits launchd's minimal PATH, where bare `git`
  * doesn't resolve at all — the undo net would silently have no git to run.
@@ -35,7 +44,7 @@ export function safetyGitDir(projectDir: string): string {
 export async function runGit(
   projectDir: string,
   args: string[],
-  opts?: { extraEnv?: Record<string, string> },
+  opts?: { extraEnv?: Record<string, string>; timeoutMs?: number },
 ): Promise<{ stdout: string; stderr: string }> {
   try {
     return await execFileP(
@@ -47,7 +56,7 @@ export async function runGit(
         // NOT override the config isolation, so it's spread first.
         env: gitEnv({ ...opts?.extraEnv, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' }),
         maxBuffer: 64 * 1024 * 1024,
-        timeout: 30_000,
+        timeout: opts?.timeoutMs ?? 30_000,
       },
     )
   } catch (err) {
@@ -77,6 +86,10 @@ const LOCAL_CONFIG: ReadonlyArray<readonly [string, string]> = [
   // (GIT_CONFIG_GLOBAL=/dev/null already removes the user's autocrlf; this nails the default too).
   ['core.autocrlf', 'false'],
   ['core.eol', 'lf'],
+  // git's automatic gc runs detached, after the command returns and the project mutex is released —
+  // its live temp packs would then look like orphans to sweepTempObjects. Reclaiming belongs to
+  // maintainStore, which runs under the mutex.
+  ['gc.auto', '0'],
 ]
 
 /**
@@ -91,11 +104,13 @@ const EXCLUDE = [
   'out/',
   '.next/',
   // Never snapshot the snapshots.
-  '/.koda/safety.git/',
+  // At any depth: a folder of projects (a hub) holds each child project's own store, and snapshotting
+  // those would copy every child's whole history into the parent's on each checkpoint.
+  '**/.koda/safety.git/',
   // Pasted-image scratch store: binary, auto-pruned, never part of the project's content (scratch.ts).
-  '/.koda/scratch/',
+  '**/.koda/scratch/',
   // Document layout sidecars are editor presentation state, not project content (docmeta.ts).
-  '/.koda/docmeta/',
+  '**/.koda/docmeta/',
   // Local databases (SQLite & sidecars): binary, churn every write, meaningless to diff — and
   // keeping them out means a "go back" rolls back code WITHOUT wiping the user's seeded data.
   // Sidecars are matched broadly (*-wal/*-shm/*-journal) so a stale WAL/journal can never be
@@ -111,6 +126,35 @@ const EXCLUDE = [
   '',
 ].join('\n')
 
+/** Rewrite the store's exclude file: the fixed set plus exact paths the caller must keep out. */
+export async function writeExcludes(projectDir: string, exactPaths: readonly string[] = []): Promise<void> {
+  const lines = exactPaths.map((p) => `/${p.replace(/[\\*?[]/g, '\\$&').replace(/ $/, '\\ ')}`)
+  await writeFile(join(safetyGitDir(projectDir), 'info', 'exclude'), EXCLUDE + lines.map((l) => `${l}\n`).join(''), 'utf8')
+}
+
+/**
+ * Delete what a killed or failed git command leaves in the store. git streams big blobs into
+ * `objects/pack/tmp_pack_*` and small ones through `tmp_obj_*`; a kill mid-write orphans them, and
+ * nothing in git ever collects them — the 2026-09-28 hub store held 95 orphaned packs (~130 GB, no
+ * real packs) and filled the disk. A left `index.lock` blocks every later checkpoint outright.
+ * ONLY call while holding the project's safety-git mutex: a live command's temp files look the same.
+ */
+export async function sweepTempObjects(projectDir: string): Promise<void> {
+  const store = safetyGitDir(projectDir)
+  const objects = join(store, 'objects')
+  const doomed = [join(store, 'index.lock')]
+  const tops = await readdir(objects).catch(() => [] as string[])
+  for (const name of tops) {
+    if (name.startsWith('tmp_') || name.startsWith('incoming-')) doomed.push(join(objects, name))
+    else if (/^[0-9a-f]{2}$/.test(name) || name === 'pack') {
+      for (const inner of await readdir(join(objects, name)).catch(() => [] as string[])) {
+        if (inner.startsWith('tmp_')) doomed.push(join(objects, name, inner))
+      }
+    }
+  }
+  await Promise.all(doomed.map((p) => rm(p, { recursive: true, force: true })))
+}
+
 /**
  * Create the safety store if absent, configure isolation, and write the exclude set. Idempotent —
  * re-running on an existing store re-inits (a no-op) and re-applies config/excludes.
@@ -122,7 +166,7 @@ export async function ensureRepo(projectDir: string): Promise<void> {
   for (const [key, value] of LOCAL_CONFIG) {
     await runGit(projectDir, ['config', key, value])
   }
-  await writeFile(join(safetyGitDir(projectDir), 'info', 'exclude'), EXCLUDE, 'utf8')
+  await writeExcludes(projectDir)
   await excludeKodaFromUserGit(projectDir)
 }
 

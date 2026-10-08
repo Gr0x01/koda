@@ -23,7 +23,7 @@
  */
 import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { runGit, safetyGitDir } from './repo'
+import { runGit, safetyGitDir, SLOW_GIT_TIMEOUT, sweepTempObjects } from './repo'
 import { checkpointKind, headSha } from './checkpoint'
 import { reconcileLabels } from '../assist/labels'
 import { log } from '../logger'
@@ -129,7 +129,7 @@ async function prunedRecently(projectDir: string, now: number): Promise<boolean>
 /** Reflog holds old ref tips reachable, so it must be expired before gc can reclaim anything. */
 async function reclaim(projectDir: string): Promise<void> {
   await runGit(projectDir, ['reflog', 'expire', '--expire=now', '--all'])
-  await runGit(projectDir, ['gc', '--prune=now', '--quiet'])
+  await runGit(projectDir, ['gc', '--prune=now', '--quiet'], { timeoutMs: SLOW_GIT_TIMEOUT })
 }
 
 /**
@@ -270,6 +270,9 @@ export async function maintainStore(
   now = Math.floor(Date.now() / 1000),
 ): Promise<Map<string, string>> {
   try {
+    // Runs under the mutex before any work, so it also collects what earlier killed commands (and
+    // Koda versions without the checkpoint-failure sweep) left behind in existing stores.
+    await sweepTempObjects(projectDir)
     const migrated = await migrate(projectDir)
     if (await prunedRecently(projectDir, now)) return migrated
     const pruned = await pruneStore(projectDir, now)

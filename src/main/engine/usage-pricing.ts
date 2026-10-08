@@ -17,17 +17,26 @@ import { app } from 'electron'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { writeFileAtomic } from '../atomic-write'
-import { publishedRate, CACHE_READ_MULTIPLIER, CACHE_WRITE_MULTIPLIER } from '@shared/model-pricing'
+import {
+  publishedRate,
+  CACHE_READ_MULTIPLIER,
+  CACHE_WRITE_MULTIPLIER,
+  LONG_PROMPT_TOKENS,
+} from '@shared/model-pricing'
 import { log } from '../logger'
 import type { PricedScanBucket, RatesProvenance, ScanCostSource } from '@shared/ipc'
 import type { ScanBucket } from './usage-scan'
 
 /** USD per single token (LiteLLM's own unit — no per-MTok conversion to mix up). */
-export interface RatePerToken {
+export interface TokenRates {
   input: number
   output: number
   cacheRead: number
   cacheCreation: number
+}
+export interface RatePerToken extends TokenRates {
+  /** The second tier for a request whose prompt exceeds LONG_PROMPT_TOKENS, when the model has one. */
+  longPrompt?: TokenRates
 }
 
 // The wire shapes (PricedScanBucket, RatesProvenance, ScanCostSource) live in shared/ipc.ts —
@@ -39,7 +48,8 @@ export const LITELLM_URL =
 const RATES_TTL_MS = 24 * 60 * 60 * 1000
 const FETCH_TIMEOUT_MS = 10_000
 
-type StoredRates = { version: 1; fetchedAt: number; rates: Record<string, RatePerToken> }
+// v2 added `longPrompt`; a v1 cache would keep pricing a tiered model flat until its TTL ran out.
+type StoredRates = { version: 2; fetchedAt: number; rates: Record<string, RatePerToken> }
 
 function filePath(): string {
   return join(app.getPath('userData'), 'koda-usage-rates.json')
@@ -62,6 +72,9 @@ function normalizeTableKey(name: string): string {
  * the first-party price (verified 2026-08-21). Skipping them beats last-write-wins roulette.
  */
 const FIRST_PARTY_PREFIXES = new Set(['anthropic', 'openai'])
+
+/** LiteLLM's suffix for the tier the scanner splits on; other thresholds have no bucket to price. */
+const LONG_PROMPT_KEY = `_above_${LONG_PROMPT_TOKENS / 1000}k_tokens`
 
 /**
  * Project the LiteLLM document into rates. Entries missing either base rate are dropped whole: a
@@ -92,6 +105,15 @@ export function parseRateTable(document: unknown): Record<string, RatePerToken> 
       cacheRead: finite(entry['cache_read_input_token_cost']) ?? input,
       cacheCreation: finite(entry['cache_creation_input_token_cost']) ?? input,
     }
+    const longInput = finite(entry[`input_cost_per_token${LONG_PROMPT_KEY}`])
+    const longOutput = finite(entry[`output_cost_per_token${LONG_PROMPT_KEY}`])
+    if (longInput !== null && longOutput !== null)
+      rates[bare].longPrompt = {
+        input: longInput,
+        output: longOutput,
+        cacheRead: finite(entry[`cache_read_input_token_cost${LONG_PROMPT_KEY}`]) ?? longInput,
+        cacheCreation: finite(entry[`cache_creation_input_token_cost${LONG_PROMPT_KEY}`]) ?? longInput,
+      }
   }
   return rates
 }
@@ -104,7 +126,7 @@ export interface RateTable {
 function readStored(): StoredRates | null {
   try {
     const p = JSON.parse(readFileSync(filePath(), 'utf8'))
-    if (p && typeof p === 'object' && typeof p.fetchedAt === 'number' && p.rates && typeof p.rates === 'object')
+    if (p && typeof p === 'object' && p.version === 2 && typeof p.fetchedAt === 'number' && p.rates && typeof p.rates === 'object')
       return p as StoredRates
   } catch {
     // Missing or corrupt cache is just "no table yet"; the named local rates keep pricing.
@@ -142,7 +164,7 @@ export function loadRateTable(fetchImpl: typeof fetch = fetch): Promise<RateTabl
       if (!response.ok) throw new Error(`rate table fetch returned ${response.status}`)
       const rates = parseRateTable(await response.json())
       if (Object.keys(rates).length === 0) throw new Error('rate table parsed to zero models')
-      const next: StoredRates = { version: 1, fetchedAt: Date.now(), rates }
+      const next: StoredRates = { version: 2, fetchedAt: Date.now(), rates }
       try {
         writeFileAtomic(filePath(), JSON.stringify(next))
       } catch (err) {
@@ -165,17 +187,22 @@ export function loadRateTable(fetchImpl: typeof fetch = fetch): Promise<RateTabl
  *  fuzzy match would be a guess wearing a citation. */
 function resolveRate(model: string, table: Record<string, RatePerToken>): { rate: RatePerToken; source: ScanCostSource } | null {
   const fromTable = table[normalizeTableKey(model)]
-  if (fromTable) return { rate: fromTable, source: 'tableRated' }
   const named = publishedRate(model)
+  // A table row that lost a tier the named rate cites would price every long prompt at the base
+  // pair under a table citation; the named rate is the complete one, so it wins for that model.
+  if (fromTable && (fromTable.longPrompt || !named?.longPrompt)) return { rate: fromTable, source: 'tableRated' }
   if (named) {
-    const input = named.inputPerMTok / 1_000_000
-    return {
-      rate: {
+    const perToken = (pair: { inputPerMTok: number; outputPerMTok: number }): TokenRates => {
+      const input = pair.inputPerMTok / 1_000_000
+      return {
         input,
-        output: named.outputPerMTok / 1_000_000,
+        output: pair.outputPerMTok / 1_000_000,
         cacheRead: input * (named.cacheReadMultiplier ?? CACHE_READ_MULTIPLIER),
         cacheCreation: input * CACHE_WRITE_MULTIPLIER,
-      },
+      }
+    }
+    return {
+      rate: { ...perToken(named), ...(named.longPrompt ? { longPrompt: perToken(named.longPrompt) } : {}) },
       source: 'published',
     }
   }
@@ -184,10 +211,11 @@ function resolveRate(model: string, table: Record<string, RatePerToken>): { rate
 
 /** Price scanned buckets against a loaded table. Pure; call sites decide when to load/refresh. */
 export function priceScanBuckets(buckets: ScanBucket[], table: RateTable): PricedScanBucket[] {
-  return buckets.map((b) => {
+  return buckets.map(({ longPrompt, ...b }) => {
     const resolved = resolveRate(b.model, table.rates)
     if (!resolved) return { ...b, costUsd: null, cacheSavingsUsd: null, costSource: 'unpriced' }
-    const { rate, source } = resolved
+    const { source } = resolved
+    const rate = (longPrompt && resolved.rate.longPrompt) || resolved.rate
     const costUsd =
       b.uncachedInput * rate.input +
       b.cachedInput * rate.cacheRead +

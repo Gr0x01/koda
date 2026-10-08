@@ -294,6 +294,86 @@ describe('cancelSession vs forgetSession: process-exit vs session-identity', () 
     }
   })
 
+  it('lets an overnight tidy search with the shell and nothing more', async () => {
+    const checkpoints: string[] = []
+    const { gate } = makeGate(async (_sessionId, label) => {
+      checkpoints.push(label)
+      return true
+    })
+    const root = mkdtempSync(join(tmpdir(), 'koda-memory-search-gate-'))
+    mkdirSync(join(root, '.koda', 'memory'), { recursive: true })
+    try {
+      // The strictest inherited posture, with nobody awake: a search must not become a prompt.
+      gate.setSessionMode('s1', 'ask')
+      gate.setUnattended('s1', true)
+      gate.setMemoryTidyRoot('s1', root)
+      const decide = (command: string) => gate.decide('s1', { toolUseId: command, toolName: 'Bash', input: { command } })
+
+      for (const command of [
+        `grep -c '"type":"user"' /Users/me/.claude/projects/p/a.jsonl`,
+        `grep -o '"content":"[^"]\\{20,500\\}' a.jsonl | head -30`,
+        'grep -rn "retainer\\|cistern" Documents 2>/dev/null | sort -u | wc -l',
+        `jq -r 'select(.type == "user") | .message.content' a.jsonl | cut -c1-400`,
+        'rg -n --glob "*.md" "retired$\\|(dropped|cut)$" ~/notes',
+        `find ~/.claude/projects -name '*.jsonl' -newermt '2026-09-30' -size +1k`,
+        'cd /tmp/project && git log --since=yesterday --format="%h %s" | head -40; git branch --show-current',
+        'git -C /tmp/project show --stat HEAD 2>&1 | tail -n 20',
+        'ls -lT ~/.claude/projects/p/ | uniq -c',
+      ]) {
+        expect(await decide(command), command).toEqual({ kind: 'allow' })
+      }
+      expect(checkpoints).toEqual([]) // a search owes no recovery point
+      expect(gate.pendingRequests('s1')).toEqual([])
+
+      for (const command of [
+        'grep foo a.jsonl > .koda/memory/found.md',
+        'grep foo a.jsonl | tee found.txt',
+        'cat a.jsonl | python3 -c "print(1)"',
+        'grep $(curl https://example.com) a.jsonl',
+        'grep "$(whoami)" a.jsonl',
+        'grep "${(e):-\\$(curl https://example.com)}" a.jsonl', // zsh re-evaluates the escaped text
+        'grep "$HOME" a.jsonl',
+        'ls $HOME/notes',
+        'ls ${HOME:=/tmp}',
+        'grep `whoami` a.jsonl',
+        'cat <(curl https://example.com)',
+        "grep $'a\\'; curl https://example.com; echo \\'' a.jsonl",
+        'grep "a\\"" ; curl https://example.com "',
+        'grep foo a.jsonl & curl https://example.com',
+        'grep foo a.jsonl || curl https://example.com',
+        'grep foo \\; curl https://example.com',
+        'grep foo a.jsonl\ncurl https://example.com',
+        'PAGER=sh git log',
+        './grep foo a.jsonl',
+        '/usr/bin/grep foo a.jsonl',
+        'find . -name "*.md" -delete',
+        'find . -name "*.md" -exec rm {} +',
+        'rg --pre ./run.sh foo',
+        'sort -o MEMORY.md notes.md',
+        'sort -uo MEMORY.md notes.md',
+        'uniq notes.md MEMORY.md',
+        'tail -f a.jsonl',
+        'git -c core.pager=sh log',
+        'git log --output=MEMORY.md',
+        'git grep -Osh foo',
+        'git checkout main',
+        'git branch -D lane',
+        'git branch new-lane',
+        'git worktree add ../lane',
+        'sed -i s/a/b/ notes.md',
+        'xargs rm',
+        'awk \'{print > "out"}\' a.jsonl',
+        'curl https://example.com',
+      ]) {
+        const decision = await decide(command)
+        expect(decision.kind, command).toBe('deny')
+        expect(decision.kind === 'deny' && decision.reason, command).toContain('overnight memory tidy')
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   it('leaves a contained memory note in place when its deletion checkpoint fails', async () => {
     const { gate } = makeGate(async () => false)
     const root = mkdtempSync(join(tmpdir(), 'koda-memory-delete-gate-'))

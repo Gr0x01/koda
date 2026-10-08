@@ -18,6 +18,9 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      # The same fail-closed snapshot build a release cut runs before it publishes. Without it here, a
+      # private reference that reaches a public file is found only mid-release, on RB's Mac.
+      - run: bash scripts/oss/publish-oss.sh --dry-run
       - run: npm ci
       - run: npm run lint
       # build = typecheck (all three tsconfigs) + electron-vite build + the mobile client bundle.
