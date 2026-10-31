@@ -1,5 +1,6 @@
-import { forwardRef, useEffect, useRef, useState } from 'react'
+import { forwardRef, useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
+import type { PreviewRestart } from '@shared/ipc'
 import { AnimatePresence, Menu, motion, useReducedMotion, duration, ease, spring } from '../motion'
 import { Caret } from '../Caret'
 import { resolveDocFormat } from '@shared/document-contract'
@@ -13,7 +14,7 @@ import { TurnChangesSurface } from './TurnChangesSurface'
 import { AgentsSurface } from './AgentsSurface'
 import { BranchGlyph } from './ChangesReview'
 import { TerminalSurfaceView } from './TerminalSurfaceView'
-import { useWorkspace, activeEditor, type FileSurface } from '../workspace/store'
+import { useWorkspace, activeEditor, paneKey, type FileSurface } from '../workspace/store'
 import { openLibrary } from '../workspace/library/LibraryHost'
 import { StarGlyph } from '../workspace/KeptDocs'
 import { DocumentDeleteConfirm } from '../workspace/DocumentShelfMenu'
@@ -513,7 +514,7 @@ function Stage() {
       <AnimatePresence mode="wait" initial={false}>
         {!termStaged && (
           <motion.div
-            key={staged?.path ?? 'empty'}
+            key={staged ? paneKey(staged.path) : 'empty'}
             className="h-full"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
@@ -531,7 +532,7 @@ function Stage() {
             ) : staged.kind === 'agents' ? (
               <AgentsSurface />
             ) : (
-              <SurfacePane key={staged.path} surface={staged} className="h-full min-w-0" />
+              <SurfacePane key={paneKey(staged.path)} surface={staged} className="h-full min-w-0" />
             )}
           </motion.div>
         )}
@@ -553,15 +554,33 @@ function Stage() {
 function StagePreview({ preview }: { preview: FileSurface }) {
   const setDockWidth = useWorkspace((s) => s.setConversationWidth)
   const persistLayout = useWorkspace((s) => s.persistLayout)
+  const activeId = useWorkspace((s) => s.activeId)
+  const recent = useWorkspace((s) => (s.activeId ? s.sessions[s.activeId]?.recentPreviews : undefined))
+  // A typed address is a user open: it re-points this session's preview and takes the stage, exactly
+  // like the picker's own Preview row.
+  const openPreview = useWorkspace((s) => s.openPreview)
   function applyViewportPreset(viewport: PreviewViewport): void {
     setDockWidth(PREVIEW_PRESET_DOCK_WIDTH[viewport])
     persistLayout()
   }
+  // Flipping back to an earlier preview replays the same window-direct restart the empty stage's button
+  // uses. Main answers with a preview:show push, which re-points this surface and moves the pick to the
+  // front of the list; a rejection (file gone, server did not start) is the caller's to show.
+  const showRecent = useCallback(
+    async (restart: PreviewRestart): Promise<void> => {
+      if (!activeId) return
+      await window.koda.previewRestart(activeId, restart)
+    },
+    [activeId],
+  )
   return (
     <PreviewSurfaceView
       url={preview.previewUrl}
       rev={preview.rev}
       className="h-full"
+      recent={recent}
+      onShowRecent={showRecent}
+      onNavigate={openPreview}
       onViewportChange={applyViewportPreset}
     />
   )
@@ -600,7 +619,7 @@ function SurfacePicker({ onPicked }: { onPicked?: () => void } = {}) {
   const hasAgents = useWorkspace((s) =>
     s.activeId ? (s.sessions[s.activeId]?.items.some(isFleetEntry) ?? false) : false,
   )
-  const lastPreview = useWorkspace((s) => (s.activeId ? s.sessions[s.activeId]?.lastPreview : undefined))
+  const lastPreview = useWorkspace((s) => (s.activeId ? s.sessions[s.activeId]?.recentPreviews?.[0] : undefined))
   // Green here too, on the same terms: this session already has a preview and something is serving it.
   const livePreview = useWorkspace((s) => activeEditor(s).surfaces.some((x) => x.kind === 'preview' && x.live))
   const [staticUrl, setStaticUrl] = useState<string | null>(null)

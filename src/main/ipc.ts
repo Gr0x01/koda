@@ -176,6 +176,7 @@ import { backupNow, getBackupStatus, listCloudBackups, restoreCloudBackup, revea
 import { probeEngine } from './engine/probe'
 import { EngineSessionManager } from './engine/sessions'
 import { DreamScheduler } from './engine/dream'
+import { flushRendererState } from './renderer-state'
 import { loadUsageHistory } from './engine/usage-history'
 import { scanUsageTranscripts } from './engine/usage-scan'
 import { loadRateTable, priceScanBuckets } from './engine/usage-pricing'
@@ -278,6 +279,7 @@ import {
   documentPreviewUrl,
   startDevServer,
   showStaticPreview,
+  previewLocation,
 } from './preview'
 import { listScratchImages } from './scratch'
 import {
@@ -448,7 +450,7 @@ export function registerIpcHandlers(): void {
   engineSessions = new EngineSessionManager(app.isPackaged ? process.resourcesPath : undefined)
 
   // Overnight dream consolidation (dream-plan.md) — inert unless the dreamEnabled flag is on.
-  const dream = new DreamScheduler(engineSessions)
+  const dream = new DreamScheduler(engineSessions, flushRendererState)
   dreamScheduler = dream
   engineSessions.setEngineActivityListener((cwd) => dream.noteActivity(cwd))
 
@@ -543,6 +545,11 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(IpcChannels.queuedTurnsList, (event) =>
     QueuedTurnSnapshotsSchema.parse(getEngineSessions().queuedTurnsForProject(rootForSender(event.sender))),
   )
+
+  ipcMain.handle(IpcChannels.compactSession, async (_event, rawArgs: unknown) => {
+    const { sessionId } = SessionRefSchema.parse(rawArgs)
+    await getEngineSessions().compact(sessionId)
+  })
 
   ipcMain.handle(IpcChannels.interruptSession, (_event, rawArgs: unknown) => {
     const { sessionId } = SessionRefSchema.parse(rawArgs)
@@ -940,6 +947,13 @@ export function registerIpcHandlers(): void {
     return restart.kind === 'dev'
       ? startDevServer(win.id, root, restart.command, sessionId, restart.cwd)
       : showStaticPreview(win.id, root, restart.relPath, sessionId)
+  })
+
+  // The address bar's read of where the preview frame is (preview.ts `previewLocation`). Window-direct
+  // and read-only: it names a page main already served to this very window.
+  ipcMain.handle(IpcChannels.previewLocation, (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    return win ? previewLocation(win.id) : null
   })
 
   // Persist a pasted/dropped image to the window project's `.koda/scratch/` folder. Root is resolved in

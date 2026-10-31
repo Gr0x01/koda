@@ -5,6 +5,8 @@ import { languageFor, MONO_FONT } from './monaco-lang'
 import { useTheme } from '../theme'
 import { useTextSize } from '../text-size'
 import { createSerialFlush, registerFileWriter } from '../workspace/file-writer-registry'
+import { useWorkspace } from '../workspace/store'
+import { fileNameForTitleEdit } from '@shared/document-contract'
 
 /**
  * The editable file surface body (ui-workspace.md §4). Lazy-loaded so `monaco-editor` stays out of
@@ -56,7 +58,12 @@ export function MonacoFileEditor({
   // The pane swaps a new file's content INTO this instance rather than remounting it (see the
   // initialContent effect below), so a per-file flag follows the user to the next file unless it's
   // cleared here.
-  useEffect(() => setNoUndo(false), [path])
+  useEffect(() => {
+    setNoUndo(false)
+    setError(null) // a save that raced a rename failed against the old path; the buffer is still here
+  }, [path])
+
+  const renameEntry = useWorkspace((s) => s.renameEntry)
 
   async function save(): Promise<void> {
     if (readOnly) return
@@ -71,8 +78,13 @@ export function MonacoFileEditor({
     setSaving(true)
     setError(null)
     try {
+      const before = baselineRef.current
       const res = await window.koda.writeFile({ path, content })
       baselineRef.current = content
+      // Not awaited: the rename drains this file's writers first, and that drain queues behind the
+      // save pass we are still inside.
+      const renamed = fileNameForTitleEdit(path.split('/').pop() ?? '', before, content)
+      if (renamed) void renameEntry(path, renamed)
       setDirty(valueRef.current !== content)
       setNoUndo(res.checkpointed === false)
       lastSaveErrorRef.current = null

@@ -8,9 +8,28 @@ import { dirname, join } from 'node:path'
 // archived conversation planted in a test is never purged out from under the assertion.
 vi.mock('./settings', () => ({ loadArchiveRetentionDays: () => 0 }))
 
+// A windowless session's only record is the engine's own file in the real home directory. These two
+// seams let a test stand one in; everything else falls through to the real store.
+const engineFiles = vi.hoisted(() => ({
+  mtime: new Map<string, number>(),
+  entries: new Map<string, unknown[]>(),
+}))
+vi.mock('./session-store', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./session-store')>()
+  return {
+    ...real,
+    engineConversationMtime: (...args: Parameters<typeof real.engineConversationMtime>) =>
+      engineFiles.mtime.get(args[2]) ?? real.engineConversationMtime(...args),
+    readEngineConversationReplayDetailed: (...args: Parameters<typeof real.readEngineConversationReplayDetailed>) =>
+      engineFiles.entries.has(args[2])
+        ? { entries: engineFiles.entries.get(args[2]) as never[], truncated: false }
+        : real.readEngineConversationReplayDetailed(...args),
+  }
+})
+
 import { invalidateDocsCache } from './fs-browse'
 import { deleteArchivedBody, saveArchivedMeta, writeArchivedBody } from './session-store'
-import { searchLibrary, splitTerms } from './library-search'
+import { recentLibrarySessions, searchLibrary, splitTerms } from './library-search'
 
 /**
  * The retrieval seam, exercised the way the feature is: a needle planted in a DOCUMENT and the same
@@ -59,6 +78,8 @@ beforeEach(() => {
   root = realpathSync(mkdtempSync(join(tmpdir(), 'koda-libsearch-')))
 })
 afterEach(() => {
+  engineFiles.mtime.clear()
+  engineFiles.entries.clear()
   invalidateDocsCache(root)
   rmSync(root, { recursive: true, force: true })
 })
@@ -329,6 +350,253 @@ describe('searchLibrary across both corpora', () => {
 
     expect(result.refs).toHaveLength(12)
     expect(result.truncated).toBe(true)
+  })
+})
+
+describe('recentLibrarySessions', () => {
+  it('reads Claude and Codex turns across hot and archived stores for one exact interval', () => {
+    plantHotSessions([
+      {
+        id: 'codex-live',
+        label: 'AIM then Montessori',
+        cwd: root,
+        engineId: 'codex',
+        lastActivityAt: 3_000,
+        items: [
+          said('Keep working on Montessori.'),
+          { kind: 'tool', name: 'Bash', result: 'tool output must not become memory evidence' },
+          replied('Revisit at 10–11 months.'),
+        ],
+      },
+      { id: 'stale', label: 'Stale', cwd: root, lastActivityAt: 900, items: [said('too old')] },
+      { id: 'future', label: 'Future', cwd: root, lastActivityAt: 5_001, items: [said('too new')] },
+      { id: 'dream', label: 'Dream · 1970-01-01', cwd: root, lastActivityAt: 2_500, items: [said('self')] },
+      {
+        id: 'dream-topic',
+        label: 'Dream setting issue',
+        cwd: root,
+        lastActivityAt: 4_000,
+        items: [said('Dream ran for days but documented nothing.')],
+      },
+    ])
+    writeArchivedBody(root, 'claude-cold', [said('AIM felt too passive.'), replied('Prefer CDC first.')])
+    writeArchivedBody(root, 'dream-cold', [said('another Dream')])
+    saveArchivedMeta(root, [
+      {
+        id: 'claude-cold',
+        label: 'Daycare research',
+        cwd: root,
+        engineId: 'claude',
+        lastActivityAt: 2_000,
+        archivedAt: 2_100,
+      },
+      {
+        id: 'dream-cold',
+        label: 'Dream REM · 1970-01-01',
+        cwd: root,
+        lastActivityAt: 3_500,
+        archivedAt: 3_600,
+      },
+    ])
+
+    const result = recentLibrarySessions(root, {
+      afterExclusive: 1_000,
+      throughInclusive: 5_000,
+      hotSessionsComplete: true,
+    })
+
+    expect(result.truncated).toBe(false)
+    expect(result.coveredThrough).toBe(5_000)
+    expect(result.sessions.map((session) => session.sessionId)).toEqual([
+      'claude-cold',
+      'codex-live',
+      'dream-topic',
+    ])
+    expect(result.sessions[0]?.turns).toEqual([
+      { who: 'User', text: 'AIM felt too passive.' },
+      { who: 'Koda', text: 'Prefer CDC first.' },
+    ])
+    expect(result.sessions[1]?.turns).toEqual([
+      { who: 'User', text: 'Keep working on Montessori.' },
+      { who: 'Koda', text: 'Revisit at 10–11 months.' },
+    ])
+  })
+
+  it('adopts an undated legacy conversation into the initial retained-history sweep', () => {
+    plantHotSessions([{ id: 'legacy', label: 'Legacy', cwd: root, items: [said('important decision')] }])
+
+    const result = recentLibrarySessions(root, {
+      afterExclusive: 0,
+      throughInclusive: Date.now(),
+      hotSessionsComplete: true,
+    })
+    expect(result.truncated).toBe(false)
+    expect(result.sessions).toEqual([
+      expect.objectContaining({ sessionId: 'legacy', updatedAt: 1 }),
+    ])
+  })
+
+  it('advances only to the complete prefix when a long outage needs multiple passes', () => {
+    plantHotSessions(
+      Array.from({ length: 65 }, (_, index) => ({
+        id: `session-${index}`,
+        label: `Session ${index}`,
+        cwd: root,
+        lastActivityAt: 1_001 + index,
+        items: [said(`Decision ${index}`)],
+      })),
+    )
+
+    const result = recentLibrarySessions(root, {
+      afterExclusive: 1_000,
+      throughInclusive: 2_000,
+      hotSessionsComplete: true,
+    })
+
+    expect(result.sessions).toHaveLength(64)
+    expect(result.truncated).toBe(true)
+    expect(result.coveredThrough).toBe(1_064)
+  })
+
+  it('consumes equal-timestamp sessions atomically so the numeric watermark cannot stall', () => {
+    plantHotSessions(
+      Array.from({ length: 65 }, (_, index) => ({
+        id: `tied-${String(index).padStart(2, '0')}`,
+        label: `Tied ${index}`,
+        cwd: root,
+        lastActivityAt: 1_500,
+        items: [said(`Decision ${index}`)],
+      })),
+    )
+
+    const result = recentLibrarySessions(root, {
+      afterExclusive: 1_000,
+      throughInclusive: 2_000,
+      hotSessionsComplete: true,
+    })
+
+    expect(result.sessions).toHaveLength(65)
+    expect(result.truncated).toBe(false)
+    expect(result.coveredThrough).toBe(2_000)
+  })
+
+  it('keeps the decision at the end of a long human turn instead of silently clipping it', () => {
+    const longDecision = `${'context '.repeat(600)}FINAL DECISION: CDC first, Montessori around 12 months.`
+    plantHotSessions([
+      {
+        id: 'long-turn',
+        label: 'Childcare decision',
+        cwd: root,
+        lastActivityAt: 1_500,
+        items: [said(longDecision)],
+      },
+    ])
+
+    const result = recentLibrarySessions(root, {
+      afterExclusive: 1_000,
+      throughInclusive: 2_000,
+      hotSessionsComplete: true,
+    })
+
+    expect(result.truncated).toBe(false)
+    expect(result.sessions[0]?.turns[0]?.text).toBe(longDecision)
+    expect(result.sessions[0]?.turns[0]?.text).toContain('Montessori around 12 months')
+  })
+
+  it('dates a windowless phone session by its engine file instead of silently skipping it', () => {
+    plantHotSessions([{ id: 'phone-1', label: 'From the phone', cwd: root, userNamed: false, items: [] }])
+    engineFiles.mtime.set('phone-1', 1_500)
+    engineFiles.entries.set('phone-1', [{ type: 'RemoteUserTurn', text: 'ship the phone tier Friday' }])
+
+    const result = recentLibrarySessions(root, {
+      afterExclusive: 1_000,
+      throughInclusive: 2_000,
+      hotSessionsComplete: true,
+    })
+
+    expect(result.truncated).toBe(false)
+    expect(result.sessions).toEqual([
+      expect.objectContaining({
+        sessionId: 'phone-1',
+        updatedAt: 1_500,
+        turns: [{ who: 'User', text: 'ship the phone tier Friday' }],
+      }),
+    ])
+  })
+
+  it('keeps the most recent turns of a conversation larger than the whole budget and advances past it', () => {
+    const chunk = (label: string): string => `${label} ${'x'.repeat(200_000)}`
+    plantHotSessions([
+      {
+        id: 'huge',
+        label: 'Marathon session',
+        cwd: root,
+        lastActivityAt: 1_500,
+        items: [said(chunk('first')), said(chunk('second')), said(chunk('third'))],
+      },
+    ])
+
+    const result = recentLibrarySessions(root, {
+      afterExclusive: 1_000,
+      throughInclusive: 2_000,
+      hotSessionsComplete: true,
+    })
+
+    expect(result.truncated).toBe(false)
+    expect(result.coveredThrough).toBe(2_000)
+    expect(result.sessions[0]?.turns.map((turn) => turn.text.split(' ')[0])).toEqual(['second', 'third'])
+    expect(result.skipped).toEqual([{ label: 'Marathon session', kind: 'partial' }])
+  })
+
+  it('names an unparseable archive and an unknown-engine session instead of pinning the watermark', () => {
+    plantArchive('corrupt', 'Corrupt archive', [said('body will be overwritten')])
+    const hash = createHash('sha256').update(root).digest('hex').slice(0, 16)
+    const body = createHash('sha256').update('corrupt').digest('hex').slice(0, 32)
+    writeFileSync(join(tmpdir(), `koda-archive-${hash}.bodies`, `${body}.json`), '{ not json')
+    saveArchivedMeta(root, [{ id: 'corrupt', label: 'Corrupt archive', cwd: root, lastActivityAt: 1_200, archivedAt: 1_300 }])
+    plantHotSessions([
+      { id: 'drift', label: 'Future engine', cwd: root, engineId: 'mystery', lastActivityAt: 1_400, items: [] },
+      liveSession('fine', 'Readable', [said('still covered')]),
+    ])
+
+    const result = recentLibrarySessions(root, {
+      afterExclusive: 1_000,
+      throughInclusive: Date.now() + 1_000,
+      hotSessionsComplete: true,
+    })
+
+    expect(result.truncated).toBe(false)
+    expect(result.sessions.map((session) => session.sessionId)).toEqual(['fine'])
+    expect(result.skipped).toEqual(
+      expect.arrayContaining([
+        { label: 'Corrupt archive', kind: 'unreadable' },
+        { label: 'Future engine', kind: 'unreadable' },
+      ]),
+    )
+  })
+
+  it('holds the watermark when the inline hot transcript was not freshly certified', () => {
+    plantHotSessions([
+      {
+        id: 'stale-inline',
+        label: 'Potentially stale transcript',
+        cwd: root,
+        engineId: 'claude',
+        lastActivityAt: 1_500,
+        items: [said('Saved before the latest engine replay event.')],
+      },
+    ])
+
+    const result = recentLibrarySessions(root, {
+      afterExclusive: 1_000,
+      throughInclusive: 2_000,
+      // Omitted on purpose: callers must prove that renderer persistence finished after the latest
+      // engine event. A stale inline copy can otherwise suppress the newer durable replay tail.
+    })
+
+    expect(result.sessions).toHaveLength(1)
+    expect(result.truncated).toBe(true)
+    expect(result.coveredThrough).toBe(1_000)
   })
 })
 

@@ -3,13 +3,19 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  captureWindowPreview,
+  settlePreviewCapture,
   DOCUMENT_PREVIEW_CSP,
   documentPreviewPathsForTest,
   documentPreviewUrl,
   documentTokenForTest,
   forgetWindowDocuments,
   isDocumentFrameEscape,
+  forgetPreviewLocation,
+  notePreviewNavigation,
+  previewLocation,
   servePreviewRequest,
+  showStaticPreview,
   staticPreviewUrl,
 } from './preview'
 import { previewTokenForWindow, registerWindow, unregisterWindow } from './window-registry'
@@ -126,6 +132,22 @@ describe('document-mode refusals', () => {
   })
 })
 
+describe('static preview path identity', () => {
+  it('serves one spelling of a file however the agent wrote the path', async () => {
+    // The restart descriptor is what the toolbar's recent-previews list dedupes and marks current by,
+    // so `./Documents//report.html` must land on the same URL as `Documents/report.html`.
+    const canonical = `koda-preview://${previewToken()}/Documents/report.html`
+    for (const spelling of ['Documents/report.html', './Documents//report.html', '/Documents/./report.html']) {
+      expect((await showStaticPreview(WIN_ID, root, spelling, 'session-1')).url).toBe(canonical)
+    }
+  })
+
+  it('still refuses a path that escapes the project or is not HTML', async () => {
+    await expect(showStaticPreview(WIN_ID, root, '../escape.html', 'session-1')).rejects.toThrow(/outside the project/)
+    await expect(showStaticPreview(WIN_ID, root, './', 'session-1')).rejects.toThrow(/\.html file/)
+  })
+})
+
 describe('app preview stays untouched', () => {
   it('keeps its own origin and never inherits the document policy', async () => {
     documentPreviewUrl(WIN_ID, DOC_REL)
@@ -142,6 +164,59 @@ describe('app preview stays untouched', () => {
 
     // The app origin still serves ordinary project files; the document origin is the strict one.
     expect((await servePreviewRequest(`koda-preview://${previewToken()}/${SECRET_REL}`)).status).toBe(200)
+  })
+})
+
+describe('preview location (the address bar)', () => {
+  const at = (rel: string): string => `koda-preview://${previewToken()}/${rel}`
+
+  afterEach(() => forgetPreviewLocation(WIN_ID))
+
+  it('is null before the frame has shown a page, then follows its navigations', () => {
+    expect(previewLocation(WIN_ID)).toBeNull()
+    notePreviewNavigation(WIN_ID, at(DOC_REL), true)
+    expect(previewLocation(WIN_ID)).toBe(at(DOC_REL))
+  })
+
+  it('records a non-HTML navigation, so the bar does not snap back to the previous page', () => {
+    notePreviewNavigation(WIN_ID, at(DOC_REL), true)
+    notePreviewNavigation(WIN_ID, at('assets/logo.png'), true)
+    expect(previewLocation(WIN_ID)).toBe(at('assets/logo.png'))
+  })
+
+  it('ignores a frame nested inside the preview and any other origin', () => {
+    notePreviewNavigation(WIN_ID, at(DOC_REL), true)
+    notePreviewNavigation(WIN_ID, at('widget.html'), false)
+    notePreviewNavigation(WIN_ID, 'koda-preview://some-other-token/x.html', true)
+    notePreviewNavigation(WIN_ID, 'http://localhost:5173/', true)
+    expect(previewLocation(WIN_ID)).toBe(at(DOC_REL))
+  })
+
+  it('forgets a closed window', () => {
+    notePreviewNavigation(WIN_ID, at(DOC_REL), true)
+    forgetPreviewLocation(WIN_ID)
+    expect(previewLocation(WIN_ID)).toBeNull()
+  })
+
+  it('names a missing path on the 404, escaped and literal', async () => {
+    const res = await servePreviewRequest(at('nope%3Cb%3E.html'))
+    expect(res.status).toBe(404)
+    expect(await res.text()).toContain('Nothing at /nope&lt;b&gt;.html.')
+  })
+
+  it('answers a path with a literal % as a 404 instead of throwing', async () => {
+    const res = await servePreviewRequest(at('100%.html'))
+    expect(res.status).toBe(404)
+  })
+
+  it('renders replacement patterns in a path literally', async () => {
+    const res = await servePreviewRequest(at('a$&b$1.html'))
+    expect(await res.text()).toContain('Nothing at /a$&amp;b$1.html.')
+  })
+
+  it('serves HTML uncached and leaves other files alone', async () => {
+    expect((await servePreviewRequest(at(DOC_REL))).headers.get('Cache-Control')).toBe('no-store')
+    expect((await servePreviewRequest(at(SECRET_REL))).headers.get('Cache-Control')).toBeNull()
   })
 })
 
@@ -198,5 +273,40 @@ describe('document and app-preview token spaces cannot cross', () => {
     // renderer keep their own separate guards and are not touched here.
     expect(isDocumentFrameEscape(`koda-preview://${appHost}/index.html`, 'https://evil.example')).toBe(false)
     expect(isDocumentFrameEscape('file:///renderer/index.html', 'https://evil.example')).toBe(false)
+  })
+})
+
+describe('view_preview capture belongs to the chat that asked', () => {
+  function fakeWindow(): { win: never; sent: { correlationId: string; sessionId: string }[] } {
+    const sent: { correlationId: string; sessionId: string }[] = []
+    const win = {
+      isDestroyed: () => false,
+      webContents: { id: 77, send: (_channel: string, payload: { correlationId: string; sessionId: string }) => sent.push(payload) },
+    }
+    return { win: win as never, sent }
+  }
+
+  it('names the asking session in the request', async () => {
+    const { win, sent } = fakeWindow()
+    const capture = captureWindowPreview(win, 1024, 'chat-b')
+    expect(sent).toHaveLength(1)
+    expect(sent[0].sessionId).toBe('chat-b')
+    settlePreviewCapture(77, { correlationId: sent[0].correlationId, rect: null, dpr: 2 })
+    await expect(capture).rejects.toThrow('Preview tab is open and visible')
+  })
+
+  it('tells a background chat its preview is not on screen instead of asking it to retry', async () => {
+    const { win, sent } = fakeWindow()
+    const capture = captureWindowPreview(win, 1024, 'chat-b')
+    settlePreviewCapture(77, { correlationId: sent[0].correlationId, rect: null, dpr: 2, background: true })
+    await expect(capture).rejects.toThrow("Don't retry")
+  })
+
+  it('ignores a reply from a different window', async () => {
+    const { win, sent } = fakeWindow()
+    const capture = captureWindowPreview(win, 1024, 'chat-b')
+    settlePreviewCapture(78, { correlationId: sent[0].correlationId, rect: null, dpr: 2, background: true })
+    settlePreviewCapture(77, { correlationId: sent[0].correlationId, rect: null, dpr: 2 })
+    await expect(capture).rejects.toThrow('Preview tab is open and visible')
   })
 })

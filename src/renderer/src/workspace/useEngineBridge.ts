@@ -154,13 +154,19 @@ export function useEngineBridge(): void {
   )
 
   // The agent's view_preview: main asks for the preview iframe's on-screen rect, then capturePage's it.
+  // Only the chat on screen has a drawn preview, so a request from any other chat is refused outright:
+  // answering it from the front chat hands the agent someone else's page and pulls the user's Stage
+  // to Preview while they work. (No session id = a preload from before the request carried one.)
   // Single responder (this hook is mounted once). If a preview exists but isn't showing, bring it to the
   // front so the agent can look even after the user switched tabs (Rung 3.1) — but fronting remounts +
   // reloads the iframe, so wait for its `load` before measuring or we'd capture a blank frame. No preview
   // surface at all → respond null (main turns that into a "open the Preview tab" hint).
   useEffect(() => {
-    return window.koda.onPreviewCaptureRequest((correlationId) => {
+    return window.koda.onPreviewCaptureRequest((correlationId, sessionId) => {
       const dpr = window.devicePixelRatio
+      if (sessionId && sessionId !== useWorkspace.getState().activeId) {
+        return window.koda.respondPreviewCapture(correlationId, null, dpr, true)
+      }
       const respond = (rect: { x: number; y: number; width: number; height: number } | null): void =>
         window.koda.respondPreviewCapture(correlationId, rect, dpr)
       const measure = (): void => {
@@ -441,37 +447,44 @@ export function useEngineBridge(): void {
   const saveTimer = useRef<number | null>(null)
   const lastQueued = useRef('')
   useEffect(() => {
-    const persistNow = (): void => {
+    let pendingSave: { serialized: string; promise: Promise<boolean> } | null = null
+    const persistNow = async (): Promise<boolean> => {
       const st = useWorkspace.getState()
-      if (!st.hydrated) return
+      if (!st.hydrated) return true
       const blob = st.persistBlob()
       const serialized = JSON.stringify(blob)
-      if (serialized === lastQueued.current) return
+      if (serialized === lastQueued.current) {
+        return pendingSave?.serialized === serialized ? pendingSave.promise : true
+      }
       lastQueued.current = serialized
-      window.koda
-        .saveSessions(blob)
-        .then((saved) => {
-          if (!saved && lastQueued.current === serialized) {
-            lastQueued.current = ''
-          }
-        })
-        .catch((err) => {
-          if (lastQueued.current === serialized) {
-            lastQueued.current = ''
-          }
+      const promise = window.koda.saveSessions(blob).then(
+        (saved) => {
+          if (!saved && lastQueued.current === serialized) lastQueued.current = ''
+          return saved
+        },
+        (err) => {
+          if (lastQueued.current === serialized) lastQueued.current = ''
           console.error(err)
-        })
+          return false
+        },
+      )
+      pendingSave = { serialized, promise }
+      try {
+        return await promise
+      } finally {
+        if (pendingSave?.promise === promise) pendingSave = null
+      }
     }
     const schedule = (): void => {
       if (saveTimer.current) window.clearTimeout(saveTimer.current)
-      saveTimer.current = window.setTimeout(persistNow, 500)
+      saveTimer.current = window.setTimeout(() => void persistNow(), 500)
     }
     const unsub = useWorkspace.subscribe(schedule)
     // Pre-quit flush: main is about to app.exit() (no unload events fire) — save whatever the
     // debounce is still holding so a turn finished in the last 500ms survives the quit.
     const unsubFlush = window.koda.onFlushState(() => {
       if (saveTimer.current) window.clearTimeout(saveTimer.current)
-      persistNow()
+      return persistNow()
     })
     return () => {
       unsub()

@@ -119,6 +119,9 @@ export interface SessionState {
   replaySeq?: number
   streaming: string
   busy: boolean
+  /** The running turn is a compaction the user asked for. Only meaningful while `busy`: the composer
+   *  holds new messages until it ends, since anything sent now would be summarized away or refused. */
+  compacting?: boolean
   /** When the running turn was dispatched, for the live "Working for 1m 12s" readout. Cleared when the
    *  turn ends, which stamps the elapsed time onto that turn's user message. Not persisted: a turn
    *  cannot survive a restart, so a stale start would tick from a time that no longer means anything. */
@@ -169,10 +172,12 @@ export interface SessionState {
   /** Per-model accumulated totals (cost + token split, cache called out), keyed by the engine's model
    *  id — drives the Usage view's by-model breakdown. Summed from each turn's `models`. Persisted. */
   byModel: Record<string, ModelSpend>
-  /** How to bring this session's preview back after it's torn down — the agent's last dev-server command
-   *  or static file (from the `preview:show` push). Drives the "Restart preview" button on the empty
-   *  stage. Persisted, so a preview is one click to recover after a window close / restart kills it. */
-  lastPreview?: PreviewRestart
+  /** Every preview this session has shown, most recent first — each the agent's dev-server command or
+   *  static file from a `preview:show` push. The first entry drives the "Restart preview" button on the
+   *  empty stage; the whole list is the Preview toolbar's switcher, so four mocks shown in a row stay
+   *  one click apart instead of the last one burying the rest. Persisted, so a preview is one click to
+   *  recover after a window close / restart kills it. */
+  recentPreviews?: PreviewRestart[]
   /** An in-flight or just-answered side question ("btw" / aside) — a question answered from this
    *  session's context WITHOUT entering the conversation. Ephemeral: shown in a dismissible overlay,
    *  never persisted, never an Entry in `items`. At most one at a time (a new ask replaces it). */
@@ -488,7 +493,8 @@ function persistedSessionFromState(s: SessionState): PersistedSession & { items:
     context: s.context,
     spendUsd: s.spendUsd,
     byModel: s.byModel,
-    lastPreview: s.lastPreview,
+    recentPreviews: s.recentPreviews,
+    lastPreview: s.recentPreviews?.[0],
     replaySeq: s.replaySeq,
     items: compactTranscriptToolOutput(s.items),
   }
@@ -542,8 +548,27 @@ function sessionStateFromPersisted(
     resumeCursor: s.resumeCursor,
     spendUsd: s.spendUsd ?? 0,
     byModel: s.byModel ?? {},
-    lastPreview: s.lastPreview,
+    recentPreviews: s.recentPreviews ?? (s.lastPreview ? [s.lastPreview] : undefined),
   }
+}
+
+/** How many previews a session keeps reachable from the Preview toolbar. */
+const RECENT_PREVIEWS_CAP = 8
+
+/** Two restart descriptors that bring back the same thing: the same file, or the same command in the
+ *  same folder. */
+function samePreview(a: PreviewRestart, b: PreviewRestart): boolean {
+  if (a.kind === 'static') return b.kind === 'static' && a.relPath === b.relPath
+  return b.kind === 'dev' && a.command === b.command && (a.cwd ?? '') === (b.cwd ?? '')
+}
+
+/** Put `restart` at the front of a session's recent previews. A re-shown entry moves up instead of
+ *  repeating, and the list stays short enough to read as a menu. */
+export function withRecentPreview(
+  recent: PreviewRestart[] | undefined,
+  restart: PreviewRestart,
+): PreviewRestart[] {
+  return [restart, ...(recent ?? []).filter((r) => !samePreview(r, restart))].slice(0, RECENT_PREVIEWS_CAP)
 }
 
 // Monotonic counters + synchronous guards live module-level (as the old App.tsx refs did) — they
@@ -575,6 +600,9 @@ const replayingSessions = new Set<string>()
 // that turn completes, the summary it produced is carried into a brand-new session (see finishHandoff).
 // Module-level like the sets above so it survives re-renders without living on SessionState.
 const handoffPending = new Set<string>()
+// Sessions whose running turn is a compaction the user asked for. ContextCompacted is the proof it
+// happened; a turn that ends still holding its mark compacted nothing and says so.
+const compactPending = new Set<string>()
 // The turn Koda sends the current agent to produce a handoff before opening a fresh chat. Engine-agnostic
 // (Claude or Codex) — it only asks for text back; the continuity happens by seeding the new session with it.
 const HANDOFF_PROMPT =
@@ -760,6 +788,10 @@ interface WorkspaceStore {
   /** Bumped when the Files tree's contents change (new doc/folder, rename, move, delete) so open
    *  directory rows re-read and reflect it. */
   filesRev: number
+  /** The document the user just made with New document, until its page takes the title focus. Named
+   *  by path so a blank doc that merely comes on stage (a session switch, a restored tab) never pulls
+   *  focus out of the composer. */
+  justCreatedDoc: string | null
   /** Koda-driven artifact renames/deletes this session, as absolute `old → new` (or `old → null` for a
    *  delete). A doc's smart artifact card keeps the portable link text the file was written with, so it
    *  consults this to open the artifact's CURRENT location after a rename it did not rewrite. In-memory
@@ -822,6 +854,13 @@ interface WorkspaceStore {
   /** True when side-line work is waiting: a clean unmerged branch, or ANOTHER worktree with loose
    *  work, unreadable status, or a missing folder. Drives the always-visible Versions cue. */
   gitSideLinesWaiting: boolean
+  /** The checkout's current branch name, `''` when the repo is on no named branch (detached HEAD or an
+   *  unborn branch), or `null` when the repo state is unknown / not a repo. `''` stays distinct from
+   *  null so the status bar can tell "off any branch" from "we don't know". In-memory. */
+  gitBranch: string | null
+  /** The trunk this project folds back into (local `main`, else `master`), or `null` when neither exists
+   *  or the repo state is unknown. Compared against gitBranch to drive the side-branch cue. In-memory. */
+  gitDefaultBranch: string | null
   /** Re-read git repo state + working-tree status into gitRepo/gitFiles. Fire-and-forget; fails soft. */
   refreshGitStatus: () => Promise<void>
   /** Session whose change group the Changes surface should scroll to on open (set by openChanges,
@@ -980,6 +1019,8 @@ interface WorkspaceStore {
    *  current agent for a handoff summary, then (on that turn's completion) opens a new session with the
    *  summary staged in its composer so the user reviews and continues. Engine-agnostic. No-op if busy. */
   continueInFreshChat: () => void
+  /** Compact the active chat in place: the engine swaps the earlier conversation for a summary. */
+  compactConversation: () => void
   selectSession: (id: string) => void
   /** Ask a side question ("btw" / aside) on a session — answered from its context without entering the
    *  conversation. Clears the draft and opens the ephemeral answer overlay. */
@@ -1129,8 +1170,9 @@ interface WorkspaceStore {
    *  session (a user click). Agent-pushed (`respectPin`) leaves a pinned stage alone; a user click
    *  always brings it on stage. */
   openPreview: (url: string, opts?: { respectPin?: boolean; sessionId?: string }) => void
-  /** Remember how to bring a session's preview back (from the `preview:show` push), so the empty stage
-   *  can offer a one-click "Restart preview" after the surface/dev-server is gone. Persisted. */
+  /** Remember how to bring a session's preview back (from the `preview:show` push): the front of its
+   *  recent-previews list, so the empty stage can offer a one-click "Restart preview" after the
+   *  surface/dev-server is gone and the Preview toolbar can flip back to an earlier one. Persisted. */
   rememberPreview: (sessionId: string, restart: PreviewRestart) => void
 
   // starred documents (project-wide)
@@ -1185,31 +1227,34 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     patchSession(id, (s) => ({ ...s, items: [...s.items, { ...item, id: eid }] }))
   }
 
-  /** A deliberate agent surface is a handoff to the user, so its owning session comes forward. Passive
-   *  edit auto-follow remains session-local and never calls this. Returns true only when the push moved
-   *  the user to another live session, which lets the arriving surface override that session's stale
-   *  pin/hide once. */
-  function frontAgentSurface(sessionId: string | undefined): boolean {
-    if (!sessionId || sessionId === get().activeId || !get().sessions[sessionId]) return false
-    get().selectSession(sessionId)
-    return true
+  /** Whether an agent's deliberate surface is arriving in a live session the user is NOT on. It never
+   *  moves them there: switching sessions under someone mid-keystroke sends their typing to the wrong
+   *  chat. The surface is instead staged in its own session, overriding that session's stale pin/hide
+   *  once, so it is in front when the user chooses to click over. Passive edit auto-follow stays
+   *  session-local and never asks. */
+  function isBackgroundPush(sessionId: string | undefined): sessionId is string {
+    return !!sessionId && sessionId !== get().activeId && !!get().sessions[sessionId]
   }
 
   /** A newly launched delegate makes the fleet visible without replaying old history into the Stage. */
   function followDelegation(id: string): void {
     if (replayingSessions.has(id)) return
-    const fronted = frontAgentSurface(id)
+    const background = isBackgroundPush(id)
     set((state) => {
       const editor = state.editors[id] ?? EMPTY_EDITOR
       // The first delegate opens the fleet. Later launches update that existing surface without
       // repeatedly pulling the user back after they deliberately selected another tab.
       if (editor.surfaces.some((surface) => surface.path === AGENTS_SURFACE_ID)) return {}
-      return stageSingleton(
+      const staged = stageSingleton(
         state,
         { kind: 'agents', path: AGENTS_SURFACE_ID, title: 'Agents' },
         id,
-        !fronted,
+        !background,
       )
+      if (!background) return staged
+      // stageSingleton only releases a hide on the session in front, so a background fleet would wait
+      // behind a Stage the user closed there before this work existed.
+      return withEditor(staged.editors, id, { ...staged.editors[id], stageShown: undefined })
     })
   }
 
@@ -1220,7 +1265,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
    * badly still gets a truthful duration instead of a stuck timer.
    */
   function endTurn(s: SessionState): SessionState {
-    if (!s.turnStartedAt) return s.busy ? { ...s, busy: false } : s
+    if (!s.turnStartedAt) return s.busy ? { ...s, busy: false, compacting: false } : s
     const elapsedMs = Date.now() - s.turnStartedAt
     let items = s.items
     for (let i = items.length - 1; i >= 0; i--) {
@@ -1229,7 +1274,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       items = [...items.slice(0, i), { ...item, elapsedMs }, ...items.slice(i + 1)]
       break
     }
-    return { ...s, busy: false, turnStartedAt: undefined, items }
+    return { ...s, busy: false, compacting: false, turnStartedAt: undefined, items }
   }
 
   function settleDeferredBillingRespawn(id: string): void {
@@ -1371,10 +1416,20 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
   // `nameFromText` opts into first-turn session naming (composer only; a Canvas edit shouldn't rename).
   async function dispatchTurn(
     id: string,
-    opts: { sentText: string; images?: ImageDraft[]; displayItem: TurnItem; nameFromText?: string },
+    opts: {
+      sentText: string
+      images?: ImageDraft[]
+      displayItem: TurnItem
+      nameFromText?: string
+      /** Send the engine's own compact request in place of `sentText`. */
+      compact?: boolean
+    },
   ): Promise<boolean> {
     const active = get().sessions[id]
     if (!active || active.busy) return false
+    // A compaction that ended without a TurnComplete (a failed reattach, a fatal engine error) must not
+    // leave its mark for this unrelated turn to answer.
+    if (!opts.compact) compactPending.delete(id)
     const needsReattach = !active.live
     const cwd = active.cwd
     // Synchronous guard: two dispatches in one tick (before `busy` flushes) could both spawn a second
@@ -1390,6 +1445,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     patchSession(id, (s) => ({
       ...s,
       busy: true,
+      compacting: !!opts.compact,
       turnStartedAt: Date.now(),
       errored: false,
       error: undefined, // a fresh turn clears any prior error banner
@@ -1441,6 +1497,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           .catch(console.error)
       } catch (err) {
         suppressStartNotice.delete(id)
+        compactPending.delete(id)
         patchSession(id, (s) => ({ ...s, busy: false }))
         pushItem(id, { kind: 'notice', text: `⚠ couldn't reattach this session: ${String(err)}` })
         reattaching.delete(id)
@@ -1450,11 +1507,13 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       }
     }
     try {
-      await window.koda.sendTurn({
-        sessionId: id,
-        text: opts.sentText,
-        images: opts.images?.length ? opts.images : undefined,
-      })
+      if (opts.compact) await window.koda.compactSession({ sessionId: id })
+      else
+        await window.koda.sendTurn({
+          sessionId: id,
+          text: opts.sentText,
+          images: opts.images?.length ? opts.images : undefined,
+        })
     } catch (err) {
       // Main is the final admission boundary and can refuse a send: a turn already running, a settings
       // change in flight, or the session still holding a pending approval whose asking turn already
@@ -1471,7 +1530,13 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       // handoff this dispatch carried — clear it, or the NEXT successful turn in this session would be
       // mistaken for the handoff summary and open a phantom fresh chat.
       handoffPending.delete(id)
-      if (opts.displayItem.kind === 'user') {
+      compactPending.delete(id)
+      if (opts.compact) {
+        // Nothing was sent, so there is no message to retry: the banner's "Try again" would have no
+        // target. Say why in the transcript and hand the composer back.
+        patchSession(id, endTurn)
+        pushItem(id, { kind: 'notice', text: `Couldn't compact this chat. ${message}` })
+      } else if (opts.displayItem.kind === 'user') {
         // Feed the refusal through the shared terminal-rejection path rather than hand-setting the
         // banner: it ends the optimistic turn, raises the same calm retryable banner engine errors use,
         // AND attaches the TurnFailure envelope to the just-appended user row — a bare banner would
@@ -1820,6 +1885,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     editors: {},
     openDirs: [],
     filesRev: 0,
+    justCreatedDoc: null,
     docRefRepairs: {},
     treeError: null,
     settingsOpen: false,
@@ -1837,6 +1903,8 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
     completionBySession: {},
     gitChangesTruncated: false,
     gitSideLinesWaiting: false,
+    gitBranch: null,
+    gitDefaultBranch: null,
     changesFocus: null,
     lightbox: null,
     scratchTick: 0,
@@ -2079,10 +2147,11 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           mutateTaskList(sid, () => e.steps)
           break
         case 'ContextCompacted':
+          compactPending.delete(sid)
           patchSession(sid, (s) => ({ ...s, context: undefined }))
           pushItem(sid, {
             kind: 'notice',
-            text: 'Codex condensed the earlier conversation and continued with a summary.',
+            text: 'The earlier conversation was condensed into a summary to free up room.',
             replaySeq: e.replaySeq,
           })
           break
@@ -2296,6 +2365,11 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
           // Keep-going-in-a-fresh-chat: this session requested a handoff summary — now that the turn is
           // done, carry it into a new session. A stopped or empty turn yields no usable summary → say so
           // and stay put rather than opening a blank chat.
+          if (compactPending.delete(sid) && !rejectedBeforeStart && !stopped)
+            pushItem(sid, {
+              kind: 'notice',
+              text: 'Nothing was compacted. This chat may be too short to summarize yet.',
+            })
           if (!rejectedBeforeStart && handoffPending.delete(sid)) {
             const items = get().sessions[sid]?.items ?? []
             const summary = [...items]
@@ -2494,7 +2568,10 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
 
     stopSubagent: (sessionId, taskId) => {
       const s = get().sessions[sessionId]
-      const child = s?.items.find((it) => it.kind === 'subagent' && it.taskId === taskId)
+      // Resuming an agent reuses its task id; completed launches remain in the transcript.
+      const child = s?.items.find(
+        (it) => it.kind === 'subagent' && it.taskId === taskId && it.status === 'running',
+      )
       if (!child || child.kind !== 'subagent' || child.status !== 'running' || child.stopRequested) return
       updateSubagent(sessionId, child.toolUseId, { stopRequested: true, lastActivityAt: Date.now() })
       window.koda.stopSubagent({ sessionId, taskId }).catch((err) => {
@@ -3508,6 +3585,23 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       })
     },
 
+    compactConversation: () => {
+      const id = get().activeId
+      const active = id ? get().sessions[id] : undefined
+      if (!id || !active || active.busy) return
+      // A dev hot reload can deliver this button before the restarted app delivers the API behind it.
+      if (typeof window.koda.compactSession !== 'function') {
+        pushItem(id, { kind: 'notice', text: 'Restart Koda to finish updating, then compact this chat.' })
+        return
+      }
+      compactPending.add(id)
+      void dispatchTurn(id, {
+        sentText: '',
+        compact: true,
+        displayItem: { kind: 'notice', text: 'Compacting this chat…' },
+      })
+    },
+
     // Select a session AND clear its attention (the user has now seen it). Guard against a session
     // closed between an event and the action that targets it (notification onclick, ⌘1–9, card).
     selectSession: (id) => {
@@ -3937,7 +4031,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       const source = get().activeId ?? undefined
       const { path } = await window.koda.createFile({ ...(parent ? { parent } : {}), ...(source ? { source } : {}) })
       // Nudge the Files tree to re-read so the new doc appears, then open it (markdown ⇒ Doc view).
-      set((state) => ({ filesRev: state.filesRev + 1 }))
+      set((state) => ({ filesRev: state.filesRev + 1, justCreatedDoc: path }))
       get().openFile(path)
     },
 
@@ -3959,6 +4053,9 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       const to = `${parentDir(path)}/${clean}`
       if (to === path) return // unchanged
       try {
+        // An open editor's unsaved text is addressed to the old path, which stops existing the moment
+        // main moves the file. Land it first, so the rename carries it along.
+        await flushFileWritersUnder(path)
         const { path: np } = await window.koda.renamePath({ from: path, to })
         get().notePathMoved(path, np)
         set({ treeError: null })
@@ -3972,6 +4069,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       if (parentDir(from) === toDir || toDir === from || toDir.startsWith(from + '/')) return
       const to = `${toDir}/${basename(from)}`
       try {
+        await flushFileWritersUnder(from) // same reason as renameEntry
         const { path: np } = await window.koda.renamePath({ from, to })
         get().notePathMoved(from, np)
         set({ treeError: null })
@@ -4046,6 +4144,7 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       // Retired local pins remain the durable copy until the hot-store save is acknowledged. Repair
       // that copy synchronously too, so a quit inside the debounce window cannot revive the old path.
       if (root && legacyPathChange) repairLegacyDocPins(root, [legacyPathChange])
+      movePaneKeys(from, to)
       set((state) => {
         const reb = (p: string): string => rebasePath(p, from, to) ?? p
         const editors = mapEditors(state.editors, (ed) => ({
@@ -4348,7 +4447,11 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       }),
 
     openPreview: (url, opts) => {
-      const fronted = frontAgentSurface(opts?.sessionId)
+      const pushedBy = opts?.sessionId
+      const background = isBackgroundPush(pushedBy)
+      // A pushed preview is something to come and look at, so its row lights up. A delegate launch is
+      // not (followDelegation leaves the mark alone): nothing there is waiting on the user.
+      if (isBackgroundPush(pushedBy)) patchSession(pushedBy, (s) => (s.attention ? s : { ...s, attention: true }))
       set((state) => {
         // The preview belongs to the session that TRIGGERED it (opts.sessionId on an agent push), not
         // whichever tab is focused when the push lands — a window can host several sessions. A user
@@ -4373,16 +4476,16 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
               live: true,
             })
         // A preview pushed by the session already in front respects its pin. A background push is an
-        // explicit handoff: front that session and show the preview once, even if its old Stage state
-        // was pinned or hidden. User opens always take the Stage.
-        const takeStage = fronted || !(opts?.respectPin && ed.pinned)
+        // explicit handoff: the preview is staged in front in its own session, even if that session's
+        // old Stage state was pinned or hidden, and waits there. User opens always take the Stage.
+        const takeStage = background || !(opts?.respectPin && ed.pinned)
         const isActive = key === editorKey(state)
         return withEditor(state.editors, key, {
           ...ed,
           surfaces,
           activeSurfaceId: takeStage ? PREVIEW_SURFACE_ID : ed.activeSurfaceId,
-          pinned: fronted ? false : ed.pinned,
-          ...(isActive ? { stageShown: undefined } : {}),
+          pinned: background ? false : ed.pinned,
+          ...(isActive || background ? { stageShown: undefined } : {}),
         })
       })
     },
@@ -4399,7 +4502,8 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
         })
       }),
 
-    rememberPreview: (sessionId, restart) => patchSession(sessionId, (s) => ({ ...s, lastPreview: restart })),
+    rememberPreview: (sessionId, restart) =>
+      patchSession(sessionId, (s) => ({ ...s, recentPreviews: withRecentPreview(s.recentPreviews, restart) })),
 
     starDoc: (rel) => {
       const { starredDocs, legacyKeptDocsImported } = get()
@@ -4515,13 +4619,36 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => {
       // Core path first: repo state + working-tree status. This must NOT depend on anything newer,
       // so a stale preload (HMR doesn't reload preload) can't take git detection down with it.
       try {
+        const noRepo = {
+          gitRepo: false,
+          gitFiles: [],
+          gitChangesTruncated: false,
+          gitSideLinesWaiting: false,
+          gitBranch: null,
+          gitDefaultBranch: null,
+        }
         const info = await window.koda.gitDetect()
         if (!info.isRepo) {
-          set({ gitRepo: false, gitFiles: [], gitChangesTruncated: false, gitSideLinesWaiting: false })
+          set(noRepo)
           return
         }
         const status = await window.koda.gitStatus()
-        set({ gitRepo: true, gitFiles: status.files, gitChangesTruncated: status.truncated })
+        // Branch truth is re-read AFTER status so the freshest fact wins: a checkout landing between
+        // the two awaits would otherwise pin a stale side-branch cue beside fresh status.
+        const fresh = await window.koda.gitDetect()
+        if (!fresh.isRepo) {
+          set(noRepo)
+          return
+        }
+        // A missing branch name on a real repo collapses to '' so detached HEAD stays distinct from
+        // the null "no repo / unknown" state the side-branch cue reads.
+        set({
+          gitRepo: true,
+          gitFiles: status.files,
+          gitChangesTruncated: status.truncated,
+          gitBranch: fresh.branch ?? '',
+          gitDefaultBranch: fresh.defaultBranch,
+        })
       } catch (err) {
         // Non-fatal — a missing project/window or a git hiccup just leaves the last-known state.
         console.error('refreshGitStatus failed', err)
@@ -4762,6 +4889,29 @@ function rebasePath(p: string, from: string, to: string): string | null {
   if (p === from) return to
   if (p.startsWith(from + '/')) return to + p.slice(from.length)
   return null
+}
+
+/**
+ * The React key of the Stage pane showing `path`. It follows the file through a rename or move, so
+ * the open editor and its unsaved buffer survive one: keyed by the path itself, the pane was torn
+ * down and faded out on every rename, and whatever was typed into the outgoing editor went to a file
+ * that no longer existed. An id rather than the first path, because two documents routinely share
+ * one (every new document starts as Untitled.md) and a shared key would hand one's editor the other.
+ */
+const paneIds = new Map<string, number>()
+let nextPaneId = 0
+export function paneKey(path: string): string {
+  let id = paneIds.get(path)
+  if (id === undefined) paneIds.set(path, (id = nextPaneId++))
+  return `pane-${id}`
+}
+function movePaneKeys(from: string, to: string): void {
+  for (const [path, id] of [...paneIds]) {
+    const moved = rebasePath(path, from, to)
+    if (!moved) continue
+    paneIds.delete(path)
+    paneIds.set(moved, id)
+  }
 }
 
 /** Convert one successful Koda filesystem operation into the project-relative prefix rule used only

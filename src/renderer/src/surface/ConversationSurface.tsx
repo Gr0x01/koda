@@ -7,7 +7,7 @@ import { anchorPlan } from './transcript-scroll'
 import { AnimatePresence, cardVariants, motion } from '../motion'
 import { useWorkspace } from '../workspace/store'
 import { busyActivity } from '../workspace/activity'
-import { ContextReadout, ContinueFreshButton } from '../workspace/ContextMeter'
+import { CompactButton, ContextReadout, ContinueFreshButton } from '../workspace/ContextMeter'
 import { ApprovalModeControl, nextApprovalMode } from '../workspace/ApprovalModeControl'
 import { ModelControl } from '../workspace/ModelControl'
 import { EffortControl } from '../workspace/EffortControl'
@@ -52,6 +52,7 @@ export function ConversationSurface() {
   const dismissAside = useWorkspace((s) => s.dismissAside)
   const promoteAside = useWorkspace((s) => s.promoteAside)
   const continueInFreshChat = useWorkspace((s) => s.continueInFreshChat)
+  const compactConversation = useWorkspace((s) => s.compactConversation)
   const retryLastTurn = useWorkspace((s) => s.retryLastTurn)
   const startSession = useWorkspace((s) => s.startSession)
   const intakePending = useWorkspace((s) => s.intakePending)
@@ -255,6 +256,9 @@ export function ConversationSurface() {
   // explicit muted secondary button. A stale dev-HMR preload without the queue API falls back to the old
   // aside-first behavior so typing-while-busy still does something.
   const draftHasText = (session?.draft.trim().length ?? 0) > 0
+  // A compaction holds the composer: a message queued behind it would arrive with no context the user
+  // can predict, and an aside would fork the conversation being rewritten. Stop stays reachable.
+  const compacting = !!session && session.busy && !!session.compacting
   // Composer content = text OR attachments, so an attachment-only follow-up can queue too (its Enter used
   // to fall into send()'s silent busy guard). A side question stays text-only — there's nothing to ask
   // about with no words.
@@ -277,7 +281,7 @@ export function ConversationSurface() {
   // normal turn. Without the queue API, busy+draft falls back to an aside so typing still does something.
   // (`send`/`queueSend` guard empty / image-only / busy themselves.)
   const submitComposer = (): void => {
-    if (!activeId || !session) return
+    if (!activeId || !session || compacting) return
     if (session.busy && hasComposerContent) {
       if (queueAvailable) queueSend()
       // Fallback for a stale dev-HMR preload without the queue API: an aside if there's text, otherwise
@@ -622,8 +626,11 @@ export function ConversationSurface() {
                   attachFiles(activeId, files)
                 }
               }}
+              disabled={compacting}
               placeholder={
-                session.busy && queueAvailable
+                compacting
+                  ? 'Compacting this chat. You can send again when it finishes.'
+                  : session.busy && queueAvailable
                   ? 'Queue a message for when this turn finishes…'
                   : 'Message the agent…'
               }
@@ -673,7 +680,7 @@ export function ConversationSurface() {
                 {/* Secondary, muted: ask a side question from this chat's context. Keeps its bg-aside
                     identity; sits before the accent primary so queue reads as the default action. Text
                     only — an aside needs words. */}
-                {session.busy && draftHasText && (
+                {!compacting && draftHasText && (
                   <button
                     onClick={submitAside}
                     title="Ask aside"
@@ -687,7 +694,7 @@ export function ConversationSurface() {
                   </button>
                 )}
                 {/* Primary while busy: queue the draft. Accent send-style, matching the idle Send button. */}
-                {canQueue && (
+                {canQueue && !compacting && (
                   <button
                     onClick={submitComposer}
                     title="Queue message"
@@ -731,6 +738,12 @@ export function ConversationSurface() {
                 context={session.context}
                 busy={session.busy}
                 onClick={continueInFreshChat}
+              />
+              <CompactButton
+                context={session.context}
+                busy={session.busy}
+                active={compacting}
+                onClick={compactConversation}
               />
               <ContextReadout context={session.context} openUpward />
             </div>

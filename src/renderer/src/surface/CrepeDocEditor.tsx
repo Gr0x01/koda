@@ -70,6 +70,15 @@ export function docEditorGuards({ readOnly, editing }: { readOnly: boolean; edit
   return { userEditable: !readOnly && editing, acceptsRefresh: !readOnly, selectable: !readOnly }
 }
 
+/**
+ * A document with nothing in it opens ready to type. Reading state protects a page from an accidental
+ * keystroke and keeps a passage selectable for Koda; an empty page has neither to offer, so holding it
+ * there leaves a just-created document that takes no typing and no rename until the user finds Edit.
+ */
+export function opensEditing(body: string): boolean {
+  return body.trim() === ''
+}
+
 /** How long the doc sits still before a coalesced autosave lands. Long enough that ordinary typing
  *  doesn't put a file write and a safety-git checkpoint behind every word, short enough that "saved
  *  automatically" is already true by the time the user looks away. */
@@ -220,8 +229,13 @@ function CrepeDocEditor({
   // `save` reports failures in the pane instead of rejecting every fire-and-forget autosave. The
   // writer registry still needs a hard failure signal so a confirmed delete can stop before main.
   const lastSaveErrorRef = useRef<unknown>(null)
-  // Reading vs. direct editing. A doc always opens in reading state; Edit is the one way in.
-  const [editing, setEditing] = useState(false)
+  // Reading vs. direct editing. A doc with content opens in reading state and Edit is the way in; an
+  // empty one opens editing (see `opensEditing`).
+  const bodyRef = useRef(body)
+  bodyRef.current = body
+  // The last disk body applied to the editor; see the live-agent-edit effect below.
+  const syncedRef = useRef(body)
+  const [editing, setEditing] = useState(() => opensEditing(body))
   const guards = docEditorGuards({ readOnly, editing })
   const editingRef = useRef(editing)
   editingRef.current = editing
@@ -430,8 +444,9 @@ function CrepeDocEditor({
     return () => window.removeEventListener('koda:export-pdf', onExport)
   }, [path])
 
-  // Mount Crepe once per open. `path` is the surface key (SurfacePane remounts on file switch), so a
-  // single mount per file is correct — no need to react to content changes here.
+  // Mount Crepe once per open. The pane is keyed per document (`paneKey`), so this instance only ever
+  // holds one file. Deliberately not re-run when `path` changes: that is a rename, and rebuilding the
+  // editor from the re-read would throw away whatever was typed while the file was moving.
   useEffect(() => {
     if (!crepeRootRef.current) return
     let disposed = false
@@ -482,8 +497,7 @@ function CrepeDocEditor({
       .create()
       .then(() => {
         if (disposed) return
-        // Reading state is the resting state, so a doc is born non-editable; the effect below follows
-        // the Edit action from here on.
+        // Apply the state the doc opened in; the effect below follows the Edit action from here on.
         crepe.setReadonly(!docEditorGuards({ readOnly, editing: editingRef.current }).userEditable)
         // Baseline against the normalised form so the doc doesn't open pre-dirtied.
         baselineRef.current = crepe.getMarkdown()
@@ -514,19 +528,20 @@ function CrepeDocEditor({
       void crepe.destroy()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [path])
+  }, [])
 
-  // A new file in this instance is a new document: it opens in reading state, carries none of the
-  // previous doc's per-file flags, and must not inherit a pending write — a queued autosave firing
-  // after the swap would put the old body under the new path.
+  // The open doc was renamed or moved. The editor and its buffer carry on untouched; what changes is
+  // where they save and the frontmatter they save with (the rename may have rewritten `title:`).
+  const pathRef = useRef(path)
   useEffect(() => {
-    setEditing(false)
+    if (pathRef.current === path) return
+    pathRef.current = path
+    // The re-read brings back the user's own saved text. Left unsynced it would read as an agent edit,
+    // replace the buffer, and open a review of a change Koda never made.
+    syncedRef.current = bodyRef.current
     setNoUndo(false)
-    setReady(false)
-    setInitError(null)
-    setSaveError(null)
-    finalBodyRef.current = null
-    autosave.cancel()
+    // Anything typed while the file was moving could only fail against the old path. Land it now.
+    void autosave.flush()
   }, [path, autosave])
 
   // The Edit action reaches ProseMirror here. Also re-asserted on `ready` so a doc that finished
@@ -589,7 +604,6 @@ function CrepeDocEditor({
   // edits live in Crepe, not this prop), so a change means the agent edited — swap the editor content
   // in place. Re-baseline to the normalised post-swap form (mirrors the mount baseline) so the doc
   // doesn't show spurious "unsaved changes". `path` is constant per mount, so this only fires on edits.
-  const syncedRef = useRef(body)
   useEffect(() => {
     if (body === syncedRef.current) return
     const crepe = crepeRef.current

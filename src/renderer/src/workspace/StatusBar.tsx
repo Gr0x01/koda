@@ -14,9 +14,10 @@ import { shortResetCountdown } from '@shared/rate-limits'
 import { SegmentBar } from './ContextMeter'
 import { engineShort, engineOrder } from './models'
 import { useWorkspace } from './store'
-import { Button } from '../ui'
+import { BranchGlyph } from './source-control/icons'
+import { Button, HoverCard } from '../ui'
 import { liveRateLimitWindows } from '@shared/rate-limits'
-import { engineCapabilities, isEngineId } from '@shared/engine-capabilities'
+import { isEngineId } from '@shared/engine-capabilities'
 
 // ── Billing fallback banner ──────────────────────────────────────────────────────
 // 'auto' mode only: shown when the subscription plan limit is hit and we haven't yet asked whether to
@@ -373,8 +374,42 @@ function FooterActions() {
           <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
         </svg>
       </FooterButton>
+      <SideBranchPill />
       <MemoryTidyPill />
     </div>
+  )
+}
+
+// Always-visible cue that the project's checkout is off its trunk: a named side branch, or a detached
+// HEAD. The product absorbs git, so a checkout parked on a task branch is otherwise invisible until
+// Versions is opened. Quiet amber like the other attention pills (never error red): the work is
+// safe, it's just waiting to fold back in. Renders nothing on the trunk or when the trunk is unknown.
+function SideBranchPill() {
+  const setVersionsOpen = useWorkspace((s) => s.setVersionsOpen)
+  const gitBranch = useWorkspace((s) => s.gitBranch)
+  const gitDefaultBranch = useWorkspace((s) => s.gitDefaultBranch)
+  // null on either side means repo/trunk unknown, so stay silent rather than guess. '' is detached.
+  if (gitDefaultBranch === null || gitBranch === null || gitBranch === gitDefaultBranch) return null
+  const detached = gitBranch === ''
+  const body = detached
+    ? `This project is not on any branch right now. Ask the agent to get it back onto ${gitDefaultBranch}.`
+    : `This project is working on a side branch right now. New changes stay on it until it is folded into ${gitDefaultBranch}. Click to open Versions.`
+  return (
+    <HoverCard
+      heading={detached ? 'Not on a branch' : gitBranch}
+      trigger={
+        <button
+          onClick={() => setVersionsOpen(true)}
+          aria-label={detached ? 'Not on a branch, open Versions' : `On side branch ${gitBranch}, open Versions`}
+          className="ml-0.5 flex select-none items-center gap-1.5 rounded-md px-1.5 py-1 text-[11px] text-amber-500 transition-colors hover:bg-surface hover:text-amber-400"
+        >
+          <BranchGlyph />
+          <span>Side branch</span>
+        </button>
+      }
+    >
+      {body}
+    </HoverCard>
   )
 }
 
@@ -503,13 +538,12 @@ function BillingStatus() {
   )
 }
 
-// ── Rate-limit windows (the 5-hour + weekly subscription caps) ───────────────────
+// ── Rate-limit windows (the plan's subscription caps) ─────────────────────────────
 // The account-level windows the TUI's /usage shows, surfaced ambiently next to the build info. The
-// engine streams the reset time + a coarse status band for whichever window is currently BINDING
-// (almost always 5-hour) — not a precise "% used" (that's behind a separate authenticated call), and
-// not every window every turn. So we anchor the 5-hour gauge as ALWAYS-PRESENT (empty/grayed before
-// the first turn, like the context meter — a missing gauge reads as broken), and let weekly join only
-// when the engine actually sends it (we never fabricate a window we can't see).
+// engine reports whichever windows the plan has, and which those are varies (a verified Claude Ultra
+// account has no 5-hour limit). So the gauge is ALWAYS-PRESENT (empty/grayed before the first read,
+// like the context meter — a missing gauge reads as broken), but a window only appears once the engine
+// reports it (we never fabricate a window we can't see).
 function RateLimitStatus() {
   // The footer is global chassis, not session-scoped: keep tabs on EVERY engine we have window data for,
   // so blowing out Claude's 5-hour cap and switching to Codex still shows Claude's window — you can see
@@ -549,9 +583,9 @@ function hasWindowData(windows?: Record<string, RateLimitInfo>): boolean {
  *  seed drops expired windows for exactly this reason, usage-history.ts), so an elapsed window is treated
  *  as absent — the gauge falls back to the em-dash until the next turn re-emits it, rather than showing a
  *  stale "31%" / color long after the window should have reset. */
-// One engine's 5-hour gauge — the only window shown inline (it's the cap you actually hit). A small
+// One engine's binding window — the only one shown inline (it's the cap you actually hit). A small
 // accent dot + brand name when more than one engine is on screen (the single-engine case stays clean
-// with just "5-hour"). Reset times and the weekly window live in a click popout (the same pattern as
+// with just the window's name). Reset times and the other windows live in a click popout (the same pattern as
 // the composer's context readout), so the footer reads at a glance instead of as a wall of text.
 function EngineWindows({
   engineId,
@@ -666,7 +700,7 @@ function EngineWindows({
             className={`h-1.5 w-1.5 rounded-full ${trouble ? 'bg-amber-500' : 'bg-emerald-500'}`}
             aria-hidden
           />
-          {showLabel || trouble ? engineShort(engineId) : windowLabel(primaryType ?? 'five_hour')}
+          {showLabel || trouble ? engineShort(engineId) : primaryType ? windowLabel(primaryType) : 'Plan'}
           {trouble && <span>· {kindWord(health?.kind)}</span>}
         </span>
         {/* Same 3-state band language as the context meter (allowed/warning/rejected → green/amber/red). */}
@@ -716,21 +750,14 @@ function EngineWindows({
                 )}
               </div>
               {presentTypes.length > 0 ? (
-                <>
-                  {presentTypes.map((t) => <WindowRow key={t} type={t} info={windows[t]} />)}
-                  {/* A server that omits windows it deems quiet (Anthropic's, since ~2026-07) still has
-                      a 5-hour limit — surface the line so it reads as "nothing to report", not as the
-                      limit vanishing. */}
-                  {engineCapabilities(engineId).anchorsFiveHourWindow && !windows['five_hour'] && (
-                    <div className="flex justify-between gap-6">
-                      <span>5-hour</span>
-                      <span className="text-text">nothing to report, likely low</span>
-                    </div>
-                  )}
-                </>
+                presentTypes.map((t) => <WindowRow key={t} type={t} info={windows[t]} />)
               ) : (
-                // No window yet (pre-first-turn): the anchored placeholder so the popout isn't empty.
-                <WindowRow type="five_hour" info={undefined} />
+                // No window yet: a placeholder so the popout isn't empty. It names no window because
+                // which ones exist depends on the plan.
+                <div className="flex justify-between gap-6">
+                  <span>Plan limits</span>
+                  <span className="text-text">updates after your next turn</span>
+                </div>
               )}
               {/* The one route from limits to the ledger: same popup as ever, plus one last row. */}
               <button
@@ -751,17 +778,8 @@ function EngineWindows({
 }
 
 // One plan window in the popout: fill on the first line (a precise % when the engine reports one —
-// Codex — else the hedged band read), the reset time under it. Weekly renders only once seen.
-function WindowRow({ type, info }: { type: string; info?: RateLimitInfo }) {
-  if (!info) {
-    if (type !== 'five_hour') return null
-    return (
-      <div className="flex justify-between gap-6">
-        <span>5-hour</span>
-        <span className="text-text">updates after your next turn</span>
-      </div>
-    )
-  }
+// Codex — else the hedged band read), the reset time under it.
+function WindowRow({ type, info }: { type: string; info: RateLimitInfo }) {
   const reset = formatReset(info.resetsAt)
   const fill = info.usedPercent != null ? `${Math.round(info.usedPercent)}% used` : statusHint(info.status)
   return (

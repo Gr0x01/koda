@@ -295,7 +295,8 @@ export const PlanUpdateSchema = z.object({
   steps: z.array(z.object({ id: z.string(), subject: z.string(), status: z.string() })),
 })
 
-/** The engine replaced older thread context with a compact summary and continued. */
+/** The engine replaced older thread context with a compact summary and continued. Emitted for the
+ *  engine's own automatic compaction and for one the user asked for. */
 export const ContextCompactedSchema = z.object({
   type: z.literal('ContextCompacted'),
   sessionId: z.string(),
@@ -1565,7 +1566,7 @@ export type PlaywrightStatus = z.infer<typeof PlaywrightStatusSchema>
 
 /** Which credential the engine bills against (Settings → Account). Declared here because
  *  KodaSettingsSchema references it; the verdict-dependent billing schemas live near AuthVerdict.
- *  - `subscription`: always the Pro/Max plan; stop at the limit.
+ *  - `subscription`: always the Pro/Max/Ultra plan; stop at the limit.
  *  - `auto`: subscription normally, fall back to the API key when the plan limit is hit (after a
  *    one-time confirm) until that window resets, then back to subscription.
  *  - `api`: always the API key. */
@@ -1657,7 +1658,7 @@ export const KodaSettingsSchema = z.object({
   /** Whether the user has completed the first-run onboarding wizard (architecture/onboarding.md).
    *  App-global, once per install: App.tsx shows the wizard while this is false, then sets it true. */
   hasOnboarded: z.boolean(),
-  /** Which credential the engine bills against. `subscription` (default) = the user's Pro/Max plan via
+  /** Which credential the engine bills against. `subscription` (default) = the user's Pro/Max/Ultra plan via
    *  the shared ~/.claude login; `api` = an opt-in BYO API key (stored encrypted, NOT here — see
    *  api-key.ts) injected at spawn through buildEngineEnv. Switching is user-visible (Settings → Account)
    *  and never silent — the two differ in the one thing the user cares about: plan window vs real $. */
@@ -1963,8 +1964,11 @@ export const PersistedSessionSchema = z.object({
   /** Per-model accumulated totals (cost + token split), keyed by the engine's model id — the Usage
    *  view's by-model breakdown. Optional for back-compat with blobs saved before this existed. */
   byModel: z.record(z.string(), ModelSpendSchema).optional(),
-  /** How to restore the session's last preview after restart. Optional for back-compat with blobs
-   *  saved before preview restart persistence existed. */
+  /** Every preview this session has shown, most recent first, each restorable after a restart — the
+   *  Preview toolbar's switcher. Optional for back-compat with blobs saved before the list existed. */
+  recentPreviews: z.array(PreviewRestartSchema).optional(),
+  /** The most recent preview, mirrored from `recentPreviews[0]` on every save so a build that predates
+   *  the list still restores one. Read only when `recentPreviews` is absent. */
   lastPreview: PreviewRestartSchema.optional(),
   /** Legacy session-scoped document stars. New builds migrate these paths into the project's
    *  `starredDocs` list below and never write this field. It remains readable so a star held only by an
@@ -3665,6 +3669,9 @@ export interface KodaApi {
    *  reload rebuilds them (they are ephemeral and never persisted). Optional for a stale preload. */
   listQueuedTurns?: () => Promise<QueuedTurnSnapshot[]>
   interruptSession: (args: SessionRef) => Promise<void>
+  /** Replace the earlier conversation with the engine's summary. Runs as a turn: resolves once the
+   *  engine has taken it, and the usual TurnComplete ends it. */
+  compactSession: (args: SessionRef) => Promise<void>
   stopSubagent: (args: StopSubagentRequest) => Promise<void>
   disposeSession: (args: SessionRef) => Promise<void>
   /** Load persisted sessions on boot. `ok: true` with `data: null` means this project has nothing saved
@@ -3919,9 +3926,9 @@ export interface KodaApi {
   /** Subscribe to app-global settings changes (broadcast to every window so live gates re-sync);
    *  returns an unsubscribe fn. */
   onSettingsChanged: (listener: (settings: KodaSettings) => void) => () => void
-  /** Subscribe to the pre-quit flush request: fire any pending debounced saves synchronously (the
-   *  preload acks to main right after the listener returns); returns an unsubscribe fn. */
-  onFlushState: (listener: () => void) => () => void
+  /** Subscribe to a main-process durability barrier (pre-quit or pre-Dream): flush pending debounced
+   *  state and report whether the save landed before preload acknowledges it. */
+  onFlushState: (listener: () => boolean | Promise<boolean>) => () => void
   // Preview surface (preview-surface.md).
   /** The window's static-preview entry URL. With an absolute `filePath` (the active editor tab),
    *  preview points at that file (if it's `.html`/`.htm` and inside the project); else the project-root
@@ -3940,6 +3947,11 @@ export interface KodaApi {
    *  "Restart preview" button. Resolves with the served URL (main also pushes `preview:show`), or
    *  rejects if the command fails to come up / the file is gone. */
   previewRestart: (sessionId: string, restart: PreviewRestart) => Promise<{ url: string }>
+  /** Where this window's preview frame most recently landed: the last project page main served to it
+   *  as a navigation, or null before it has shown one. The frame is cross-origin, so this is the
+   *  address bar's only source of truth after a link click, Back, or Forward inside the page. Only
+   *  meaningful while the frame is on the `koda-preview://` origin; a dev server serves its own pages. */
+  previewLocation: () => Promise<string | null>
   /** Subscribe to "show this preview URL" pushes (the agent started the dev server, or the user hit
    *  Restart); returns an unsubscribe fn. The renderer opens/points the preview surface at the URL, on
    *  the editor of the session that triggered it (`sessionId`) — not whichever session is focused when
@@ -3951,11 +3963,17 @@ export interface KodaApi {
   onPreviewStopped: (listener: (url: string) => void) => () => void
   /** Subscribe to main's "measure the preview iframe" requests (the agent called view_preview):
    *  reply via respondPreviewCapture with the iframe's rect, or null if no preview is showing.
-   *  Returns an unsubscribe fn. */
-  onPreviewCaptureRequest: (listener: (correlationId: string) => void) => () => void
+   *  `sessionId` is the chat that asked. Returns an unsubscribe fn. */
+  onPreviewCaptureRequest: (listener: (correlationId: string, sessionId?: string) => void) => () => void
   /** Answer a capture request with the preview iframe's on-screen rect (null = nothing to capture) and
    *  the window's devicePixelRatio (so main caps the capture by PHYSICAL pixels — the real token lever). */
-  respondPreviewCapture: (correlationId: string, rect: PreviewRect | null, dpr: number) => void
+  respondPreviewCapture: (
+    correlationId: string,
+    rect: PreviewRect | null,
+    dpr: number,
+    /** The asking chat is not the one on screen, so there is nothing of its own to capture. */
+    background?: boolean,
+  ) => void
   /** Persist a pasted/dropped attachment to the project's `.koda/scratch/` folder; returns its relative path. */
   saveScratchImage: (args: ScratchSaveRequest) => Promise<ScratchSaveResult>
   /** Composer attach menu: native file dialog → picked files' bytes (staged like a drop). */

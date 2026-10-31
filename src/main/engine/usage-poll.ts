@@ -88,7 +88,7 @@ function parseLine(line: string, now: number): RateLimitInfo | undefined {
 
 export type UsagePollResult = {
   windows: RateLimitInfo[]
-  /** True only when both baseline windows arrived and every recognized window parsed. Any weaker
+  /** True only when the weekly window arrived and every `Current …` line parsed. Any weaker
    *  read is a sparse update, never authority to erase a previously known window. */
   complete: boolean
 }
@@ -100,9 +100,10 @@ export function authoritativeUsageTypes(
 ): string[] | undefined {
   if (!result.complete) return undefined
   const types = new Set(result.windows.map((window) => window.rateLimitType))
-  // The CLI always names the two baseline windows, but model-specific weeklies can appear or vanish
-  // without an end marker. Omission therefore cannot prove one is gone. Preserve a previously known
-  // optional window until its measured reset expires; the normal live-window filter clears it then.
+  // A complete read has the weekly line, and the session line prints above it, so omitting five_hour
+  // proves the account has none. Model-specific weeklies can appear or vanish without an end marker,
+  // so omission cannot prove one is gone: preserve a previously known optional window until its
+  // measured reset expires; the normal live-window filter clears it then.
   for (const [type, info] of Object.entries(prior)) {
     if (type !== 'five_hour' && type !== 'seven_day' && info.resetsAt > nowSec) types.add(type)
   }
@@ -113,16 +114,16 @@ function parseResult(result: string, now = Date.now()): UsagePollResult {
   const windows: RateLimitInfo[] = []
   let everyNamedWindowParsed = true
   for (const line of result.split('\n')) {
-    const windowLine = /^Current\s+(session|week)\b/i.test(line.trim())
+    const windowLine = /^Current\b/i.test(line.trim())
     const info = parseLine(line, now)
     if (info) windows.push(info)
     else if (windowLine) everyNamedWindowParsed = false
   }
   const types = new Set(windows.map((window) => window.rateLimitType))
-  // Authority requires positive proof that the CLI's two baseline subscription windows arrived.
-  // Merely seeing no malformed line is insufficient: stdout can truncate, or upstream can rename a
-  // line so it no longer matches our `Current …` recognizer. Model-specific weeklies are optional.
-  const complete = everyNamedWindowParsed && types.has('five_hour') && types.has('seven_day')
+  // Authority requires positive proof that the weekly window arrived: stdout can truncate. The session
+  // window is optional because verified Ultra accounts have no 5-hour limit, and an unrecognized
+  // `Current …` line withholds authority so an upstream rename can't read as that limit being gone.
+  const complete = everyNamedWindowParsed && types.has('seven_day')
   return { windows, complete }
 }
 

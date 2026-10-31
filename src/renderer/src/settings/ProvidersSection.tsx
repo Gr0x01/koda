@@ -314,7 +314,7 @@ function ClaudeAccount({
   )
 }
 
-/** Claude sign-in: a Pro/Max plan OAuth login (reuses the onboarding `auth:*` flow — button → open the
+/** Claude sign-in: a Pro/Max/Ultra plan OAuth login (reuses the onboarding `auth:*` flow — button → open the
  *  browser → paste the code back). Renders the sign-in row + its in-flight/failed UI; the account status
  *  itself shows in the provider header badge, so there's no separate status row here. */
 function ClaudeSignIn({ billing, onChanged }: { billing: BillingState | null; onChanged: () => void }) {
@@ -371,7 +371,7 @@ function ClaudeSignIn({ billing, onChanged }: { billing: BillingState | null; on
       )}
       <SettingsRow
         label="Claude subscription"
-        description="Bill your turns against your Pro or Max plan, free at the point of use."
+        description="Bill your turns against your Pro, Max, or Ultra plan, free at the point of use."
         control={
           phase === 'awaiting-code' ? (
             <BusyText className="text-[13px] text-text-muted">Waiting for the code…</BusyText>
@@ -859,17 +859,17 @@ function PlanLimits({ engineId, windows }: { engineId: EngineId; windows: Record
   const five = liveWindows['five_hour']
   // Claude's stream names the weekly cap 'seven_day'; Codex names it 'weekly'. Same row.
   const weekly = liveWindows['weekly'] ?? liveWindows['seven_day']
-  // Anchor the 5-hour row for an engine whose plan always has one (always-present empty state); for
-  // any other engine only show a window once it actually reports one (never fabricate a gauge).
-  const anchorFiveHour = engineCapabilities(engineId).anchorsFiveHourWindow
-  if (!anchorFiveHour && !five && !weekly) return null
+  // Only a reported window gets a row (never fabricate a gauge). An engine whose plans always have
+  // windows keeps the section before the first read, without guessing which windows this plan has.
+  if (!engineCapabilities(engineId).anchorsPlanLimits && !five && !weekly) return null
   return (
     <SettingsSection
       title="Plan limits"
       note="These are your subscription usage windows as the engine reports them, so the provider’s own side enforces the exact limit. The full accounting lives under Usage."
     >
-      {(anchorFiveHour || five) && <PlanWindowRow label="5-hour limit" info={five} />}
+      {five && <PlanWindowRow label="5-hour limit" info={five} />}
       {weekly && <PlanWindowRow label="Weekly limit" info={weekly} />}
+      {!five && !weekly && <PlanWindowRow label="Usage windows" />}
     </SettingsSection>
   )
 }

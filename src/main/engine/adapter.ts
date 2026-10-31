@@ -221,6 +221,10 @@ export interface EngineSession {
   /** Returns whether the turn was accepted for delivery; callers holding must-arrive
    *  content (e.g. a restore notice) re-queue it on false. */
   sendTurn(text: string, images?: TurnImage[]): boolean
+  /** Replace the earlier conversation with the engine's own summary, as a turn of its own: it ends in
+   *  the same TurnComplete a message does. Returns whether the engine took the request. Absent on a
+   *  driver with no on-request compaction. */
+  compact?(): boolean
   interrupt(): void
   /** A targeted stop for an engine-owned delegated child; absent without a task protocol. */
   stopTask?(taskId: string): boolean
@@ -286,6 +290,12 @@ class ClaudeSession implements EngineSession {
    *  so it massively over-reports window fill (a 17-step turn read ~400k when 61k was in the
    *  window). Feed the gauge from this instead. Subagent messages excluded (`!parentToolUseId`). */
   private lastAssistantUsage: unknown = undefined
+  /** A compaction's own `result` reports zero usage and the boundary's `post_tokens` leaves out the
+   *  system prompt and tools, so neither is the window fill. Set until the next assistant step reports
+   *  a real prompt size; the meter stays empty rather than showing a number that is not the fill. */
+  private awaitingPostCompactUsage = false
+  /** Whether the engine's init listed `/compact`. Undefined before the first init. */
+  private compactAvailable: boolean | undefined
   private readonly onClose?: (sessionId: string) => void
   /** Agent/Task launch tool_use ids — lets us route the top-level Agent tool_result to the
    *  subagent lifecycle rather than a stray ToolResult. */
@@ -437,6 +447,23 @@ class ClaudeSession implements EngineSession {
     return true
   }
 
+  /** `/compact` is a local command the headless CLI runs itself; it has no control_request form
+   *  (checked against the 2.1.234 SDK types and a live run). It must be the whole message: any text
+   *  around it turns it into ordinary prose for the model. */
+  compact(): boolean {
+    if (this.disposed || this.closed || !this.child.stdin.writable) {
+      this.emitError('cannot compact: engine session is not running', false)
+      return false
+    }
+    if (this.compactAvailable === false) {
+      this.emitError('This Claude Code version cannot compact a conversation on request.', false)
+      return false
+    }
+    const msg = { type: 'user', message: { role: 'user', content: [{ type: 'text', text: '/compact' }] } }
+    this.child.stdin.write(JSON.stringify(msg) + '\n')
+    return true
+  }
+
   /**
    * The user's stop button — a graceful, mid-turn interrupt. `claude -p` stream-json accepts a
    * `control_request` on stdin that aborts the CURRENT turn but keeps the long-lived process alive
@@ -550,6 +577,7 @@ class ClaudeSession implements EngineSession {
           return typeof name === 'string' ? [name] : []
         })
       : []
+    if (Array.isArray(ev.slash_commands)) this.compactAvailable = ev.slash_commands.includes('compact')
     const snapshot = buildSessionCapabilitySnapshot({
       engine: 'claude',
       cwd: typeof ev.cwd === 'string' ? ev.cwd : this.cwd,
@@ -631,6 +659,12 @@ class ClaudeSession implements EngineSession {
             this.emitResumeCursor()
           }
           this.observeCapabilities(ev)
+        } else if (ev.subtype === 'compact_boundary') {
+          // Manual and automatic compaction both land here. The summary that follows is a `user`
+          // message with string content, which the tool_result loop below already passes over.
+          this.lastAssistantUsage = undefined
+          this.awaitingPostCompactUsage = true
+          this.emit({ type: 'ContextCompacted', sessionId: this.id })
         } else {
           this.translateTask(ev) // system/task_* — agents and ordinary background jobs share this wire
         }
@@ -663,7 +697,10 @@ class ClaudeSession implements EngineSession {
       case 'assistant':
         // Capture this step's prompt size (top-level only) — the true window fill, used by the
         // gauge at `result` time instead of the result event's cumulative-per-turn usage.
-        if (!parentToolUseId && ev?.message?.usage) this.lastAssistantUsage = ev.message.usage
+        if (!parentToolUseId && ev?.message?.usage) {
+          this.lastAssistantUsage = ev.message.usage
+          this.awaitingPostCompactUsage = false
+        }
         for (const block of asArray(ev?.message?.content)) {
           if (block?.type === 'text' && typeof block.text === 'string') {
             // A top-level API failure (5xx/429/auth) arrives as the CLI's own "API Error: …" assistant
@@ -809,7 +846,12 @@ class ClaudeSession implements EngineSession {
           sessionId: this.id,
           // Window fill = the LAST assistant step's prompt size (lastAssistantUsage), NOT the
           // result event's cumulative-per-turn usage. modelUsage still supplies the window LIMIT.
-          context: extractContextUsage(this.lastAssistantUsage ?? ev.usage, ev.modelUsage, this.model),
+          // A turn with no model step (a local command such as a compact that found nothing to do)
+          // reports all-zero usage. That is not a fill either, so the meter keeps what it had.
+          context:
+            this.awaitingPostCompactUsage || (!this.lastAssistantUsage && ev.num_turns === 0)
+              ? undefined
+              : extractContextUsage(this.lastAssistantUsage ?? ev.usage, ev.modelUsage, this.model),
           costEstimate: typeof ev.total_cost_usd === 'number' ? ev.total_cost_usd : undefined,
           models: extractModelUsage(ev.modelUsage),
           stopReason: typeof ev.subtype === 'string' ? ev.subtype : undefined,

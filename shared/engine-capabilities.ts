@@ -61,12 +61,12 @@ export interface EngineCapabilities {
    */
   customModelIds: boolean
   /**
-   * Does the account always have a 5-hour plan window worth showing, even when the engine reports
-   * nothing? Anthropic's server went quiet on windows it considers unremarkable, so the row is
-   * anchored and reads "nothing to report" instead of vanishing. Never fabricate a gauge for an engine
-   * that doesn't publish one.
+   * Does a signed-in account always have plan windows, so Settings keeps its Plan limits section
+   * before the first read? The anchor names no specific window: which ones exist varies by plan (a
+   * verified Claude Ultra account has no 5-hour limit). Never fabricate a gauge for an engine that
+   * doesn't publish one.
    */
-  anchorsFiveHourWindow: boolean
+  anchorsPlanLimits: boolean
   /**
    * Does Koda's plan-limit → API-key auto-fallback apply to this engine? Only the Anthropic path has
    * the confirmed 'rejected' window signal and a Koda-held key to switch forward onto.
@@ -98,7 +98,7 @@ export const CLAUDE_CAPABILITIES: EngineCapabilities = {
   approvals: 'broker',
   transcriptOnDisk: true,
   customModelIds: true,
-  anchorsFiveHourWindow: true,
+  anchorsPlanLimits: true,
   apiKeyFallback: true,
   delegation: 'subagents',
   structuredGeneration: true,
@@ -114,7 +114,7 @@ export const CODEX_CAPABILITIES: EngineCapabilities = {
   approvals: 'native',
   transcriptOnDisk: false,
   customModelIds: true,
-  anchorsFiveHourWindow: false,
+  anchorsPlanLimits: false,
   apiKeyFallback: false,
   delegation: 'collab',
   structuredGeneration: true,

@@ -18,6 +18,7 @@ export const IpcChannels = {
   // rebuilds them (the slot is ephemeral, never persisted).
   queuedTurnsList: 'engine:queuedTurnsList',
   interruptSession: 'engine:interrupt',
+  compactSession: 'engine:compact',
   stopSubagent: 'engine:stopSubagent',
   disposeSession: 'engine:dispose',
   engineEvent: 'engine:event',
@@ -268,9 +269,8 @@ export const IpcChannels = {
   // Settings changed (in any window) — broadcast to ALL windows so each one's live gates (notification
   // pref, default approval posture) stay in sync without a restart. main→renderer (send).
   uiSettingsChanged: 'ui:settingsChanged',
-  // Quit flush — main asks each window to fire its pending debounced state save NOW (push), and the
-  // preload acks once it's sent (send). app.exit() never fires unload events, so without this a turn
-  // finished inside the save-debounce window would be lost at ⌘Q. See flushRendererState (index.ts).
+  // Durability barrier — main asks each window to fire its pending debounced state save NOW (push),
+  // and preload acks with the save result. Used before quit and before Dream reads transcripts.
   uiFlushState: 'ui:flushState',
   uiFlushStateDone: 'ui:flushStateDone',
   // Preview surface — the window's static-preview entry URL (invoke); and a main→renderer push telling
@@ -295,6 +295,8 @@ export const IpcChannels = {
   // "Restart preview" button. A window-direct invoke (like previewStaticUrl), NOT the agent's gated
   // capability: it re-runs a command the user already saw the agent run. See preview.ts.
   previewRestart: 'preview:restart',
+  // Where the preview frame last landed (the address bar's read). Window-direct, read-only, no args.
+  previewLocation: 'preview:location',
   // Agent-sees-preview (preview-surface.md, Rung 3): main asks the window's renderer for the preview
   // iframe's on-screen rect (request push → response send, correlated by id), then captures those
   // pixels via webContents.capturePage and returns them to the agent through the broker. See preview.ts.

@@ -165,26 +165,18 @@ describe('buildTurns — the settled turn', () => {
     expect(turn.body.map((node) => node.type)).toEqual(['fleet', 'item'])
   })
 
-  it('keeps a substantial mid-turn passage out of the fold when the closing line is smaller', () => {
-    const substance =
-      'Here is the verbatim quote you asked about, with the full explanation of where it came from and ' +
-      'why it matters. This is the real reply: several sentences the reader was meant to see, written ' +
-      'before the edits ran. If the fold swallowed it, the closing line below would reference a quote ' +
-      'the reader never saw, which is exactly the silent failure the fail-open rule exists to stop.'
-    const items = [user('go'), say(substance), tool('Edit'), tool('Edit'), say('Done.')]
+  it('folds every mid-turn message, however long, behind the final reply', () => {
+    const progress =
+      'The three reports are in the Preview: one real week on the branch, nothing forged. The whole test ' +
+      'set ran once and everything passed except one number in the first week, so I raised that penalty ' +
+      'and the rerun is on the PC now. Nothing is committed yet. When the rerun passes I will commit the ' +
+      'branch, and the hit on a lieutenant still waits on a crew the fixture has free that week.'
+    const items = [user('go'), say(progress), tool('Bash'), say('Committed.')]
     const [turn] = buildTurns(items, { live: false })
-    expect(turn.fold).toMatchObject({ count: 2 }) // only the two edits
+    expect(turn.fold).toMatchObject({ count: 2 }) // the progress note and the run
     expect(turn.body.map((n) => n.type === 'item' && n.entry.kind === 'assistant' && n.entry.markdown)).toEqual([
-      substance,
-      'Done.',
+      'Committed.',
     ])
-  })
-
-  it('still folds a status line that merely outruns a terse closer', () => {
-    const items = [user('go'), say('Confirmed the pack is the right seam, adding the rule there now.'), tool('Edit'), say('Done.')]
-    const [turn] = buildTurns(items, { live: false })
-    expect(turn.fold).toMatchObject({ count: 2 }) // the status line and the edit
-    expect(turn.body).toHaveLength(1)
   })
 
   it('folds an interrupted turn that never produced an answer', () => {

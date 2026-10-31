@@ -25,6 +25,7 @@ import {
   queryLibrary,
   readProjectFile,
   readProjectImage,
+  renameProjectPath,
   prepareProjectDocumentDelete,
   resolveProjectDocs,
   searchProject,
@@ -726,5 +727,19 @@ describe('docExcerpt', () => {
 
   it('refuses a path outside the project', async () => {
     await expect(docExcerpt(root, '../escape.md')).resolves.toBeUndefined()
+  })
+})
+
+describe('renameProjectPath document titles', () => {
+  it('carries a rename into a title that still matched the old filename', async () => {
+    const made = await createProjectFile(root)
+    const renamed = await renameProjectPath(root, made, join(dirname(made), 'Trip plan.md'))
+    expect(parseDocFrontmatter(readFileSync(renamed, 'utf8')).title).toBe('Trip plan')
+  })
+
+  it('leaves a title the author set apart from the filename', async () => {
+    file('Documents/notes.md', '---\ntitle: Field notes\nkind: note\n---\n\nBody.\n')
+    const renamed = await renameProjectPath(root, 'Documents/notes.md', 'Documents/trip.md')
+    expect(readFileSync(renamed, 'utf8')).toBe('---\ntitle: Field notes\nkind: note\n---\n\nBody.\n')
   })
 })

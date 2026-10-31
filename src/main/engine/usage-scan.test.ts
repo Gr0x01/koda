@@ -3,7 +3,7 @@
 // TZ is pinned before any Date use so local-day assertions hold on any machine.
 process.env.TZ = 'America/Chicago'
 
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, statSync, utimesSync } from 'node:fs'
+import { appendFileSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, statSync, utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -231,6 +231,99 @@ describe('cache and coverage', () => {
     expect(third.buckets[0].output).toBe(10)
   })
 
+  it('resumes a grown file at its last offset instead of re-reading the start', async () => {
+    const project = join(claudeRoot, '-users-rb-proj')
+    mkdirSync(project)
+    const file = join(project, 'a.jsonl')
+    const first = claudeRecord({ messageId: 'm1', requestId: 'r1', output: 7 })
+    writeFileSync(file, first + '\n')
+    expect((await scanUsageTranscripts(roots)).buckets[0].output).toBe(7)
+
+    // Rewrite the already-scanned bytes in place at the same length, then append. Only the
+    // appended record may be parsed, so the poisoned first line must not change the total.
+    const poisoned = claudeRecord({ messageId: 'm1', requestId: 'r1', output: 9 })
+    writeFileSync(file, poisoned.padEnd(first.length) + '\n' + claudeRecord({ messageId: 'm2', requestId: 'r2', output: 3 }) + '\n')
+    expect((await scanUsageTranscripts(roots)).buckets[0].output).toBe(10)
+  })
+
+  it('waits for a record caught mid-write and counts it once it completes', async () => {
+    const project = join(claudeRoot, '-users-rb-proj')
+    mkdirSync(project)
+    const file = join(project, 'a.jsonl')
+    const whole = claudeRecord({ messageId: 'm2', requestId: 'r2', output: 3 })
+    writeFileSync(file, claudeRecord({ messageId: 'm1', requestId: 'r1', output: 7 }) + '\n' + whole.slice(0, 40))
+    const partial = await scanUsageTranscripts(roots)
+    expect(partial.buckets[0].output).toBe(7)
+    expect(partial.sources.find((x) => x.root === claudeRoot)?.malformedRecords).toBe(0)
+
+    appendFileSync(file, whole.slice(40) + '\n')
+    expect((await scanUsageTranscripts(roots)).buckets[0].output).toBe(10)
+  })
+
+  it('re-reads a file from the top when it shrank', async () => {
+    const project = join(claudeRoot, '-users-rb-proj')
+    mkdirSync(project)
+    const file = join(project, 'a.jsonl')
+    writeFileSync(file, claudeRecord({ output: 7 }) + '\n' + claudeRecord({ output: 3 }) + '\n')
+    expect((await scanUsageTranscripts(roots)).buckets[0].output).toBe(10)
+    writeFileSync(file, claudeRecord({ output: 4 }) + '\n')
+    expect((await scanUsageTranscripts(roots)).buckets[0].output).toBe(4)
+  })
+
+  it('keeps a Codex rollout model and delta collapse across an appended tail', async () => {
+    const day = join(codexOutsideRoot, '2026', '08', '19')
+    mkdirSync(day, { recursive: true })
+    const file = join(day, 'rollout-1.jsonl')
+    const one = { input: 1000, cached: 900, output: 50, reasoning: 10 }
+    writeFileSync(file, codexFile('gpt-5.6-sol', [one]))
+    await scanUsageTranscripts(roots)
+
+    // The appended tail repeats the last delta (one lifecycle copy) then adds a new one, with no
+    // fresh turn_context: both the model and the collapse must carry over from the cached state.
+    const tail = codexFile('ignored', [one, { input: 200, cached: 0, output: 30, reasoning: 5 }]).split('\n').slice(2).join('\n')
+    appendFileSync(file, tail)
+    const b = (await scanUsageTranscripts(roots)).buckets.find((x) => x.engine === 'codex')
+    expect(b).toMatchObject({ model: 'gpt-5.6-sol', output: 80, records: 2 })
+  })
+
+  it('attributes cached rows to koda once their session registers later', async () => {
+    const project = join(claudeRoot, '-users-rb-proj')
+    mkdirSync(project)
+    writeFileSync(join(project, 'a.jsonl'), claudeRecord({ sessionId: 'late-sess', messageId: 'm1', requestId: 'r1' }) + '\n')
+    expect((await scanUsageTranscripts(roots)).buckets[0].origin).toBe('outside')
+    recordKodaClaudeSession('late-sess')
+    expect((await scanUsageTranscripts(roots)).buckets[0].origin).toBe('koda')
+  })
+
+  it('carries the Koda session registry across a cache format change', async () => {
+    writeFileSync(
+      join(dir, 'koda-usage-scan.json'),
+      JSON.stringify({ version: 2, knownClaudeSessions: { 'old-koda': new Date().toISOString().slice(0, 10) }, files: {} }),
+    )
+    const project = join(claudeRoot, '-users-rb-proj')
+    mkdirSync(project)
+    writeFileSync(join(project, 'a.jsonl'), claudeRecord({ sessionId: 'old-koda', messageId: 'm1', requestId: 'r1' }) + '\n')
+    expect((await scanUsageTranscripts(roots)).buckets[0].origin).toBe('koda')
+  })
+
+  it('keeps an aged registry id while a transcript still uses it, and prunes it once none does', async () => {
+    writeFileSync(
+      join(dir, 'koda-usage-scan.json'),
+      JSON.stringify({ version: 3, knownClaudeSessions: { 'aged-koda': '2020-01-01', 'aged-gone': '2020-01-01' }, files: {} }),
+    )
+    const project = join(claudeRoot, '-users-rb-proj')
+    mkdirSync(project)
+    const file = join(project, 'a.jsonl')
+    writeFileSync(file, claudeRecord({ sessionId: 'aged-koda', messageId: 'm1', requestId: 'r1' }) + '\n')
+    expect((await scanUsageTranscripts(roots)).buckets[0].origin).toBe('koda')
+    const kept = JSON.parse(readFileSync(join(dir, 'koda-usage-scan.json'), 'utf8')).knownClaudeSessions
+    expect(Object.keys(kept)).toEqual(['aged-koda'])
+
+    rmSync(file)
+    await scanUsageTranscripts(roots)
+    expect(JSON.parse(readFileSync(join(dir, 'koda-usage-scan.json'), 'utf8')).knownClaudeSessions).toEqual({})
+  })
+
   it('treats an older cache version as stale and rebuilds it, keeping the cache writable', async () => {
     // A v1 file (pre-hourly rows) parses fine; treating it as corrupt would flip writable off and
     // disable the cache forever. It must be discarded, rebuilt, and OVERWRITTEN on the first scan.
@@ -244,7 +337,7 @@ describe('cache and coverage', () => {
     const summary = await scanUsageTranscripts(roots)
     expect(summary.buckets).toHaveLength(1)
     const rewritten = JSON.parse(readFileSync(join(dir, 'koda-usage-scan.json'), 'utf8'))
-    expect(rewritten.version).toBe(2)
+    expect(rewritten.version).toBe(3)
     expect(rewritten.files['/old/file.jsonl']).toBeUndefined()
   })
 

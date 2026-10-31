@@ -80,6 +80,37 @@ describe('usage /usage parsing', () => {
     expect(parsed.complete).toBe(false)
   })
 
+  it('treats a weekly read with no session line as complete, for a plan with no 5-hour limit', () => {
+    const parsed = parseResult(
+      [
+        'Current week (all models): 36% used · resets Aug 5 at 7am',
+        'Current week (Fable): 48% used · resets Aug 5 at 7am',
+      ].join('\n'),
+      now,
+    )
+
+    expect(parsed.complete).toBe(true)
+    // A five_hour window remembered from before the account was verified must not survive the read.
+    expect(
+      authoritativeUsageTypes(parsed, {
+        five_hour: { rateLimitType: 'five_hour', resetsAt: now / 1000 + 60, status: 'allowed' },
+      }, now / 1000),
+    ).toEqual(['seven_day', 'seven_day_fable'])
+  })
+
+  it('withholds prune authority when an unknown Current line could be a renamed session window', () => {
+    const parsed = parseResult(
+      [
+        'Current 5-hour block: 47% used · resets Aug 2 at 6:49am',
+        'Current week (all models): 36% used · resets Aug 5 at 7am',
+      ].join('\n'),
+      now,
+    )
+
+    expect(parsed.windows.map((window) => window.rateLimitType)).toEqual(['seven_day'])
+    expect(parsed.complete).toBe(false)
+  })
+
   it('preserves an omitted model window until its known reset', () => {
     const result = parseResult(
       [

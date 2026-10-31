@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type RefObject } from 'react'
 import type { ContextUsage } from '@shared/ipc'
-import { MessageSquarePlus } from 'lucide-react'
+import { MessageSquarePlus, Shrink } from 'lucide-react'
 import { Menu } from '../motion'
 
 /**
@@ -50,6 +50,107 @@ export function ContinueFreshButton({
     >
       <MessageSquarePlus size={14} aria-hidden />
     </button>
+  )
+}
+
+/** Closes an open popover on an outside press or Escape. The trigger lives inside `ref`, so its own
+ *  toggle press is not "outside". Listens only while open. */
+function useDismiss(open: boolean, ref: RefObject<HTMLElement | null>, close: () => void): void {
+  useEffect(() => {
+    if (!open) return
+    const onDown = (e: PointerEvent): void => {
+      if (ref.current && !ref.current.contains(e.target as Node)) close()
+    }
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') close()
+    }
+    document.addEventListener('pointerdown', onDown)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('pointerdown', onDown)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [open, ref, close])
+}
+
+/** A compaction locks the composer until the engine finishes, so a stray press must not start one.
+ *  Cancel takes focus: Enter right after a misclick backs out instead of committing. */
+function CompactConfirm({ onConfirm, onCancel }: { onConfirm: () => void; onCancel: () => void }) {
+  return (
+    <div className="whitespace-normal font-sans">
+      <p className="text-[12px] font-medium text-text">Compact this chat?</p>
+      <p className="mt-0.5 text-[11px] leading-snug text-text-muted">
+        The earlier conversation becomes a summary. You can send again when it finishes.
+      </p>
+      <div className="mt-2.5 flex justify-end gap-1.5">
+        <button
+          autoFocus
+          onClick={onCancel}
+          className="rounded-md px-2.5 py-1 text-[12px] text-text-muted transition-colors hover:bg-surface-hover hover:text-text"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={onConfirm}
+          className="rounded-md bg-accent px-2.5 py-1 text-[12px] text-white transition-opacity hover:opacity-90"
+        >
+          Compact
+        </button>
+      </div>
+    </div>
+  )
+}
+
+/** Compact in place, always beside the meter once there is a conversation to summarize. Quieter than
+ *  the handoff button because it is the routine choice: the chat keeps going where it is. */
+export function CompactButton({
+  context,
+  busy,
+  active,
+  onClick,
+}: {
+  context?: ContextUsage
+  busy?: boolean
+  /** A compaction is running. The button stays put and pulses, so the press visibly did something. */
+  active?: boolean
+  onClick: () => void
+}) {
+  const [confirming, setConfirming] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+  const close = useCallback(() => setConfirming(false), [])
+  useDismiss(confirming, ref, close)
+  if (!context && !active) return null
+  return (
+    <div ref={ref} className="relative">
+      <button
+        onClick={() => setConfirming((v) => !v)}
+        disabled={busy}
+        title={
+          active
+            ? 'Compacting this chat…'
+            : 'Compact this chat. The earlier conversation is replaced with a summary to free up room.'
+        }
+        aria-label={active ? 'Compacting this chat' : 'Compact this chat'}
+        className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-md transition-colors hover:bg-surface-hover hover:text-text ${
+          active ? 'text-accent' : 'text-text-muted disabled:opacity-40'
+        }`}
+      >
+        <Shrink size={13} aria-hidden className={active ? 'animate-pulse' : undefined} />
+      </button>
+      <Menu
+        open={confirming && !busy}
+        origin="origin-bottom-right"
+        className="absolute bottom-full right-0 z-10 mb-1.5 w-60 rounded-xl border border-border bg-surface p-3 shadow-pop"
+      >
+        <CompactConfirm
+          onCancel={close}
+          onConfirm={() => {
+            setConfirming(false)
+            onClick()
+          }}
+        />
+      </Menu>
+    </div>
   )
 }
 
@@ -133,32 +234,22 @@ export function ContextReadout({
   context,
   openUpward = false,
   segments = COMPOSER_SEGMENTS,
+  onCompact,
 }: {
   context?: ContextUsage
   openUpward?: boolean
+  /** Adds a compact action under the breakdown, for a surface with no room for CompactButton (the
+   *  phone composer). The breakdown is a narrow mono readout with no room for a decision, so this only
+   *  closes it and hands off: the caller owns the confirmation. Omit while a turn is running. */
+  onCompact?: () => void
   /** Tick count in the flat gauge. Defaults to the desktop's 10; the pocket-width mobile composer
    *  passes fewer so the bar reads calmer next to the other controls. */
   segments?: number
 }) {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
-  // Dismiss the breakdown on an outside click or Escape (the trigger itself is inside `ref`, so its
-  // own toggle click isn't treated as "outside"). Only listens while open.
-  useEffect(() => {
-    if (!open) return
-    const onDown = (e: PointerEvent): void => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
-    }
-    const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') setOpen(false)
-    }
-    document.addEventListener('pointerdown', onDown)
-    document.addEventListener('keydown', onKey)
-    return () => {
-      document.removeEventListener('pointerdown', onDown)
-      document.removeEventListener('keydown', onKey)
-    }
-  }, [open])
+  const close = useCallback(() => setOpen(false), [])
+  useDismiss(open, ref, close)
   if (!context) return null
   const ratio = ratioOf(context)
   const pct = ratio === null ? null : Math.round(ratio * 100)
@@ -194,6 +285,18 @@ export function ContextReadout({
         <Row label="· fresh input" value={fmt(context.inputTokens)} />
         <Row label="· cached" value={fmt(context.cacheReadTokens + context.cacheCreationTokens)} />
         <Row label="last output" value={fmt(context.outputTokens)} />
+        {onCompact && (
+          <button
+            onClick={() => {
+              close()
+              onCompact()
+            }}
+            className="mt-1.5 flex w-full items-center gap-1.5 border-t border-border/60 pt-1.5 font-sans text-[12px] text-text active:opacity-70"
+          >
+            <Shrink size={13} aria-hidden />
+            Compact this chat
+          </button>
+        )}
       </Menu>
     </div>
   )

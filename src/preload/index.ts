@@ -52,6 +52,7 @@ const api: KodaApi = {
   cancelQueuedTurn: (args) => ipcRenderer.invoke(IpcChannels.cancelQueuedTurn, args),
   listQueuedTurns: () => ipcRenderer.invoke(IpcChannels.queuedTurnsList),
   interruptSession: (args) => ipcRenderer.invoke(IpcChannels.interruptSession, args),
+  compactSession: (args) => ipcRenderer.invoke(IpcChannels.compactSession, args),
   stopSubagent: (args) => ipcRenderer.invoke(IpcChannels.stopSubagent, args),
   disposeSession: (args) => ipcRenderer.invoke(IpcChannels.disposeSession, args),
   loadSessions: () => ipcRenderer.invoke(IpcChannels.sessionsLoad),
@@ -253,11 +254,14 @@ const api: KodaApi = {
     return () => ipcRenderer.removeListener(IpcChannels.uiSettingsChanged, handler)
   },
   onFlushState: (listener) => {
-    const handler = (): void => {
-      listener()
-      // Ack AFTER the listener's own sends — same-renderer IPC is FIFO, so the flushed save is
-      // guaranteed to land in main before this does.
-      ipcRenderer.send(IpcChannels.uiFlushStateDone)
+    const handler = async (): Promise<void> => {
+      let saved: boolean
+      try {
+        saved = await listener()
+      } catch {
+        saved = false
+      }
+      ipcRenderer.send(IpcChannels.uiFlushStateDone, saved)
     }
     ipcRenderer.on(IpcChannels.uiFlushState, handler)
     return () => ipcRenderer.removeListener(IpcChannels.uiFlushState, handler)
@@ -270,6 +274,7 @@ const api: KodaApi = {
   exportPdf: (args) => ipcRenderer.invoke(IpcChannels.docExportPdf, args),
   previewRestart: (sessionId, restart) =>
     ipcRenderer.invoke(IpcChannels.previewRestart, { sessionId, restart }),
+  previewLocation: () => ipcRenderer.invoke(IpcChannels.previewLocation),
   onPreviewShow: (listener) => {
     const handler = (
       _e: IpcRendererEvent,
@@ -284,13 +289,13 @@ const api: KodaApi = {
     return () => ipcRenderer.removeListener(IpcChannels.previewStopped, handler)
   },
   onPreviewCaptureRequest: (listener) => {
-    const handler = (_e: IpcRendererEvent, payload: { correlationId: string }): void =>
-      listener(payload.correlationId)
+    const handler = (_e: IpcRendererEvent, payload: { correlationId: string; sessionId?: string }): void =>
+      listener(payload.correlationId, payload.sessionId)
     ipcRenderer.on(IpcChannels.previewCaptureRequest, handler)
     return () => ipcRenderer.removeListener(IpcChannels.previewCaptureRequest, handler)
   },
-  respondPreviewCapture: (correlationId, rect, dpr) =>
-    ipcRenderer.send(IpcChannels.previewCaptureResponse, { correlationId, rect, dpr }),
+  respondPreviewCapture: (correlationId, rect, dpr, background) =>
+    ipcRenderer.send(IpcChannels.previewCaptureResponse, { correlationId, rect, dpr, background }),
   saveScratchImage: (args) => ipcRenderer.invoke(IpcChannels.scratchSave, args),
   pickComposerFiles: () => ipcRenderer.invoke(IpcChannels.composerPickFiles),
   pickComposerPath: () => ipcRenderer.invoke(IpcChannels.composerPickPath),

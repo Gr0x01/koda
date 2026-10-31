@@ -274,7 +274,7 @@ function SignInStep({ onSignedInChange }: { onSignedInChange: (v: boolean) => vo
             ? 'Approve in your browser, then paste the code below'
             : claude.kind === 'error'
               ? claude.message
-              : 'Uses your Claude Pro or Max plan'
+              : 'Uses your Claude Pro, Max, or Ultra plan'
 
   const codexSub =
     codex.kind === 'checking'

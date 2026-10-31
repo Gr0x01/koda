@@ -715,3 +715,57 @@ describe('Claude driver: a refused model', () => {
     expect(events.find((e) => e.type === 'AssistantBlock')).toMatchObject({ markdown: 'Here you go.' })
   })
 })
+
+/** The sequence a live `/compact` produced on 2.1.234 (2026-10-13): boundary, summary, a zero-usage result. */
+describe('Claude driver: compaction', () => {
+  const init = (slash_commands: string[]) =>
+    `${JSON.stringify({ type: 'system', subtype: 'init', model: 'sonnet', tools: [], cwd: '/tmp/koda-raw-test', slash_commands })}\n`
+
+  it('sends the bare command and reports the compaction without a stale or zero context fill', async () => {
+    const child = new FakeClaudeProcess()
+    spawnMock.mockReturnValue(child)
+    const events: EngineEvent[] = []
+    const session = startClaudeSession((e) => events.push(e), { sessionId: 'compact-1', cwd: '/tmp/koda-raw-test' })
+    child.stdout.write(init(['compact', 'context']))
+    child.stdout.write(
+      `${JSON.stringify({ type: 'assistant', message: { content: [], usage: { input_tokens: 10, cache_read_input_tokens: 107000 } } })}\n`,
+    )
+    await tick()
+
+    expect(session.compact?.()).toBe(true)
+    await tick()
+    expect(child.writes.at(-1)).toEqual({
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'text', text: '/compact' }] },
+    })
+
+    for (const ev of [
+      { type: 'system', subtype: 'status', status: 'compacting' },
+      { type: 'system', subtype: 'status', status: null, compact_result: 'success' },
+      { type: 'system', subtype: 'compact_boundary', compact_metadata: { trigger: 'manual', pre_tokens: 107426, post_tokens: 2114 } },
+      { type: 'user', message: { role: 'user', content: 'This session is being continued from a previous conversation.' } },
+      { type: 'result', subtype: 'success', usage: { input_tokens: 0, output_tokens: 0 }, modelUsage: {} },
+    ])
+      child.stdout.write(`${JSON.stringify(ev)}\n`)
+    await tick()
+
+    expect(events.filter((e) => e.type === 'ContextCompacted')).toHaveLength(1)
+    expect(events.some((e) => e.type === 'AssistantBlock')).toBe(false)
+    const done = events.find((e) => e.type === 'TurnComplete')
+    expect(done).toBeDefined()
+    expect(done).not.toHaveProperty('context', expect.anything())
+  })
+
+  it('refuses when the engine did not list the command', async () => {
+    const child = new FakeClaudeProcess()
+    spawnMock.mockReturnValue(child)
+    const events: EngineEvent[] = []
+    const session = startClaudeSession((e) => events.push(e), { sessionId: 'compact-2', cwd: '/tmp/koda-raw-test' })
+    child.stdout.write(init(['context']))
+    await tick()
+
+    expect(session.compact?.()).toBe(false)
+    expect(child.writes).toEqual([])
+    expect(events.find((e) => e.type === 'EngineError')).toMatchObject({ fatal: false })
+  })
+})

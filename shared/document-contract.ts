@@ -198,6 +198,25 @@ export function splitDocumentFrontmatter(raw: string): DocumentFrontmatterSplit 
   return { kind, block, frontmatter: match[0], body: raw.slice(match[0].length) }
 }
 
+/**
+ * The file name a saved edit of `title:` asks for, or null when it asks for none. The page shows the
+ * file name as the document's name, so a title edited in the raw view otherwise changes nothing the
+ * user can see. Only a title that matched the file name before the edit carries: one the author set
+ * apart from the file name is a different name on purpose, and editing it must not move the file.
+ */
+export function fileNameForTitleEdit(fileName: string, before: string, after: string): string | null {
+  const name = /^(.*)(\.(?:md|markdown))$/i.exec(fileName)
+  if (!name) return null
+  const titleOf = (raw: string): string | undefined => {
+    const split = splitDocumentFrontmatter(raw)
+    return split.kind === 'koda' ? topLevelFrontmatterScalars(split.block).get('title')?.trim() : undefined
+  }
+  const next = titleOf(after)?.replace(/[/\\]/g, '').trim()
+  // A leading dot would hide the document from the Library the moment it was renamed.
+  if (!next || next.startsWith('.') || next === name[1] || titleOf(before) !== name[1]) return null
+  return next + name[2]
+}
+
 /** Top-level scalar key/value pairs, lowercased keys. Shared with main's metadata parser. */
 export function topLevelFrontmatterScalars(block: string): Map<string, string> {
   const out = new Map<string, string>()

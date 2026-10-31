@@ -797,6 +797,73 @@ test('Create interactive view carves a sibling HTML, links back portably, and op
   }
 })
 
+test('text typed in the Markdown view is on the page when you switch back', async () => {
+  const project = realpathSync(mkdtempSync(join(tmpdir(), 'koda-doc-views-')))
+  const filename = 'view-switch.md'
+  const path = join(project, filename)
+  writeFileSync(path, '---\ntitle: View switch\nkind: note\n---\n\nOriginal body.\n')
+  const app = await launchSeeded(project)
+  try {
+    const win = await app.firstWindow()
+    await win.getByRole('button', { name: 'New chat' }).waitFor({ timeout: 20_000 })
+    await openFileViaLibrary(win, filename)
+    const prose = win.locator('.milkdown .ProseMirror')
+    await expect(prose).toBeVisible({ timeout: 20_000 })
+
+    const viewMenu = win.getByRole('menu', { name: 'Document view' })
+    await win.getByRole('button', { name: 'Doc', exact: true }).click()
+    await viewMenu.getByRole('menuitemradio', { name: 'Markdown', exact: true }).click()
+    const monaco = win.locator('.monaco-editor').first()
+    await expect(monaco).toBeVisible({ timeout: 20_000 })
+    await monaco.click()
+    await win.keyboard.press('ControlOrMeta+End')
+    await win.keyboard.type('Added in markdown.')
+
+    // No save step in between: the switch itself has to carry the unsaved buffer onto the page.
+    await win.getByRole('button', { name: 'Markdown', exact: true }).click()
+    await viewMenu.getByRole('menuitemradio', { name: 'Doc', exact: true }).click()
+    await expect(prose).toContainText('Added in markdown.', { timeout: 20_000 })
+    expect(readFileSync(path, 'utf8')).toContain('Added in markdown.')
+  } finally {
+    await app.close()
+    rmSync(project, { recursive: true, force: true })
+  }
+})
+
+test('editing the title line in the Markdown view renames the document', async () => {
+  const project = realpathSync(mkdtempSync(join(tmpdir(), 'koda-doc-title-')))
+  writeFileSync(join(project, 'Old name.md'), '---\ntitle: Old name\nkind: note\n---\n\nBody stays.\n')
+  const app = await launchSeeded(project)
+  try {
+    const win = await app.firstWindow()
+    await win.getByRole('button', { name: 'New chat' }).waitFor({ timeout: 20_000 })
+    await openFileViaLibrary(win, 'Old name.md')
+    const prose = win.locator('.milkdown .ProseMirror')
+    await expect(prose).toBeVisible({ timeout: 20_000 })
+
+    const viewMenu = win.getByRole('menu', { name: 'Document view' })
+    await win.getByRole('button', { name: 'Doc', exact: true }).click()
+    await viewMenu.getByRole('menuitemradio', { name: 'Markdown', exact: true }).click()
+    const monaco = win.locator('.monaco-editor').first()
+    await expect(monaco).toBeVisible({ timeout: 20_000 })
+    await monaco.click()
+    await win.keyboard.press('ControlOrMeta+Home')
+    await win.keyboard.press('ArrowDown')
+    await win.keyboard.press('End')
+    await win.keyboard.type(' two')
+
+    await win.getByRole('button', { name: 'Markdown', exact: true }).click()
+    await viewMenu.getByRole('menuitemradio', { name: 'Doc', exact: true }).click()
+    await expect.poll(() => existsSync(join(project, 'Old name two.md'))).toBe(true)
+    expect(existsSync(join(project, 'Old name.md'))).toBe(false)
+    await expect(win.locator('[data-doc-editor] textarea')).toHaveValue('Old name two', { timeout: 20_000 })
+    await expect(prose).toContainText('Body stays.')
+  } finally {
+    await app.close()
+    rmSync(project, { recursive: true, force: true })
+  }
+})
+
 test('New document in the Library creates a document and opens it in the editor', async () => {
   // Isolated temp project so the created file is auto-discarded with the temp dir.
   const project = realpathSync(mkdtempSync(join(tmpdir(), 'koda-doc-proj-')))
@@ -818,6 +885,40 @@ test('New document in the Library creates a document and opens it in the editor'
     const shelf = win.locator('section[aria-labelledby="documents-shelf-heading"]')
     await expect(shelf.getByRole('heading', { name: 'Starred documents', exact: true })).toBeVisible()
     await expect(shelf.getByRole('button', { name: 'Untitled', exact: true })).toHaveCount(0)
+
+    // An empty document is ready to name and type into without finding Edit first.
+    const prose = win.locator('.milkdown .ProseMirror')
+    await expect(prose).toHaveAttribute('contenteditable', 'true')
+    const title = win.locator('[data-doc-editor] textarea')
+    await expect(title).toBeFocused()
+    await prose.click()
+    await win.keyboard.type('Pack the tent.')
+    await expect
+      .poll(() => readFileSync(join(project, 'Documents', 'Untitled.md'), 'utf8'), { timeout: 10_000 })
+      .toContain('Pack the tent.')
+
+    // The page name is the document's title everywhere, so a rename carries into the file's own title.
+    await title.fill('Trip plan')
+    await title.press('Enter')
+    await expect
+      .poll(() => existsSync(join(project, 'Documents', 'Trip plan.md')) && readFileSync(join(project, 'Documents', 'Trip plan.md'), 'utf8'))
+      .toMatch(/title: Trip plan[\s\S]*Pack the tent\./)
+
+    await expect(prose).toContainText('Pack the tent.')
+    await expect(prose).toHaveAttribute('contenteditable', 'true')
+    await expect(win.getByText('Koda changed 1 passage')).toBeHidden()
+
+    // A rename neither locks the page nor drops what is typed while the file is still moving: no wait
+    // between the Enter that commits the name and the typing that follows it.
+    await title.fill('Trip plans')
+    await title.press('Enter')
+    await prose.locator('p').last().click()
+    await win.keyboard.press('End')
+    await win.keyboard.type(' Bring water.')
+    await expect
+      .poll(() => existsSync(join(project, 'Documents', 'Trip plans.md')) && readFileSync(join(project, 'Documents', 'Trip plans.md'), 'utf8'), { timeout: 10_000 })
+      .toMatch(/title: Trip plans[\s\S]*Pack the tent\. Bring water\./)
+    await expect(prose).toContainText('Pack the tent. Bring water.')
   } finally {
     await app.close()
   }

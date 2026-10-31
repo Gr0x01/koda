@@ -53,6 +53,8 @@ import {
   amendDocFrontmatter,
   docDateStamp,
   inferDocKind,
+  isDocFrontmatterBlock,
+  parseDocFrontmatter,
   readDocMetadata,
   writeDocFrontmatter,
   type DocFrontmatter,
@@ -843,8 +845,28 @@ export async function renameProjectPath(root: string, from: string, to: string):
   if (src === dest) return src // no-op (renamed to the same name) — nothing to do
   if (existsSync(dest)) throw new Error('a file or folder with that name already exists')
   await rename(src, dest)
+  await retitleRenamedDoc(src, dest)
   invalidateDocsCache(root)
   return dest
+}
+
+/**
+ * Carry a rename into the document's own `title:`. The Library shows that title, not the filename, so
+ * a doc renamed from its page kept reading "Untitled" everywhere the user went looking for it. Only a
+ * title that still equals the old filename follows: one the author set apart from the filename is
+ * theirs. Fail-soft, because the rename itself already succeeded and is what the caller reports.
+ */
+async function retitleRenamedDoc(src: string, dest: string): Promise<void> {
+  const stem = (path: string): string => basename(path).replace(/\.(md|markdown)$/i, '')
+  const [from, to] = [stem(src), stem(dest)]
+  if (from === to || to === basename(dest)) return
+  try {
+    const raw = await readFile(dest, 'utf8')
+    if (!isDocFrontmatterBlock(raw) || parseDocFrontmatter(raw).title !== from) return
+    await writeFile(dest, amendDocFrontmatter(raw, { title: to }), 'utf8')
+  } catch {
+    // A folder, or a file that vanished or can't be read: the rename stands with its old title.
+  }
 }
 
 export type ProjectDocumentDeleteTarget = RequiredCheckpointFile

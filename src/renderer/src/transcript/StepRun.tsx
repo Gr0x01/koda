@@ -4,7 +4,7 @@ import { PixelGlyph } from '../ui'
 import { ToolCard } from './ToolCard'
 import { ThinkingIndicator } from './ThinkingIndicator'
 import { runSummary } from './step-summary'
-import { formatDuration } from './folding'
+import { formatDuration, QUIET_AFTER_MS } from './folding'
 import type { Entry } from './types'
 
 /**
@@ -94,6 +94,35 @@ export function ElapsedLabel({ startedAt }: { startedAt: number }) {
   return <span ref={ref} className="tabular-nums opacity-70">{formatDuration(Date.now() - startedAt)}</span>
 }
 
+/**
+ * "1m 10s", ticking: how long the engine has been silent, shown only once that is long enough to
+ * doubt. A long command sends nothing while it runs, so without this a healthy session and a view that
+ * stopped updating look the same. Bare, because beside "Running a command" it reads as that step's age.
+ */
+export function QuietLabel({ since }: { since: number }) {
+  const ref = useRef<HTMLSpanElement>(null)
+  useEffect(() => {
+    const tick = (): void => {
+      if (ref.current) ref.current.textContent = quietText(Date.now() - since)
+    }
+    tick()
+    const id = setInterval(tick, 1000)
+    return () => clearInterval(id)
+  }, [since])
+  return <span ref={ref} className="tabular-nums opacity-70">{quietText(Date.now() - since)}</span>
+}
+
+export function quietText(quietMs: number): string {
+  return quietMs < QUIET_AFTER_MS ? '' : formatDuration(quietMs)
+}
+
+/** One clock on the live strip. The silence clock wins when a remote head has it: it keeps showing
+ *  seconds, where the turn's age stops moving visibly once it passes an hour. */
+export function LiveClocks({ startedAt, quietSince }: { startedAt?: number; quietSince?: number }) {
+  if (quietSince !== undefined) return <QuietLabel since={quietSince} />
+  return startedAt !== undefined ? <ElapsedLabel startedAt={startedAt} /> : null
+}
+
 function plural(n: number, noun: string): string {
   return `${n} ${noun}${n === 1 ? '' : 's'}`
 }
@@ -122,6 +151,7 @@ export const StepRun = memo(function StepRun({
   live,
   working,
   startedAt,
+  quietSince,
   onToggle,
 }: {
   /** This run's transcript-local identity, handed back on toggle so the caller's handler stays stable. */
@@ -134,6 +164,8 @@ export const StepRun = memo(function StepRun({
   working?: string | null
   /** When the running turn started, for the ticking readout. */
   startedAt?: number
+  /** When the engine last said anything, on this device's clock. Remote heads only. */
+  quietSince?: number
   onToggle: (key: string) => void
 }) {
   const toggle = (): void => onToggle(runKey)
@@ -156,7 +188,7 @@ export const StepRun = memo(function StepRun({
         glyph={live ? <PixelGlyph loader variant="diamond" size={12} className="text-accent" /> : <RestDot />}
         lead={live ? (working ?? 'Working') : plural(entries.length, 'step')}
         detail={summary.name ? `${summary.name.toLowerCase()}${summary.detail ? ` · ${summary.detail}` : ''}` : undefined}
-        meta={live && startedAt !== undefined ? <ElapsedLabel startedAt={startedAt} /> : undefined}
+        meta={live ? <LiveClocks startedAt={startedAt} quietSince={quietSince} /> : undefined}
         expanded={false}
         onToggle={toggle}
       />
@@ -175,7 +207,7 @@ export const StepRun = memo(function StepRun({
         </span>
         <span>{plural(entries.length, 'step')}</span>
         <span className="ml-auto flex shrink-0 items-center gap-2">
-          {live && startedAt !== undefined && <ElapsedLabel startedAt={startedAt} />}
+          {live && <LiveClocks startedAt={startedAt} quietSince={quietSince} />}
           <Caret dir="up" size={12} className="opacity-50" />
         </span>
       </button>

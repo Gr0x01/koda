@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   docFormatCapabilities,
+  fileNameForTitleEdit,
   isLibraryAdmittedDocumentPath,
   isLibraryDocumentPath,
   isUnderDocumentsHome,
@@ -194,5 +195,22 @@ describe('shared leading-frontmatter split', () => {
       expect(split.frontmatter).toBe('')
       expect(split.body).toBe(raw)
     }
+  })
+})
+
+describe('fileNameForTitleEdit', () => {
+  const doc = (title: string): string => `---\ntitle: ${title}\nkind: note\n---\n\nBody.\n`
+
+  it('renames the file when a title that matched its name is edited', () => {
+    expect(fileNameForTitleEdit('Untitled.md', doc('Untitled'), doc('Trip plan'))).toBe('Trip plan.md')
+    expect(fileNameForTitleEdit('Untitled.md', doc('Untitled'), doc('"Plan: a/b"'))).toBe('Plan: ab.md')
+  })
+
+  it('leaves the file alone when the title was already its own name, or did not change', () => {
+    expect(fileNameForTitleEdit('notes.md', doc('Field notes'), doc('Field notes two'))).toBeNull()
+    expect(fileNameForTitleEdit('Untitled.md', doc('Untitled'), doc('Untitled'))).toBeNull()
+    expect(fileNameForTitleEdit('Untitled.md', doc('Untitled'), 'Untitled\n')).toBeNull()
+    expect(fileNameForTitleEdit('data.txt', doc('data'), doc('other'))).toBeNull()
+    expect(fileNameForTitleEdit('Untitled.md', doc('Untitled'), doc('.draft'))).toBeNull()
   })
 })

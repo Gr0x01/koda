@@ -217,7 +217,10 @@ export function writeDocFrontmatter(fields: {
  * A file with no block gets one — unreachable for a just-born document, and better than silently
  * dropping the field it was asked to write.
  */
-export function amendDocFrontmatter(raw: string, fields: { description?: string; kind?: DocKind }): string {
+export function amendDocFrontmatter(
+  raw: string,
+  fields: { title?: string; description?: string; kind?: DocKind },
+): string {
   const entries = Object.entries(fields).filter(
     (entry): entry is [string, string] => typeof entry[1] === 'string' && entry[1].trim() !== '',
   )

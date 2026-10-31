@@ -614,6 +614,8 @@ export class EngineSessionManager {
    *  distinguish a busy turn from a silent stall, and prevents corpus certification from accepting a
    *  renderer snapshot that predates a delegated lifecycle change. */
   private readonly engineEventAt = new Map<string, number>()
+  /** When each in-flight parent turn started. Owned by markWorking/clearWorking alongside `working`. */
+  private readonly workingSince = new Map<string, number>()
   /** sessionId → the current turn's top-level reply, ACCUMULATED across blocks (same reason the loop
    *  driver accumulates: a final message can arrive as several AssistantBlocks, and last-write-wins
    *  would let a "did work" + quiet-token pair read as a quiet night). Reset on each turn's send,
@@ -1168,6 +1170,10 @@ export class EngineSessionManager {
       // the remote-user-turn publication (which assumes one). deliverQueued echoes the bubble on
       // acceptance instead — no pre-acceptance replay record, no append:false stamp, nothing on failure.
       queued?: boolean
+      // An on-request compaction (see compact()). It takes every lifecycle claim a message does, but it
+      // carries no words: the driver sends its own compact request, and anything Koda would prepend or
+      // replay for a human message stays held for the next real one.
+      compact?: boolean
     } = {},
   ): Promise<RemoteTurnReceipt> {
     requireRealAccountAccess()
@@ -1262,6 +1268,8 @@ export class EngineSessionManager {
         })
       }
       session = this.require(sessionId)
+      if (internal.compact && !session.compact)
+        throw new Error('This engine cannot compact a conversation on request.')
       // start() awaits broker/driver setup. Even though public posture mutations are locked out during
       // that gap, verify the replacement still matches current intent before converting the admission
       // claim into `working`; an internal or future intent writer must never send on the wrong child.
@@ -1343,6 +1351,7 @@ export class EngineSessionManager {
     const publishUserTurn = (): void => {
       if (
         userTurnPublished ||
+        internal.compact ||
         internal.logicalContinuation ||
         continuingLogicalTurn ||
         !this.remoteAttached.has(sessionId)
@@ -1472,7 +1481,8 @@ export class EngineSessionManager {
     // Ride any finished background-workflow results in ahead of the human's words, framed as context so
     // the agent picks up where it left off. Only what the ENGINE sees is augmented — the user's visible
     // bubble, replay entry, checkpoint label and titling above all use the untouched `text`.
-    const pending = continuingLogicalTurn ? '' : this.drainWorkflowResults(sessionId)
+    const pending =
+      continuingLogicalTurn || internal.compact ? '' : this.drainWorkflowResults(sessionId)
     const withResults = pending ? (engineText ? `${pending}\n\n${engineText}` : pending) : engineText
     // A turn written to a child that is about to die on a resume miss goes nowhere, and the user would
     // watch their message sit unanswered. Hold it until the turn actually completes, so the recovery can
@@ -1482,7 +1492,8 @@ export class EngineSessionManager {
     // A continuation is infrastructure, not a new human turn. Keep the first accepted turn's untouched
     // visible payload and original engine material authoritative across any number of broker/resume-miss
     // respawns; otherwise a later miss could replay a broker nudge or path-expanded text as the user's row.
-    if (!internal.logicalContinuation || !this.pendingTurns.has(sessionId))
+    if (internal.compact) this.pendingTurns.delete(sessionId)
+    else if (!internal.logicalContinuation || !this.pendingTurns.has(sessionId))
       this.pendingTurns.set(sessionId, {
         engineText: withResults,
         ...(inline?.length ? { inlineImages: inline } : {}),
@@ -1496,15 +1507,17 @@ export class EngineSessionManager {
       })
     // A restore notice rides even a logical continuation: the tree moved regardless of whose turn this
     // is, and an agent resuming mid-turn is exactly the one holding the stalest file contents.
-    const notice = this.pendingRestoreNotices.get(sessionId) ?? ''
+    const notice = internal.compact ? '' : (this.pendingRestoreNotices.get(sessionId) ?? '')
     throwIfAdmissionCancelled()
     let sent: boolean | void
     let acceptedAdmission: boolean
     try {
-      sent = session.sendTurn(
-        notice ? (withResults ? `${notice}\n\n${withResults}` : notice) : withResults,
-        inline?.length ? inline : undefined,
-      )
+      sent = internal.compact
+        ? session.compact!()
+        : session.sendTurn(
+            notice ? (withResults ? `${notice}\n\n${withResults}` : notice) : withResults,
+            inline?.length ? inline : undefined,
+          )
       acceptedAdmission =
         sent !== false && !!admission && this.turnAdmissions.get(sessionId) === admission
     } catch (error) {
@@ -1530,7 +1543,7 @@ export class EngineSessionManager {
     // The engine owns a fresh human turn now. It supersedes either a seen/unseen completion or an
     // unresolved terminal error; infrastructure continuations remain the same logical turn and retain it.
     if (!internal.logicalContinuation) this.terminalAttention.delete(sessionId)
-    if (!internal.logicalContinuation) {
+    if (!internal.logicalContinuation && !internal.compact) {
       const clean = text.trim()
       if (clean && clean !== '(image)' && !this.sessionFirstPrompts.has(sessionId))
         this.sessionFirstPrompts.set(sessionId, clean)
@@ -1569,7 +1582,7 @@ export class EngineSessionManager {
     if (newRemoteAttempt) publishUserTurn()
     // Any accepted human follow-up supersedes the prior retryable failure, regardless of which head
     // sent it. Until this boundary, Stop/preflight failure must leave the old exact bytes authoritative.
-    if (!internal.logicalContinuation && previousRemotePayload?.failed) {
+    if (!internal.logicalContinuation && !internal.compact && previousRemotePayload?.failed) {
       this.stripRemoteTurnPayload(sessionId, previousRemotePayload)
       if (this.remoteTurnPayloads.get(sessionId) === previousRemotePayload)
         this.remoteTurnPayloads.delete(sessionId)
@@ -1596,6 +1609,16 @@ export class EngineSessionManager {
     // The revision rides the receipt so the sending head learns, in the same round trip, which launcher
     // rows already account for this turn. Read AFTER the working claim above, never before it.
     return { status: 'accepted', workingRevision: this.workingRevision(sessionId), statusEpoch: this.statusEpoch(sessionId) }
+  }
+
+  /**
+   * Compact this conversation now, on either engine. It is admitted as a turn so every head sees the
+   * session working and nothing else can start underneath it; the pre-turn checkpoint is harmless and
+   * keeps this on the one admission path. `ContextCompacted` is the proof it happened. A conversation
+   * too short to summarize ends in a plain TurnComplete with no such event.
+   */
+  compact(sessionId: string, origin: 'local' | 'remote' = 'local'): Promise<RemoteTurnReceipt> {
+    return this.sendTurn(sessionId, 'Compact conversation', undefined, origin, { compact: true })
   }
 
   // ── Queued-send ─────────────────────────────────────────────────────────────
@@ -3098,12 +3121,32 @@ export class EngineSessionManager {
   private markWorking(sessionId: string): void {
     if (this.working.has(sessionId)) return
     this.working.add(sessionId)
+    this.workingSince.set(sessionId, Date.now())
     this.bumpWorkingRevision(sessionId)
   }
 
   private clearWorking(sessionId: string): void {
     if (!this.working.delete(sessionId)) return
+    this.workingSince.delete(sessionId)
     this.bumpWorkingRevision(sessionId)
+  }
+
+  /** How long the parent turn has been running, and how long since the engine last said anything. A
+   *  remote head opening a session mid-turn has no other way to tell a long quiet command from a view
+   *  that stopped updating. Durations, never timestamps: the two devices share no clock. Undefined when
+   *  there is nothing truthful to report (idle, or delegated work outliving its parent turn). */
+  workingForMs(sessionId: string): number | undefined {
+    const since = this.workingSince.get(sessionId)
+    return since !== undefined && this.isWorking(sessionId) ? Math.max(0, Date.now() - since) : undefined
+  }
+
+  quietForMs(sessionId: string): number | undefined {
+    const at = this.engineEventAt.get(sessionId)
+    if (at === undefined || !this.isWorking(sessionId)) return undefined
+    // Sending a turn does not stamp the event clock, so until the first delta it still holds the
+    // PREVIOUS turn's last event. Never report a silence longer than the turn it is measured in.
+    const since = this.workingSince.get(sessionId)
+    return Math.max(0, Date.now() - Math.max(at, since ?? at))
   }
 
   private bumpWorkingRevision(sessionId: string): void {
@@ -4460,7 +4503,7 @@ export class EngineSessionManager {
   async capturePreview(sessionId: string): Promise<{ data: string; mimeType: string }> {
     const ctx = contextForSession(sessionId)
     if (!ctx) throw new Error('no project window for this session')
-    return captureWindowPreview(ctx.win, IMAGE_DETAIL_CAPS[loadImageDetail()])
+    return captureWindowPreview(ctx.win, IMAGE_DETAIL_CAPS[loadImageDetail()], sessionId)
   }
 
   /**
@@ -5114,7 +5157,12 @@ export class EngineSessionManager {
             ...(replay.visible.clientTurnId ? { clientTurnId: replay.visible.clientTurnId } : {}),
           },
         )
-      } else this.clearWorking(sessionId)
+      } else {
+        // A compaction holds no replay: there is nothing left to summarize on a clean conversation.
+        // Its turn still needs a real terminal, or the owning window stays busy on a turn that is gone.
+        if (this.working.has(sessionId)) this.settleStoppedContinuation(sessionId)
+        this.clearWorking(sessionId)
+      }
     } catch (err) {
       this.clearWorking(sessionId)
       this.forward({

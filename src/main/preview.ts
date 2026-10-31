@@ -9,11 +9,11 @@
  * (window-registry), NOT the integer window id — so a previewed app can't enumerate ids to read
  * another open project's files. `/` serves `index.html`.
  */
-import { protocol, ipcMain, BrowserWindow } from 'electron'
+import { protocol, ipcMain, BrowserWindow, webFrameMain } from 'electron'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { stat } from 'node:fs/promises'
-import { extname } from 'node:path'
+import { extname, posix } from 'node:path'
 import http from 'node:http'
 import https from 'node:https'
 import { IpcChannels } from '@shared/channels'
@@ -206,7 +206,10 @@ export async function showStaticPreview(
   relPath: string,
   sessionId: string,
 ): Promise<{ url: string }> {
-  const rel = relPath.replace(/^\/+/, '').trim()
+  // One canonical spelling per file: the restart descriptor pushed below is what the toolbar's
+  // recent-previews list dedupes and marks current by, so `./mocks/a.html` and `mocks/a.html` must
+  // not become two entries. `..` survives normalize and is refused by containedReal as before.
+  const rel = posix.normalize(relPath.trim()).replace(/^(?:\.\/|\/)+/, '')
   if (!/\.html?$/i.test(rel)) throw new Error('preview_file needs a path to an .html file')
   let file: string
   try {
@@ -249,6 +252,58 @@ export function registerPreviewProtocol(): void {
   protocol.handle(PREVIEW_SCHEME, (req) => servePreviewRequest(req.url))
 }
 
+/** Where each window's preview frame last landed, keyed by window id. The toolbar's address bar reads
+ *  this after every frame `load`: the frame is cross-origin, so its own location is unreadable from the
+ *  renderer. It comes from the frame's own committed navigations, not from request headers, because a
+ *  request cannot say whether it was the preview frame, a page nested inside it, or a subresource. */
+const locationByWindow = new Map<number, string>()
+
+/** Where the window's preview frame most recently landed, or null before it has shown a project page. */
+export function previewLocation(winId: number): string | null {
+  return locationByWindow.get(winId) ?? null
+}
+
+/** Drop a closed window's recorded location. */
+export function forgetPreviewLocation(winId: number): void {
+  locationByWindow.delete(winId)
+}
+
+/**
+ * Record one committed frame navigation. Only the preview frame counts: a direct child of the Koda
+ * window's main frame (`parentIsMainFrame`) whose URL is on this window's own preview origin. A page
+ * nested inside the preview, or a frame on any other origin, never moves the address bar. Any content
+ * type counts, and so does a 404, so the bar shows what was asked.
+ */
+export function notePreviewNavigation(winId: number, url: string, parentIsMainFrame: boolean): void {
+  if (!parentIsMainFrame) return
+  const token = previewTokenForWindow(winId)
+  try {
+    const u = new URL(url)
+    if (u.protocol !== `${PREVIEW_SCHEME}:` || !token || u.hostname !== token) return
+  } catch {
+    return
+  }
+  locationByWindow.set(winId, url)
+}
+
+/** Feed `notePreviewNavigation` from a window's webContents. Call once per window after it is registered. */
+export function trackPreviewLocation(win: BrowserWindow): void {
+  const wc = win.webContents
+  const note = (url: string, isMainFrame: boolean, processId: number, routingId: number): void => {
+    if (isMainFrame) return
+    const frame = webFrameMain.fromId(processId, routingId)
+    const parent = frame?.parent
+    notePreviewNavigation(win.id, url, !!parent && parent.frameTreeNodeId === wc.mainFrame.frameTreeNodeId)
+  }
+  wc.on('did-frame-navigate', (_e, url, _code, _text, isMainFrame, processId, routingId) =>
+    note(url, isMainFrame, processId, routingId),
+  )
+  // Hash and history.pushState moves inside the page commit no new document but do change the address.
+  wc.on('did-navigate-in-page', (_e, url, isMainFrame, processId, routingId) =>
+    note(url, isMainFrame, processId, routingId),
+  )
+}
+
 /**
  * Answer one `koda-preview://` request. Exported so the containment tests exercise the shipped
  * handler rather than a re-implementation of its rules.
@@ -261,7 +316,13 @@ export async function servePreviewRequest(rawUrl: string): Promise<Response> {
     return blankPreviewResponse(400)
   }
 
-  let rel = decodeURIComponent(url.pathname)
+  let rel: string
+  try {
+    rel = decodeURIComponent(url.pathname)
+  } catch {
+    // A literal `%` (`100%.html`) is not a valid escape; it names nothing, so it is a miss.
+    return blankPreviewResponse(404, url.pathname.replace(/^\/+/, ''))
+  }
   if (rel === '/' || rel === '') rel = '/index.html'
   rel = rel.replace(/^\/+/, '') // strip leading '/' → project-relative
 
@@ -274,7 +335,15 @@ export async function servePreviewRequest(rawUrl: string): Promise<Response> {
 
   const ctx = contextForPreviewToken(url.hostname)
   if (!ctx || !ctx.projectPath) return blankPreviewResponse(404)
-  return serveAppPreviewFile(ctx.projectPath, rel)
+  const res = await serveAppPreviewFile(ctx.projectPath, rel)
+  // A miss is named so a typed or linked path that missed reads as a miss rather than an empty app.
+  if (!res.ok) return blankPreviewResponse(404, rel)
+  if (!res.headers.get('Content-Type')?.startsWith('text/html')) return res
+  // Pages are never cached: Back and Forward must come back through here so the address bar learns
+  // where the frame went, and a reload must show the agent's latest bytes, not the previous draft.
+  const headers = new Headers(res.headers)
+  headers.set('Cache-Control', 'no-store')
+  return new Response(res.body, { status: res.status, headers })
 }
 
 /**
@@ -372,14 +441,22 @@ function refusedDocumentResponse(): Response {
   })
 }
 
-/** A calm, on-brand placeholder shown in the preview iframe when there's nothing to render yet —
- *  no project entry, a file that doesn't exist, or a bad request. Adapts to light/dark via
- *  `prefers-color-scheme` (the iframe can't read Koda's theme, so we let the OS decide). */
-function blankPreviewResponse(status: number): Response {
-  return new Response(BLANK_PREVIEW_HTML, {
+/** A calm, on-brand placeholder shown in the preview iframe when there's nothing to render — no project
+ *  entry, a bad request, or (with `missing`, the project-relative path asked for) a page that isn't
+ *  there, named so a typed or linked path that missed reads as a miss rather than an empty app. The same
+ *  line covers a path that escapes the project: the preview learns nothing from the difference. Adapts
+ *  to light/dark via `prefers-color-scheme` (the iframe can't read Koda's theme, so we let the OS decide). */
+function blankPreviewResponse(status: number, missing?: string): Response {
+  const message = missing === undefined ? 'Nothing to preview yet.' : `Nothing at /${escapeHtml(missing)}.`
+  return new Response(BLANK_PREVIEW_HTML.replace('{{message}}', () => message), {
     status,
-    headers: { 'Content-Type': 'text/html; charset=utf-8' },
+    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
   })
+}
+
+function escapeHtml(text: string): string {
+  const named: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }
+  return text.replace(/[&<>"']/g, (c) => named[c] ?? c)
 }
 
 const BLANK_PREVIEW_HTML = `<!doctype html>
@@ -402,7 +479,7 @@ const BLANK_PREVIEW_HTML = `<!doctype html>
 </style>
 </head>
 <body>
-  <p>Nothing to preview yet.</p>
+  <p>{{message}}</p>
 </body>
 </html>`
 
@@ -629,6 +706,8 @@ export function killDevServer(winId: number): void {
 interface CaptureReply {
   rect: PreviewRect | null
   dpr: number
+  /** The asking chat is not the one on screen, so its preview is not drawn anywhere to capture. */
+  background: boolean
 }
 interface PendingCapture {
   resolve: (reply: CaptureReply) => void
@@ -641,40 +720,54 @@ const CAPTURE_RECT_TIMEOUT_MS = 3_000
 
 /** Wire the renderer's rect replies. Call once after app `ready` (index.ts), beside registerPreviewProtocol. */
 export function registerPreviewCaptureResponder(): void {
-  ipcMain.on(IpcChannels.previewCaptureResponse, (event, raw: unknown) => {
-    const payload = raw as { correlationId?: unknown; rect?: unknown; dpr?: unknown }
-    if (typeof payload?.correlationId !== 'string') return
-    const pending = pendingCaptures.get(payload.correlationId)
-    if (!pending || pending.senderId !== event.sender.id) return // ignore unknown id / wrong window
-    pendingCaptures.delete(payload.correlationId)
-    clearTimeout(pending.timer)
-    const parsed = PreviewRectSchema.safeParse(payload.rect)
-    const dpr = typeof payload.dpr === 'number' && payload.dpr >= 1 ? payload.dpr : 1
-    pending.resolve({ rect: parsed.success ? parsed.data : null, dpr })
-  })
+  ipcMain.on(IpcChannels.previewCaptureResponse, (event, raw: unknown) => settlePreviewCapture(event.sender.id, raw))
+}
+
+/** One renderer reply. Split from the listener so the capture contract can be driven without Electron. */
+export function settlePreviewCapture(senderId: number, raw: unknown): void {
+  const payload = raw as { correlationId?: unknown; rect?: unknown; dpr?: unknown; background?: unknown }
+  if (typeof payload?.correlationId !== 'string') return
+  const pending = pendingCaptures.get(payload.correlationId)
+  if (!pending || pending.senderId !== senderId) return // ignore unknown id / wrong window
+  pendingCaptures.delete(payload.correlationId)
+  clearTimeout(pending.timer)
+  const parsed = PreviewRectSchema.safeParse(payload.rect)
+  const dpr = typeof payload.dpr === 'number' && payload.dpr >= 1 ? payload.dpr : 1
+  pending.resolve({ rect: parsed.success ? parsed.data : null, dpr, background: payload.background === true })
 }
 
 /**
- * Capture the window's currently-visible preview as a downscaled JPEG (base64) for the agent's
- * view_preview. Rejects when no preview is showing/visible (the renderer reports a null/empty rect)
- * so the tool returns a clear hint rather than a blank frame. `maxEdge` caps the longest side in
- * PHYSICAL pixels — the real token lever (the manager passes the imageDetail cap).
+ * Capture `sessionId`'s preview as a downscaled JPEG (base64) for the agent's view_preview. Rejects
+ * when that preview is not on screen (the renderer reports a null/empty rect) so the tool returns a
+ * clear hint rather than a blank frame. `maxEdge` caps the longest side in PHYSICAL pixels — the real
+ * token lever (the manager passes the imageDetail cap).
+ *
+ * The request names the asking session because a window hosts several chats and draws only the front
+ * one's Stage. Unnamed, the renderer answered with whichever chat was in front: a background agent
+ * was handed a screenshot of someone else's preview, and the user's Stage was pulled to it mid-work.
  */
 export async function captureWindowPreview(
   win: BrowserWindow,
   maxEdge: number,
+  sessionId: string,
 ): Promise<{ data: string; mimeType: string }> {
   if (win.isDestroyed()) throw new Error('the preview window is gone')
 
   const correlationId = randomUUID()
-  const { rect, dpr } = await new Promise<CaptureReply>((resolve) => {
+  const { rect, dpr, background } = await new Promise<CaptureReply>((resolve) => {
     const timer = setTimeout(() => {
       pendingCaptures.delete(correlationId)
-      resolve({ rect: null, dpr: 1 })
+      resolve({ rect: null, dpr: 1, background: false })
     }, CAPTURE_RECT_TIMEOUT_MS)
     pendingCaptures.set(correlationId, { resolve, timer, senderId: win.webContents.id })
-    win.webContents.send(IpcChannels.previewCaptureRequest, { correlationId })
+    win.webContents.send(IpcChannels.previewCaptureRequest, { correlationId, sessionId })
   })
+  if (background) {
+    // Retrying cannot help and Koda will not switch the user's chat to make it work, so say both.
+    throw new Error(
+      "couldn't see the preview: this chat is not the one on screen, and Koda only draws the preview of the chat the user is looking at. It is still open in this chat's Preview tab. Don't retry; continue without the screenshot, or check the page another way.",
+    )
+  }
   if (!rect || rect.width < 1 || rect.height < 1) {
     // Either nothing is running or the Preview tab isn't the visible surface (only the foreground
     // pane is mounted). Don't say "start one" — that risks the agent redundantly relaunching a server.

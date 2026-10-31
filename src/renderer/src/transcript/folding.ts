@@ -52,6 +52,9 @@ export type Turn = {
 }
 
 /** Elapsed time as a person would say it: `12s`, `2m 14s`, `1h 4m`. */
+/** Past this much engine silence a remote reader starts wondering whether the view is stuck. */
+export const QUIET_AFTER_MS = 5000
+
 export function formatDuration(ms: number): string {
   const total = Math.max(0, Math.round(ms / 1000))
   if (total < 60) return `${total}s`
@@ -174,27 +177,19 @@ export function buildTurns(
       if (tail?.type === 'group') tail.live = true
       return { id: turn.id, header: turn.header, fold: null, body }
     }
-    // The turn's answer is its LAST prose block; earlier prose is narration of work that's now folded.
-    // That split leans on the agent putting substance last, and an agent that breaks the contract
-    // would have its real reply silently swallowed behind the fold. So the fold fails OPEN: an
-    // earlier block that outweighs BOTH the final one and a tweet-sized floor reads as substance,
-    // not narration, and stays visible. The floor is what keeps a status line above a terse closer
-    // from surfacing as noise — a genuinely swallowed answer runs paragraphs, not a sentence.
+    // The turn's answer is its LAST prose block; earlier prose folds with the work, however long. The
+    // pack obliges the agent to restate in its final message anything that mattered mid-turn. A
+    // length-based fail-open used to keep long earlier blocks visible, and in practice it surfaced
+    // stale progress notes ("nothing is committed yet") stacked above the reply that superseded them.
     let answer: Entry | undefined
-    let answerLength = 0
     for (let i = turn.entries.length - 1; i >= 0; i--) {
-      const entry = turn.entries[i]
-      if (entry.kind === 'assistant') {
-        answer = entry
-        answerLength = entry.markdown.length
+      if (turn.entries[i].kind === 'assistant') {
+        answer = turn.entries[i]
         break
       }
     }
     const liveFleet = turn.entries.some((entry) => isFleetEntry(entry) && fleetEntryIsLive(entry))
-    const substanceFloor = Math.max(answerLength, 280)
-    const kept = turn.entries.filter(
-      (e) => e === answer || (e.kind === 'assistant' && e.markdown.length > substanceFloor) || survivesFold(e, liveFleet),
-    )
+    const kept = turn.entries.filter((e) => e === answer || survivesFold(e, liveFleet))
     const count = turn.entries.length - kept.length
     if (count === 0) {
       return { id: turn.id, header: turn.header, fold: null, body: toNodes(turn.entries, false, expandedRuns) }

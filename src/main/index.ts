@@ -1,6 +1,6 @@
 import { basename, dirname, join } from 'node:path'
 import { existsSync, realpathSync } from 'node:fs'
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, screen, session, shell } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, Menu, screen, session, shell } from 'electron'
 import { IpcChannels } from '@shared/channels'
 import { disposeEngineSessions, getEngineSessions, registerIpcHandlers, runDreamNow } from './ipc'
 import { probeEngine } from './engine/probe'
@@ -27,6 +27,8 @@ import {
   registerPreviewCaptureResponder,
   killDevServer,
   forgetWindowDocuments,
+  forgetPreviewLocation,
+  trackPreviewLocation,
   isDocumentFrameEscape,
 } from './preview'
 import { stopAllLanForwards } from './lan-forward'
@@ -40,6 +42,7 @@ import { startProbeGovernor } from './probe-governor'
 import { startScratchRetentionSweep } from './scratch-retention'
 import { closeAllNeuralViews, openNeuralView } from './neural-view'
 import { appNameFor, isE2EProfile, runtimeProfile } from './runtime-profile'
+import { flushRendererState } from './renderer-state'
 
 // Pin the app name before any getPath() call (unpackaged Electron would otherwise name it
 // "Electron"). Dev and E2E deliberately get distinct identities: dev can coexist with the installed
@@ -169,6 +172,7 @@ function createWindow(projectPath: string, newProjectIntent = false): void {
   })
 
   registerWindow(win, projectPath, newProjectIntent)
+  trackPreviewLocation(win)
   // Title the window by project so multiple windows are distinguishable in the macOS window switcher.
   if (projectPath) win.setTitle(projectPath.split('/').filter(Boolean).pop() || 'Koda')
 
@@ -193,6 +197,7 @@ function createWindow(projectPath: string, newProjectIntent = false): void {
   // restore-on-boot set (a user closing a window means "don't reopen it"; quitting preserves the set).
   win.on('closed', () => {
     killDevServer(win.id) // a managed preview dev server must not outlive its window
+    forgetPreviewLocation(win.id)
     forgetWindowDocuments(win.id) // nor the paths its document origin was allowed to serve
     stopStaticPreviewServersForWindow(win.id) // nor the phone's loopback server over its project
     killTerminal(win.id) // nor the window's interactive shell
@@ -568,28 +573,6 @@ app.whenReady().then(async () => {
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
-
-/** Ask every window to fire its pending debounced state save and wait for the acks (see
- *  uiFlushState in channels.ts) — bounded, because quit must never wedge on a hung renderer. */
-function flushRendererState(): Promise<void> {
-  const wins = BrowserWindow.getAllWindows().filter((w) => !w.isDestroyed())
-  if (wins.length === 0) return Promise.resolve()
-  return new Promise((resolve) => {
-    let remaining = wins.length
-    const onDone = (): void => {
-      remaining -= 1
-      if (remaining <= 0) finish()
-    }
-    const finish = (): void => {
-      clearTimeout(timer)
-      ipcMain.removeListener(IpcChannels.uiFlushStateDone, onDone)
-      resolve()
-    }
-    const timer = setTimeout(finish, 1000)
-    ipcMain.on(IpcChannels.uiFlushStateDone, onDone)
-    for (const w of wins) w.webContents.send(IpcChannels.uiFlushState)
-  })
-}
 
 // Tear down live engine processes before the app exits so no orphaned `claude`
 // child outlives the shell. app.exit() bypasses before-quit, so no re-entry loop.

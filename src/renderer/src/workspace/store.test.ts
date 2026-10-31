@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { TURN_REJECTED_STOP_REASON, type ArchivedSessionMeta, type DocShelf } from '@shared/ipc'
+import {
+  TURN_REJECTED_STOP_REASON,
+  type ArchivedSessionMeta,
+  type DocShelf,
+  type PreviewRestart,
+} from '@shared/ipc'
 import { turnFailureOf } from '@shared/delegation'
 // Imported before `window` exists on purpose: the module's boot-time git refresh is behind a
 // `typeof window !== 'undefined'` guard, so the store loads clean in the node lane and the fake bridge
@@ -11,6 +16,7 @@ import {
   stageVisible,
   statusOf,
   useWorkspace,
+  withRecentPreview,
   type SessionState,
 } from './store'
 import { busyActivity } from './activity'
@@ -725,7 +731,7 @@ describe('delegated work opens the Agents stage', () => {
     expect(editor.pinned).toBe(true)
   })
 
-  it('fronts a background workflow and opens its Agents tab', () => {
+  it('stages a background workflow in its own session without moving the user', () => {
     const a = session('a')
     const b = session('b')
     useWorkspace.setState({
@@ -746,9 +752,10 @@ describe('delegated work opens the Agents stage', () => {
     })
 
     const state = useWorkspace.getState()
-    expect(state.activeId).toBe('b')
-    expect(stageVisible(state)).toBe(true)
+    expect(state.activeId).toBe('a')
+    expect(state.sessions.b.attention).toBe(false)
     expect(state.editors.a.surfaces).toEqual([])
+    expect(state.editors.a.stageShown).toBe(false)
     expect(state.editors.b.surfaces).toEqual([
       expect.objectContaining({ kind: 'agents', title: 'Agents' }),
     ])
@@ -756,9 +763,9 @@ describe('delegated work opens the Agents stage', () => {
     expect(state.editors.b.stageShown).toBeUndefined()
   })
 
-  it('fronts a background session and shows the preview its agent pushed', () => {
+  it('lights up a background session whose agent pushed a preview, and has it in front on arrival', () => {
     const a = session('a')
-    const b = { ...session('b'), attention: true }
+    const b = session('b')
     useWorkspace.setState({
       sessions: { a, b },
       order: ['a', 'b'],
@@ -778,9 +785,14 @@ describe('delegated work opens the Agents stage', () => {
       .getState()
       .openPreview('http://localhost:5173', { respectPin: true, sessionId: 'b' })
 
+    const waiting = useWorkspace.getState()
+    expect(waiting.activeId).toBe('a')
+    expect(waiting.sessions.b.attention).toBe(true)
+
+    useWorkspace.getState().selectSession('b')
+
     const state = useWorkspace.getState()
     const editor = state.editors.b
-    expect(state.activeId).toBe('b')
     expect(state.sessions.b.attention).toBe(false)
     expect(stageVisible(state)).toBe(true)
     expect(editor.surfaces.map((surface) => surface.kind ?? 'file')).toEqual(['file', 'preview'])
@@ -2359,6 +2371,45 @@ describe('background subagent lifecycle', () => {
     expect(child.kind === 'subagent' && child.stopRequested).toBeUndefined()
   })
 
+  it('stops a resumed agent even when an earlier launch has the same task id', () => {
+    const stopSubagent = vi.fn(async () => {})
+    const interruptSession = vi.fn(async () => {})
+    installBridge({ stopSubagent, interruptSession })
+    const a = session('a')
+    const completed = { ...runningChild, status: 'completed' as const, resultText: 'Earlier result' }
+    const resumed = { ...runningChild, id: 102, toolUseId: 'resumed-tool' }
+    const sibling = { ...runningChild, id: 103, toolUseId: 'sibling-tool', taskId: 'sibling-task' }
+    a.busy = true
+    a.items = [completed, resumed, sibling]
+    useWorkspace.setState({ sessions: { a }, order: ['a'], activeId: 'a' })
+
+    useWorkspace.getState().stopSubagent('a', 'task-1')
+    useWorkspace.getState().stopSubagent('a', 'task-1')
+
+    expect(stopSubagent).toHaveBeenCalledExactlyOnceWith({ sessionId: 'a', taskId: 'task-1' })
+    expect(interruptSession).not.toHaveBeenCalled()
+    expect(useWorkspace.getState().sessions.a.busy).toBe(true)
+    expect(useWorkspace.getState().sessions.a.items).toEqual([
+      completed,
+      { ...resumed, stopRequested: true, lastActivityAt: expect.any(Number) },
+      sibling,
+    ])
+
+    useWorkspace.getState().applyEngineEvent({
+      type: 'SubagentCompleted',
+      sessionId: 'a',
+      toolUseId: 'resumed-tool',
+      taskId: 'task-1',
+      outcome: 'interrupted',
+    })
+    expect(useWorkspace.getState().sessions.a.items[1]).toMatchObject({
+      status: 'interrupted',
+      stopRequested: undefined,
+    })
+    expect(useWorkspace.getState().sessions.a.items[0]).toEqual(completed)
+    expect(useWorkspace.getState().sessions.a.items[2]).toEqual(sibling)
+  })
+
   it('clears a pending stop when main refuses the request', async () => {
     installBridge({ stopSubagent: vi.fn(async () => Promise.reject(new Error('already finished'))) })
     const a = session('a')
@@ -3382,5 +3433,34 @@ describe('queued-send', () => {
     useWorkspace.setState({ sessions: { a }, order: ['a'], activeId: 'a' })
     useWorkspace.getState().applyQueuedTurns([{ sessionId: 'a', text: 'held message', attachmentCount: 2 }])
     expect(useWorkspace.getState().sessions.a.queuedTurn).toEqual({ text: 'held message', attachmentCount: 2 })
+  })
+})
+
+// Four mocks shown in a row used to leave only the last one reachable: the session held one restart
+// descriptor. The list keeps every one the agent showed, newest first, so the toolbar can flip back.
+describe('recent previews', () => {
+  it('keeps every preview the agent showed, newest first, and moves a re-shown one to the front', () => {
+    const a = session('a')
+    useWorkspace.setState({ sessions: { a }, order: ['a'], activeId: 'a' })
+    const remember = useWorkspace.getState().rememberPreview
+    remember('a', { kind: 'static', relPath: 'mocks/one.html' })
+    remember('a', { kind: 'dev', command: 'npm run dev' })
+    remember('a', { kind: 'static', relPath: 'mocks/two.html' })
+    remember('a', { kind: 'static', relPath: 'mocks/one.html' })
+    expect(useWorkspace.getState().sessions.a.recentPreviews).toEqual([
+      { kind: 'static', relPath: 'mocks/one.html' },
+      { kind: 'static', relPath: 'mocks/two.html' },
+      { kind: 'dev', command: 'npm run dev' },
+    ])
+  })
+
+  it('tells the same command in two folders apart and stays short enough to read as a menu', () => {
+    let recent: PreviewRestart[] | undefined
+    recent = withRecentPreview(recent, { kind: 'dev', command: 'npm run dev', cwd: 'web' })
+    recent = withRecentPreview(recent, { kind: 'dev', command: 'npm run dev', cwd: 'docs' })
+    expect(recent).toHaveLength(2)
+    for (let i = 0; i < 12; i++) recent = withRecentPreview(recent, { kind: 'static', relPath: `m/${i}.html` })
+    expect(recent).toHaveLength(8)
+    expect(recent[0]).toEqual({ kind: 'static', relPath: 'm/11.html' })
   })
 })

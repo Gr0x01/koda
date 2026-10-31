@@ -36,6 +36,16 @@ export function DocPageChrome({
     setTitle(stem)
   }, [path, stem])
 
+  // A document the user just made lands on its name, selected, so the first thing typed names it.
+  // Claimed once from the store rather than inferred from an empty page: a blank doc that only came on
+  // stage must not take focus from the composer, where the next keystrokes would rename the file.
+  useEffect(() => {
+    if (useWorkspace.getState().justCreatedDoc !== path) return
+    useWorkspace.setState({ justCreatedDoc: null })
+    titleRef.current?.focus()
+    titleRef.current?.select()
+  }, [path])
+
   const commitTitle = (): void => {
     const clean = title.trim()
     if (!clean || clean === stem) {

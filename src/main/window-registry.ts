@@ -107,3 +107,9 @@ export function windowForProject(projectPath: string): BrowserWindow | undefined
 export function openProjectPaths(): string[] {
   return [...new Set([...registry.values()].map((ctx) => ctx.projectPath).filter(Boolean))]
 }
+
+/** Every workspace window the app registered. Windows outside the registry (Neural View, the hidden
+ * image encoder) load no preload, so a caller that needs a reply from a renderer must not count them. */
+export function registeredWindows(): BrowserWindow[] {
+  return [...registry.values()].map((ctx) => ctx.win)
+}

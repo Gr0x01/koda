@@ -323,9 +323,9 @@ describe('engine contract', () => {
     const { windows, complete } = await pollAccountUsage(CANDIDATE ? { binaryPath: CANDIDATE } : {})
     expect(complete).toBe(true)
     expect(windows.length, '/usage reported at least one plan window').toBeGreaterThan(0)
-    const session = windows.find((w) => w.rateLimitType === 'five_hour')
+    // The 5-hour window is optional: verified Ultra accounts have none, and `complete` above already
+    // fails if a reworded session line stops parsing.
     const weekly = windows.find((w) => w.rateLimitType === 'seven_day')
-    expect(session, 'the 5-hour window parsed').toBeTruthy()
     expect(weekly, 'the weekly window parsed').toBeTruthy()
     for (const w of windows) {
       expect(w.usedPercent, `${w.rateLimitType} carries a percent`).toBeGreaterThanOrEqual(0)

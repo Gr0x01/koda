@@ -1,6 +1,7 @@
-import { Suspense, useEffect, useState } from 'react'
+import { Suspense, useEffect, useRef, useState } from 'react'
 import type { ReadFileResult } from '@shared/ipc'
 import { lazyWithRetry } from '../ui'
+import { flushFileWritersUnder } from '../workspace/file-writer-registry'
 
 // Lazy so Crepe/Milkdown is NOT in the conversation-only bundle — it loads only when a doc is opened.
 const CrepeDocEditor = lazyWithRetry(() => import('./CrepeDocEditor'))
@@ -36,11 +37,29 @@ export function DocSurfaceView({
   const [file, setFile] = useState<ReadFileResult | null>(null)
   const [error, setError] = useState<string | null>(null)
 
+  // Coming here from the Markdown view, that editor is still writing its buffer as it unmounts. Reading
+  // before the write lands opens the page on the old text, and the page's next save then puts that old
+  // text back over what was typed there. One drain per path, started by the first read: on a later
+  // `rev` the only writer is this page's own editor, and draining it would write over the agent edit
+  // being loaded. The promise is kept, not a flag, so a re-run that arrives mid-drain (StrictMode's
+  // second effect, an early `rev`) waits on the same write instead of reading past it.
+  const settledRef = useRef<{ path: string; done: Promise<void> } | null>(null)
+
   useEffect(() => {
     let alive = true
     setError(null)
-    window.koda
-      .readFile({ path })
+    if (settledRef.current?.path !== path) {
+      settledRef.current = {
+        path,
+        // A failed save is the outgoing editor's to report; the page still opens on disk truth.
+        done: flushFileWritersUnder(path).then(
+          () => {},
+          () => {},
+        ),
+      }
+    }
+    settledRef.current.done
+      .then(() => window.koda.readFile({ path }))
       .then((r) => alive && setFile(r))
       .catch((e) => alive && setError(String(e)))
     return () => {

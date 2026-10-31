@@ -307,7 +307,7 @@ class CodexSession implements EngineSession {
    *  doesn't create the replacement before this one's teardown ran — mirrors the Claude adapter). */
   private closeResolve?: () => void
   /** Turns sent before the thread handshake finished — flushed in order once ready. */
-  private readonly turnQueue: { text: string; images?: TurnImage[] }[] = []
+  private readonly turnQueue: ({ text: string; images?: TurnImage[] } | 'compact')[] = []
   /** itemId → file path, captured from `item/started` (fileChange) so the file-change approval — whose
    *  params DON'T carry the path — can label the gate request + checkpoint with the real file. */
   private readonly itemPaths = new Map<string, string[]>()
@@ -485,7 +485,10 @@ class CodexSession implements EngineSession {
       // not the stale boot-seeded value (the `updated` push is sparse — see refreshRateLimits).
       this.refreshRateLimits()
       // Flush any turns the user sent during the handshake, in order.
-      for (const q of this.turnQueue.splice(0)) this.doTurn(q.text, q.images)
+      for (const q of this.turnQueue.splice(0)) {
+        if (q === 'compact') this.compact()
+        else this.doTurn(q.text, q.images)
+      }
     } catch (err) {
       if (this.disposed) return
       this.emit({
@@ -616,37 +619,51 @@ class CodexSession implements EngineSession {
     for (const img of images ?? []) {
       input.push({ type: 'image', url: `data:${img.mediaType};base64,${img.dataBase64}` })
     }
-    this.rpc('turn/start', { threadId: this.threadId, input }).then(
-      (res) => {
-        const turnId = (res as { turn?: { id?: string } })?.turn?.id
-        if (turnId) this.currentTurnId = turnId
-      },
-      (err) => {
-        // No turn is running, so nothing is owed the block's rules until the next one goes out.
-        this.steeredTurnMode = null
-        if (this.disposed) return
-        const message = `turn failed: ${err.message}`
-        this.emit({
-          type: 'EngineError',
-          sessionId: this.id,
-          message,
-          fatal: false,
-          category: 'turnRejected',
-          ...(looksLikeProviderDown(message) ? { providerStatus: 'down' as const } : {}),
-        })
-        // `turnRejected` was added after the first phone client shipped. That client only releases its
-        // busy gate for TurnComplete or a fatal EngineError, and marking this reusable process fatal
-        // would be false. Pair the classified error with an explicitly unsuccessful legacy terminal.
-        // The handshake carries no app/capability version, so we cannot withhold this from newer clients
-        // or stop old clients that haptic on every TurnComplete; the new client suppresses that haptic.
-        this.emit({
-          type: 'TurnComplete',
-          sessionId: this.id,
-          stopReason: TURN_REJECTED_STOP_REASON,
-        })
-      },
-    )
+    this.rpc('turn/start', { threadId: this.threadId, input }).then((res) => {
+      const turnId = (res as { turn?: { id?: string } })?.turn?.id
+      if (turnId) this.currentTurnId = turnId
+    }, this.turnRejected)
     return true
+  }
+
+  /** `thread/compact/start` answers `{}` at once and then runs as a turn of its own: `turn/started`,
+   *  a `contextCompaction` item, `turn/completed`. The existing handlers for those carry the rest. It
+   *  takes no input, so no steering block rides it and no posture is pinned. */
+  compact(): boolean {
+    if (this.disposed) return false
+    if (!this.ready) {
+      this.turnQueue.push('compact')
+      return true
+    }
+    if (!this.threadId) return false
+    this.compactionNotifiedThisTurn = false
+    this.rpc('thread/compact/start', { threadId: this.threadId }).catch(this.turnRejected)
+    return true
+  }
+
+  private readonly turnRejected = (err: Error): void => {
+    // No turn is running, so nothing is owed the block's rules until the next one goes out.
+    this.steeredTurnMode = null
+    if (this.disposed) return
+    const message = `turn failed: ${err.message}`
+    this.emit({
+      type: 'EngineError',
+      sessionId: this.id,
+      message,
+      fatal: false,
+      category: 'turnRejected',
+      ...(looksLikeProviderDown(message) ? { providerStatus: 'down' as const } : {}),
+    })
+    // `turnRejected` was added after the first phone client shipped. That client only releases its
+    // busy gate for TurnComplete or a fatal EngineError, and marking this reusable process fatal
+    // would be false. Pair the classified error with an explicitly unsuccessful legacy terminal.
+    // The handshake carries no app/capability version, so we cannot withhold this from newer clients
+    // or stop old clients that haptic on every TurnComplete; the new client suppresses that haptic.
+    this.emit({
+      type: 'TurnComplete',
+      sessionId: this.id,
+      stopReason: TURN_REJECTED_STOP_REASON,
+    })
   }
 
   interrupt(): void {

@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createSaveCoalescer, docEditorGuards } from './CrepeDocEditor'
+import { createSaveCoalescer, docEditorGuards, opensEditing } from './CrepeDocEditor'
 
 /**
  * The document surface's two load-bearing rules: reading state blocks the USER without blocking the
@@ -30,6 +30,14 @@ function functionBody(src: string, signature: string): string {
   }
   throw new Error(`unbalanced braces after ${signature}`)
 }
+
+describe('opensEditing', () => {
+  it('opens an empty document ready to type and leaves a written one in reading state', () => {
+    expect(opensEditing('')).toBe(true)
+    expect(opensEditing('\n\n')).toBe(true)
+    expect(opensEditing('# Plan\n')).toBe(false)
+  })
+})
 
 describe('docEditorGuards', () => {
   it('lets a document be read, selected, and refreshed without being typeable', () => {

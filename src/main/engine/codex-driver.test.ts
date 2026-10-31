@@ -1148,6 +1148,31 @@ describe('Codex delegation labels', () => {
  * whether that thread is worth reattaching, and a thread the engine has lost comes back as a recoverable
  * resume miss instead of "Codex session failed to start".
  */
+describe('Codex driver: compaction on request', () => {
+  it('starts a compact turn on the live thread', async () => {
+    const child = new FakeCodexProcess()
+    spawnMock.mockReturnValue(child)
+    const events: EngineEvent[] = []
+    const session = startCodexSession((event) => events.push(event), {
+      sessionId: 'koda-session',
+      cwd: '/tmp/project',
+      binaryPath: '/fake/codex',
+      decide: async () => ({ kind: 'allow' }),
+    })
+    await vi.waitFor(() => expect(events.some((event) => event.type === 'SessionStarted')).toBe(true))
+
+    expect(session.compact?.()).toBe(true)
+    await vi.waitFor(() =>
+      expect(child.requests).toContainEqual(
+        expect.objectContaining({ method: 'thread/compact/start', params: { threadId: expect.any(String) } }),
+      ),
+    )
+    expect(child.requests.some((request) => request.method === 'turn/start')).toBe(false)
+
+    await session.dispose()
+  })
+})
+
 describe('Codex resume cursor', () => {
   it('only calls a thread resumable once it has completed a turn', () => {
     expect(codexResumeCursor('t1', 0)).toEqual({

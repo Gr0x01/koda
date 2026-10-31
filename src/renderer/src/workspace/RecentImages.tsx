@@ -106,8 +106,7 @@ export function RecentImages() {
     >
       <div
         ref={setScrollEl}
-        // p-1 rather than none: the `+` badge floats outside each thumb (-top-1 -right-1) and a scroll
-        // box clips it, so the grid needs a hair of room on every edge.
+        // p-1 keeps the right column a hair clear of the box's own scrollbar lane.
         className="grid max-h-64 grid-cols-3 gap-1.5 overflow-y-auto p-1"
       >
         {images.map((img) => (
@@ -137,7 +136,10 @@ export function RecentImages() {
                     },
                   ])
                 }
-                className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-accent text-[11px] leading-none text-white opacity-0 outline-none transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
+                // Inside the thumb, not overhanging its corner. On the right column an overhanging badge
+                // sat in the scroll box's overlay-scrollbar lane: once the grid had been scrolled, the
+                // scrollbar took the pointer, the group lost hover, and the badge faded under the cursor.
+                className="absolute right-1.5 top-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-accent text-[13px] leading-none text-white opacity-0 shadow-pop outline-none transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
               >
                 +
               </button>

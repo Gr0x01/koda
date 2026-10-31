@@ -10,6 +10,79 @@ notes and the in-app "What's New" popup. The public `/changelog` page mirrors it
 
 ## [Unreleased]
 
+## [0.1.23] - 2026-10-30
+
+### Changed
+
+- A finished turn now shows only the agent's final reply. Updates it wrote while working fold
+  behind the "Worked for" line with the rest of the work, even long ones, so an old progress note
+  no longer sits above the reply that replaced it.
+- Compacting a chat now asks first. The composer waits while a chat compacts, so a stray press on
+  the small button no longer holds up what you were about to send.
+
+### Fixed
+
+- Koda now understands Anthropic's Ultra plan. Verified Ultra accounts have no 5-hour limit, so the
+  usage gauge and Settings show the weekly limit instead of a 5-hour row, and the overnight tidy
+  watches the weekly limit too. Other plans keep the 5-hour gauge whenever one is reported.
+- Stop in the Agents tab now reaches a resumed agent, even when its earlier completed run is
+  still in the list. Previously, clicking Stop could silently do nothing.
+- Settings → Usage counts very long chats again. A session whose history grew past about half a
+  gigabyte, which long Opus 5.5 days now reach, was being left out of the totals entirely. Usage
+  now reads only what a running chat added since the last look, so it stays quick however long the
+  chat gets.
+- The + that adds a recent image to your message is now a real target. It sits inside the picture
+  instead of hanging off its corner, and it is bigger, so it no longer fades away as your pointer
+  reaches it in a long list of images.
+
+## [0.1.22] - 2026-10-15
+
+### Added
+
+- You can now compact a long chat without leaving it. A small button beside the context meter
+  replaces the earlier conversation with a summary, so the chat gets its room back and keeps going
+  where it is. While it runs, the composer waits and the button pulses, so nothing you send gets
+  lost in the summary. It works on Claude and Codex, and a chat now also tells you when the engine
+  condensed the earlier conversation on its own.
+
+- The status bar shows a quiet marker when your project is working on a side branch. Hover it to
+  read what that means and where new changes are waiting, and click it to open Versions and fold the
+  work back into your main line. On your main line the marker stays out of the way.
+
+- The Preview toolbar names the file or server it is showing. When a chat has shown more than one
+  thing, that name opens a list so you can flip between them.
+
+- The address above the Preview works like a browser's. Type a path from the project or a localhost
+  address and press Enter to load it. It follows links you click inside the page, and a path that
+  is not there says so instead of going blank.
+
+### Changed
+
+- Koda no longer switches chats on you. When an agent in another chat opens a Preview or starts a
+  team of agents, you stay where you are and keep typing. A Preview lights up that chat's name in the
+  sidebar, and the result is in front on its Stage when you click over.
+
+### Fixed
+
+- A new document opens ready to use. Its name is selected so the first thing you type names it, and
+  the empty page takes typing straight away. Before, it opened locked like a finished document and
+  nothing worked until you found Edit.
+
+- Renaming a document now reaches everywhere at once. The Library shows the new name instead of
+  "Untitled", editing the `title:` line in the Markdown view renames it the same as renaming from the
+  page, and a rename no longer closes and reopens the page or drops what you had typed.
+
+- Text typed in a document's Markdown view now shows on the page when you switch back. The page used
+  to open on the old text, as if the edit had not happened.
+
+- An agent checking its preview from a chat you are not in no longer pulls your Stage over to
+  Preview, and no longer gets a picture of your chat's page instead of its own.
+
+- The overnight memory tidy now covers every night since its last complete pass, reading both Claude
+  and Codex conversations from Koda's own history. Skipped nights no longer disappear, a scan that
+  could not finish says so in the digest instead of being recorded as done, and the tidy waits for
+  open chats to finish saving before it reads them.
+
 ## [0.1.21] - 2026-10-07
 
 ### Added
@@ -811,7 +884,9 @@ _First versioned build — the baseline the auto-updater ships from._
 - Settings now shows the Koda version, the bundled Claude engine version, and a
   "Check for updates" button.
 
-[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.21...HEAD
+[Unreleased]: https://github.com/Gr0x01/koda/compare/v0.1.23...HEAD
+[0.1.23]: https://github.com/Gr0x01/koda/releases/tag/v0.1.23
+[0.1.22]: https://github.com/Gr0x01/koda/releases/tag/v0.1.22
 [0.1.21]: https://github.com/Gr0x01/koda/releases/tag/v0.1.21
 [0.1.20]: https://github.com/Gr0x01/koda/releases/tag/v0.1.20
 [0.1.19]: https://github.com/Gr0x01/koda/releases/tag/v0.1.19

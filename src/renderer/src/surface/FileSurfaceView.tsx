@@ -33,16 +33,12 @@ export function FileSurfaceView({
   // Bumped when the open file changes on disk (agent, another session, external editor) so we re-read.
   const [reloadNonce, setReloadNonce] = useState(0)
 
-  // Switching files: blank to the loading state so the previous file's content never lingers.
-  useEffect(() => {
-    setFile(null)
-    setError(null)
-  }, [path])
-
-  // Read on open/switch and on each disk change. A disk-change reload does NOT null `file` first, so
-  // the mounted editor swaps content in place (keeps cursor/scroll) instead of flashing "Loading…".
+  // Read on open, on a rename, and on each disk change. None of them null `file` first, so the mounted
+  // editor keeps its cursor, scroll and unsaved buffer. The pane is keyed per document (`paneKey`), so
+  // `path` only changes here when the open file is renamed or moved, never to a different file.
   useEffect(() => {
     let alive = true
+    setError(null)
     window.koda
       .readFile({ path })
       .then((r) => alive && setFile(r))
